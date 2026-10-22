@@ -4,7 +4,7 @@
 name = "guamp"
 soc = "SM6115"
 description = "Motorola Moto G9 Play"
-kit = "guamp"                      # the package/ of this repository appears as kits/gta4l in the build tree
+kit = "guamp"                      # the package/ of this repository appears as kits/guamp in the build tree
 
 # The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image. Give --ipsw PATH to use a local file; without
 # it the remote url is read with range requests, only the members that are needed.
@@ -46,7 +46,7 @@ archives = [
   "build-native-aes-bindings.py",
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
-  "build-gta4l-display-stub.py",
+  "build-guamp-display-stub.py",
 ]
 
 [kernel.prelink]
@@ -147,7 +147,8 @@ ipad_identity = true
 unique_chip_id = "required"          # the platform seed is not stored in any repository
 
 # Image parameters come from the Mu-Silicium device config; these override them
-# with the offsets the gta4l ABL accepts (verified with the ios-topaz image).
+# with ramdisk_offset 0x20000000 as on gta4l (same SoC): the original guamp offset 0x01000000 would put a
+# 192 MiB payload over the DTB at 0x01F00000. Not yet verified on the guamp ABL.
 [bootimg.image]
 base = 0
 kernel_offset = 0x00008000
