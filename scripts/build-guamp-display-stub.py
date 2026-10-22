@@ -25,7 +25,7 @@ def main() -> int:
     subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-c', '-target', 'arm64-apple-ios17.0',
                     '-isysroot', sdk, '-mkernel', '-ffreestanding', '-O2',
                     '-o', str(obj), str(source)], check=True)
-    archive = OUT / 'libGta4lDisplayStub.a'
+    archive = OUT / 'libGuampDisplayStub.a'
     archive.unlink(missing_ok=True)
     subprocess.run(['xcrun', 'ar', 'rcs', str(archive), str(obj)], check=True)
     print(f'display stub: {archive}')

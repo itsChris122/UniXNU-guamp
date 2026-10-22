@@ -1,4 +1,4 @@
-# Kernel configuration of the gta4l image. CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
+# Kernel configuration of the guamp image (from gta4l, same SoC). CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
 
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
@@ -12,7 +12,7 @@ CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/gta4l-display-stub/libGta4lDisplayStub.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/guamp-display-stub/libGuampDisplayStub.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n
 
 # The archive builders reuse these flags and add -Werror; Apple clang 17 (Xcode 16.4) does not know
