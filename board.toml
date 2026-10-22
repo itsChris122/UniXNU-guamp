@@ -156,3 +156,4 @@ ramdisk_offset = 0x20000000
 tags_offset = 0x00000100
 pagesize = 4096
 header_version = 2
+dtb_offset = 0x01F00000              # same as the stock guamp boot image
