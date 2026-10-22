@@ -23,11 +23,11 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
 "044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
 
 # The raw image for the userdata partition: the OS and SystemOS disk images of the IPSW behind a manifest.
-# gta4l uses eMMC (mmcblk0) with 512-byte logical sectors; first_lba/last_lba are the GPT entry of the LUN 0
-# "userdata" partition. Still to be read from the device before an install is attempted.
+# guamp uses eMMC (mmcblk0) with 512-byte logical sectors; first_lba/last_lba are the GPT entry of "userdata" (mmcblk0p77),
+# read from the device in TWRP on 2026-10-22.
 [userdata]
-first_lba = 0x2f3840
-last_lba = 0x3d0abfa
+first_lba = 0x1634000
+last_lba = 0x747bfde
 lba_bytes = 512
 windows = [
   { name = "OS", component = "OS" },
@@ -90,14 +90,14 @@ roots = [
 ]
 
 [firmware]
-config = "gta4l"                   # Resources/Configs/gta4l.toml in the Mu-Silicium checkout (--uefi)
-dsc = "Platforms/Samsung/gta4lPkg/gta4l.dsc"
-fd = "Build/gta4lPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
-preflight = ["scripts/check-gta4l.py"]
+config = "guamp"                   # Resources/Configs/guamp.toml in the Mu-Silicium checkout (--uefi)
+dsc = "Platforms/Motorola/guampPkg/guamp.dsc"
+fd = "Build/guampPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+preflight = []
 submodules = ["Common/Mu", "Common/Mu_OEM_Sample", "Silicium-ACPI", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
 packages = [
   "{uefi}",
-  "{uefi}/Platforms/Samsung",
+  "{uefi}/Platforms/Motorola",
   "{tree}/package",
   "{tree}/drivers/DarwinBoot",
   "{edk2}",
@@ -106,25 +106,25 @@ packages = [
   "{uefi}/Silicon/Qualcomm",
   "{uefi}/Silicon/Silicium",
   "{uefi}/Silicium-ACPI",
-  "{uefi}/Silicium-ACPI/Platforms/Samsung",
+  "{uefi}/Silicium-ACPI/Platforms/Motorola",
   "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
 ]
 
 [firmware.defines]
-ENABLE_SECUREBOOT = "1"
-DEVICE_MODEL = "gta4l"
+ENABLE_SECUREBOOT = "0"
+DEVICE_MODEL = "guamp"
 MEMORY_PROTECTION = "TRUE"
 SHIP_MODE = "FALSE"
-BUILDID_STRING = "gta4l-research"
+BUILDID_STRING = "guamp-research"
 
 # The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device tree and
 # the optional trust cache and Data seed. The loader (DarwinBoot) is part of the firmware volume.
 [payload]
-volume = "GTA4LESP"
+volume = "GUAMPESP"
 size_mib = 192
 loader = "firmware"
-title = "gta4l first boot: source 4K XNU to console"
-dram_size = "0x76000000"             # 3 GiB variant: 0x8a000000 + 0x76000000 = 0x100000000
+title = "guamp first boot: source 4K XNU to console"
+dram_size = "0x100000000"             # 4 GiB LPDDR4x from 0x40000000 (fastboot: ram 4GB)
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true
 kernel_args = [
@@ -136,9 +136,9 @@ kernel_args = [
 ]
 
 [payload.adt]
-tool = "scripts/make-gta4l-adt.py"
+tool = "scripts/make-guamp-adt.py"
 chip_id = "0x1bc"                    # SM6115
-owned_memory_size = "0x76000000"
+owned_memory_size = "0x100000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Kryo 260: Silver cluster 0x0-0x3, Gold cluster 0x100-0x103 (Affinity1 numbering)
 cpu_regs = "0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"
@@ -152,6 +152,6 @@ unique_chip_id = "required"          # the platform seed is not stored in any re
 base = 0
 kernel_offset = 0x00008000
 ramdisk_offset = 0x20000000
-tags_offset = 0x01e00000
+tags_offset = 0x00000100
 pagesize = 4096
 header_version = 2
