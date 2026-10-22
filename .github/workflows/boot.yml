@@ -1,0 +1,184 @@
+name: boot.img
+
+# Builds the whole gta4l chain on macOS, because the UniXNU kernel step needs
+# Xcode: 4 KiB XNU -> packages -> ESP payload -> firmware -> boot.img.
+# The image is packed by UniXNU's Python bootimg (BootShim + FD, the ESP as the
+# ramdisk) - the same code path as a local `./unixnu bootimg`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Build target"
+        type: choice
+        options: [DEBUG, RELEASE]
+        default: DEBUG
+      unique_chip_id:
+        description: "Platform seed (8 bytes, hex); the payload ADT needs it"
+        default: "0x1122334455667788"
+      unixnu_ref:
+        description: "UniXNU ref"
+        default: main
+      uefi_ref:
+        description: "mu-gta4l ref"
+        default: main
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bootimg:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}
+      TARGET: ${{ inputs.target || 'DEBUG' }}
+      CHIP: ${{ inputs.unique_chip_id || '0x1122334455667788' }}
+      UNIXNU_REF: ${{ inputs.unixnu_ref || 'main' }}
+      UEFI_REF: ${{ inputs.uefi_ref || 'main' }}
+
+    steps:
+      - name: Checkout device repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout UniXNU driver
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout Mu-Silicium (gta4l + UniXNU loaders)
+        uses: actions/checkout@v4
+        with:
+          repository: NoNameBuilder/mu-gta4l
+          ref: ${{ env.UEFI_REF }}
+          path: mu-gta4l
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode 16
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then
+            sudo xcode-select -s "$XC/Contents/Developer"
+            echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+          xcrun --find mig
+
+      - name: Dependencies
+        run: |
+          brew install llvm lld mtools
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          # Homebrew keeps llvm keg-only, and its bottle has no COFF driver name;
+          # lld dispatches on argv[0], so expose lld as lld-link.
+          [ -x "$LLVM_BIN/lld-link" ] || ln -sf "$(brew --prefix lld)/bin/lld" /opt/homebrew/bin/lld-link
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+          export PATH="$LLVM_BIN:$PATH"
+          lld-link --version
+          sw_vers
+          python3 --version
+
+      - name: Configure and fetch sources
+        working-directory: UniXNU
+        run: |
+          ./unixnu defconfig gta4l_defconfig -D "$UNIXNU_DEVICE"
+          ./unixnu fetch
+          ./unixnu tree
+
+      # prepare-xnu-source.py lists Apple headers with the unauthenticated GitHub API,
+      # which is rate limited on shared runner IPs (HTTP 403). Cache the listings here.
+      - name: Cache XNU DriverKit header listings
+        working-directory: UniXNU
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out/gta4l/tree/.cache/sources
+          cd out/gta4l/tree/.cache/sources
+          gh api "repos/apple-oss-distributions/xnu/contents/iokit/DriverKit?ref=xnu-10063.121.3&per_page=100" > xnu-driverkit-10063.121.3.json
+          gh api "repos/apple-oss-distributions/xnu/contents/iokit/DriverKit/crypto?ref=xnu-10063.121.3&per_page=100" > xnu-driverkit-crypto-10063.121.3.json
+          gh api "repos/apple-oss-distributions/xnu/contents/EXTERNAL_HEADERS/TrustCache?ref=xnu-8796.101.5&per_page=100" > xnu-trustcache-8796.101.5.json
+          wc -c *.json
+
+      - name: Build kernel
+        working-directory: UniXNU
+        run: ./unixnu build kernel --target "$TARGET" -j"$(sysctl -n hw.ncpu)"
+
+      - name: Build packages, payload and firmware
+        working-directory: UniXNU
+        run: |
+          ./unixnu build package --target "$TARGET"
+          ./unixnu build payload --target "$TARGET" --unique-chip-id "$CHIP"
+          ./unixnu build firmware --target "$TARGET" --uefi ../mu-gta4l
+
+      # The driver writes the real build output to out/gta4l/logs; without this
+      # a failed kernel step only shows the make wrapper.
+      - name: Dump driver logs
+        if: always()
+        working-directory: UniXNU
+        run: |
+          ls -l out/gta4l/logs || true
+          for f in out/gta4l/logs/*.log; do
+            echo "===== $f"
+            tail -n 120 "$f"
+          done
+          # The driver only starts the archive builders once startup.o.json exists; show where the records went.
+          B=out/gta4l/tree/build/xnu/ios-obj
+          ls -la "$B" 2>/dev/null | head -20 || true
+          echo "startup.o.json:"; find "$B" -name 'startup.o.json' 2>/dev/null | head
+          echo "records:"; find "$B" -name '*.o.json' 2>/dev/null | head -5
+          echo "record count:"; find "$B" -name '*.json' 2>/dev/null | wc -l
+          echo "startup objects:"; find "$B" -name 'startup.o*' 2>/dev/null | head
+
+      - name: Pack boot.img
+        working-directory: UniXNU
+        run: |
+          DTB="$UNIXNU_DEVICE/mu-gta4l/Platforms/Samsung/gta4lPkg/FdtBlob/sm6115-samsung-gta4l.dtb"
+          ./unixnu bootimg \
+            --uefi ../mu-gta4l \
+            --fd "../mu-gta4l/Build/gta4lPkg/${TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd" \
+            --dtb "$DTB" \
+            --target "$TARGET" \
+            -o boot.img
+
+      - name: Show image
+        run: |
+          ls -l UniXNU/boot.img
+          python3 - <<'EOF'
+          import struct
+          data = open('UniXNU/boot.img', 'rb').read()
+          assert data[:8] == b'ANDROID!', data[:8]
+          size, addr, rsize, raddr, _, _, tags, page, version, _ = struct.unpack_from('<10I', data, 8)
+          print(f'kernel {size} @{addr:#x}  ramdisk {rsize} @{raddr:#x}  tags {tags:#x}  page {page}  header v{version}')
+          print(f'bytes {len(data)}  sha256 {__import__("hashlib").sha256(data).hexdigest()}')
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4l-boot-${{ env.TARGET }}
+          path: |
+            UniXNU/boot.img
+            UniXNU/out/gta4l/boot/boot.json
+            mu-gta4l/Build/gta4lPkg/*/FV/SILICIUM_UEFI.fd
+            UniXNU/out/gta4l/logs/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4l-logs-${{ env.TARGET }}
+          path: UniXNU/out/gta4l/logs/**
+          if-no-files-found: warn
+          retention-days: 7
