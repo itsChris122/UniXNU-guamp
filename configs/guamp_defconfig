@@ -11,6 +11,9 @@ CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 
+# Run the [kernel] archives of board.toml (corecrypto, ARM drivers, display stub) before the link.
+CONFIG_XNU_BUILD_ARCHIVES=y
+
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/guamp-display-stub/libGuampDisplayStub.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n
