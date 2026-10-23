@@ -29,7 +29,7 @@ GUAMP_HARDWARE_SPEC = {
         {"name": "pil_gpu_mem",     "base": 0x53E15000, "size": 0x00002000},
         {"name": "framebuffer0",    "base": 0x5C000000, "size": 0x00465000},
         # RAM log of guampPkg (RamLog.h): kept so later stages can append to it
-        {"name": "guamp_ram_log",   "base": 0x5CA00000, "size": 0x00100000},  # live + previous boot log
+        {"name": "guamp_ram_log",   "base": 0x13FE00000, "size": 0x00200000},  # live + previous boot log (RamLog.h)
         {"name": "removed_mem",     "base": 0x60000000, "size": 0x03900000},
     ],
 }
