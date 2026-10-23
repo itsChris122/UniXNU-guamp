@@ -122,7 +122,7 @@ BUILDID_STRING = "guamp-research"
 [payload]
 timeout = 1                          # menu timeout (s): fast probe loop
 volume = "GUAMPESP"
-size_mib = 64                        # guamp ABL: "Not Enough space left to load kernel image" with 192 MiB
+size_mib = 512                       # payload on the eMMC userdata partition (FAT), outside the ABL ramdisk limit
 loader = "firmware"
 title = "guamp first boot: source 4K XNU to console"
 dram_size = "0x100000000"             # 4 GiB LPDDR4x from 0x40000000 (fastboot: ram 4GB)
@@ -131,9 +131,10 @@ panic_screen = false                 # broken display; no room next to the stage
 # Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
 # shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
 entry_probe_reset_delay = 2
-entry_probe_reset_after = "_bzero"
-entry_probe_reset_in = "_PE_create_console"
+entry_probe_reset_after = "_IOFindBSDRoot"
+entry_probe_reset_in = "_bsd_init"
 kernel_args = [
+  "rd=md0",                           # root on the RAM disk DarwinBoot hands over (iOS restore ramdisk)
   "-v",
   "serial=3",
   "debug=0x14e",
@@ -148,7 +149,7 @@ owned_memory_size = "0x40000000"            # 1 GiB DarwinBoot window (fits the 
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Kryo 260: Silver cluster 0x0-0x3, Gold cluster 0x100-0x103 (Affinity1 numbering)
 cpu_regs = "0x0,0x1,0x2,0x3"                  # Silver cluster only: the BCM2837 kernel config has MAX_CPUS 4, one cluster
-packed_data_ramdisk = true
+packed_data_ramdisk = false            # dense iOS restore ramdisk (APFS) as md0
 ipad_identity = true
 unique_chip_id = "required"          # the platform seed is not stored in any repository
 
