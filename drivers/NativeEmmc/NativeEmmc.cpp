@@ -69,7 +69,7 @@ constexpr uint32_t kFbEvery = 5;      // mirror passes per framebuffer copy
 enum : uint32_t {
   rArg = 0x08, rXfer = 0x0C, rCmd = 0x0E, rResp = 0x10, rData = 0x20, rPresent = 0x24, rHostCtl = 0x28,
   rPower = 0x29, rClock = 0x2C, rTimeout = 0x2E, rReset = 0x2F, rStatus = 0x30, rStatusEn = 0x34, rSignalEn = 0x38,
-  rHostCtl2 = 0x3E, rBlockSize = 0x04, rBlockCount = 0x06,
+  rHostCtl2 = 0x3E, rCaps = 0x40, rBlockSize = 0x04, rBlockCount = 0x06,
   // msm-v5 vendor ("MCI removed" layout)
   rPwrStatus = 0x240, rPwrMask = 0x244, rPwrClear = 0x248, rPwrCtl = 0x24C,
   // CQHCI, one page above the host
@@ -169,14 +169,10 @@ public:
       w32(rPwrCtl, ((request & 3) ? 1u : 0u) | ((request & 0xC) ? 4u : 0u));
       IODelay(100000);
     }
-    // Slow SDR clock: base / 16
-    w16(rClock, 0);
-    w16(rClock, (8 << 8) | 1);
-    uint64_t end = deadline(1000);
-    while (!(r16(rClock) & 2)) {
-      if (mach_absolute_time() > end) return 2;
-    }
-    w16(rClock, r16(rClock) | 4);
+    // Slow SDR clock (base / 16) while the card is switched back from HS200/HS400
+    baseMHz = (r32(rCaps) >> 8) & 0xFF;
+    if (!baseMHz) baseMHz = 200;
+    if (!setClock(8)) return 2;
     w8(rHostCtl, r8(rHostCtl) & ~0x18);                    // no DMA
     if (!resetLines()) return 1;
     w32(rStatusEn, 0xFFFFFFFF);
@@ -186,7 +182,49 @@ public:
     if (!command(6, (3u << 24) | (185u << 16) | (1u << 8), true)) return 9;   // HS_TIMING = HS
     if (!command(6, (3u << 24) | (183u << 16) | (2u << 8), true)) return 9;   // BUS_WIDTH = 8 bit SDR
     w8(rHostCtl, static_cast<uint8_t>((r8(rHostCtl) & ~0x06) | 0x20));
+    // Working clock: at most 25 MHz (legacy-compatible sampling, no HS edge), from the controller's base clock;
+    // readBlocks() halves it on transfer errors
+    uint32_t divider = (baseMHz + 49) / 50;
+    if (!divider) divider = 1;
+    if (!setClock(divider)) return 2;
     return 0;
+  }
+
+  uint32_t baseMHz = 0, divider = 0, clockKHz = 0;
+
+  // SDCLK = base / (2 * n), 10-bit divided clock mode
+  bool setClock(uint32_t n) {
+    w16(rClock, static_cast<uint16_t>(r16(rClock) & ~4));
+    w16(rClock, static_cast<uint16_t>(((n & 0xFF) << 8) | (((n >> 8) & 3) << 6) | 1));
+    uint64_t end = deadline(1000);
+    while (!(r16(rClock) & 2)) {
+      if (mach_absolute_time() > end) return false;
+    }
+    w16(rClock, static_cast<uint16_t>(r16(rClock) | 4));
+    divider = n;
+    clockKHz = baseMHz * 1000 / (2 * n);
+    return true;
+  }
+
+  bool slower() { return divider < 512 && setClock(divider * 2); }
+
+  // CMD18 with block count and auto CMD12: up to kBounceBlocks blocks per command
+  bool readMulti(uint64_t lba, uint32_t count, uint8_t *out) {
+    w32(rStatus, 0xFFFFFFFF);
+    w16(rBlockSize, kBlock);
+    w16(rBlockCount, static_cast<uint16_t>(count));
+    w32(rArg, static_cast<uint32_t>(lba));
+    w16(rXfer, (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1));
+    w16(rCmd, (18 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
+    if (wait(sCmdDone, 100)) return false;
+    for (uint32_t b = 0; b < count; b++) {
+      if (wait(sReadReady, 1000)) return false;
+      uint32_t *words = reinterpret_cast<uint32_t *>(out + static_cast<uint64_t>(b) * kBlock);
+      for (unsigned i = 0; i < kBlock / 4; i++) words[i] = r32(rData);
+    }
+    if (wait(sXferDone, 1000)) return false;
+    native_emmc_reads += count;
+    return true;
   }
 
   bool readBlock(uint64_t lba, uint8_t *out) {
@@ -244,9 +282,26 @@ struct Card {
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
+  // Multi-block reads; after a failed command the clock is halved and the run retried, and as a last resort
+  // the blocks are read one by one
   bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
-    for (uint32_t i = 0; i < count; i++) {
-      if (!host.readBlock(lba + i, out + static_cast<uint64_t>(i) * kBlock)) return false;
+    for (uint32_t done = 0; done < count;) {
+      uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : count - done;
+      uint8_t *at = out + static_cast<uint64_t>(done) * kBlock;
+      bool ok = false;
+      for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
+        ok = host.readMulti(lba + done, n, at);
+        if (!ok) {
+          native_emmc_errors++;
+          host.resetLines();
+          if (attempt < 2) host.slower();
+        }
+      }
+      for (uint32_t i = 0; !ok && i < n; i++) {
+        if (!host.readBlock(lba + done + i, at + static_cast<uint64_t>(i) * kBlock)) return false;
+        ok = i + 1 == n;
+      }
+      done += n;
     }
     return true;
   }
@@ -313,6 +368,7 @@ bool Card::findPartitions()
 //   0 "GUAMPLOG"  8 version 2  12 msg_size  16 msg_bufx  20 sequence  24 init stage  28 msg_magic
 //   32 mach_absolute_time  40 reads  48 writes  56 errors
 //   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)
+//   84 SD clock kHz  88 clock divider
 void Card::mirror(bool framebuffer)
 {
   guamp_msgbuf *ring = msgbufp;
@@ -338,7 +394,7 @@ void Card::mirror(bool framebuffer)
   memcpy(header + 8, words, sizeof(words));
   uint64_t counters[4] = { mach_absolute_time(), native_emmc_reads, native_emmc_writes, native_emmc_errors };
   memcpy(header + 32, counters, sizeof(counters));
-  uint32_t fbWords[5] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence };
+  uint32_t fbWords[7] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence, host.clockKHz, host.divider };
   memcpy(header + 64, fbWords, sizeof(fbWords));
   if (ok) writeLogBlock(0, header);
   native_emmc_mirrors++;
@@ -447,18 +503,20 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
       buffer->getLength() < count * kBlock) return kIOReturnBadArgument;
   if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
   Card &card = gCard;
-  IOLockLock(card.gate);
-  if (!card.online) { IOLockUnlock(card.gate); return kIOReturnNotReady; }
+  if (!card.online) return kIOReturnNotReady;
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
+  // The gate is taken per bounce-buffer run, so a long request does not starve the log mirror
   while (done < count) {
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
-    if (!card.readBlocks(first + block + done, n, card.bounce)) { status = kIOReturnIOError; break; }
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
-    if (buffer->writeBytes(done * kBlock, card.bounce, bytes) != bytes) { status = kIOReturnIOError; break; }
+    IOLockLock(card.gate);
+    bool ok = card.readBlocks(first + block + done, n, card.bounce) &&
+        buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
+    IOLockUnlock(card.gate);
+    if (!ok) { status = kIOReturnIOError; break; }
     done += n;
   }
-  IOLockUnlock(card.gate);
   completion->action(completion->target, completion->parameter, status, done * kBlock);
   return kIOReturnSuccess;
 }
@@ -547,8 +605,8 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   native_emmc_stage = card.host.init();
   if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
   if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
-  IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks)\n",
-        card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks);
+  IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks), clock %u kHz (base %u MHz)\n",
+        card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks, card.host.clockKHz, card.host.baseMHz);
   card.fb = mapPhysical(kFbPhys, kFbBytes);
   card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
   if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
