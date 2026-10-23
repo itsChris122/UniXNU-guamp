@@ -18,6 +18,9 @@ CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/guamp-display-stub/libGuampDisplayStub.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n
+# The BCM2837 configuration reads its panic log at 0x3C0FC000, which is not RAM on SM6115 (the read hung
+# PE_create_console). Take the panic region from the DT (/pram) instead; without /pram there is none.
+CONFIG_XNU_DT_PANIC_REGION=y
 
 # The archive builders reuse these flags and add -Werror; Apple clang 17 (Xcode 16.4) does not know
 # -Wno-unnecessary-virtual-specifier, so keep the default list without it.
