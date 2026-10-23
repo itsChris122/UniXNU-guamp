@@ -182,11 +182,8 @@ public:
     if (!command(6, (3u << 24) | (185u << 16) | (1u << 8), true)) return 9;   // HS_TIMING = HS
     if (!command(6, (3u << 24) | (183u << 16) | (2u << 8), true)) return 9;   // BUS_WIDTH = 8 bit SDR
     w8(rHostCtl, static_cast<uint8_t>((r8(rHostCtl) & ~0x06) | 0x20));
-    // Working clock: at most 25 MHz (legacy-compatible sampling, no HS edge), from the controller's base clock;
-    // readBlocks() halves it on transfer errors
-    uint32_t divider = (baseMHz + 49) / 50;
-    if (!divider) divider = 1;
-    if (!setClock(divider)) return 2;
+    // Stays at base / 16, the proven clock; Card::calibrate() then tries faster ones (the reported base clock is
+    // not the real one: a speed computed from it broke every transfer)
     return 0;
   }
 
@@ -282,33 +279,31 @@ struct Card {
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
-  // Multi-block reads; after a failed command the clock is halved and the run retried, and as a last resort
-  // the blocks are read one by one
+  // Multi-block reads (CMD18). A failed run is read again block by block (CMD17, the proven path); only when
+  // that fails too is the clock halved and the run tried once more.
+  bool readSingles(uint64_t lba, uint32_t n, uint8_t *at) {
+    for (uint32_t i = 0; i < n; i++) {
+      if (!host.readBlock(lba + i, at + static_cast<uint64_t>(i) * kBlock)) return false;
+    }
+    return true;
+  }
   bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
     for (uint32_t done = 0; done < count;) {
       uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : count - done;
       uint8_t *at = out + static_cast<uint64_t>(done) * kBlock;
-      bool ok = false;
-      for (unsigned attempt = 0; attempt < 3 && !ok; attempt++) {
-        ok = host.readMulti(lba + done, n, at);
-        if (!ok) {
-          native_emmc_errors++;
-          host.resetLines();
-          if (attempt < 2) host.slower();
-        }
-      }
-      for (uint32_t i = 0; !ok && i < n; i++) {
-        if (!host.readBlock(lba + done + i, at + static_cast<uint64_t>(i) * kBlock)) return false;
-        ok = i + 1 == n;
+      if (!host.readMulti(lba + done, n, at)) {
+        native_emmc_errors++;
+        host.resetLines();
+        if (!readSingles(lba + done, n, at) && !(host.slower() && readSingles(lba + done, n, at))) return false;
       }
       done += n;
     }
     return true;
   }
-  // The only writes of this driver, confined to the log partition
+  // The only writes of this driver, confined to the log partition; a failed write halves the clock once
   bool writeLogBlock(uint64_t index, const uint8_t *in) {
     if (!logBlocks || index >= logBlocks) return false;
-    return host.writeBlock(logFirst + index, in);
+    return host.writeBlock(logFirst + index, in) || (host.slower() && host.writeBlock(logFirst + index, in));
   }
   // Writes the blocks of source that differ from shadow; false on a write error
   bool mirrorRange(uint64_t firstBlock, const volatile uint8_t *source, uint8_t *copy, uint32_t bytes) {
@@ -325,6 +320,7 @@ struct Card {
     return true;
   }
   bool findPartitions();
+  void calibrate();
   void mirror(bool framebuffer);
 };
 
@@ -361,6 +357,26 @@ bool Card::findPartitions()
     if (!strcmp(name, "userdata")) { dataFirst = first; dataBlocks = last - first + 1; }
   }
   return logBlocks > kFbFirstBlock + kFbBytes / kBlock;
+}
+
+// Picks the fastest divider (1, 2 or 4; else the proven 8) at which a multi-block read of the GPT header matches
+// the copy read at the proven clock and a write to the last kpan block reads back unchanged
+void Card::calibrate()
+{
+  uint8_t reference[kBlock], pattern[kBlock];
+  if (!host.readBlock(1, reference)) return;
+  for (unsigned i = 0; i < kBlock; i++) pattern[i] = static_cast<uint8_t>(i * 7 + 0x5A);
+  static const uint32_t candidates[] = { 1, 2, 4 };
+  for (uint32_t n : candidates) {
+    if (!host.setClock(n)) break;
+    bool ok = host.readMulti(1, 8, bounce) && !memcmp(bounce, reference, kBlock) &&
+        host.writeBlock(logFirst + logBlocks - 1, pattern) && host.readMulti(logFirst + logBlocks - 1, 1, bounce) &&
+        !memcmp(bounce, pattern, kBlock);
+    if (ok) return;
+    host.resetLines();
+  }
+  host.setClock(8);
+  host.resetLines();
 }
 
 // Log layout in kpan: block 0 = header, blocks 1.. = the raw message ring (msg_size bytes, at most 1023
@@ -605,6 +621,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   native_emmc_stage = card.host.init();
   if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
   if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
+  card.calibrate();
   IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks), clock %u kHz (base %u MHz)\n",
         card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks, card.host.clockKHz, card.host.baseMHz);
   card.fb = mapPhysical(kFbPhys, kFbBytes);
