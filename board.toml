@@ -133,7 +133,7 @@ panic_screen = false                 # broken display; no room next to the stage
 kernel_args = [
   "-v",
   "serial=3",
-  "debug=0x14e",
+  "debug=0x14a",                      # no DB_NMI (0x4): a panic restarts through ArmDTPlatform::haltRestart
   "kt_fixed_zones=120",
   "boot-progress=2",
   "guamp-emmc-reset=45",               # NativeEmmc: PSCI reset after 45 log mirrors (1 s each)
