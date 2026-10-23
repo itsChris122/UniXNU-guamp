@@ -217,22 +217,14 @@ public:
 // methods it would inherit are reimplemented below from the public IOStorageFamily source. The class
 // hierarchy is joined to the kext's real metaclass at run time (linkMetaClass).
 __asm__(
-  ".text
-"
-  ".p2align 2
-"
-  ".globl __ZN20IOBlockStorageDeviceC2EPK11OSMetaClass
-"
-  "__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass:
-"
-  "  b __ZN9IOServiceC2EPK11OSMetaClass
-"
-  ".globl __ZN20IOBlockStorageDeviceD2Ev
-"
-  "__ZN20IOBlockStorageDeviceD2Ev:
-"
-  "  b __ZN9IOServiceD2Ev
-");
+  ".text\n"
+  ".p2align 2\n"
+  ".globl __ZN20IOBlockStorageDeviceC2EPK11OSMetaClass\n"
+  "__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass:\n"
+  "  b __ZN9IOServiceC2EPK11OSMetaClass\n"
+  ".globl __ZN20IOBlockStorageDeviceD2Ev\n"
+  "__ZN20IOBlockStorageDeviceD2Ev:\n"
+  "  b __ZN9IOServiceD2Ev\n");
 
 class NativeEmmc : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeEmmc)
@@ -448,8 +440,7 @@ static IOService *gPlatform = nullptr;
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
-  if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked
-"); return; }
+  if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked\n"); return; }
   NativeEmmc *disk = OSTypeAlloc(NativeEmmc);
   if (!disk) return;
   if (disk->init(nullptr) && disk->bringUp() && disk->attach(gPlatform)) {
