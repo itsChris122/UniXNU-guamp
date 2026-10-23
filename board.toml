@@ -120,6 +120,7 @@ BUILDID_STRING = "guamp-research"
 # The ramdisk of the boot image: a FAT volume with the UniXNU config, the kernel, its device tree and
 # the optional trust cache and Data seed. The loader (DarwinBoot) is part of the firmware volume.
 [payload]
+timeout = 1                          # menu timeout (s): fast probe loop
 volume = "GUAMPESP"
 size_mib = 64                        # guamp ABL: "Not Enough space left to load kernel image" with 192 MiB
 loader = "firmware"
@@ -129,7 +130,8 @@ skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = false                 # broken display; no room next to the stage 3 probe in the kernel padding
 # Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
 # shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
-entry_probe_reset_delay = 20
+entry_probe_reset_delay = 2
+entry_probe_reset_after = "_wfe_timeout_init"
 kernel_args = [
   "-v",
   "serial=3",

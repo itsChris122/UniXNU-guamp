@@ -64,6 +64,14 @@ def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
         pack_adt_prop("cluster-type", cluster_type),
         pack_adt_prop("timebase-frequency", u32(19200000)),
         pack_adt_prop("fixed-frequency-khz", u32(1804800 if mpidr < 0x100 else 2016000)),
+        # pe_identify_machine() reads the clocks only from the CPU whose "state" is "running" (the boot CPU)
+        pack_adt_prop("state", cstr("running" if cpu_idx == 0 else "waiting")),
+        # bus / timebase must be a whole ratio >= 1 (bus_to_dec_rate_den); 192 MHz = 10 x 19.2 MHz
+        pack_adt_prop("bus-frequency", u32(192000000)),
+        pack_adt_prop("memory-frequency", u32(1804000000)),
+        pack_adt_prop("peripheral-frequency", u32(19200000)),
+        pack_adt_prop("fixed-frequency", u32(19200000)),
+        pack_adt_prop("clock-frequency", u32(1804800000 if mpidr < 0x100 else 2016000000)),
     ]
     return struct.pack("<II", len(props), 0) + b"".join(props)
 
@@ -106,7 +114,19 @@ def generate_adt(args: argparse.Namespace) -> bytes:
         pack_adt_prop("#address-cells", u32(2)),
         pack_adt_prop("#size-cells", u32(2)),
     ]
-    root_children = [cpus_node, chosen_node]
+    # /arm-io: pe_identify_machine() returns before setting any clock (timebase 0 -> UBSan trap in
+    # wfe_timeout_configure) when pe_arm_get_soc_base_phys() finds no "ranges" here. Child 0 maps to the
+    # SM6115 peripheral space from 1 MiB up to 0x10000000 (TCSR 0x3C0000 ... APSS 0xF500000).
+    arm_io_props = [
+        pack_adt_prop("name", cstr("arm-io")),
+        pack_adt_prop("device_type", cstr("bengal-io")),
+        pack_adt_prop("compatible", cstr("arm-io,qcom-sm6115")),
+        pack_adt_prop("ranges", u64(0x0) + u64(0x00100000) + u64(0x0FF00000)),
+        pack_adt_prop("#address-cells", u32(2)),
+        pack_adt_prop("#size-cells", u32(2)),
+    ]
+    arm_io_node = struct.pack("<II", len(arm_io_props), 0) + b"".join(arm_io_props)
+    root_children = [cpus_node, chosen_node, arm_io_node]
     return (
         struct.pack("<II", len(root_props), len(root_children))
         + b"".join(root_props)
