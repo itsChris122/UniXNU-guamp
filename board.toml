@@ -131,7 +131,6 @@ panic_screen = false                 # broken display; no room next to the stage
 # Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
 # shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
 kernel_args = [
-  "rd=md0",                           # root on the RAM disk DarwinBoot hands over (iOS restore ramdisk)
   "-v",
   "serial=3",
   "debug=0x14e",
