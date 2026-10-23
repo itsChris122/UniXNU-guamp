@@ -8,22 +8,26 @@
 // the transfer state at HS200/HS400, so the card is brought back to HS timing with an 8-bit SDR bus at a
 // slow clock.
 //
-// Two jobs:
+// Jobs:
 //  - the whole user area is published as one read-only IOBlockStorageDevice (IOGUIDPartitionScheme
 //    splits it into the GPT partitions);
-//  - the kernel message buffer is mirrored every second to the empty "kpan" partition, the only block
-//    range this driver ever writes, so the boot can be read from TWRP afterwards
-//    (strumenti/leggi-log-xnu.sh). Boot argument guamp-emmc-reset=N: PSCI reset after N mirrors.
+//  - the root windows of a SHNGROOT image inside "userdata" (scripts/unixnu/userdata.py layout; here at
+//    userdata + 0 or + 512 MiB, after the FAT payload) are published as read-only devices of their own, so
+//    APFS finds the OS and SystemOS containers and XNU the root volume by UUID;
+//  - the kernel message buffer and the console framebuffer are mirrored to the empty "kpan" partition, the
+//    only block range this driver ever writes, so the boot can be read from TWRP afterwards
+//    (strumenti/leggi-log-xnu.sh). The platform's haltRestart() flushes them once more before a restart,
+//    power off or panic (guamp_emmc_flush). Boot argument guamp-emmc-reset=N: PSCI reset after N mirrors.
 //
 // Started by the device ArmDTPlatform at the end of configure() (guamp_emmc_start), no personality.
 
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
-#include <libkern/OSKextLib.h>
 #include <kern/thread_call.h>
+#include <libkern/OSKextLib.h>
+#include <libkern/crypto/sha2.h>
 #include <pexpert/pexpert.h>
 
 struct guamp_msgbuf {               // bsd/sys/msgbuf.h
@@ -37,6 +41,7 @@ struct guamp_msgbuf {               // bsd/sys/msgbuf.h
 extern "C" {
 extern struct guamp_msgbuf *msgbufp;
 void guamp_emmc_start(IOService *platform);
+void guamp_emmc_flush(unsigned type);
 // Observation: last failing init stage (0 = ready), blocks moved, mirror passes.
 volatile uint32_t native_emmc_stage = 0xff;
 uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, native_emmc_mirrors = 0;   // under the gate
@@ -47,6 +52,14 @@ namespace {
 constexpr uint64_t kSdhcPhys = 0x04744000, kGccSdccPhys = 0x01438000;
 constexpr uint32_t kBlock = 512;
 constexpr uint32_t kBounceBlocks = 128;
+
+// Console framebuffer (the UEFI GOP surface XNU's console draws into: initialize_screen b=5C000000 w=720
+// h=1600 r=2880, 32 bpp) and where its copy goes in kpan
+constexpr uint64_t kFbPhys = 0x5C000000;
+constexpr uint32_t kFbWidth = 720, kFbHeight = 1600, kFbRowBytes = 2880;
+constexpr uint32_t kFbBytes = kFbRowBytes * kFbHeight;
+constexpr uint32_t kLogFirstBlock = 1, kLogMaxBlocks = 1023, kFbFirstBlock = 1024;
+constexpr uint32_t kFbEvery = 5;      // mirror passes per framebuffer copy
 
 // SDHCI registers
 enum : uint32_t {
@@ -60,6 +73,16 @@ enum : uint32_t {
 };
 
 enum : uint32_t { sCmdDone = 1u << 0, sXferDone = 1u << 1, sWriteReady = 1u << 4, sReadReady = 1u << 5, sErrors = 0xFFFF8000u };
+
+// Uncached device mapping, kept for the life of the kernel
+volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length)
+{
+  IOMemoryDescriptor *range = IOMemoryDescriptor::withPhysicalAddress(physical, length, kIODirectionInOut);
+  if (!range) return nullptr;
+  IOMemoryMap *mapping = range->map(kIOMapInhibitCache);
+  range->release();
+  return mapping ? reinterpret_cast<volatile uint8_t *>(mapping->getVirtualAddress()) : nullptr;
+}
 
 class Host {
 public:
@@ -115,19 +138,10 @@ public:
     return true;
   }
 
-  // Uncached device mapping, kept for the life of the kernel
-  static volatile uint8_t *map(uint64_t physical, uint64_t length) {
-    IOMemoryDescriptor *range = IOMemoryDescriptor::withPhysicalAddress(physical, length, kIODirectionInOut);
-    if (!range) return nullptr;
-    IOMemoryMap *mapping = range->map(kIOMapInhibitCache);
-    range->release();
-    return mapping ? reinterpret_cast<volatile uint8_t *>(mapping->getVirtualAddress()) : nullptr;
-  }
-
   // Returns 0 when ready, else the failing stage (native_emmc_stage)
   unsigned init() {
-    base = map(kSdhcPhys, 0x2000);
-    gcc = map(kGccSdccPhys, 0x1000);
+    base = mapPhysical(kSdhcPhys, 0x2000);
+    gcc = mapPhysical(kGccSdccPhys, 0x1000);
     if (!base || !gcc) return 10;
     // SDCC1 AHB + APPS branch clocks
     *reinterpret_cast<volatile uint32_t *>(gcc + 0x8) |= 1;
@@ -210,6 +224,140 @@ public:
   }
 };
 
+// Everything shared by the published devices: one host, one lock, one bounce buffer
+struct Card {
+  Host host;
+  IOLock *gate = nullptr;
+  uint8_t *bounce = nullptr;               // kBounceBlocks blocks
+  uint64_t capacity = 0;                   // blocks of the user area
+  uint64_t logFirst = 0, logBlocks = 0;    // "kpan"
+  uint64_t dataFirst = 0, dataBlocks = 0;  // "userdata"
+  uint8_t *shadow = nullptr;               // last mirrored message buffer
+  uint32_t shadowSize = 0;
+  uint8_t *fbShadow = nullptr;             // last mirrored framebuffer
+  volatile uint8_t *fb = nullptr;
+  uint32_t sequence = 0, fbSequence = 0, resetAfter = 0;
+  thread_call_t mirrorCall = nullptr;
+  bool online = false;
+
+  bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
+    for (uint32_t i = 0; i < count; i++) {
+      if (!host.readBlock(lba + i, out + static_cast<uint64_t>(i) * kBlock)) return false;
+    }
+    return true;
+  }
+  // The only writes of this driver, confined to the log partition
+  bool writeLogBlock(uint64_t index, const uint8_t *in) {
+    if (!logBlocks || index >= logBlocks) return false;
+    return host.writeBlock(logFirst + index, in);
+  }
+  // Writes the blocks of source that differ from shadow; false on a write error
+  bool mirrorRange(uint64_t firstBlock, const volatile uint8_t *source, uint8_t *copy, uint32_t bytes) {
+    uint32_t blocks = (bytes + kBlock - 1) / kBlock;
+    for (uint32_t b = 0; b < blocks; b++) {
+      uint8_t *page = bounce;
+      uint32_t offset = b * kBlock, length = bytes - offset < kBlock ? bytes - offset : kBlock;
+      memset(page, 0, kBlock);
+      for (uint32_t i = 0; i < length; i++) page[i] = source[offset + i];
+      if (!memcmp(page, copy + offset, kBlock)) continue;
+      if (!writeLogBlock(firstBlock + b, page)) return false;
+      memcpy(copy + offset, page, kBlock);
+    }
+    return true;
+  }
+  bool findPartitions();
+  void mirror(bool framebuffer);
+};
+
+Card gCard;
+IOService *gPlatform = nullptr;
+
+bool Card::findPartitions()
+{
+  uint8_t *block = bounce;
+  if (!readBlocks(1, 1, block) || memcmp(block, "EFI PART", 8)) return false;
+  uint64_t alternate, entriesLba;
+  uint32_t entries, entrySize;
+  memcpy(&alternate, block + 32, 8);
+  memcpy(&entriesLba, block + 72, 8);
+  memcpy(&entries, block + 80, 4);
+  memcpy(&entrySize, block + 84, 4);
+  if (!alternate || entrySize < 128 || entrySize > kBlock || (kBlock % entrySize) || entries > 1024) return false;
+  capacity = alternate + 1;
+  const uint32_t perBlock = kBlock / entrySize;
+  for (uint32_t i = 0; i < entries; i++) {
+    if (i % perBlock == 0 && !readBlocks(entriesLba + i / perBlock, 1, block)) return false;
+    const uint8_t *entry = block + (i % perBlock) * entrySize;
+    char name[16] = {};
+    for (unsigned c = 0; c + 1 < sizeof(name); c++) {
+      uint16_t unit = static_cast<uint16_t>(entry[56 + 2 * c] | (entry[57 + 2 * c] << 8));
+      if (!unit || unit > 0x7f) break;
+      name[c] = static_cast<char>(unit);
+    }
+    uint64_t first, last;
+    memcpy(&first, entry + 32, 8);
+    memcpy(&last, entry + 40, 8);
+    if (first < 34 || last < first || last >= capacity) continue;
+    if (!strcmp(name, "kpan") && last - first + 1 <= (64ULL << 20) / kBlock) { logFirst = first; logBlocks = last - first + 1; }
+    if (!strcmp(name, "userdata")) { dataFirst = first; dataBlocks = last - first + 1; }
+  }
+  return logBlocks > kFbFirstBlock + kFbBytes / kBlock;
+}
+
+// Log layout in kpan: block 0 = header, blocks 1.. = the raw message ring (msg_size bytes, at most 1023
+// blocks), blocks 1024.. = the framebuffer (kFbRowBytes * kFbHeight bytes, XRGB little endian).
+//   0 "GUAMPLOG"  8 version 2  12 msg_size  16 msg_bufx  20 sequence  24 init stage  28 msg_magic
+//   32 mach_absolute_time  40 reads  48 writes  56 errors
+//   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)
+void Card::mirror(bool framebuffer)
+{
+  guamp_msgbuf *ring = msgbufp;
+  if (!online || !ring || !ring->msg_bufc || ring->msg_size <= 0) return;
+  uint32_t size = static_cast<uint32_t>(ring->msg_size);
+  if (size > kLogMaxBlocks * kBlock) size = kLogMaxBlocks * kBlock;
+  if (shadowSize != size) {
+    if (shadow) IOFree(shadow, static_cast<vm_size_t>(shadowSize) + kBlock);
+    shadowSize = size;
+    shadow = static_cast<uint8_t *>(IOMallocZero(static_cast<vm_size_t>(size) + kBlock));
+    if (shadow) memset(shadow, 0xA5, static_cast<size_t>(size) + kBlock);   // force a first full write
+  }
+  bool ok = shadow && mirrorRange(kLogFirstBlock, reinterpret_cast<volatile uint8_t *>(ring->msg_bufc), shadow, size);
+  if (ok && framebuffer && fb && fbShadow) {
+    ok = mirrorRange(kFbFirstBlock, fb, fbShadow, kFbBytes);
+    if (ok) fbSequence = sequence + 1;
+  }
+  uint8_t *header = bounce;
+  memset(header, 0, kBlock);
+  memcpy(header, "GUAMPLOG", 8);
+  uint32_t words[6] = { 2, size, static_cast<uint32_t>(ring->msg_bufx), ++sequence, native_emmc_stage,
+                        static_cast<uint32_t>(ring->msg_magic) };
+  memcpy(header + 8, words, sizeof(words));
+  uint64_t counters[4] = { mach_absolute_time(), native_emmc_reads, native_emmc_writes, native_emmc_errors };
+  memcpy(header + 32, counters, sizeof(counters));
+  uint32_t fbWords[5] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence };
+  memcpy(header + 64, fbWords, sizeof(fbWords));
+  if (ok) writeLogBlock(0, header);
+  native_emmc_mirrors++;
+}
+
+void psci(uint64_t function)
+{
+  register uint64_t x0 __asm__("x0") = function;
+  __asm__ volatile("smc #0" : "+r"(x0) : : "memory");
+}
+
+void mirrorEntry(thread_call_param_t, thread_call_param_t)
+{
+  Card &card = gCard;
+  IOLockLock(card.gate);
+  card.mirror(card.sequence % kFbEvery == 0);
+  IOLockUnlock(card.gate);
+  if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
+  uint64_t when = 0;
+  clock_interval_to_deadline(1, kSecondScale, &when);
+  thread_call_enter_delayed(card.mirrorCall, when);
+}
+
 } // namespace
 
 // IOBlockStorageDevice lives in the IOStorageFamily kext, not in the kernel this driver is linked into. Its
@@ -236,41 +384,19 @@ __asm__(
   "  .quad __ZN20IOBlockStorageDevice10gMetaClassE\n"
   ".text\n");
 
+// One read-only block range of the card: the whole user area, or a root window
 class NativeEmmc : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeEmmc)
-  IOLock *gate = nullptr;
-  Host host;
-  uint64_t capacity = 0;                 // blocks
-  uint64_t logFirst = 0, logBlocks = 0;  // "kpan"
-  uint8_t *bounce = nullptr;             // kBounceBlocks blocks
-  uint8_t *shadow = nullptr;             // last mirrored message buffer
-  uint32_t shadowSize = 0;
-  uint32_t sequence = 0, resetAfter = 0;
-  thread_call_t mirrorCall = nullptr;
-  bool online = false;
-
-  bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
-    for (uint32_t i = 0; i < count; i++) {
-      if (!host.readBlock(lba + i, out + static_cast<uint64_t>(i) * kBlock)) return false;
-    }
-    return true;
-  }
-  // The only writes of this driver, confined to the log partition
-  bool writeLogBlock(uint64_t index, const uint8_t *in) {
-    if (!logBlocks || index >= logBlocks) return false;
-    return host.writeBlock(logFirst + index, in);
-  }
-  bool findLogPartition();
-  void mirror();
-  static void mirrorEntry(thread_call_param_t self, thread_call_param_t) { static_cast<NativeEmmc *>(self)->mirror(); }
-  void armMirror() {
-    uint64_t when = 0;
-    clock_interval_to_deadline(1, kSecondScale, &when);
-    thread_call_enter_delayed(mirrorCall, when);
-  }
+  uint64_t first = 0, blocks = 0;
+  char product[40] = {};
 
 public:
-  bool bringUp();
+  bool setRange(uint64_t start, uint64_t count, const char *name) {
+    first = start;
+    blocks = count;
+    snprintf(product, sizeof(product), "eMMC %s", name);
+    return count != 0;
+  }
   // Base methods of IOBlockStorageDevice (IOStorageFamily IOBlockStorageDevice.cpp, iOS build)
   using IOBlockStorageDevice::init;
   bool init(OSDictionary *properties) override {
@@ -291,18 +417,18 @@ public:
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
   char *getVendorString() override { return const_cast<char *>("Qualcomm"); }
-  char *getProductString() override { return const_cast<char *>("SDHC1 eMMC"); }
+  char *getProductString() override { return product; }
   char *getRevisionString() override { return const_cast<char *>("1.0"); }
-  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("polled PIO, read-only"); }
+  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("SDHC1, polled PIO, read-only"); }
   IOReturn reportBlockSize(UInt64 *value) override { *value = kBlock; return kIOReturnSuccess; }
   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportMaxValidBlock(UInt64 *value) override { *value = capacity - 1; return kIOReturnSuccess; }
+  IOReturn reportMaxValidBlock(UInt64 *value) override { *value = blocks - 1; return kIOReturnSuccess; }
   IOReturn reportMediaState(bool *present, bool *changed) override {
-    *present = online; if (changed) *changed = false; return kIOReturnSuccess;
+    *present = gCard.online; if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportWriteProtection(bool *value) override { *value = true; return kIOReturnSuccess; }
-  IOReturn doSynchronizeCache() override { return online ? kIOReturnSuccess : kIOReturnNotReady; }
+  IOReturn doSynchronizeCache() override { return gCard.online ? kIOReturnSuccess : kIOReturnNotReady; }
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
   IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
@@ -310,120 +436,25 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeEmmc, IOBlockStorageDevice)
 
-bool NativeEmmc::findLogPartition()
-{
-  uint8_t *block = bounce;
-  if (!readBlocks(1, 1, block) || memcmp(block, "EFI PART", 8)) return false;
-  uint64_t alternate, entriesLba;
-  uint32_t entries, entrySize;
-  memcpy(&alternate, block + 32, 8);
-  memcpy(&entriesLba, block + 72, 8);
-  memcpy(&entries, block + 80, 4);
-  memcpy(&entrySize, block + 84, 4);
-  if (!alternate || entrySize < 128 || entrySize > kBlock || (kBlock % entrySize) || entries > 1024) return false;
-  capacity = alternate + 1;
-  static const char name[] = "kpan";
-  const uint32_t perBlock = kBlock / entrySize;
-  for (uint32_t i = 0; i < entries; i++) {
-    if (i % perBlock == 0 && !readBlocks(entriesLba + i / perBlock, 1, block)) return false;
-    const uint8_t *entry = block + (i % perBlock) * entrySize;
-    bool match = true;
-    for (unsigned c = 0; c < sizeof(name); c++) {
-      uint16_t unit = static_cast<uint16_t>(entry[56 + 2 * c] | (entry[57 + 2 * c] << 8));
-      if (unit != static_cast<uint8_t>(name[c])) { match = false; break; }
-    }
-    if (!match) continue;
-    uint64_t first, last;
-    memcpy(&first, entry + 32, 8);
-    memcpy(&last, entry + 40, 8);
-    if (first < 34 || last < first || last >= capacity || last - first + 1 > (64ULL << 20) / kBlock) return false;
-    logFirst = first;
-    logBlocks = last - first + 1;
-    return true;
-  }
-  return false;
-}
-
-// Log layout in kpan: block 0 = header, blocks 1.. = the raw message ring (msg_size bytes).
-//   0 "GUAMPLOG"  8 version 1  12 msg_size  16 msg_bufx  20 sequence  24 init stage  28 msg_magic
-//   32 mach_absolute_time  40 reads  48 writes  56 errors
-void NativeEmmc::mirror()
-{
-  IOLockLock(gate);
-  guamp_msgbuf *ring = msgbufp;
-  if (ring && ring->msg_bufc && ring->msg_size > 0) {
-    uint32_t size = static_cast<uint32_t>(ring->msg_size);
-    uint32_t blocks = (size + kBlock - 1) / kBlock;
-    if (blocks + 1 > logBlocks) blocks = static_cast<uint32_t>(logBlocks - 1);
-    if (shadowSize != size) {
-      if (shadow) IOFree(shadow, static_cast<vm_size_t>(shadowSize) + kBlock);
-      shadowSize = size;
-      shadow = static_cast<uint8_t *>(IOMallocZero(static_cast<vm_size_t>(size) + kBlock));
-      if (shadow) memset(shadow, 0xA5, static_cast<size_t>(size) + kBlock);   // force a first full write
-    }
-    bool ok = shadow != nullptr;
-    for (uint32_t b = 0; ok && b < blocks; b++) {
-      uint8_t *page = bounce;
-      uint32_t offset = b * kBlock, length = size - offset < kBlock ? size - offset : kBlock;
-      memset(page, 0, kBlock);
-      memcpy(page, ring->msg_bufc + offset, length);
-      if (!memcmp(page, shadow + offset, kBlock)) continue;
-      ok = writeLogBlock(1 + b, page);
-      if (ok) memcpy(shadow + offset, page, kBlock);
-    }
-    uint8_t *header = bounce;
-    memset(header, 0, kBlock);
-    memcpy(header, "GUAMPLOG", 8);
-    uint32_t words[6] = { 1, size, static_cast<uint32_t>(ring->msg_bufx), ++sequence, native_emmc_stage,
-                          static_cast<uint32_t>(ring->msg_magic) };
-    memcpy(header + 8, words, sizeof(words));
-    uint64_t counters[4] = { mach_absolute_time(), native_emmc_reads, native_emmc_writes, native_emmc_errors };
-    memcpy(header + 32, counters, sizeof(counters));
-    if (ok) writeLogBlock(0, header);
-    native_emmc_mirrors++;
-  }
-  IOLockUnlock(gate);
-  if (resetAfter && sequence >= resetAfter) {
-    register uint64_t x0 __asm__("x0") = 0x84000009;   // PSCI SYSTEM_RESET
-    __asm__ volatile("smc #0" : "+r"(x0) : : "memory");
-  }
-  armMirror();
-}
-
-bool NativeEmmc::bringUp()
-{
-  gate = IOLockAlloc();
-  bounce = static_cast<uint8_t *>(IOMallocZero(kBounceBlocks * kBlock));
-  if (!gate || !bounce) return false;
-  native_emmc_stage = host.init();
-  if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return false; }
-  if (!findLogPartition()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT or kpan not found\n"); return false; }
-  IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks)\n", capacity, logFirst, logBlocks);
-  online = true;
-  PE_parse_boot_argn("guamp-emmc-reset", &resetAfter, sizeof(resetAfter));
-  mirrorCall = thread_call_allocate(&NativeEmmc::mirrorEntry, this);
-  if (mirrorCall) mirror();
-  return true;
-}
-
 IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
     IOStorageAttributes *, IOStorageCompletion *completion)
 {
-  if (!buffer || !completion || !completion->action || !count || block >= capacity || count > capacity - block ||
+  if (!buffer || !completion || !completion->action || !count || block >= blocks || count > blocks - block ||
       buffer->getLength() < count * kBlock) return kIOReturnBadArgument;
   if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
-  IOLockLock(gate);
-  if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
+  Card &card = gCard;
+  IOLockLock(card.gate);
+  if (!card.online) { IOLockUnlock(card.gate); return kIOReturnNotReady; }
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
   while (done < count) {
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
-    if (!readBlocks(block + done, n, bounce)) { status = kIOReturnIOError; break; }
+    if (!card.readBlocks(first + block + done, n, card.bounce)) { status = kIOReturnIOError; break; }
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
-    if (buffer->writeBytes(done * kBlock, bounce, bytes) != bytes) { status = kIOReturnIOError; break; }
+    if (buffer->writeBytes(done * kBlock, card.bounce, bytes) != bytes) { status = kIOReturnIOError; break; }
     done += n;
   }
-  IOLockUnlock(gate);
+  IOLockUnlock(card.gate);
   completion->action(completion->target, completion->parameter, status, done * kBlock);
   return kIOReturnSuccess;
 }
@@ -447,18 +478,82 @@ static bool linkMetaClass()
   return ok && NativeEmmc::metaClass->getSuperClass() == real;
 }
 
-static IOService *gPlatform = nullptr;
-
-static void startLater(thread_call_param_t, thread_call_param_t)
+static void publish(uint64_t first, uint64_t blocks, const char *name)
 {
-  if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked\n"); return; }
   NativeEmmc *disk = OSTypeAlloc(NativeEmmc);
   if (!disk) return;
-  if (disk->init(nullptr) && disk->bringUp() && disk->attach(gPlatform)) {
+  if (disk->init(nullptr) && disk->setRange(first, blocks, name) && disk->attach(gPlatform)) {
     if (disk->start(gPlatform)) disk->registerService();
     else disk->detach(gPlatform);
   }
   disk->release();
+}
+
+// SHNGROOT manifest (scripts/unixnu/userdata.py) at the start of userdata or after the 512 MiB payload
+static void publishWindows()
+{
+  Card &card = gCard;
+  static const uint64_t offsets[] = { 0, (512ULL << 20) / kBlock };
+  uint8_t *manifest = static_cast<uint8_t *>(IOMallocZero(4096));
+  if (!manifest || !card.dataBlocks) { if (manifest) IOFree(manifest, 4096); return; }
+  for (uint64_t offset : offsets) {
+    uint64_t base = card.dataFirst + offset;
+    IOLockLock(card.gate);
+    bool read = card.readBlocks(base, 8, manifest);
+    IOLockUnlock(card.gate);
+    if (!read || memcmp(manifest, "SHNGROOT", 8)) continue;
+    uint8_t digest[32];
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    SHA256_Update(&context, manifest, 4064);
+    SHA256_Final(digest, &context);
+    uint32_t version, count;
+    uint64_t imageBytes;
+    memcpy(&version, manifest + 8, 4);
+    memcpy(&count, manifest + 12, 4);
+    memcpy(&imageBytes, manifest + 16, 8);
+    if (memcmp(digest, manifest + 4064, 32) || version != 1 || count > 31 ||
+        imageBytes / kBlock > card.dataBlocks - offset) {
+      IOLog("NativeEmmc: SHNGROOT at userdata+%llu refused\n", offset);
+      continue;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      const uint8_t *entry = manifest + 24 + 128 * i;
+      char name[33] = {};
+      memcpy(name, entry, 32);
+      uint64_t start, size;
+      memcpy(&start, entry + 32, 8);
+      memcpy(&size, entry + 40, 8);
+      if ((start % kBlock) || (size % kBlock) || start + size > imageBytes) continue;
+      IOLog("NativeEmmc: window %s at userdata+%llu, %llu blocks\n", name, offset + start / kBlock, size / kBlock);
+      publish(base + start / kBlock, size / kBlock, name);
+    }
+    break;
+  }
+  IOFree(manifest, 4096);
+}
+
+static void startLater(thread_call_param_t, thread_call_param_t)
+{
+  Card &card = gCard;
+  if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked\n"); return; }
+  card.gate = IOLockAlloc();
+  card.bounce = static_cast<uint8_t *>(IOMallocZero(kBounceBlocks * kBlock));
+  if (!card.gate || !card.bounce) return;
+  native_emmc_stage = card.host.init();
+  if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
+  if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
+  IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks)\n",
+        card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks);
+  card.fb = mapPhysical(kFbPhys, kFbBytes);
+  card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
+  if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
+  card.online = true;
+  PE_parse_boot_argn("guamp-emmc-reset", &card.resetAfter, sizeof(card.resetAfter));
+  card.mirrorCall = thread_call_allocate(mirrorEntry, nullptr);
+  if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
+  publish(0, card.capacity, "user area");
+  publishWindows();
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
@@ -468,4 +563,16 @@ extern "C" void guamp_emmc_start(IOService *platform)
   platform->retain();
   thread_call_t call = thread_call_allocate(startLater, nullptr);
   if (call) thread_call_enter(call);
+}
+
+// Called by ArmDTPlatform::haltRestart before the restart, power off or panic step of type (IOPlatformExpert
+// kPE* values). A panic may stop the machine while the gate is held, so a panic flush does not wait for it.
+extern "C" void guamp_emmc_flush(unsigned type)
+{
+  Card &card = gCard;
+  if (!card.online || !card.gate) return;
+  bool panic = type >= kPEPanicRestartCPU;
+  bool locked = panic ? IOLockTryLock(card.gate) : (IOLockLock(card.gate), true);
+  card.mirror(true);
+  if (locked) IOLockUnlock(card.gate);
 }

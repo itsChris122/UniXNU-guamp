@@ -21,6 +21,7 @@
 
 // guamp: eMMC driver (drivers/NativeEmmc), started without a personality once the platform is configured
 extern "C" void guamp_emmc_start (IOService *platform);
+extern "C" void guamp_emmc_flush (unsigned type);
 
 // Observation counters describe actual published nubs, not started drivers.
 extern "C" {
@@ -39,6 +40,7 @@ public:
   bool configure (IOService *provider) override;
   const char *deleteList (void) override;
   const char *excludeList (void) override;
+  int haltRestart (unsigned int type) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
@@ -121,6 +123,34 @@ static void platformStageReset (void)
   register uint64_t x3 __asm__ ("x3") = 0;
   __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
   for (;;) { __asm__ volatile ("wfe"); }
+}
+
+// guamp: the inherited haltRestart has no way to reset or power off this board, so a reboot request (or a
+// panic) left the machine hung. Save the eMMC log and framebuffer copy (drivers/NativeEmmc), then use PSCI.
+static void platformPsci (uint64_t function)
+{
+  register uint64_t x0 __asm__ ("x0") = function;
+  __asm__ volatile ("smc #0" : "+r" (x0) : : "memory");
+}
+
+int ArmDTPlatform::haltRestart (unsigned int type)
+{
+  guamp_emmc_flush (type);
+  switch (type) {
+  case kPEHaltCPU:
+  case kPEUPSDelayHaltCPU:
+    platformPsci (0x84000008);   // SYSTEM_OFF
+    break;
+  case kPERestartCPU:
+  case kPEPanicRestartCPU:
+  case kPEPanicRestartCPUNoCallouts:
+  case kPEPanicEnd:
+    platformPsci (0x84000009);   // SYSTEM_RESET
+    break;
+  default:
+    break;
+  }
+  return IODTPlatformExpert::haltRestart (type);
 }
 
 bool ArmDTPlatform::configure (IOService *provider)
