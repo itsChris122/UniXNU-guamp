@@ -121,7 +121,7 @@ BUILDID_STRING = "guamp-research"
 # the optional trust cache and Data seed. The loader (DarwinBoot) is part of the firmware volume.
 [payload]
 volume = "GUAMPESP"
-size_mib = 192
+size_mib = 64                        # guamp ABL: "Not Enough space left to load kernel image" with 192 MiB
 loader = "firmware"
 title = "guamp first boot: source 4K XNU to console"
 dram_size = "0x100000000"             # 4 GiB LPDDR4x from 0x40000000 (fastboot: ram 4GB)
