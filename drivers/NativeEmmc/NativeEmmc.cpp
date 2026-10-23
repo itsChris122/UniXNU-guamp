@@ -24,6 +24,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <libkern/OSKextLib.h>
