@@ -134,7 +134,7 @@ kernel_args = [
   "rd=md0",                           # root on the RAM disk DarwinBoot hands over (iOS restore ramdisk)
   "-v",
   "serial=3",
-  # no "debug=0x14e": a panic then restarts the phone (PSCI warm reset keeps the RAM and /pram)
+  "debug=0x14e",
   "kt_fixed_zones=120",
   "boot-progress=2",
 ]

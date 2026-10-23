@@ -150,8 +150,6 @@ def main():
                                   args.root_match_volume_uuid.upper() + '</string></dict></dict>\0').encode())]
               if args.root_match_volume_uuid else []),
             ('amfi-only-platform-code', u32(1)),
-            # Panic region (kernel built with DT_PANIC_REGION): /pram below; the firmware saves it as PANIC.BIN
-            ('embedded-panic-log-size', u32(PANIC_SIZE)),
             *([('text-fixups', b''.join(f.encode() + b'\0' for f in args.text_fixup))] if args.text_fixup else []),
             *empty_nvram_proxy(),
         ], [
@@ -168,7 +166,7 @@ def main():
         # pmap_bootstrap() asserts /defaults; no suspend on this board
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560))]),
         node('options'),
-        node('pram', [('reg', struct.pack('<QQ', PANIC_BASE, PANIC_SIZE))]),
+        # No /pram: with it the kernel stopped before load_init_program (2026-10-23); to be investigated
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),
                             ('home-button-type', u32(2))])] if ipad else []),
