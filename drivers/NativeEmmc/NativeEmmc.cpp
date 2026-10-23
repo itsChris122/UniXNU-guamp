@@ -44,6 +44,13 @@ struct guamp_msgbuf {               // bsd/sys/msgbuf.h
 
 extern "C" {
 extern struct guamp_msgbuf *msgbufp;
+// Boot progress kept by XNU and by the UniXNU owner-root patches (bsd_init.c, kern_exec.c, IOKitBSDInit.cpp),
+// copied into the kpan header on every mirror pass: they say where the boot is even when the log text stops
+extern int nprocs;
+extern volatile int native_owner_root_apple_autherr, native_owner_root_decision, native_owner_root_accepted;
+extern volatile int native_owner_cache_stage, native_owner_cache_status;
+extern volatile int native_owner_data_stage, native_owner_data_status;
+extern volatile int native_owner_boot_manifest_status;
 void guamp_emmc_start(IOService *platform);
 void guamp_emmc_flush(unsigned type);
 // Observation: last failing init stage (0 = ready), blocks moved, mirror passes.
@@ -275,7 +282,7 @@ struct Card {
   uint32_t shadowSize = 0;
   uint8_t *fbShadow = nullptr;             // last mirrored framebuffer
   volatile uint8_t *fb = nullptr;
-  uint32_t sequence = 0, fbSequence = 0, resetAfter = 0;
+  uint32_t sequence = 0, fbSequence = 0, resetAfter = 0, flushType = 0;
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
@@ -385,6 +392,8 @@ void Card::calibrate()
 //   32 mach_absolute_time  40 reads  48 writes  56 errors
 //   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)
 //   84 SD clock kHz  88 clock divider
+//   92 int32: root Apple autherr, root owner decision, root accepted, SystemOS stage, SystemOS status, Data stage,
+//      Data status, boot manifest status, nprocs, flush type (0 = periodic, else haltRestart type + 1), text ok
 void Card::mirror(bool framebuffer)
 {
   guamp_msgbuf *ring = msgbufp;
@@ -412,7 +421,13 @@ void Card::mirror(bool framebuffer)
   memcpy(header + 32, counters, sizeof(counters));
   uint32_t fbWords[7] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence, host.clockKHz, host.divider };
   memcpy(header + 64, fbWords, sizeof(fbWords));
-  if (ok) writeLogBlock(0, header);
+  int32_t progress[11] = { native_owner_root_apple_autherr, native_owner_root_decision, native_owner_root_accepted,
+                           native_owner_cache_stage, native_owner_cache_status, native_owner_data_stage,
+                           native_owner_data_status, native_owner_boot_manifest_status, nprocs,
+                           static_cast<int32_t>(flushType), ok ? 1 : 0 };
+  memcpy(header + 92, progress, sizeof(progress));
+  // The header goes out even when a block of the text failed: it carries the progress words
+  writeLogBlock(0, header);
   native_emmc_mirrors++;
 }
 
@@ -754,8 +769,11 @@ extern "C" void guamp_emmc_flush(unsigned type)
 {
   Card &card = gCard;
   if (!card.online || !card.gate) return;
-  bool panic = type >= kPEPanicRestartCPU;
+  bool panic = type >= kPEPanicRestartCPU && type != kPEPagingOff;
   bool locked = panic ? IOLockTryLock(card.gate) : (IOLockLock(card.gate), true);
+  // A panic may have stopped another thread in the middle of a transfer: start from clean CMD/DAT lines
+  if (panic) card.host.resetLines();
+  card.flushType = type + 1;
   card.mirror(true);
   if (locked) IOLockUnlock(card.gate);
 }
