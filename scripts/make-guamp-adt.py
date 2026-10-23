@@ -63,7 +63,7 @@ def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
         pack_adt_prop("device_type", cstr("cpu")),
         pack_adt_prop("reg", u32(mpidr)),
         pack_adt_prop("cpu-id", u32(cpu_idx)),
-        pack_adt_prop("cluster-type", cluster_type),
+        # no "cluster-type": the BCM2837 kernel configuration has one SMP cluster (MAX_CPU_CLUSTERS)
         pack_adt_prop("timebase-frequency", u32(19200000)),
         pack_adt_prop("fixed-frequency-khz", u32(1804800 if mpidr < 0x100 else 2016000)),
         # pe_identify_machine() reads the clocks only from the CPU whose "state" is "running" (the boot CPU)
@@ -142,7 +142,7 @@ def main() -> int:
     parser.add_argument("--dram-size", default=None)
     parser.add_argument("--owned-memory-size", default="0x40000000")
     parser.add_argument("--root-match-volume-uuid", default="04769D26-2CA0-4825-B443-E2E5F88300F2")
-    parser.add_argument("--cpu-regs", default="0x0,0x1,0x2,0x3,0x100,0x101,0x102,0x103")
+    parser.add_argument("--cpu-regs", default="0x0,0x1,0x2,0x3")
     parser.add_argument("--unique-chip-id", default="0x1122334455667788")
     # Accepted for the payload step of board.toml; this generator does not model them.
     parser.add_argument("--chip-id", default="0x1bc")
