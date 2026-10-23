@@ -20,7 +20,9 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
+#include <libkern/OSKextLib.h>
 #include <kern/thread_call.h>
 #include <pexpert/pexpert.h>
 
@@ -210,6 +212,28 @@ public:
 
 } // namespace
 
+// IOBlockStorageDevice lives in the IOStorageFamily kext, not in the kernel this driver is linked into. Its
+// constructor and destructor only chain to IOService, so they are provided here as tail calls; the other base
+// methods it would inherit are reimplemented below from the public IOStorageFamily source. The class
+// hierarchy is joined to the kext's real metaclass at run time (linkMetaClass).
+__asm__(
+  ".text
+"
+  ".p2align 2
+"
+  ".globl __ZN20IOBlockStorageDeviceC2EPK11OSMetaClass
+"
+  "__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass:
+"
+  "  b __ZN9IOServiceC2EPK11OSMetaClass
+"
+  ".globl __ZN20IOBlockStorageDeviceD2Ev
+"
+  "__ZN20IOBlockStorageDeviceD2Ev:
+"
+  "  b __ZN9IOServiceD2Ev
+");
+
 class NativeEmmc : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeEmmc)
   IOLock *gate = nullptr;
@@ -245,6 +269,21 @@ class NativeEmmc : public IOBlockStorageDevice {
 
 public:
   bool bringUp();
+  // Base methods of IOBlockStorageDevice (IOStorageFamily IOBlockStorageDevice.cpp, iOS build)
+  using IOBlockStorageDevice::init;
+  bool init(OSDictionary *properties) override {
+    return IOService::init(properties) && setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
+  }
+  using IOBlockStorageDevice::getProperty;
+  OSObject *getProperty(const OSSymbol *key) const override {
+    if (key->isEqualTo(kIOBlockStorageDeviceWriteCacheStateKey)) return kOSBooleanFalse;
+    return IOService::getProperty(key);
+  }
+  IOReturn setProperties(OSObject *properties) override { return IOService::setProperties(properties); }
+  IOReturn doUnmap(IOBlockStorageDeviceExtent *, UInt32, IOStorageUnmapOptions) override { return kIOReturnUnsupported; }
+  IOReturn doSetPriority(IOBlockStorageDeviceExtent *, UInt32, IOStoragePriority) override { return kIOReturnUnsupported; }
+  IOReturn doGetProvisionStatus(UInt64, UInt64, UInt32 *, IOBlockStorageProvisionDeviceExtent *,
+                                IOStorageGetProvisionStatusOptions) override { return kIOReturnUnsupported; }
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
@@ -386,13 +425,45 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   return kIOReturnSuccess;
 }
 
-extern "C" void guamp_emmc_start(IOService *platform)
+// Our metaclass must name the kext's real IOBlockStorageDevice metaclass as its superclass (IOKit matching and
+// OSDynamicCast walk that chain). Load the kext, then check and set the link (OSMetaClass: vptr, reserved,
+// superClassLink, ...) before the first instance exists.
+static bool linkMetaClass()
 {
+  if (OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily") != kOSReturnSuccess) return false;
+  const OSSymbol *name = OSSymbol::withCStringNoCopy("IOBlockStorageDevice");
+  if (!name) return false;
+  const OSMetaClass *real = OSMetaClass::copyMetaClassWithName(name);
+  name->release();
+  if (!real) return false;
+  const OSMetaClass **link = reinterpret_cast<const OSMetaClass **>(
+      reinterpret_cast<uintptr_t>(NativeEmmc::metaClass) + 2 * sizeof(void *));
+  bool ok = *link == real || *link == reinterpret_cast<const OSMetaClass *>(IOBlockStorageDevice::metaClass);
+  if (ok) *link = real;
+  real->releaseMetaClass();
+  return ok && NativeEmmc::metaClass->getSuperClass() == real;
+}
+
+static IOService *gPlatform = nullptr;
+
+static void startLater(thread_call_param_t, thread_call_param_t)
+{
+  if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked
+"); return; }
   NativeEmmc *disk = OSTypeAlloc(NativeEmmc);
   if (!disk) return;
-  if (disk->init(nullptr) && disk->bringUp() && disk->attach(platform)) {
-    if (disk->start(platform)) disk->registerService();
-    else disk->detach(platform);
+  if (disk->init(nullptr) && disk->bringUp() && disk->attach(gPlatform)) {
+    if (disk->start(gPlatform)) disk->registerService();
+    else disk->detach(gPlatform);
   }
   disk->release();
+}
+
+// Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
+extern "C" void guamp_emmc_start(IOService *platform)
+{
+  gPlatform = platform;
+  platform->retain();
+  thread_call_t call = thread_call_allocate(startLater, nullptr);
+  if (call) thread_call_enter(call);
 }
