@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Apple Device Tree (ADT) generator for the Motorola Moto G9 Play (guamp, SM6115)."""
 import argparse
+import os
 import pathlib
 import struct
 import sys
@@ -96,6 +97,9 @@ def generate_adt(args: argparse.Namespace) -> bytes:
     chosen_props = [
         pack_adt_prop("name", cstr("chosen")),
         pack_adt_prop("root-matching", cstr(args.root_match_volume_uuid)),
+        # bootseed_init() (via early_random() in arm_vm_init) panics with fewer than 64 bytes here.
+        # Fixed per payload build; an Apple bootloader (and later DarwinBoot) gives a new one each boot.
+        pack_adt_prop("random-seed", os.urandom(64)),
         pack_adt_prop("dram-base", u64(0x40000000)),
         pack_adt_prop("dram-size", u64(int(args.dram_size or args.owned_memory_size, 0))),
         pack_adt_prop("display-base", u64(GUAMP_HARDWARE_SPEC["framebuffer"]["base"])),
