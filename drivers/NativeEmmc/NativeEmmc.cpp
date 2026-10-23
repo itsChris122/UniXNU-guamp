@@ -212,6 +212,14 @@ public:
 
   bool slower() { return divider < 512 && setClock(divider * 2); }
 
+  // After a failed multi-block transfer the card may still be in its data state, sending or expecting blocks
+  // until it gets STOP_TRANSMISSION: reset the host lines, then CMD12 (R1b) so the card is back in transfer state
+  void stopTransfer() {
+    resetLines();
+    command(12, 0, true);
+    resetLines();
+  }
+
   // CMD18 with block count and auto CMD12: up to kBounceBlocks blocks per command
   bool readMulti(uint64_t lba, uint32_t count, uint8_t *out) {
     w32(rStatus, 0xFFFFFFFF);
@@ -300,7 +308,7 @@ struct Card {
       uint8_t *at = out + static_cast<uint64_t>(done) * kBlock;
       if (!host.readMulti(lba + done, n, at)) {
         native_emmc_errors++;
-        host.resetLines();
+        host.stopTransfer();
         if (!readSingles(lba + done, n, at) && !(host.slower() && readSingles(lba + done, n, at))) return false;
       }
       done += n;
@@ -337,7 +345,8 @@ IOService *gPlatform = nullptr;
 bool Card::findPartitions()
 {
   uint8_t *block = bounce;
-  if (!readBlocks(1, 1, block) || memcmp(block, "EFI PART", 8)) return false;
+  // The GPT is read with CMD17, the path proven before XNU, not with the newer CMD18 runs
+  if (!readSingles(1, 1, block) || memcmp(block, "EFI PART", 8)) return false;
   uint64_t alternate, entriesLba;
   uint32_t entries, entrySize;
   memcpy(&alternate, block + 32, 8);
@@ -348,7 +357,7 @@ bool Card::findPartitions()
   capacity = alternate + 1;
   const uint32_t perBlock = kBlock / entrySize;
   for (uint32_t i = 0; i < entries; i++) {
-    if (i % perBlock == 0 && !readBlocks(entriesLba + i / perBlock, 1, block)) return false;
+    if (i % perBlock == 0 && !readSingles(entriesLba + i / perBlock, 1, block)) return false;
     const uint8_t *entry = block + (i % perBlock) * entrySize;
     char name[16] = {};
     for (unsigned c = 0; c + 1 < sizeof(name); c++) {
@@ -380,7 +389,7 @@ void Card::calibrate()
         host.writeBlock(logFirst + logBlocks - 1, pattern) && host.readMulti(logFirst + logBlocks - 1, 1, bounce) &&
         !memcmp(bounce, pattern, kBlock);
     if (ok) return;
-    host.resetLines();
+    host.stopTransfer();
   }
   host.setClock(8);
   host.resetLines();
@@ -635,8 +644,18 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   if (!card.gate || !card.bounce) return;
   native_emmc_stage = card.host.init();
   if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
-  if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
-  card.calibrate();
+  bool found = card.findPartitions();
+  if (!found) {
+    // Still keep the kernel log: kpan where the GPT of this phone puts it (boot logs of 2026-10-23), no disks
+    native_emmc_stage = 11;
+    IOLog("NativeEmmc: GPT, kpan or userdata not found; log only, at the known kpan\n");
+    card.logFirst = 2623488;
+    card.logBlocks = 16384;
+    card.dataBlocks = 0;
+    card.capacity = 0;
+  }
+  // Card::calibrate() is not called: a CMD18 failing at a too fast clock left the card in its data state and
+  // every later command failed (boot of 2026-10-23 21:2x). The proven clock is kept.
   IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks), clock %u kHz (base %u MHz)\n",
         card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks, card.host.clockKHz, card.host.baseMHz);
   card.fb = mapPhysical(kFbPhys, kFbBytes);
@@ -646,6 +665,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   PE_parse_boot_argn("guamp-emmc-reset", &card.resetAfter, sizeof(card.resetAfter));
   card.mirrorCall = thread_call_allocate(mirrorEntry, nullptr);
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
+  if (!found) return;
   publish(0, card.capacity, "user area");
   publishWindows();
 }
