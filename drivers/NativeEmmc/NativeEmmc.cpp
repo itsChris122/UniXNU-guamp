@@ -22,7 +22,6 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
-#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
 struct guamp_msgbuf {               // bsd/sys/msgbuf.h
@@ -114,10 +113,19 @@ public:
     return true;
   }
 
+  // Uncached device mapping, kept for the life of the kernel
+  static volatile uint8_t *map(uint64_t physical, uint64_t length) {
+    IOMemoryDescriptor *range = IOMemoryDescriptor::withPhysicalAddress(physical, length, kIODirectionInOut);
+    if (!range) return nullptr;
+    IOMemoryMap *mapping = range->map(kIOMapInhibitCache);
+    range->release();
+    return mapping ? reinterpret_cast<volatile uint8_t *>(mapping->getVirtualAddress()) : nullptr;
+  }
+
   // Returns 0 when ready, else the failing stage (native_emmc_stage)
   unsigned init() {
-    base = reinterpret_cast<volatile uint8_t *>(ml_io_map(kSdhcPhys, 0x2000));
-    gcc = reinterpret_cast<volatile uint8_t *>(ml_io_map(kGccSdccPhys, 0x1000));
+    base = map(kSdhcPhys, 0x2000);
+    gcc = map(kGccSdccPhys, 0x1000);
     if (!base || !gcc) return 10;
     // SDCC1 AHB + APPS branch clocks
     *reinterpret_cast<volatile uint32_t *>(gcc + 0x8) |= 1;
@@ -382,7 +390,7 @@ extern "C" void guamp_emmc_start(IOService *platform)
 {
   NativeEmmc *disk = OSTypeAlloc(NativeEmmc);
   if (!disk) return;
-  if (disk->init() && disk->bringUp() && disk->attach(platform)) {
+  if (disk->init(nullptr) && disk->bringUp() && disk->attach(platform)) {
     if (disk->start(platform)) disk->registerService();
     else disk->detach(platform);
   }
