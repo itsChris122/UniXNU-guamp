@@ -40,6 +40,7 @@ defconfig = "guamp_defconfig"
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
+  "build-arm-driver.py NativeEmmc",
   "build-arm-driver.py ArmDTPlatform",
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
@@ -128,8 +129,8 @@ dram_size = "0x100000000"             # 4 GiB LPDDR4x from 0x40000000 (fastboot:
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = false                 # broken display; no room next to the stage 3 probe in the kernel padding
 entry_probe_reset_delay = 2
-entry_probe_reset_after = "_vfstable_add"
-entry_probe_reset_in = "_vfs_fsadd"
+entry_probe_reset_after = "_sleh_interrupt_handler_prologue"
+entry_probe_reset_in = "_sleh_irq"
 # Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
 # shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
 kernel_args = [
@@ -139,6 +140,7 @@ kernel_args = [
   "debug=0x14e",
   "kt_fixed_zones=120",
   "boot-progress=2",
+  "guamp-emmc-reset=45",               # NativeEmmc: PSCI reset after 45 log mirrors (1 s each)
 ]
 
 [payload.adt]
