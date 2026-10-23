@@ -55,7 +55,9 @@ def cstr(val: str) -> bytes:
 
 
 def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
-    cluster_type = b"ECore\x00" if mpidr < 0x100 else b"PCore\x00"
+    # ml_parse_cpu_topology() reads cluster-type as an integer ('E'/'P'); a 6-byte string makes
+    # ml_readprop() panic ("bad size 6") before the console exists.
+    cluster_type = u32(ord('E') if mpidr < 0x100 else ord('P'))
     props = [
         pack_adt_prop("name", cstr(f"cpu{cpu_idx}")),
         pack_adt_prop("device_type", cstr("cpu")),
