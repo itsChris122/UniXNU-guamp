@@ -224,7 +224,17 @@ __asm__(
   "  b __ZN9IOServiceC2EPK11OSMetaClass\n"
   ".globl __ZN20IOBlockStorageDeviceD2Ev\n"
   "__ZN20IOBlockStorageDeviceD2Ev:\n"
-  "  b __ZN9IOServiceD2Ev\n");
+  "  b __ZN9IOServiceD2Ev\n"
+  // Placeholder metaclass until linkMetaClass() points our superclass link at the kext's real one
+  ".section __DATA,__data\n"
+  ".p2align 3\n"
+  ".globl __ZN20IOBlockStorageDevice10gMetaClassE\n"
+  "__ZN20IOBlockStorageDevice10gMetaClassE:\n"
+  "  .space 128\n"
+  ".globl __ZN20IOBlockStorageDevice9metaClassE\n"
+  "__ZN20IOBlockStorageDevice9metaClassE:\n"
+  "  .quad __ZN20IOBlockStorageDevice10gMetaClassE\n"
+  ".text\n");
 
 class NativeEmmc : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeEmmc)
@@ -276,6 +286,7 @@ public:
   IOReturn doSetPriority(IOBlockStorageDeviceExtent *, UInt32, IOStoragePriority) override { return kIOReturnUnsupported; }
   IOReturn doGetProvisionStatus(UInt64, UInt64, UInt32 *, IOBlockStorageProvisionDeviceExtent *,
                                 IOStorageGetProvisionStatusOptions) override { return kIOReturnUnsupported; }
+  IOReturn requestIdle() override { return kIOReturnUnsupported; }
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
