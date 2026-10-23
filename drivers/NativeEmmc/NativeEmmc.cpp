@@ -25,6 +25,9 @@
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOBSD.h>
+#include <IOKit/IOKitKeys.h>
+#include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <libkern/OSKextLib.h>
@@ -564,6 +567,101 @@ extern "C" void guamp_emmc_start(IOService *platform)
   platform->retain();
   thread_call_t call = thread_call_allocate(startLater, nullptr);
   if (call) thread_call_enter(call);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Root and SystemOS hooks of the UniXNU owner-root kernel patches (offline-owner-*: XNU_VERIFIED_ROOT_PROBE,
+// OWNER_ROOT_AUDIT/TRUST, OWNER_CACHE_MOUNT/STARTUP, OWNER_BOOT_MANIFEST). On the UniXNU reference boards a
+// verified block driver supplies them from a signed policy; here the root and SystemOS volumes are the unchanged
+// IPSW images in the eMMC windows above, published read-only by this driver, and these hooks accept exactly the
+// media that sit on NativeEmmc (CONFIG_XNU_VERIFIED_ROOT_ARCHIVE links this archive in place of that driver).
+// ---------------------------------------------------------------------------------------------------------------
+
+static bool onEmmc(IOService *media)
+{
+  unsigned depth = 0;
+  for (IOService *provider = media; provider && depth++ < 64; provider = provider->getProvider()) {
+    if (OSDynamicCast(NativeEmmc, provider)) return true;
+  }
+  return false;
+}
+
+// The IOMedia for a BSD device number, retained, or null
+static IOService *mediaForDevice(dev_t device)
+{
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  if (!matching) return nullptr;
+  OSIterator *iterator = IOService::getMatchingServices(matching);
+  matching->release();
+  if (!iterator) return nullptr;
+  IOService *found = nullptr;
+  while (OSObject *object = iterator->getNextObject()) {
+    IOService *media = OSDynamicCast(IOService, object);
+    OSNumber *mjr = media ? OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey)) : nullptr;
+    OSNumber *mnr = media ? OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey)) : nullptr;
+    if (mjr && mnr && mjr->unsigned32BitValue() == static_cast<uint32_t>(major(device)) &&
+        mnr->unsigned32BitValue() == static_cast<uint32_t>(minor(device))) {
+      found = media;
+      found->retain();
+      break;
+    }
+  }
+  iterator->release();
+  return found;
+}
+
+extern "C" void native_verified_root_probe(void) {}
+
+extern "C" int native_verified_block_root_authorized(dev_t device)
+{
+  IOService *media = mediaForDevice(device);
+  bool ok = media && onEmmc(media);
+  OSSafeReleaseNULL(media);
+  return ok;
+}
+
+// The single IOMedia with this APFS volume UUID on NativeEmmc; waits for APFS to publish it (it runs right after
+// the root mount, while the SystemOS container may still be probed)
+extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size)
+{
+  if (!uuid || !device || !path || size < 6) return 0;
+  *device = NODEV;
+  path[0] = 0;
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity(1);
+  OSString *wanted = OSString::withCString(uuid);
+  bool ready = matching && properties && wanted && properties->setObject("UUID", wanted) &&
+      matching->setObject(gIOPropertyMatchKey, properties);
+  OSSafeReleaseNULL(wanted);
+  OSSafeReleaseNULL(properties);
+  if (!ready) { OSSafeReleaseNULL(matching); return 0; }
+  IOService *media = IOService::waitForMatchingService(matching, 60ULL * NSEC_PER_SEC);
+  matching->release();
+  if (!media) { IOLog("NativeEmmc: volume %s not published\n", uuid); return 0; }
+  OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
+  OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
+  OSNumber *mnr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
+  int ok = name && mjr && mnr && onEmmc(media) && name->getLength() + 6 < size;
+  if (ok) {
+    *device = static_cast<dev_t>(makedev(mjr->unsigned32BitValue(), mnr->unsigned32BitValue()));
+    snprintf(path, size, "/dev/%s", name->getCStringNoCopy());
+    IOLog("NativeEmmc: volume %s is %s\n", uuid, path);
+  }
+  media->release();
+  return ok;
+}
+
+// Identity of a volume for the owner boot manifest: SHA-384 over a fixed domain and the volume UUID
+extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *uuid, uint8_t digest[48])
+{
+  if (!uuid || !native_verified_block_root_authorized(device)) return 0;
+  static const char domain[] = "guamp.NativeEmmc.unchanged-ipsw-volume.v1";
+  SHA384_CTX context;
+  SHA384_Init(&context);
+  SHA384_Update(&context, domain, sizeof(domain));
+  SHA384_Update(&context, uuid, strlen(uuid));
+  SHA384_Final(digest, &context);
+  return 1;
 }
 
 // Called by ArmDTPlatform::haltRestart before the restart, power off or panic step of type (IOPlatformExpert

@@ -17,7 +17,7 @@ CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_BUILD_ARCHIVES=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
-CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/native-emmc/libNativeEmmc.a {tree}/build/guamp-display-stub/libGuampDisplayStub.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/guamp-display-stub/libGuampDisplayStub.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n
 # The BCM2837 configuration reads its panic log at 0x3C0FC000, which is not RAM on SM6115 (the read hung
 # PE_create_console). Take the panic region from the DT (/pram) instead; without /pram there is none.
@@ -26,3 +26,18 @@ CONFIG_XNU_DT_PANIC_REGION=y
 # The archive builders reuse these flags and add -Werror; Apple clang 17 (Xcode 16.4) does not know
 # -Wno-unnecessary-virtual-specifier, so keep the default list without it.
 CONFIG_XNU_EXTRA_CFLAGS="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-suggest-destructor-override -Wno-ms-bitfield-padding"
+
+# iPadOS from the eMMC (drivers/NativeEmmc): the owner-root path of UniXNU mounts the SystemOS cryptex over the
+# root (union) and the Data RAM disk (md0, payload --data-ramdisk) at /private/var before launchd. Its root and
+# volume hooks come from NativeEmmc, linked as the "verified root" archive (force-loaded by the build script);
+# scripts/build-xnu-4k-baseline.sh is the guamp copy that accepts it instead of the virtio driver.
+CONFIG_XNU_GUAMP_EMMC_ROOT=y
+CONFIG_XNU_VERIFIED_ROOT_PROBE=y
+CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/native-emmc/libNativeEmmc.a"
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
