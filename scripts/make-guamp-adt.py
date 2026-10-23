@@ -106,7 +106,11 @@ def generate_adt(args: argparse.Namespace) -> bytes:
     ]
     if args.unique_chip_id:
         chosen_props.append(pack_adt_prop("unique-chip-id", u64(int(args.unique_chip_id, 0))))
-    chosen_node = struct.pack("<II", len(chosen_props), 0) + b"".join(chosen_props)
+    # /chosen/memory-map: arm_vm_init() asserts it exists (its TrustCache/AuxKC/RAMDisk entries are
+    # optional); DarwinBoot fills RAMDisk/TrustCache here when they are present.
+    memory_map_props = [pack_adt_prop("name", cstr("memory-map"))]
+    memory_map_node = struct.pack("<II", len(memory_map_props), 0) + b"".join(memory_map_props)
+    chosen_node = struct.pack("<II", len(chosen_props), 1) + b"".join(chosen_props) + memory_map_node
 
     root_props = [
         pack_adt_prop("name", cstr("device-tree")),
