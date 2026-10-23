@@ -1,171 +1,201 @@
 #!/usr/bin/env python3
-"""Apple Device Tree (ADT) generator for the Motorola Moto G9 Play (guamp, SM6115)."""
+"""Apple-format DT (ADT) for the Motorola Moto G9 Play (guamp, Qualcomm SM6115).
+
+Structure of make-sheng-adt.py (UniXNU-sheng, the port that reaches userland) with the guamp values:
+
+  - DRAM base 0x40000000 (4 GiB LPDDR4x, fastboot getvar ram)
+  - GICv3: distributor 0x0F200000/0x10000, redistributors 0x0F300000/0x100000, stride 0x20000
+    (sm6115.dtsi), as children of an arm-io window at 0x0F000000
+  - timebase 19.2 MHz; PSCI 1.0 over smc (sm6115.dtsi)
+  - Kryo 260 Silver cores only (MPIDR 0x0..0x3): the kernel uses the BCM2837 configuration, one SMP
+    cluster of at most four CPUs, so there is no cluster-type and no Gold cluster yet
+
+Each value below fixed a stop of the first boot (found with the UniXNU entry probe, 2026-10-23):
+/arm-io + CPU clocks (pe_identify_machine), "running" boot CPU and integer properties
+(ml_parse_cpu_topology), /chosen/memory-map (arm_vm_init), random-seed (early_random),
+/defaults (pmap_bootstrap), /options and the NVRAM proxy (platform expert configure()).
+"""
+from pathlib import Path
 import argparse
 import os
-import pathlib
 import struct
-import sys
+import zlib
 
-GUAMP_HARDWARE_SPEC = {
-    # Values read from the device (dtbo_b / boot_b DTBs, fastboot getvar) on 2026-10-22.
-    "model": "Motorola Moto G9 Play",
-    "compatible": ["qcom,bengal-guamp", "qcom,sm6115"],
-    "msm_id": [0x1A1, 0x1BC],
-    "board_id": 0xB000,
-    "clock_frequency": 19200000,
-    "framebuffer": {
-        # cont_splash_region, Himax HX83102D 720x1600 video mode panel, native portrait
-        "base": 0x5C000000,
-        "size": 720 * 1600 * 4,
-        "width": 720,
-        "height": 1600,
-        "stride": 720 * 4,
-        "format": "a8r8g8b8",
-        "rotation": 0,
-    },
-    "reserved_memory": [
-        {"name": "pil_adsp_mem",    "base": 0x52200000, "size": 0x01C00000},
-        {"name": "pil_ipa_fw_mem",  "base": 0x53E00000, "size": 0x00010000},
-        {"name": "pil_ipa_gsi_mem", "base": 0x53E10000, "size": 0x00005000},
-        {"name": "pil_gpu_mem",     "base": 0x53E15000, "size": 0x00002000},
-        {"name": "framebuffer0",    "base": 0x5C000000, "size": 0x00465000},
-        # RAM log of guampPkg (RamLog.h): kept so later stages can append to it
-        {"name": "guamp_ram_log",   "base": 0x13FE00000, "size": 0x00200000},  # live + previous boot log (RamLog.h)
-        {"name": "removed_mem",     "base": 0x60000000, "size": 0x03900000},
-    ],
-}
+DRAM_BASE = 0x40000000
+ARMIO_BASE = 0x0F000000          # APSS block with the GIC
+ARMIO_SIZE = 0x01000000
+GIC_DIST = 0x0F200000
+GIC_DIST_SIZE = 0x10000
+GIC_REDIST = 0x0F300000
+GIC_REDIST_SIZE = 0x100000
+GIC_REDIST_STRIDE = 0x20000
+TIMEBASE = 19200000
 
 
-def pack_adt_prop(name: str, value: bytes) -> bytes:
-    name_bytes = name.encode("ascii")[:31].ljust(32, b"\x00")
-    length = len(value)
-    padded_len = (length + 3) & ~3
-    return name_bytes + struct.pack("<I", length) + value.ljust(padded_len, b"\x00")
+def node(name, properties=(), children=()):
+    properties = [('name', name.encode() + b'\0'), *properties]
+    result = struct.pack('<II', len(properties), len(children))
+    for key, data in properties:
+        result += struct.pack('<32sI', key.encode(), len(data))
+        result += data + bytes(-len(data) % 4)
+    return result + b''.join(children)
 
 
-def u32(val: int) -> bytes:
-    return struct.pack("<I", val)
+def u32(value):
+    return struct.pack('<I', value)
 
 
-def u64(val: int) -> bytes:
-    return struct.pack("<Q", val)
+def u64(value):
+    return struct.pack('<Q', value)
 
 
-def cstr(val: str) -> bytes:
-    return val.encode("utf-8") + b"\x00"
+def empty_nvram_proxy():
+    """A fresh volatile CHRP bank for upstream IODTNVRAM, with no controller (from make-sheng-adt.py)."""
+    def header(name, size):
+        raw = bytearray(struct.pack('<BBH12s', 0x70, 0, size // 16, name))
+        checksum = sum(raw)
+        while checksum > 255:
+            checksum = (checksum & 255) + (checksum >> 8)
+        raw[1] = checksum
+        return raw
+
+    image = bytearray(8192)
+    image[:16] = header(b'nvram', 32)
+    image[32:48] = header(b'common', 16 + 2048)
+    free_at = 32 + 16 + 2048
+    image[free_at:free_at + 16] = header(b'free', len(image) - free_at)
+    struct.pack_into('<I', image, 16, zlib.adler32(image[20:]))
+    return [('nvram-bank-size', u32(len(image))),
+            ('nvram-bank-count', u32(1)),
+            ('nvram-current-bank', u32(0)),
+            ('nvram-proxy-data', bytes(image))]
 
 
-def build_cpu_node(cpu_idx: int, mpidr: int) -> bytes:
-    # ml_parse_cpu_topology() reads cluster-type as an integer ('E'/'P'); a 6-byte string makes
-    # ml_readprop() panic ("bad size 6") before the console exists.
-    cluster_type = u32(ord('E') if mpidr < 0x100 else ord('P'))
-    props = [
-        pack_adt_prop("name", cstr(f"cpu{cpu_idx}")),
-        pack_adt_prop("device_type", cstr("cpu")),
-        pack_adt_prop("reg", u32(mpidr)),
-        pack_adt_prop("cpu-id", u32(cpu_idx)),
-        # no "cluster-type": the BCM2837 kernel configuration has one SMP cluster (MAX_CPU_CLUSTERS)
-        pack_adt_prop("timebase-frequency", u32(19200000)),
-        pack_adt_prop("fixed-frequency-khz", u32(1804800 if mpidr < 0x100 else 2016000)),
-        # pe_identify_machine() reads the clocks only from the CPU whose "state" is "running" (the boot CPU)
-        pack_adt_prop("state", cstr("running" if cpu_idx == 0 else "waiting")),
-        # bus / timebase must be a whole ratio >= 1 (bus_to_dec_rate_den); 192 MHz = 10 x 19.2 MHz
-        pack_adt_prop("bus-frequency", u32(192000000)),
-        pack_adt_prop("memory-frequency", u32(1804000000)),
-        pack_adt_prop("peripheral-frequency", u32(19200000)),
-        pack_adt_prop("fixed-frequency", u32(19200000)),
-        pack_adt_prop("clock-frequency", u32(1804800000 if mpidr < 0x100 else 2016000000)),
-    ]
-    return struct.pack("<II", len(props), 0) + b"".join(props)
+def cpu_node(index, reg):
+    return node('cpu%d' % index, [
+        # pe_identify_machine() and ml_is_boot_cpu() look for the "running" boot CPU
+        ('state', b'running\0' if index == 0 else b'waiting\0'),
+        ('reg', u32(reg)),
+        ('device_type', b'cpu\0'),
+        ('compatible', b'qcom,kryo260\0arm,cortex-a53\0'),
+        ('cpu-id', u32(index)),
+        ('timebase-frequency', u32(TIMEBASE)),
+        # bus / timebase must be a whole ratio >= 1 (bus_to_dec_rate_den): 192 MHz = 10 x 19.2 MHz
+        ('bus-frequency', u32(192000000)),
+        ('memory-frequency', u32(1804000000)),
+        ('peripheral-frequency', u32(TIMEBASE)),
+        ('fixed-frequency', u32(TIMEBASE)),
+        ('clock-frequency', u32(1804800000)),
+    ])
 
 
-def generate_adt(args: argparse.Namespace) -> bytes:
-    cpu_regs = [int(x.strip(), 0) for x in args.cpu_regs.split(",") if x.strip()]
-    cpu_children = [build_cpu_node(i, reg) for i, reg in enumerate(cpu_regs)]
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', '-o', type=Path, required=True)
+    parser.add_argument('--dram-size', type=lambda v: int(v, 0), required=True)
+    parser.add_argument('--owned-memory-size', type=lambda v: int(v, 0), default=None,
+                        help='DarwinBoot window: 256 MiB..8 GiB in 2 MiB steps, inside one free run of the firmware map')
+    parser.add_argument('--root-match-volume-uuid', default=None)
+    parser.add_argument('--unique-chip-id', type=lambda v: int(v, 16), default=None)
+    parser.add_argument('--chip-id', type=lambda v: int(v, 16), default=None)
+    parser.add_argument('--cpu-regs', default='0x0,0x1,0x2,0x3')
+    parser.add_argument('--psci-method', choices=['smc', 'hvc'], default='smc')
+    parser.add_argument('--ipad-identity', action='store_true')
+    parser.add_argument('--data-ramdisk', action='store_true')
+    parser.add_argument('--packed-data-ramdisk', action='store_true')
+    parser.add_argument('--persistent-data', action='store_true')
+    parser.add_argument('--trust-cache', action='store_true')
+    parser.add_argument('--gpu-addon', action='store_true')
+    parser.add_argument('--text-fixup', action='append', default=[])
+    args = parser.parse_args()
 
-    cpus_props = [
-        pack_adt_prop("name", cstr("cpus")),
-        pack_adt_prop("#address-cells", u32(1)),
-        pack_adt_prop("#size-cells", u32(0)),
-    ]
-    cpus_node = (
-        struct.pack("<II", len(cpus_props), len(cpu_children))
-        + b"".join(cpus_props)
-        + b"".join(cpu_children)
-    )
+    if (args.unique_chip_id is None) != (args.chip_id is None):
+        parser.error('--unique-chip-id and --chip-id must be supplied together')
+    if args.owned_memory_size is not None and (not 0x10000000 <= args.owned_memory_size <= 0x200000000
+                                               or args.owned_memory_size % 0x200000):
+        parser.error('owned memory must be 256 MiB to 8 GiB, aligned to 2 MiB')
+    cpu_regs = [int(v, 0) for v in args.cpu_regs.split(',')]
+    if not cpu_regs or cpu_regs[0] != 0 or len(cpu_regs) > 4 or len(set(cpu_regs)) != len(cpu_regs):
+        parser.error('--cpu-regs: up to four distinct Silver cores (BCM2837 kernel configuration), boot CPU 0x0 first')
 
-    chosen_props = [
-        pack_adt_prop("name", cstr("chosen")),
-        pack_adt_prop("root-matching", cstr(args.root_match_volume_uuid)),
-        # bootseed_init() (via early_random() in arm_vm_init) panics with fewer than 64 bytes here.
-        # Fixed per payload build; an Apple bootloader (and later DarwinBoot) gives a new one each boot.
-        pack_adt_prop("random-seed", os.urandom(64)),
-        pack_adt_prop("dram-base", u64(0x40000000)),
-        pack_adt_prop("dram-size", u64(int(args.dram_size or args.owned_memory_size, 0))),
-        pack_adt_prop("display-base", u64(GUAMP_HARDWARE_SPEC["framebuffer"]["base"])),
-        pack_adt_prop("display-width", u32(GUAMP_HARDWARE_SPEC["framebuffer"]["width"])),
-        pack_adt_prop("display-height", u32(GUAMP_HARDWARE_SPEC["framebuffer"]["height"])),
-        pack_adt_prop("display-stride", u32(GUAMP_HARDWARE_SPEC["framebuffer"]["stride"])),
-        pack_adt_prop("display-rotation", u32(GUAMP_HARDWARE_SPEC["framebuffer"]["rotation"])),
-    ]
-    if args.unique_chip_id:
-        chosen_props.append(pack_adt_prop("unique-chip-id", u64(int(args.unique_chip_id, 0))))
-    # /chosen/memory-map: arm_vm_init() asserts it exists (its TrustCache/AuxKC/RAMDisk entries are
-    # optional); DarwinBoot fills RAMDisk/TrustCache here when they are present.
-    memory_map_props = [pack_adt_prop("name", cstr("memory-map"))]
-    memory_map_node = struct.pack("<II", len(memory_map_props), 0) + b"".join(memory_map_props)
-    chosen_node = struct.pack("<II", len(chosen_props), 1) + b"".join(chosen_props) + memory_map_node
+    cpus = [cpu_node(index, reg) for index, reg in enumerate(cpu_regs)]
+    ipad = args.ipad_identity
 
-    root_props = [
-        pack_adt_prop("name", cstr("device-tree")),
-        pack_adt_prop("model", cstr("iPad7,1")),
-        pack_adt_prop("compatible", cstr("J120AP")),
-        pack_adt_prop("board-id", u32(12)),
-        pack_adt_prop("#address-cells", u32(2)),
-        pack_adt_prop("#size-cells", u32(2)),
-    ]
-    # /arm-io: pe_identify_machine() returns before setting any clock (timebase 0 -> UBSan trap in
-    # wfe_timeout_configure) when pe_arm_get_soc_base_phys() finds no "ranges" here. Child 0 maps to the
-    # SM6115 peripheral space from 1 MiB up to 0x10000000 (TCSR 0x3C0000 ... APSS 0xF500000).
-    arm_io_props = [
-        pack_adt_prop("name", cstr("arm-io")),
-        pack_adt_prop("device_type", cstr("bengal-io")),
-        pack_adt_prop("compatible", cstr("arm-io,qcom-sm6115")),
-        pack_adt_prop("ranges", u64(0x0) + u64(0x00100000) + u64(0x0FF00000)),
-        pack_adt_prop("#address-cells", u32(2)),
-        pack_adt_prop("#size-cells", u32(2)),
-    ]
-    arm_io_node = struct.pack("<II", len(arm_io_props), 0) + b"".join(arm_io_props)
-    root_children = [cpus_node, chosen_node, arm_io_node]
-    return (
-        struct.pack("<II", len(root_props), len(root_children))
-        + b"".join(root_props)
-        + b"".join(root_children)
-    )
+    tree = node('device-tree', [
+        ('model', b'iPad7,1\0' if ipad else b'guamp-first-boot\0'),
+        *([('target-type', b'J120\0')] if ipad else []),
+        ('compatible', b'motorola,guamp\0qcom,bengal\0qcom,sm6115\0'),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+    ], [
+        node('chosen', [
+            # bootseed_init() panics with fewer than 64 bytes (fixed per payload build)
+            ('random-seed', os.urandom(64)),
+            *([('unique-chip-id', u64(args.unique_chip_id)), ('chip-id', u32(args.chip_id))]
+              if args.unique_chip_id is not None else []),
+            ('osenvironment', b'main\0'),
+            *([('certificate-production-status', u32(0)), ('effective-production-status-ap', u32(0)),
+               ('certificate-security-mode', u32(1)), ('effective-security-mode-sep', u32(1))] if ipad else []),
+            *([('ephemeral-storage', u32(1))]
+              if (args.data_ramdisk or args.packed_data_ramdisk) and not args.persistent_data else []),
+            *([('darwinboot-memory-size', u64(args.owned_memory_size))] if args.owned_memory_size else []),
+            ('dram-base', u64(DRAM_BASE)),
+            ('dram-size', u64(args.dram_size)),
+            ('crypto-hash-method', b'sha2-384\0'),
+            *([('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
+                                  '<key>IOPropertyMatch</key><dict><key>UUID</key><string>' +
+                                  args.root_match_volume_uuid.upper() + '</string></dict></dict>\0').encode())]
+              if args.root_match_volume_uuid else []),
+            ('amfi-only-platform-code', u32(1)),
+            *([('text-fixups', b''.join(f.encode() + b'\0' for f in args.text_fixup))] if args.text_fixup else []),
+            *empty_nvram_proxy(),
+        ], [
+            # arm_vm_init() asserts /chosen/memory-map exists; DarwinBoot fills the placeholders
+            node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))]
+                                if (args.data_ramdisk or args.packed_data_ramdisk) else []) +
+                               ([('TrustCache', bytes(16))] if args.trust_cache else []) +
+                               ([('GpuAddon', bytes(16))] if args.gpu_addon else [])),
+            node('manifest-properties'),
+        ]),
+        node('cpus', children=cpus),
+        *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])]
+          if len(cpus) > 1 else []),
+        # pmap_bootstrap() asserts /defaults; no suspend on this board
+        node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560))]),
+        node('options'),
+        *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
+                            ('button-names', b'hold\0voldown\0volup\0'),
+                            ('home-button-type', u32(2))])] if ipad else []),
+        node('product', [
+            ('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if ipad else b'Moto G9 Play\0'),
+            ('model', b'motorola,guamp\0'),
+            *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
+               ('artwork-device-idiom', b'pad\0'),
+               ('artwork-device-subtype', u32(2732)),
+               ('artwork-scale-factor', u32(2)),
+               ('artwork-display-gamut', b'P3\0'),
+               ('compatible-device-fallback', b'iPad6,7\0'),
+               ('thin-bezel', u32(1))] if ipad else []),
+        ]),
+        # pe_arm_get_soc_base_phys() reads ranges[1]; pe_identify_machine() returns early without it
+        node('arm-io', [
+            ('device_type', b'arm-io\0'),
+            ('#address-cells', u32(2)),
+            ('#size-cells', u32(2)),
+            ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, ARMIO_SIZE)),
+        ], [
+            node('intc', [
+                ('compatible', b'arm,gic-v3\0'),
+                ('reg', struct.pack('<4Q', GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
+                                    GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
+                ('redistributor-stride', u64(GIC_REDIST_STRIDE)),
+            ]),
+        ]),
+    ])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(tree)
+    print(f'[make-guamp-adt] {len(tree)} bytes, dram {args.dram_size:#x}, {len(cpus)} CPUs, timebase {TIMEBASE}')
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Emit guamp ADT for UniXNU")
-    parser.add_argument("--output", "-o", required=True)
-    parser.add_argument("--dram-size", default=None)
-    parser.add_argument("--owned-memory-size", default="0x40000000")
-    parser.add_argument("--root-match-volume-uuid", default="04769D26-2CA0-4825-B443-E2E5F88300F2")
-    parser.add_argument("--cpu-regs", default="0x0,0x1,0x2,0x3")
-    parser.add_argument("--unique-chip-id", default="0x1122334455667788")
-    # Accepted for the payload step of board.toml; this generator does not model them.
-    parser.add_argument("--chip-id", default="0x1bc")
-    parser.add_argument("--packed-data-ramdisk", action="store_true")
-    parser.add_argument("--trust-cache", action="store_true")
-    parser.add_argument("--ipad-identity", action="store_true")
-    args, _unknown = parser.parse_known_args()
-
-    out = pathlib.Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    blob = generate_adt(args)
-    out.write_bytes(blob)
-    print(f"[make-guamp-adt] Wrote {len(blob)} bytes to {out}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()
