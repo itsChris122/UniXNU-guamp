@@ -9,7 +9,8 @@ CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
-CONFIG_XNU_NATIVE_PAN=y
+# Kryo 260 (Cortex-A73/A53) is ARMv8.0: no PAN, "msr PAN, #1" before arm_vm_init is UNDEFINED there.
+# CONFIG_XNU_NATIVE_PAN is not set
 
 # Run the [kernel] archives of board.toml (corecrypto, ARM drivers, display stub) before the link.
 CONFIG_XNU_BUILD_ARCHIVES=y

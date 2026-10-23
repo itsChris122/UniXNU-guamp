@@ -131,7 +131,7 @@ panic_screen = false                 # broken display; no room next to the stage
 # Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
 # shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
 entry_probe_reset_delay = 2
-entry_probe_reset_after = "_ml_parse_cpu_topology"
+entry_probe_reset_after = "_processor_bootstrap"
 kernel_args = [
   "-v",
   "serial=3",
