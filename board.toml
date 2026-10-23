@@ -127,6 +127,9 @@ title = "guamp first boot: source 4K XNU to console"
 dram_size = "0x100000000"             # 4 GiB LPDDR4x from 0x40000000 (fastboot: ram 4GB)
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true
+# Stage 3 probe: 6 s after the MMU is on the kernel resets the device (PSCI). A reboot by itself
+# shows that XNU got that far; with "fastboot oem fb_mode_set" the phone then waits in fastboot.
+entry_probe_reset_delay = 6
 kernel_args = [
   "-v",
   "serial=3",
