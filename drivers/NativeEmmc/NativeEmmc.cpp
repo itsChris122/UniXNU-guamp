@@ -612,6 +612,15 @@ static IOService *mediaForDevice(dev_t device)
 
 extern "C" void native_verified_root_probe(void) {}
 
+// The boot-time GPU addon of the owner Data mount (zzy-native-gpu-addon-mount) comes from NativeRamBlock on the
+// reference boards; guamp has no GPU addon
+extern "C" int native_ram_block_gpu_addon(const uint8_t **data, uint64_t *bytes)
+{
+  if (data) *data = nullptr;
+  if (bytes) *bytes = 0;
+  return 0;
+}
+
 extern "C" int native_verified_block_root_authorized(dev_t device)
 {
   IOService *media = mediaForDevice(device);
