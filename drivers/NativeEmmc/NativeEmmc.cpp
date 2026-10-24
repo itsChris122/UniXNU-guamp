@@ -65,6 +65,8 @@ uint64_t native_emmc_rereads = 0, native_emmc_last_lba = 0;
 extern unsigned int vm_page_free_count;
 // Who issues the reads: the process of the last request (the cluster layer reads in the faulting thread)
 char native_emmc_last_proc[32];
+// Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
+uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
 int native_emmc_last_pid = -1;
 void proc_selfname(char *, int);
 int proc_selfpid(void);
@@ -477,8 +479,16 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   card.mirror(card.sequence % kFbEvery == 0);
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
   IOLockUnlock(card.gate);
-  static uint64_t lastReads = 0;
+  static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0, lastTime = 0;
   if (card.sequence % 10 == 0) {
+    uint64_t now = mach_absolute_time(), busy = native_emmc_busy, requests = native_emmc_requests;
+    uint64_t busyNs = 0, spanNs = 0;
+    absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
+    absolutetime_to_nanoseconds(now - lastTime, &spanNs);
+    IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, driver busy %llu%%\n",
+          requests - lastRequests, requests > lastRequests ? (reads - lastReads) / (requests - lastRequests) : 0,
+          spanNs ? busyNs * 100 / spanNs : 0);
+    lastBusy = busy; lastRequests = requests; lastTime = now;
     IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
           reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     lastReads = reads;
@@ -584,7 +594,9 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   if (write && !writable) return kIOReturnNotWritable;
   Card &card = gCard;
   if (!card.online) return kIOReturnNotReady;
+  uint64_t started = mach_absolute_time();
   if (!write) {
+    native_emmc_requests++;
     native_emmc_last_pid = proc_selfpid();
     proc_selfname(native_emmc_last_proc, sizeof(native_emmc_last_proc));
   }
@@ -603,6 +615,7 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     if (!ok) { status = kIOReturnIOError; break; }
     done += n;
   }
+  __atomic_fetch_add(&native_emmc_busy, mach_absolute_time() - started, __ATOMIC_RELAXED);
   completion->action(completion->target, completion->parameter, status, done * kBlock);
   return kIOReturnSuccess;
 }
