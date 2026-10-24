@@ -62,7 +62,8 @@ void buildMsOs20()
   auto put16 = [&](uint16_t v) { *p++ = v & 0xFF; *p++ = v >> 8; };
   auto put32 = [&](uint32_t v) { put16(v & 0xFFFF); put16(v >> 16); };
   put16(10); put16(0); put32(0x06030000); put16(162);                       // set header, Windows 8.1+
-  put16(20); put16(3); for (char c : {'W', 'I', 'N', 'U', 'S', 'B', 0, 0}) *p++ = static_cast<uint8_t>(c);
+  static const char compatible[8] = {'W', 'I', 'N', 'U', 'S', 'B', 0, 0};
+  put16(20); put16(3); for (char c : compatible) *p++ = static_cast<uint8_t>(c);
   for (int i = 0; i < 8; i++) *p++ = 0;                                      // compatible ID
   const char name[] = "DeviceInterfaceGUIDs";                               // REG_MULTI_SZ property
   const char guid[] = "{4D6F746F-4739-4D69-7272-6F7230303031}";
