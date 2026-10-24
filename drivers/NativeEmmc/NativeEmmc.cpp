@@ -780,6 +780,38 @@ static void publishWindows()
   IOFree(manifest, 4096);
 }
 
+
+// USB probe (first step of a live screen over USB): does the firmware leave the USB 3.0 controller (DWC3 at 0x04E00000,
+// QUSB2 PHY at 0x01613000) powered and clocked after ExitBootServices? GCC registers can always be read; the DWC3 and
+// PHY registers only when their GDSC and clocks are on (an unclocked access can hang the bus). Offsets from Linux
+// gcc-sm6115.c: GDSC bit 31 = power on; branch CBCR bit 31 = clock off, bit 0 = enable.
+static void usbProbe()
+{
+  volatile uint8_t *gcc = mapPhysical(0x0141A000, 0x4000);     // 0x1a000-0x1dfff of GCC at 0x01400000
+  if (!gcc) { IOLog("NativeEmmc USB: GCC not mapped\n"); return; }
+  auto g = [gcc](uint32_t offset) { return *reinterpret_cast<volatile uint32_t *>(gcc + offset - 0x1a000); };
+  uint32_t gdsc = g(0x1a004), master = g(0x1a010), sleep = g(0x1a014), utmi = g(0x1a018), sysnoc = g(0x1a080),
+           cfgnoc = g(0x1a084), ahb2phy = g(0x1d008);
+  IOLog("NativeEmmc USB: GDSC %08x master %08x sleep %08x utmi %08x sysnoc %08x cfgnoc %08x ahb2phy %08x\n",
+        gdsc, master, sleep, utmi, sysnoc, cfgnoc, ahb2phy);
+  bool on = (gdsc & (1u << 31)) && !(master & (1u << 31)) && !(cfgnoc & (1u << 31)) && !(sysnoc & (1u << 31));
+  if (on) {
+    volatile uint8_t *dwc = mapPhysical(0x04E0C000, 0x1000);
+    if (dwc) {
+      auto d = [dwc](uint32_t offset) { return *reinterpret_cast<volatile uint32_t *>(dwc + offset - 0xC000); };
+      IOLog("NativeEmmc USB: DWC3 GSNPSID %08x GCTL %08x GUSB2PHYCFG %08x DCFG %08x DCTL %08x DSTS %08x GEVNTSIZ %08x\n",
+            d(0xC120), d(0xC110), d(0xC200), d(0xC700), d(0xC704), d(0xC70C), d(0xC408));
+    }
+  } else {
+    IOLog("NativeEmmc USB: controller not powered or clocked, registers not read\n");
+  }
+  if (!(ahb2phy & (1u << 31))) {
+    volatile uint8_t *phy = mapPhysical(0x01613000, 0x1000);
+    if (phy) IOLog("NativeEmmc USB: QUSB2 PLL_STATUS %02x POWERDOWN %02x TUNE1 %02x\n",
+                   phy[0x38], phy[0xb4], phy[0x80]);
+  }
+}
+
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
   Card &card = gCard;
@@ -845,6 +877,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
   publish(0, card.capacity, "user area");
   publishWindows();
+  usbProbe();
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
