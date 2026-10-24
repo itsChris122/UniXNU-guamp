@@ -138,13 +138,14 @@ kernel_args = [
   "kt_fixed_zones=120",
   "boot-progress=2",
   "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
-  "guamp-emmc-reset=240",              # NativeEmmc: PSCI reset after 240 log mirrors (1 s each)
+  "guamp-emmc-reset=600",              # NativeEmmc: PSCI reset after 600 log mirrors (1 s each); launchd reads the whole dyld cache
+  "guamp-emmc-div=4",                   # NativeEmmc: SD clock base/8 if it reads back correctly (proven: 8 = base/16)
 ]
 
 [payload.adt]
 tool = "scripts/make-guamp-adt.py"
 chip_id = "0x1bc"                    # SM6115
-owned_memory_size = "0xA0000000"            # 2.5 GiB DarwinBoot window (the free run 0x80000000-0x13FE00000 is ~3 GiB); 1 GiB ran out while dyld read the shared cache
+owned_memory_size = "0x78000000"            # 1.875 GiB DarwinBoot window inside the free 0x80000000-0x100000000 run (the RAM log at 0x100000000 splits the rest; 2.5 GiB = Out of Resources, 1 GiB ran out while dyld read the shared cache)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Kryo 260: Silver cluster 0x0-0x3, Gold cluster 0x100-0x103 (Affinity1 numbering)
 cpu_regs = "0x0,0x1,0x2,0x3"                  # Silver cluster only: the BCM2837 kernel config has MAX_CPUS 4, one cluster

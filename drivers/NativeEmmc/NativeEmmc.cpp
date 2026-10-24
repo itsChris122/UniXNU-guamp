@@ -219,6 +219,21 @@ public:
     return 0;
   }
 
+  uint32_t divider = 8;                    // SDCLK = base / (2 * divider); 8 is the proven clock
+
+  // SDCLK = base / (2 * n), 10-bit divided clock mode; false if the internal clock does not settle
+  bool setClock(uint32_t n) {
+    w16(rClock, static_cast<uint16_t>(r16(rClock) & ~4));
+    w16(rClock, static_cast<uint16_t>(((n & 0xFF) << 8) | (((n >> 8) & 3) << 6) | 1));
+    uint64_t end = deadline(1000);
+    while (!(r16(rClock) & 2)) {
+      if (mach_absolute_time() > end) return false;
+    }
+    w16(rClock, static_cast<uint16_t>(r16(rClock) | 4));
+    divider = n;
+    return true;
+  }
+
   // CMD18 with block count and auto CMD12, at the same proven clock: one command per run instead of per block
   bool readMulti(uint64_t lba, uint32_t count, uint8_t *out) {
     w32(rStatus, 0xFFFFFFFF);
@@ -403,7 +418,7 @@ bool Card::findPartitions()
 // blocks), blocks 1024.. = the framebuffer (kFbRowBytes * kFbHeight bytes, XRGB little endian).
 //   0 "GUAMPLOG"  8 version 2  12 msg_size  16 msg_bufx  20 sequence  24 init stage  28 msg_magic
 //   32 mach_absolute_time  40 reads  48 writes  56 errors
-//   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)  84, 88 unused
+//   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)  84 unused  88 SD clock divider
 //   92 int32: root Apple autherr, root owner decision, root accepted, SystemOS stage, SystemOS status, Data stage,
 //      Data status, boot manifest status, nprocs, flush type (0 = periodic, else haltRestart type + 1), text ok
 //   136 panic region copy: first block, bytes (0 = none)  144 uint64 Data window block writes
@@ -433,7 +448,7 @@ void Card::mirror(bool framebuffer)
   memcpy(header + 8, words, sizeof(words));
   uint64_t counters[4] = { mach_absolute_time(), native_emmc_reads, native_emmc_writes, native_emmc_errors };
   memcpy(header + 32, counters, sizeof(counters));
-  uint32_t fbWords[5] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence };
+  uint32_t fbWords[7] = { kFbFirstBlock, kFbWidth, kFbHeight, kFbRowBytes, fbSequence, 0, host.divider };
   memcpy(header + 64, fbWords, sizeof(fbWords));
   int32_t progress[11] = { native_owner_root_apple_autherr, native_owner_root_decision, native_owner_root_accepted,
                            native_owner_cache_stage, native_owner_cache_status, native_owner_data_stage,
@@ -691,6 +706,24 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   native_emmc_stage = card.host.init();
   if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
   if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
+  // Boot argument guamp-emmc-div=N: faster SD clock (base / 2N, N < 8) kept only if the GPT header and a CMD18 run
+  // of the partition entries read back identical to the proven clock; otherwise back to N = 8
+  uint32_t wanted = 8;
+  if (PE_parse_boot_argn("guamp-emmc-div", &wanted, sizeof(wanted)) && wanted >= 1 && wanted < 8) {
+    uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
+    bool ok = reference && check && card.readBlocks(1, 33, reference) && card.host.setClock(wanted);
+    for (unsigned pass = 0; ok && pass < 4; pass++) {
+      memset(check, 0, 33 * kBlock);
+      ok = card.readBlocks(1, 33, check) && !memcmp(reference, check, 33 * kBlock);
+    }
+    if (!ok) {
+      card.host.resetLines();
+      card.host.setClock(8);
+    }
+    IOLog("NativeEmmc: clock divider %u requested, %u in use\n", wanted, card.host.divider);
+    if (reference) IOFree(reference, 33 * kBlock);
+    if (check) IOFree(check, 33 * kBlock);
+  }
   IOLog("NativeEmmc: %llu blocks, log kpan at %llu (%llu blocks), userdata at %llu (%llu blocks)\n",
         card.capacity, card.logFirst, card.logBlocks, card.dataFirst, card.dataBlocks);
   card.fb = mapPhysical(kFbPhys, kFbBytes);
