@@ -13,9 +13,12 @@
 //    splits it into the GPT partitions);
 //  - the root windows of a SHNGROOT image inside "userdata" (scripts/unixnu/userdata.py layout; here at
 //    userdata + 0 or + 512 MiB, after the FAT payload) are published as read-only devices of their own, so
-//    APFS finds the OS and SystemOS containers and XNU the root volume by UUID;
-//  - the kernel message buffer and the console framebuffer are mirrored to the empty "kpan" partition, the
-//    only block range this driver ever writes, so the boot can be read from TWRP afterwards
+//    APFS finds the OS and SystemOS containers and XNU the root volume by UUID; a window whose manifest
+//    flags lack bit 0 (read-only) is published writable: the persistent iPadOS Data container, mounted on
+//    /private/var by the owner Data path (native_ram_block_volume_seed below);
+//  - the kernel message buffer and the console framebuffer are mirrored to the empty "kpan" partition, so
+//    the boot can be read from TWRP afterwards. kpan and the writable windows are the only block ranges this
+//    driver ever writes
 //    (strumenti/leggi-log-xnu.sh). The platform's haltRestart() flushes them once more before a restart,
 //    power off or panic (guamp_emmc_flush). Boot argument guamp-emmc-reset=N: PSCI reset after N mirrors.
 //
@@ -139,15 +142,18 @@ public:
   }
 
   // R1/R1b command without data
-  bool command(uint8_t index, uint32_t argument, bool busy) {
+  bool command(uint8_t index, uint32_t argument, bool busy, uint64_t busyMs = 1000) {
     w32(rStatus, 0xFFFFFFFF);
     w32(rArg, argument);
     w16(rXfer, 0);
     w16(rCmd, static_cast<uint16_t>((index << 8) | (1 << 4) | (1 << 3) | (busy ? 0x3 : 0x2)));
     if (wait(sCmdDone, 100)) return false;
-    if (busy && wait(sXferDone, 1000)) return false;
+    if (busy && wait(sXferDone, busyMs)) return false;
     return true;
   }
+
+  // CMD6 FLUSH_CACHE (EXT_CSD 32): the card's volatile cache to flash; the card ignores it with the cache off
+  bool flushCache() { return command(6, (3u << 24) | (32u << 16) | (1u << 8), true, 10000); }
 
   // Returns 0 when ready, else the failing stage (native_emmc_stage)
   unsigned init() {
@@ -257,7 +263,14 @@ struct Card {
     }
     return true;
   }
-  // The only writes of this driver, confined to the log partition
+  // Writes of a writable window (its device checks the range)
+  bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in) {
+    for (uint32_t i = 0; i < count; i++) {
+      if (!host.writeBlock(lba + i, in + static_cast<uint64_t>(i) * kBlock)) return false;
+    }
+    return true;
+  }
+  // Log writes, confined to the log partition
   bool writeLogBlock(uint64_t index, const uint8_t *in) {
     if (!logBlocks || index >= logBlocks) return false;
     return host.writeBlock(logFirst + index, in);
@@ -403,19 +416,24 @@ __asm__(
   "  .quad __ZN20IOBlockStorageDevice10gMetaClassE\n"
   ".text\n");
 
-// One read-only block range of the card: the whole user area, or a root window
+// One block range of the card: the whole user area or a root window (read-only), or the Data window (writable)
 class NativeEmmc : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeEmmc)
   uint64_t first = 0, blocks = 0;
+  bool writable = false;
   char product[40] = {};
 
 public:
-  bool setRange(uint64_t start, uint64_t count, const char *name) {
+  bool setRange(uint64_t start, uint64_t count, const char *name, bool write) {
     first = start;
     blocks = count;
+    writable = write;
     snprintf(product, sizeof(product), "eMMC %s", name);
     return count != 0;
   }
+  bool isWritable() const { return writable; }
+  uint64_t firstBlock() const { return first; }
+  uint64_t blockCount() const { return blocks; }
   // Base methods of IOBlockStorageDevice (IOStorageFamily IOBlockStorageDevice.cpp, iOS build)
   using IOBlockStorageDevice::init;
   bool init(OSDictionary *properties) override {
@@ -438,7 +456,9 @@ public:
   char *getVendorString() override { return const_cast<char *>("Qualcomm"); }
   char *getProductString() override { return product; }
   char *getRevisionString() override { return const_cast<char *>("1.0"); }
-  char *getAdditionalDeviceInfoString() override { return const_cast<char *>("SDHC1, polled PIO, read-only"); }
+  char *getAdditionalDeviceInfoString() override {
+    return const_cast<char *>(writable ? "SDHC1, polled PIO" : "SDHC1, polled PIO, read-only");
+  }
   IOReturn reportBlockSize(UInt64 *value) override { *value = kBlock; return kIOReturnSuccess; }
   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportMaxValidBlock(UInt64 *value) override { *value = blocks - 1; return kIOReturnSuccess; }
@@ -446,8 +466,8 @@ public:
     *present = gCard.online; if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportWriteProtection(bool *value) override { *value = true; return kIOReturnSuccess; }
-  IOReturn doSynchronizeCache() override { return gCard.online ? kIOReturnSuccess : kIOReturnNotReady; }
+  IOReturn reportWriteProtection(bool *value) override { *value = !writable; return kIOReturnSuccess; }
+  IOReturn doSynchronizeCache() override;
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
   IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
@@ -460,7 +480,9 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
 {
   if (!buffer || !completion || !completion->action || !count || block >= blocks || count > blocks - block ||
       buffer->getLength() < count * kBlock) return kIOReturnBadArgument;
-  if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
+  bool write = buffer->getDirection() == kIODirectionOut;
+  if (!write && buffer->getDirection() != kIODirectionIn) return kIOReturnBadArgument;
+  if (write && !writable) return kIOReturnNotWritable;
   Card &card = gCard;
   if (!card.online) return kIOReturnNotReady;
   uint64_t done = 0;
@@ -470,14 +492,27 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
     IOLockLock(card.gate);
-    bool ok = card.readBlocks(first + block + done, n, card.bounce) &&
-        buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
+    bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
+                          card.writeBlocks(first + block + done, n, card.bounce)
+                    : card.readBlocks(first + block + done, n, card.bounce) &&
+                          buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
     IOLockUnlock(card.gate);
     if (!ok) { status = kIOReturnIOError; break; }
     done += n;
   }
   completion->action(completion->target, completion->parameter, status, done * kBlock);
   return kIOReturnSuccess;
+}
+
+IOReturn NativeEmmc::doSynchronizeCache()
+{
+  Card &card = gCard;
+  if (!card.online) return kIOReturnNotReady;
+  if (!writable) return kIOReturnSuccess;
+  IOLockLock(card.gate);
+  bool ok = card.host.flushCache();
+  IOLockUnlock(card.gate);
+  return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
 // Our metaclass must name the kext's real IOBlockStorageDevice metaclass as its superclass (IOKit matching and
@@ -499,11 +534,11 @@ static bool linkMetaClass()
   return ok && NativeEmmc::metaClass->getSuperClass() == real;
 }
 
-static void publish(uint64_t first, uint64_t blocks, const char *name)
+static void publish(uint64_t first, uint64_t blocks, const char *name, bool writable = false)
 {
   NativeEmmc *disk = OSTypeAlloc(NativeEmmc);
   if (!disk) return;
-  if (disk->init(nullptr) && disk->setRange(first, blocks, name) && disk->attach(gPlatform)) {
+  if (disk->init(nullptr) && disk->setRange(first, blocks, name, writable) && disk->attach(gPlatform)) {
     if (disk->start(gPlatform)) disk->registerService();
     else disk->detach(gPlatform);
   }
@@ -543,11 +578,15 @@ static void publishWindows()
       char name[33] = {};
       memcpy(name, entry, 32);
       uint64_t start, size;
+      uint32_t flags;
       memcpy(&start, entry + 32, 8);
       memcpy(&size, entry + 40, 8);
+      memcpy(&flags, entry + 52, 4);
       if ((start % kBlock) || (size % kBlock) || start + size > imageBytes) continue;
-      IOLog("NativeEmmc: window %s at userdata+%llu, %llu blocks\n", name, offset + start / kBlock, size / kBlock);
-      publish(base + start / kBlock, size / kBlock, name);
+      bool writable = !(flags & 1);
+      IOLog("NativeEmmc: window %s at userdata+%llu, %llu blocks%s\n", name, offset + start / kBlock, size / kBlock,
+            writable ? ", writable" : "");
+      publish(base + start / kBlock, size / kBlock, name, writable);
     }
     break;
   }
@@ -594,13 +633,21 @@ extern "C" void guamp_emmc_start(IOService *platform)
 // media that sit on NativeEmmc (CONFIG_XNU_VERIFIED_ROOT_ARCHIVE links this archive in place of that driver).
 // ---------------------------------------------------------------------------------------------------------------
 
-static bool onEmmc(IOService *media)
+// The NativeEmmc device under this media, or null
+static NativeEmmc *emmcUnder(IOService *media)
 {
   unsigned depth = 0;
   for (IOService *provider = media; provider && depth++ < 64; provider = provider->getProvider()) {
-    if (OSDynamicCast(NativeEmmc, provider)) return true;
+    if (NativeEmmc *disk = OSDynamicCast(NativeEmmc, provider)) return disk;
   }
-  return false;
+  return nullptr;
+}
+
+// Media of the unchanged IPSW images: on a read-only NativeEmmc range
+static bool onEmmc(IOService *media)
+{
+  NativeEmmc *disk = emmcUnder(media);
+  return disk && !disk->isWritable();
 }
 
 // The IOMedia for a BSD device number, retained, or null
@@ -646,11 +693,12 @@ extern "C" int native_verified_block_root_authorized(dev_t device)
   return ok;
 }
 
-// The single IOMedia with this APFS volume UUID on NativeEmmc; waits for APFS to publish it (it runs right after
-// the root mount, while the SystemOS container may still be probed)
-extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size)
+// The single IOMedia with this APFS volume UUID on a NativeEmmc range of the wanted kind (read-only image or the
+// writable Data window); waits for APFS to publish it (it runs right after the root mount, while the containers
+// may still be probed). Returns that range, or null.
+static NativeEmmc *findVolume(const char *uuid, bool writable, dev_t *device, char *path, size_t size)
 {
-  if (!uuid || !device || !path || size < 6) return 0;
+  if (!uuid || !device || !path || size < 6) return nullptr;
   *device = NODEV;
   path[0] = 0;
   OSDictionary *matching = IOService::serviceMatching("IOMedia");
@@ -660,21 +708,53 @@ extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *devi
       matching->setObject(gIOPropertyMatchKey, properties);
   OSSafeReleaseNULL(wanted);
   OSSafeReleaseNULL(properties);
-  if (!ready) { OSSafeReleaseNULL(matching); return 0; }
+  if (!ready) { OSSafeReleaseNULL(matching); return nullptr; }
   IOService *media = IOService::waitForMatchingService(matching, 60ULL * NSEC_PER_SEC);
   matching->release();
-  if (!media) { IOLog("NativeEmmc: volume %s not published\n", uuid); return 0; }
+  if (!media) { IOLog("NativeEmmc: volume %s not published\n", uuid); return nullptr; }
   OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
   OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
   OSNumber *mnr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
-  int ok = name && mjr && mnr && onEmmc(media) && name->getLength() + 6 < size;
-  if (ok) {
+  NativeEmmc *disk = emmcUnder(media);
+  if (!disk || disk->isWritable() != writable) disk = nullptr;
+  if (disk && name && mjr && mnr && name->getLength() + 6 < size) {
     *device = static_cast<dev_t>(makedev(mjr->unsigned32BitValue(), mnr->unsigned32BitValue()));
     snprintf(path, size, "/dev/%s", name->getCStringNoCopy());
     IOLog("NativeEmmc: volume %s is %s\n", uuid, path);
+  } else {
+    IOLog("NativeEmmc: volume %s refused (not on a %s eMMC range)\n", uuid, writable ? "writable" : "read-only");
+    disk = nullptr;
   }
   media->release();
-  return ok;
+  return disk;
+}
+
+extern "C" int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size)
+{
+  return findVolume(uuid, false, device, path, size) != nullptr;
+}
+
+// Data volume of the owner Data mount (kern_exec.c native_owner_data_prepare, XNU_NATIVE_RAM_BLOCK path; the
+// reference boards answer it from NativeRamBlock): the volume with this UUID in the writable Data window. Seed
+// base and size are the window's eMMC byte range; the digest only names the volume (the window is not a fixed seed).
+extern "C" int native_ram_block_volume_seed(const char *uuid, dev_t *device, char *path, size_t size,
+    uint64_t *base, uint64_t *bytes, uint8_t digest[32])
+{
+  if (!base || !bytes || !digest) return 0;
+  *base = 0;
+  *bytes = 0;
+  memset(digest, 0, 32);
+  NativeEmmc *disk = findVolume(uuid, true, device, path, size);
+  if (!disk) return 0;
+  *base = disk->firstBlock() * kBlock;
+  *bytes = disk->blockCount() * kBlock;
+  static const char domain[] = "guamp.NativeEmmc.data-window.v1";
+  SHA256_CTX context;
+  SHA256_Init(&context);
+  SHA256_Update(&context, domain, sizeof(domain));
+  SHA256_Update(&context, uuid, strlen(uuid));
+  SHA256_Final(digest, &context);
+  return 1;
 }
 
 // Identity of a volume for the owner boot manifest: SHA-384 over a fixed domain and the volume UUID
@@ -702,5 +782,6 @@ extern "C" void guamp_emmc_flush(unsigned type)
   if (panic) card.host.resetLines();
   card.flushType = type + 1;
   card.mirror(true);
+  card.host.flushCache();                  // Data window writes still in the card cache
   if (locked) IOLockUnlock(card.gate);
 }
