@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Link target for the display probe the DEVELOPMENT-only probe patch calls unconditionally.
+"""Weak definitions of hooks that the patched XNU and the display archive reference from components guamp leaves out.
 
-guamp has no display bring-up yet: the real NativeLegacyDisplay archive needs the sheng ABI
-generator. The probe only runs for the offline-legacy-register boot argument, which this board
-does not pass, so an empty function keeps the link honest without pretending to drive the panel.
+The kernel link needs each symbol even where its caller never runs or treats it as absent (as UniXNU-qemu's
+package/LinkStubs.c). All weak: a linked component that defines one (the display archive defines
+native_legacy_display_probe) replaces it. sheng's boot progress screen is not part of guamp: the display may always draw,
+keeps no diagnostic mapping and reports no stages; sheng's button probe is not either (no buttons sink).
 """
 import subprocess
 from pathlib import Path
@@ -12,7 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'build/guamp-display-stub'
 
 STUB = '''
-void native_legacy_display_probe(void) {}
+#include <stdint.h>
+#define WEAK __attribute__((weak))
+WEAK void native_legacy_display_probe(void) {}
+WEAK int boot_progress_prepare_scanout(void) { return 1; }
+WEAK void boot_progress_cancel_scanout(void) {}
+WEAK void boot_progress_stage(const char *message) { (void)message; }
+WEAK char boot_progress_ext[8][48];
+WEAK int boot_progress_pulse_anchor(uintptr_t address, uint64_t bytes, unsigned width, unsigned height, unsigned row)
+{ (void)address; (void)bytes; (void)width; (void)height; (void)row; return 0; }
+WEAK void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) { (void)sink; (void)context; }
 '''
 
 
