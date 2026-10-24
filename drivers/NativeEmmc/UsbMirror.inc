@@ -16,7 +16,7 @@
 
 extern "C" {
 volatile uint32_t native_usb_stage = 0, native_usb_speed = 0, native_usb_configured = 0;
-volatile uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0;
+uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0;
 }
 
 namespace usbm {
