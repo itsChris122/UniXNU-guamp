@@ -47,3 +47,7 @@ CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # (/dev/diskNs1: a whole container such as md0 has no volume index, APFS "invalid fsindex: -1").
 CONFIG_XNU_GUAMP_EMMC_DATA=y
 CONFIG_XNU_OWNER_DATA_VOLUME_UUID="829D33D3-9308-4A72-A5A0-2DB1F2A92109"
+
+# AMFI looks up the ApplePMGR nub once launchd runs ("AMFI: No PMGR?"). The sheng integration publishes the original
+# nub with a guarded provider (package/ShengPlatformPower.cpp, scripts/build-guamp-platform-power.py, sheng-pmgr=2).
+CONFIG_XNU_SHENG_PMGR=y

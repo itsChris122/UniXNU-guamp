@@ -166,6 +166,9 @@ def main():
         # pmap_bootstrap() asserts /defaults; no suspend on this board
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560))]),
         node('options'),
+        # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
+        # DT has /filesystems/DoNotUseSEP ("insecure boot"): no SEP here to wrap the volume keys
+        node('filesystems', [('DoNotUseSEP', u32(1))]),
         # No /pram: with it the kernel stopped before load_init_program (2026-10-23); to be investigated
         *([node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
                             ('button-names', b'hold\0voldown\0volup\0'),

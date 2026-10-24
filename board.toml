@@ -47,6 +47,7 @@ archives = [
   "build-native-aes-bindings.py",
   "build-libpthread-kernel.py",
   "build-guamp-display-stub.py",
+  "build-guamp-platform-power.py",   # ApplePMGR nub for AMFI (CONFIG_XNU_SHENG_PMGR, sheng-pmgr=2)
 ]
 
 [kernel.prelink]
@@ -136,6 +137,7 @@ kernel_args = [
   "debug=0x14a",                      # no DB_NMI (0x4): a panic restarts through ArmDTPlatform::haltRestart
   "kt_fixed_zones=120",
   "boot-progress=2",
+  "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
   "guamp-emmc-reset=45",               # NativeEmmc: PSCI reset after 45 log mirrors (1 s each)
 ]
 
