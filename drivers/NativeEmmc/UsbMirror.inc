@@ -397,7 +397,12 @@ void thread(void *, wait_result_t)
       m.sendLog();
       uint64_t now = mach_absolute_time(), interval = 0;
       nanoseconds_to_absolutetime(100 * 1000 * 1000ULL, &interval);   // up to 10 frames per second
-      if (now - lastFrame > interval) { m.sendFrame(gCard.fb); lastFrame = now; }
+      if (now - lastFrame > interval) {
+        // A whole frame every 30 frames (~3 s): a viewer opened later, or after a lost transfer, catches up
+        if (m.frame % 30 == 0 && m.shadow) memset(m.shadow, 0xA5, kFbBytes);
+        m.sendFrame(gCard.fb);
+        lastFrame = now;
+      }
     }
     IOSleep(1);
   }
