@@ -302,7 +302,7 @@ struct Mirror {
       // skip unchanged rows, then send a run of changed ones
       while (y < kFbHeight) {
         bool same = true;
-        for (uint32_t i = 0; i < kFbRowBytes; i += 8) {
+        for (uint32_t i = (y & 3) * 8; i < kFbRowBytes; i += 32) {   // one word in four, offset by row
           uint64_t a = *reinterpret_cast<volatile const uint64_t *>(fb + y * kFbRowBytes + i);
           if (memcmp(&a, shadow + y * kFbRowBytes + i, 8)) { same = false; break; }
         }
@@ -396,15 +396,15 @@ void thread(void *, wait_result_t)
     if (native_usb_configured) {
       m.sendLog();
       uint64_t now = mach_absolute_time(), interval = 0;
-      nanoseconds_to_absolutetime(100 * 1000 * 1000ULL, &interval);   // up to 10 frames per second
+      nanoseconds_to_absolutetime(500 * 1000 * 1000ULL, &interval);   // 2 frames per second: the frame buffer is uncached
       if (now - lastFrame > interval) {
         // A whole frame every 30 frames (~3 s): a viewer opened later, or after a lost transfer, catches up
-        if (m.frame % 30 == 0 && m.shadow) memset(m.shadow, 0xA5, kFbBytes);
+        if (m.frame % 6 == 0 && m.shadow) memset(m.shadow, 0xA5, kFbBytes);                  // whole frame every ~3 s
         m.sendFrame(gCard.fb);
         lastFrame = now;
       }
     }
-    IOSleep(1);
+    IOSleep(native_usb_configured ? 5 : 20);   // leave the CPU to iOS
   }
 }
 
