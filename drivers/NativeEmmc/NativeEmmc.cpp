@@ -271,7 +271,8 @@ public:
 
   bool setupDma() {
     dmaBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache, kDmaBytes + 4096, 0xFFFFF000ULL);
+        static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) |
+        static_cast<IOOptionBits>(kIOMapInhibitCache), kDmaBytes + 4096, 0xFFFFF000ULL);
     if (!dmaBuffer) return false;
     uint8_t *virt = static_cast<uint8_t *>(dmaBuffer->getBytesNoCopy());
     uint64_t phys = dmaBuffer->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
