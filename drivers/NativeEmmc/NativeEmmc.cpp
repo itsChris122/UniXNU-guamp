@@ -302,9 +302,10 @@ struct Card {
   bool findPartitions();
   void mirror(bool framebuffer);
   uint32_t panicCopied = 0;
-  // The panic region (header + text) to kpan, once, from the panic flush
+  // The panic region (header + text) to kpan, from every panic flush: XNU calls haltRestart at panic begin, before
+  // the text exists, and again at panic sync and restart
   void savePanic() {
-    if (!guamp_panic_base || panicCopied) return;
+    if (!guamp_panic_base) return;
     uint32_t bytes = guamp_panic_size < kPanicBytes ? guamp_panic_size : kPanicBytes;
     const uint8_t *region = reinterpret_cast<const uint8_t *>(guamp_panic_base);
     for (uint32_t b = 0; b * kBlock < bytes; b++) {
