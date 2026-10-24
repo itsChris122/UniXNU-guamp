@@ -27,6 +27,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitKeys.h>
@@ -63,10 +64,14 @@ uint64_t native_emmc_window_writes = 0, native_emmc_multi_failures = 0;
 // Read pattern: 4 KiB pages of the card read before (a page cache that keeps dropping what it read shows up here)
 uint64_t native_emmc_rereads = 0, native_emmc_last_lba = 0;
 extern unsigned int vm_page_free_count;
+extern task_t kernel_task;
 // Who issues the reads: the process of the last request (the cluster layer reads in the faulting thread)
 char native_emmc_last_proc[32];
 // Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
+// ADMA2 reads (boot argument guamp-emmc-dma=1): 1 when verified and in use, and the failed DMA runs
+uint32_t native_emmc_dma = 0;
+uint64_t native_emmc_dma_failures = 0;
 int native_emmc_last_pid = -1;
 void proc_selfname(char *, int);
 int proc_selfpid(void);
@@ -98,7 +103,7 @@ constexpr uint32_t kPanicFirstBlock = 12288, kPanicBytes = 64 * 1024;   // panic
 enum : uint32_t {
   rArg = 0x08, rXfer = 0x0C, rCmd = 0x0E, rResp = 0x10, rData = 0x20, rPresent = 0x24, rHostCtl = 0x28,
   rPower = 0x29, rClock = 0x2C, rTimeout = 0x2E, rReset = 0x2F, rStatus = 0x30, rStatusEn = 0x34, rSignalEn = 0x38,
-  rHostCtl2 = 0x3E, rBlockSize = 0x04, rBlockCount = 0x06,
+  rHostCtl2 = 0x3E, rAdmaAddr = 0x58, rBlockSize = 0x04, rBlockCount = 0x06,
   // msm-v5 vendor ("MCI removed" layout)
   rPwrStatus = 0x240, rPwrMask = 0x244, rPwrClear = 0x248, rPwrCtl = 0x24C,
   // CQHCI, one page above the host
@@ -255,6 +260,62 @@ public:
     return true;
   }
 
+  // ADMA2 with 32-bit descriptors: the controller writes the blocks into a physically contiguous buffer below 4 GiB
+  // (uncached, so no cache maintenance) and the CPU copies them out; PIO reads one 32-bit data word at a time
+  // (~1.3 us each on this bus), which kept the driver 92% busy at 2.4 MB/s.
+  IOBufferMemoryDescriptor *dmaBuffer = nullptr;
+  volatile uint8_t *dmaData = nullptr;
+  volatile uint32_t *dmaTable = nullptr;
+  uint32_t dmaDataPhys = 0, dmaTablePhys = 0;
+  static constexpr uint32_t kDmaBytes = kBounceBlocks * kBlock, kDmaChunk = 32768;
+
+  bool setupDma() {
+    dmaBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache, kDmaBytes + 4096, 0xFFFFF000ULL);
+    if (!dmaBuffer) return false;
+    uint8_t *virt = static_cast<uint8_t *>(dmaBuffer->getBytesNoCopy());
+    uint64_t phys = dmaBuffer->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    if (!virt || !phys || phys + kDmaBytes + 4096 > 0x100000000ULL) return false;
+    dmaData = virt;
+    dmaTable = reinterpret_cast<volatile uint32_t *>(virt + kDmaBytes);
+    dmaDataPhys = static_cast<uint32_t>(phys);
+    dmaTablePhys = static_cast<uint32_t>(phys + kDmaBytes);
+    return true;
+  }
+
+  // CMD18 (auto CMD12) of count blocks into the DMA buffer, then copied to out
+  bool readDma(uint64_t lba, uint32_t count, uint8_t *out) {
+    uint32_t bytes = count * kBlock;
+    if (!dmaData || !count || bytes > kDmaBytes) return false;
+    unsigned descriptors = 0;
+    for (uint32_t at = 0; at < bytes; at += kDmaChunk, descriptors++) {
+      uint32_t length = bytes - at < kDmaChunk ? bytes - at : kDmaChunk;
+      bool last = at + length >= bytes;
+      dmaTable[2 * descriptors] = (length << 16) | 0x20 | (last ? 0x2 : 0) | 0x1;   // tran, end, valid
+      dmaTable[2 * descriptors + 1] = dmaDataPhys + at;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    w32(rStatus, 0xFFFFFFFF);
+    w32(rAdmaAddr, dmaTablePhys);
+    w32(rAdmaAddr + 4, 0);
+    w8(rHostCtl, static_cast<uint8_t>((r8(rHostCtl) & ~0x18) | 0x10));     // ADMA2, 32-bit
+    w16(rBlockSize, kBlock);
+    w16(rBlockCount, static_cast<uint16_t>(count));
+    w32(rArg, static_cast<uint32_t>(lba));
+    w16(rXfer, (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0));
+    w16(rCmd, (18 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
+    bool ok = !wait(sCmdDone, 100) && !wait(sXferDone, 2000);
+    w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
+    if (!ok) return false;
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (uint32_t i = 0; i < bytes; i += 8) {
+      uint64_t word = *reinterpret_cast<volatile uint64_t *>(dmaData + i);
+      memcpy(out + i, &word, 8);
+    }
+    native_emmc_reads += count;
+    return true;
+  }
+
   bool readBlock(uint64_t lba, uint8_t *out) {
     for (unsigned attempt = 0; attempt < 3; attempt++) {
       w32(rStatus, 0xFFFFFFFF);
@@ -323,6 +384,12 @@ struct Card {
   // One CMD18 per run; after a failed multi-block command (counted, lines reset) the run is read block by block
   bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
     notePages(lba, count);
+    if (native_emmc_dma) {
+      if (host.readDma(lba, count, out)) return true;
+      native_emmc_errors++;
+      host.resetLines();
+      if (++native_emmc_dma_failures >= 8) native_emmc_dma = 0;    // back to PIO for good
+    }
     if (count > 1 && multiOk) {
       if (host.readMulti(lba, count, out)) return true;
       native_emmc_errors++;
@@ -425,6 +492,7 @@ bool Card::findPartitions()
 //      Data status, boot manifest status, nprocs, flush type (0 = periodic, else haltRestart type + 1), text ok
 //   136 panic region copy: first block, bytes (0 = none)  144 uint64 Data window block writes
 //   152 uint64 failed CMD18 runs (8 failures switch back to single-block reads)
+//   160 uint32 ADMA2 reads in use  168 uint64 failed ADMA2 runs (8 failures switch back to PIO)
 void Card::mirror(bool framebuffer)
 {
   guamp_msgbuf *ring = msgbufp;
@@ -461,6 +529,8 @@ void Card::mirror(bool framebuffer)
   memcpy(header + 136, panicWords, sizeof(panicWords));
   memcpy(header + 144, &native_emmc_window_writes, sizeof(native_emmc_window_writes));
   memcpy(header + 152, &native_emmc_multi_failures, sizeof(native_emmc_multi_failures));
+  memcpy(header + 160, &native_emmc_dma, sizeof(native_emmc_dma));
+  memcpy(header + 168, &native_emmc_dma_failures, sizeof(native_emmc_dma_failures));
   // The header goes out even when a block of the text failed: it carries the progress words
   writeLogBlock(0, header);
   native_emmc_mirrors++;
@@ -734,6 +804,21 @@ static void startLater(thread_call_param_t, thread_call_param_t)
       card.host.setClock(8);
     }
     IOLog("NativeEmmc: clock divider %u requested, %u in use\n", wanted, card.host.divider);
+    if (reference) IOFree(reference, 33 * kBlock);
+    if (check) IOFree(check, 33 * kBlock);
+  }
+  // Boot argument guamp-emmc-dma=1: ADMA2 reads, kept only if three DMA reads of the GPT header and entries match PIO
+  uint32_t dma = 0;
+  if (PE_parse_boot_argn("guamp-emmc-dma", &dma, sizeof(dma)) && dma) {
+    uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
+    bool ok = reference && check && card.host.setupDma() && card.readBlocks(1, 33, reference);
+    for (unsigned pass = 0; ok && pass < 3; pass++) {
+      memset(check, 0, 33 * kBlock);
+      ok = card.host.readDma(1, 33, check) && !memcmp(reference, check, 33 * kBlock);
+    }
+    if (!ok) card.host.resetLines();
+    native_emmc_dma = ok ? 1 : 0;
+    IOLog("NativeEmmc: ADMA2 reads %s\n", ok ? "verified, in use" : "refused, PIO");
     if (reference) IOFree(reference, 33 * kBlock);
     if (check) IOFree(check, 33 * kBlock);
   }
