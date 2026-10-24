@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
+// guamp: LegacyDisplayProbe.cpp of UniXNU-sheng without the probes of sheng hardware (CPU frequency, GPU power, touch panel).
 // Bounded offline original lifecycle instrument; no desktop claim.
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceMemory.h>
@@ -470,14 +471,8 @@ void native_legacy_display_probe(void) {
 void native_legacy_display_late_probe(void);
 extern void native_hid_input_probe(void);
 extern void native_keystore_probe(void);
-extern void native_touch_probe(void);
-extern void sheng_cpufreq_probe(void);
-extern void sheng_gpu_power_probe(void);
 void native_legacy_display_late_probe(void) {
     native_keystore_probe();
-    sheng_cpufreq_probe();
-    sheng_gpu_power_probe();
-    native_touch_probe();
     native_hid_input_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");

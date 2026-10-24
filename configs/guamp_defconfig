@@ -51,3 +51,8 @@ CONFIG_XNU_OWNER_DATA_VOLUME_UUID="829D33D3-9308-4A72-A5A0-2DB1F2A92109"
 # AMFI looks up the ApplePMGR nub once launchd runs ("AMFI: No PMGR?"). The sheng integration publishes the original
 # nub with a guarded provider (package/ShengPlatformPower.cpp, scripts/build-guamp-platform-power.py, sheng-pmgr=2).
 CONFIG_XNU_SHENG_PMGR=y
+
+# Display: NativeLegacyDisplay (a subclass of the original IOMobileFramebufferLegacy) on the UEFI frame buffer, published as
+# the system display; QuartzCore's original CPU renderer draws (no Metal device). With it the AppleKeyStore stand-in and the
+# HID device (KeyStoreProbe/HidInputProbe). Archive: scripts/build-guamp-legacy-display.py (UniXNU-qemu's, reduced).
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y

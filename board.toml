@@ -48,6 +48,7 @@ archives = [
   "build-libpthread-kernel.py",
   "build-guamp-display-stub.py",
   "build-guamp-platform-power.py",   # ApplePMGR nub for AMFI (CONFIG_XNU_SHENG_PMGR, sheng-pmgr=2)
+  "build-guamp-legacy-display.py",   # display + key store + HID (CONFIG_XNU_NATIVE_LEGACY_DISPLAY, offline-* arguments)
 ]
 
 [kernel.prelink]
@@ -137,6 +138,25 @@ kernel_args = [
   "debug=0x14a",                      # no DB_NMI (0x4): a panic restarts through ArmDTPlatform::haltRestart
   "kt_fixed_zones=120",
   "boot-progress=2",
+  # Display, key store and HID as on UniXNU-qemu / sheng: load IOMobileGraphicsFamily, create NativeLegacyDisplay and publish
+  # it under /arm-io as the system display (phase 4) on the UEFI frame buffer (gop), one pixel per point, with firmware-powered
+  # PM, swap validation, the CPU copy to the frame buffer and retirement; the AppleKeyStore stand-in (without it
+  # SpringBoard never takes over the display); a HID device with keyboard, Home button and touch screen.
+  "-apfs_shared_datavolume",
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-unit-scale=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-key-events=1",
+  "sheng-aks=1",
+  "offline-hid-input=1",
+  "offline-hid-home=1",
+  "sheng-touch-hid=1",
   "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
   "guamp-emmc-reset=900",              # NativeEmmc: PSCI reset after 900 log mirrors (~1.3 s each); launchd boot tasks start ~400 s
   "guamp-emmc-dma=1",                   # NativeEmmc: ADMA2 reads if they match PIO (PIO: 2.4 MB/s, driver 92% busy)
