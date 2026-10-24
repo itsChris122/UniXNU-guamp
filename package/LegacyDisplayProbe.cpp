@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// guamp: LegacyDisplayProbe.cpp of UniXNU-sheng without the probes of sheng hardware (CPU frequency, GPU power, touch panel).
+// guamp: LegacyDisplayProbe.cpp of UniXNU-sheng (251b291) without the probes of sheng hardware (touch panel, CPU frequency,
+// GPU power, Wi-Fi, buttons, backlight).
 // Bounded offline original lifecycle instrument; no desktop claim.
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceMemory.h>
@@ -212,9 +213,19 @@ extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     }
     return at;
 }
+// The display refresh tick (NativeLegacyDisplay, sheng-vsync): vsync messages sent, arms, idle stops, late ticks, starts, refresh
+// properties reported at that rate, and the rate.
+static volatile uint64_t vsyncEvents[6];
+static volatile unsigned vsyncHz;
+void native_legacy_vsync_observed(unsigned event,unsigned hz) {
+    if(event<6)vsyncEvents[event]=vsyncEvents[event]+1;
+    vsyncHz=hz;
+}
 extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
-    return snprintf(out,cap,"prepare calls=%u failures=%u retried=%u max_attempts=%u waited_ms=%llu",native_legacy_prepare_calls,native_legacy_prepare_failures,
-        native_legacy_prepare_retried,native_legacy_prepare_max_attempts,(unsigned long long)(native_legacy_prepare_wait_us/1000));
+    return snprintf(out,cap,"prepare calls=%u failures=%u retried=%u max_attempts=%u waited_ms=%llu vsync hz=%u sent=%llu arms=%llu idle=%llu late=%llu start=%llu refresh=%llu",
+        native_legacy_prepare_calls,native_legacy_prepare_failures,native_legacy_prepare_retried,native_legacy_prepare_max_attempts,
+        (unsigned long long)(native_legacy_prepare_wait_us/1000),vsyncHz,(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0],
+        (unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[5]);
 }
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
     if(accepted)native_legacy_swap_stage(0);
