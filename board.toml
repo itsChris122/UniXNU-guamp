@@ -167,7 +167,7 @@ kernel_args = [
 [payload.adt]
 tool = "scripts/make-guamp-adt.py"
 chip_id = "0x1bc"                    # SM6115
-owned_memory_size = "0x78000000"            # 1.875 GiB DarwinBoot window inside the free 0x80000000-0x100000000 run (the RAM log at 0x100000000 splits the rest; 2.5 GiB = Out of Resources, 1 GiB ran out while dyld read the shared cache)
+owned_memory_size = "0xB0000000"            # 2.75 GiB DarwinBoot window inside the free 0x80000000-0x13FC00000 run (RAM log moved to the top of DRAM; 1.875 GiB thrashed the page cache)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Kryo 260: Silver cluster 0x0-0x3, Gold cluster 0x100-0x103 (Affinity1 numbering)
 cpu_regs = "0x0,0x1,0x2,0x3"                  # Silver cluster only: the BCM2837 kernel config has MAX_CPUS 4, one cluster

@@ -1,0 +1,92 @@
+diff -ru a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5756,6 +5756,34 @@
+ unsigned long cs_native4k_page_checks = 0;
+ unsigned long cs_native4k_ready_blobs = 0;
+ 
++#if defined(XNU_GUAMP_CS_SEALED) && XNU_GUAMP_CS_SEALED
++extern int native_verified_block_root_authorized(dev_t);
++unsigned long cs_native4k_sealed_blobs = 0;
++
++/* The guamp system volumes (OS root, SystemOS cryptex) are read-only APFS volumes on NativeEmmc
++ * read-only ranges: APFS verifies every block it reads against the volume seal, so the code
++ * pages need no derived 4K digests and the whole-file read below is skipped for them.
++ */
++static boolean_t
++cs_native4k_sealed_volume(vnode_t vp)
++{
++	mount_t mp = vnode_mount(vp);
++	vnode_t devvp;
++	dev_t dev = NODEV;
++
++	if (mp == NULL || !(vfs_flags(mp) & MNT_RDONLY) ||
++	    strcmp(vfs_statfs(mp)->f_fstypename, "apfs") != 0) {
++		return FALSE;
++	}
++	devvp = vfs_devvp(mp);
++	if (devvp != NULLVP) {
++		dev = vnode_specrdev(devvp);
++		vnode_put(devvp);
++	}
++	return dev != NODEV && native_verified_block_root_authorized(dev);
++}
++#endif
++
+ /* The original signed 16K hash authenticates the whole immutable input
+  * buffer first. Only then derive native-page digests from that same buffer.
+  * Publish nothing until every original block has passed, and make the
+@@ -5792,6 +5820,14 @@
+ 		return ENOTSUP;
+ 	}
+ 	count = (limit + PAGE_MASK) >> PAGE_SHIFT;
++#if defined(XNU_GUAMP_CS_SEALED) && XNU_GUAMP_CS_SEALED
++	if (cs_native4k_sealed_volume(vp)) {
++		blob->csb_native4k_sealed = 1;
++		blob->csb_native4k_hash_count = count;
++		os_atomic_inc(&cs_native4k_sealed_blobs, relaxed);
++		return 0;
++	}
++#endif
+ 	if (os_mul_overflow(count, (vm_size_t)md->cs_size, &allocation) ||
+ 	    round_page_overflow(allocation, &allocation)) {
+ 		return EOVERFLOW;
+@@ -5927,6 +5963,24 @@
+ #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
+ 			if (PAGE_SHIFT == 12 && blob->csb_hash_pageshift == 14) {
+ 				vm_size_t index = (vm_size_t)offset >> PAGE_SHIFT;
++#if defined(XNU_GUAMP_CS_SEALED) && XNU_GUAMP_CS_SEALED
++				if (blob->csb_native4k_sealed && !(offset & PAGE_MASK) && offset < codeLimit &&
++				    index < blob->csb_native4k_hash_count) {
++					/* Expected digest = digest of the page APFS returned (same size as below). */
++					size_t sealed_size = PAGE_SIZE;
++					union cs_hash_union sealed_ctx;
++					if ((off_t)(offset + sealed_size) > codeLimit) {
++						sealed_size = (size_t)(codeLimit & (sealed_size - 1));
++					}
++					hashtype->cs_init(&sealed_ctx);
++					hashtype->cs_update(&sealed_ctx, data, sealed_size);
++					hashtype->cs_final(expected_hash, &sealed_ctx);
++					found_hash = TRUE;
++					native4k_cached = TRUE;
++					os_atomic_inc(&cs_native4k_page_checks, relaxed);
++					break;
++				}
++#endif
+ 				if ((offset & PAGE_MASK) || offset >= codeLimit ||
+ 				    blob->csb_native4k_hashes == NULL ||
+ 				    index >= blob->csb_native4k_hash_count ||
+diff -ru a/bsd/sys/ubc_internal.h b/bsd/sys/ubc_internal.h
+--- a/bsd/sys/ubc_internal.h
++++ b/bsd/sys/ubc_internal.h
+@@ -165,6 +165,10 @@
+ 	const uint8_t   *csb_native4k_hashes;
+ 	vm_size_t       csb_native4k_hashes_size;
+ 	vm_size_t       csb_native4k_hash_count;
++	/* Read-only APFS volume on the eMMC: APFS checks every block it reads, so pages are
++	 * accepted without per-page digests (XNU_GUAMP_CS_SEALED).
++	 */
++	uint8_t         csb_native4k_sealed;
+ };
+ 
+ /*
