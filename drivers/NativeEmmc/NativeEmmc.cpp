@@ -60,6 +60,9 @@ void guamp_emmc_flush(unsigned type);
 volatile uint32_t native_emmc_stage = 0xff;
 uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, native_emmc_mirrors = 0;   // under the gate
 uint64_t native_emmc_window_writes = 0, native_emmc_multi_failures = 0;
+// Read pattern: 4 KiB pages of the card read before (a page cache that keeps dropping what it read shows up here)
+uint64_t native_emmc_rereads = 0, native_emmc_last_lba = 0;
+extern unsigned int vm_page_free_count;
 // Panic region (osfmk/kern/debug.c, pexpert/arm/pe_init.c). guamp has none (no RAM survives a reset and /pram stopped
 // the boot), so without one XNU keeps no panic text at all; the driver gives it plain memory (startLater) and copies
 // it to kpan in the panic flush. Asm names: pexpert.h declares some of them with private types.
@@ -285,8 +288,19 @@ struct Card {
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
+  uint8_t *seen = nullptr;                 // one bit per 4 KiB page of the user area
+  void notePages(uint64_t lba, uint32_t count) {
+    native_emmc_last_lba = lba;
+    if (!seen) return;
+    for (uint64_t page = lba / 8; page <= (lba + count - 1) / 8 && page / 8 < (capacity + 63) / 64; page++) {
+      uint8_t bit = static_cast<uint8_t>(1u << (page & 7));
+      if (seen[page / 8] & bit) native_emmc_rereads++;
+      seen[page / 8] |= bit;
+    }
+  }
   // One CMD18 per run; after a failed multi-block command (counted, lines reset) the run is read block by block
   bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
+    notePages(lba, count);
     if (count > 1 && multiOk) {
       if (host.readMulti(lba, count, out)) return true;
       native_emmc_errors++;
@@ -441,7 +455,14 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   Card &card = gCard;
   IOLockLock(card.gate);
   card.mirror(card.sequence % kFbEvery == 0);
+  uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
   IOLockUnlock(card.gate);
+  static uint64_t lastReads = 0;
+  if (card.sequence % 10 == 0) {
+    IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages\n",
+          reads, reads - lastReads, rereads, last, vm_page_free_count);
+    lastReads = reads;
+  }
   if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
   uint64_t when = 0;
   clock_interval_to_deadline(1, kSecondScale, &when);
@@ -666,6 +687,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   card.fb = mapPhysical(kFbPhys, kFbBytes);
   card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
   if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
+  card.seen = static_cast<uint8_t *>(IOMallocZero((card.capacity + 63) / 64));
   card.online = true;
   if (!guamp_panic_base) {
     void *region = IOMallocZero(kPanicBytes);
