@@ -643,8 +643,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
       guamp_panic_info = region;
       guamp_panic_base = reinterpret_cast<vm_offset_t>(region);
       debug_log_init();
-      IOLog("NativeEmmc: panic region %u bytes, copied to kpan block %u on panic
-", kPanicBytes, kPanicFirstBlock);
+      IOLog("NativeEmmc: panic region %u bytes, copied to kpan block %u on panic\n", kPanicBytes, kPanicFirstBlock);
     }
   }
   PE_parse_boot_argn("guamp-emmc-reset", &card.resetAfter, sizeof(card.resetAfter));
