@@ -64,6 +64,8 @@ uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, 
 uint64_t native_emmc_window_writes = 0, native_emmc_multi_failures = 0;
 // Read pattern: 4 KiB pages of the card read before (a page cache that keeps dropping what it read shows up here)
 uint64_t native_emmc_rereads = 0, native_emmc_last_lba = 0;
+uint64_t native_emmc_recoveries = 0, native_emmc_stuck_busy = 0;   // card recoveries, of them busy past 10 s
+uint32_t native_emmc_last_error = 0;                              // last error status (0x30) seen by wait
 extern unsigned int vm_page_free_count;
 extern task_t kernel_task;
 // Who issues the reads: the process of the last request (the cluster layer reads in the faulting thread)
@@ -146,7 +148,7 @@ public:
     uint64_t end = deadline(ms);
     do {
       uint32_t status = r32(rStatus);
-      if (status & sErrors) { w32(rStatus, status); return 2; }
+      if (status & sErrors) { native_emmc_last_error = status; w32(rStatus, status); return 2; }
       if (status & bits) { w32(rStatus, status & bits); return 0; }
     } while (mach_absolute_time() < end);
     return 1;
@@ -164,6 +166,30 @@ public:
     }
     w32(rStatus, 0xFFFFFFFF);
     return true;
+  }
+
+  // DAT0 high (present state bit 20): the card is not busy programming
+  bool waitIdle(uint64_t ms) {
+    uint64_t end = deadline(ms);
+    while (!(r32(rPresent) & (1u << 20))) {
+      if (mach_absolute_time() > end) return false;
+    }
+    return true;
+  }
+
+  // After a failed transfer. resetLines only resets the host: under heavy writes (a 500 MB core dump to Data) the card
+  // was left receiving, sending or programming, and every later command failed (I/O errors on all volumes at once).
+  // CMD12 takes a card in a data state back to tran (in tran it is an illegal command, answered by nothing), then
+  // the card's busy has to end before the next command.
+  void recover() {
+    native_emmc_recoveries++;
+    uint32_t failure = native_emmc_last_error;            // keep the transfer error, not the CMD12 one
+    resetLines();
+    command(12, 0, true, 5000);
+    native_emmc_last_error = failure;
+    resetLines();
+    if (!waitIdle(10000)) native_emmc_stuck_busy++;
+    resetLines();
   }
 
   // R1/R1b command without data
@@ -332,13 +358,14 @@ public:
         if (!wait(sXferDone, 100)) { native_emmc_reads++; return true; }
       }
       native_emmc_errors++;
-      resetLines();
+      recover();
     }
     return false;
   }
 
   bool writeBlock(uint64_t lba, const uint8_t *in) {
     for (unsigned attempt = 0; attempt < 3; attempt++) {
+      if (!waitIdle(5000)) native_emmc_stuck_busy++;
       w32(rStatus, 0xFFFFFFFF);
       w16(rBlockSize, kBlock);
       w16(rBlockCount, 1);
@@ -348,10 +375,10 @@ public:
       if (!wait(sCmdDone, 100) && !wait(sWriteReady, 1000)) {
         const uint32_t *words = reinterpret_cast<const uint32_t *>(in);
         for (unsigned i = 0; i < kBlock / 4; i++) w32(rData, words[i]);
-        if (!wait(sXferDone, 2000)) { native_emmc_writes++; return true; }
+        if (!wait(sXferDone, 5000)) { native_emmc_writes++; return true; }
       }
       native_emmc_errors++;
-      resetLines();
+      recover();
     }
     return false;
   }
@@ -389,14 +416,14 @@ struct Card {
     if (native_emmc_dma) {
       if (host.readDma(lba, count, out)) return true;
       native_emmc_errors++;
-      host.resetLines();
+      host.recover();
       if (++native_emmc_dma_failures >= 8) native_emmc_dma = 0;    // back to PIO for good
     }
     if (count > 1 && multiOk) {
       if (host.readMulti(lba, count, out)) return true;
       native_emmc_errors++;
       native_emmc_multi_failures++;
-      host.resetLines();
+      host.recover();
       if (native_emmc_multi_failures >= 8) multiOk = false;     // keep the proven path if CMD18 keeps failing
     }
     for (uint32_t i = 0; i < count; i++) {
@@ -564,6 +591,9 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
     IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
           reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     lastReads = reads;
+    if (native_emmc_errors)
+      IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes\n",
+            native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes);
   }
   if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
   uint64_t when = 0;
