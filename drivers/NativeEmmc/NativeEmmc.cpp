@@ -34,6 +34,7 @@
 #include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <libkern/OSKextLib.h>
 #include <libkern/crypto/sha2.h>
 #include <pexpert/pexpert.h>
@@ -812,6 +813,8 @@ static void usbProbe()
   }
 }
 
+#include "UsbMirror.inc"
+
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
   Card &card = gCard;
@@ -878,6 +881,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   publish(0, card.capacity, "user area");
   publishWindows();
   usbProbe();
+  usbMirrorStart();
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
