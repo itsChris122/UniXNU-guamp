@@ -63,6 +63,11 @@ uint64_t native_emmc_window_writes = 0, native_emmc_multi_failures = 0;
 // Read pattern: 4 KiB pages of the card read before (a page cache that keeps dropping what it read shows up here)
 uint64_t native_emmc_rereads = 0, native_emmc_last_lba = 0;
 extern unsigned int vm_page_free_count;
+// Who issues the reads: the process of the last request (the cluster layer reads in the faulting thread)
+char native_emmc_last_proc[32];
+int native_emmc_last_pid = -1;
+void proc_selfname(char *, int);
+int proc_selfpid(void);
 // Panic region (osfmk/kern/debug.c, pexpert/arm/pe_init.c). guamp has none (no RAM survives a reset and /pram stopped
 // the boot), so without one XNU keeps no panic text at all; the driver gives it plain memory (startLater) and copies
 // it to kpan in the panic flush. Asm names: pexpert.h declares some of them with private types.
@@ -459,8 +464,8 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   IOLockUnlock(card.gate);
   static uint64_t lastReads = 0;
   if (card.sequence % 10 == 0) {
-    IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages\n",
-          reads, reads - lastReads, rereads, last, vm_page_free_count);
+    IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
+          reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     lastReads = reads;
   }
   if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
@@ -564,6 +569,10 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   if (write && !writable) return kIOReturnNotWritable;
   Card &card = gCard;
   if (!card.online) return kIOReturnNotReady;
+  if (!write) {
+    native_emmc_last_pid = proc_selfpid();
+    proc_selfname(native_emmc_last_proc, sizeof(native_emmc_last_proc));
+  }
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
   // The gate is taken per bounce-buffer run, so a long request does not starve the log mirror
