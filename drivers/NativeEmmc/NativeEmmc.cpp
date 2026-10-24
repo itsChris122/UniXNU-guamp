@@ -59,6 +59,14 @@ void guamp_emmc_flush(unsigned type);
 // Observation: last failing init stage (0 = ready), blocks moved, mirror passes.
 volatile uint32_t native_emmc_stage = 0xff;
 uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, native_emmc_mirrors = 0;   // under the gate
+uint64_t native_emmc_window_writes = 0;
+// Panic region (osfmk/kern/debug.c, pexpert/arm/pe_init.c). guamp has none (no RAM survives a reset and /pram stopped
+// the boot), so without one XNU keeps no panic text at all; the driver gives it plain memory (startLater) and copies
+// it to kpan in the panic flush. Asm names: pexpert.h declares some of them with private types.
+extern vm_offset_t guamp_panic_base __asm__("_gPanicBase");
+extern unsigned int guamp_panic_size __asm__("_gPanicSize");
+extern void *guamp_panic_info __asm__("_panic_info");
+void debug_log_init(void);
 }
 
 namespace {
@@ -74,6 +82,7 @@ constexpr uint32_t kFbWidth = 720, kFbHeight = 1600, kFbRowBytes = 2880;
 constexpr uint32_t kFbBytes = kFbRowBytes * kFbHeight;
 constexpr uint32_t kLogFirstBlock = 1, kLogMaxBlocks = 1023, kFbFirstBlock = 1024;
 constexpr uint32_t kFbEvery = 5;      // mirror passes per framebuffer copy
+constexpr uint32_t kPanicFirstBlock = 12288, kPanicBytes = 64 * 1024;   // panic region copy in kpan
 
 // SDHCI registers
 enum : uint32_t {
@@ -267,6 +276,7 @@ struct Card {
   bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in) {
     for (uint32_t i = 0; i < count; i++) {
       if (!host.writeBlock(lba + i, in + static_cast<uint64_t>(i) * kBlock)) return false;
+      native_emmc_window_writes++;
     }
     return true;
   }
@@ -291,6 +301,19 @@ struct Card {
   }
   bool findPartitions();
   void mirror(bool framebuffer);
+  uint32_t panicCopied = 0;
+  // The panic region (header + text) to kpan, once, from the panic flush
+  void savePanic() {
+    if (!guamp_panic_base || panicCopied) return;
+    uint32_t bytes = guamp_panic_size < kPanicBytes ? guamp_panic_size : kPanicBytes;
+    const uint8_t *region = reinterpret_cast<const uint8_t *>(guamp_panic_base);
+    for (uint32_t b = 0; b * kBlock < bytes; b++) {
+      memset(bounce, 0, kBlock);
+      memcpy(bounce, region + b * kBlock, bytes - b * kBlock < kBlock ? bytes - b * kBlock : kBlock);
+      if (!writeLogBlock(kPanicFirstBlock + b, bounce)) return;
+    }
+    panicCopied = bytes;
+  }
 };
 
 Card gCard;
@@ -325,7 +348,7 @@ bool Card::findPartitions()
     if (!strcmp(name, "kpan") && last - first + 1 <= (64ULL << 20) / kBlock) { logFirst = first; logBlocks = last - first + 1; }
     if (!strcmp(name, "userdata")) { dataFirst = first; dataBlocks = last - first + 1; }
   }
-  return logBlocks > kFbFirstBlock + kFbBytes / kBlock;
+  return logBlocks >= kPanicFirstBlock + kPanicBytes / kBlock;
 }
 
 // Log layout in kpan: block 0 = header, blocks 1.. = the raw message ring (msg_size bytes, at most 1023
@@ -335,6 +358,7 @@ bool Card::findPartitions()
 //   64 fb first block  68 width  72 height  76 row bytes  80 fb sequence (0 = no copy yet)  84, 88 unused
 //   92 int32: root Apple autherr, root owner decision, root accepted, SystemOS stage, SystemOS status, Data stage,
 //      Data status, boot manifest status, nprocs, flush type (0 = periodic, else haltRestart type + 1), text ok
+//   136 panic region copy: first block, bytes (0 = none)  144 uint64 Data window block writes
 void Card::mirror(bool framebuffer)
 {
   guamp_msgbuf *ring = msgbufp;
@@ -367,6 +391,9 @@ void Card::mirror(bool framebuffer)
                            native_owner_data_status, native_owner_boot_manifest_status, nprocs,
                            static_cast<int32_t>(flushType), ok ? 1 : 0 };
   memcpy(header + 92, progress, sizeof(progress));
+  uint32_t panicWords[2] = { kPanicFirstBlock, panicCopied };
+  memcpy(header + 136, panicWords, sizeof(panicWords));
+  memcpy(header + 144, &native_emmc_window_writes, sizeof(native_emmc_window_writes));
   // The header goes out even when a block of the text failed: it carries the progress words
   writeLogBlock(0, header);
   native_emmc_mirrors++;
@@ -609,6 +636,17 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
   if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
   card.online = true;
+  if (!guamp_panic_base) {
+    void *region = IOMallocZero(kPanicBytes);
+    if (region) {
+      guamp_panic_size = kPanicBytes;
+      guamp_panic_info = region;
+      guamp_panic_base = reinterpret_cast<vm_offset_t>(region);
+      debug_log_init();
+      IOLog("NativeEmmc: panic region %u bytes, copied to kpan block %u on panic
+", kPanicBytes, kPanicFirstBlock);
+    }
+  }
   PE_parse_boot_argn("guamp-emmc-reset", &card.resetAfter, sizeof(card.resetAfter));
   card.mirrorCall = thread_call_allocate(mirrorEntry, nullptr);
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
@@ -781,6 +819,7 @@ extern "C" void guamp_emmc_flush(unsigned type)
   // A panic may have stopped another thread in the middle of a transfer: start from clean CMD/DAT lines
   if (panic) card.host.resetLines();
   card.flushType = type + 1;
+  if (panic) card.savePanic();
   card.mirror(true);
   card.host.flushCache();                  // Data window writes still in the card cache
   if (locked) IOLockUnlock(card.gate);
