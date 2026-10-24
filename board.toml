@@ -138,7 +138,7 @@ kernel_args = [
   "kt_fixed_zones=120",
   "boot-progress=2",
   "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
-  "guamp-emmc-reset=45",               # NativeEmmc: PSCI reset after 45 log mirrors (1 s each)
+  "guamp-emmc-reset=240",              # NativeEmmc: PSCI reset after 240 log mirrors (1 s each)
 ]
 
 [payload.adt]

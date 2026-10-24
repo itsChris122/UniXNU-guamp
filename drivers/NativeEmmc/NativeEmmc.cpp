@@ -59,7 +59,7 @@ void guamp_emmc_flush(unsigned type);
 // Observation: last failing init stage (0 = ready), blocks moved, mirror passes.
 volatile uint32_t native_emmc_stage = 0xff;
 uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, native_emmc_mirrors = 0;   // under the gate
-uint64_t native_emmc_window_writes = 0;
+uint64_t native_emmc_window_writes = 0, native_emmc_multi_failures = 0;
 // Panic region (osfmk/kern/debug.c, pexpert/arm/pe_init.c). guamp has none (no RAM survives a reset and /pram stopped
 // the boot), so without one XNU keeps no panic text at all; the driver gives it plain memory (startLater) and copies
 // it to kpan in the panic flush. Asm names: pexpert.h declares some of them with private types.
@@ -211,6 +211,25 @@ public:
     return 0;
   }
 
+  // CMD18 with block count and auto CMD12, at the same proven clock: one command per run instead of per block
+  bool readMulti(uint64_t lba, uint32_t count, uint8_t *out) {
+    w32(rStatus, 0xFFFFFFFF);
+    w16(rBlockSize, kBlock);
+    w16(rBlockCount, static_cast<uint16_t>(count));
+    w32(rArg, static_cast<uint32_t>(lba));
+    w16(rXfer, (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1));
+    w16(rCmd, (18 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
+    if (wait(sCmdDone, 100)) return false;
+    for (uint32_t b = 0; b < count; b++) {
+      if (wait(sReadReady, 1000)) return false;
+      uint32_t *words = reinterpret_cast<uint32_t *>(out + static_cast<uint64_t>(b) * kBlock);
+      for (unsigned i = 0; i < kBlock / 4; i++) words[i] = r32(rData);
+    }
+    if (wait(sXferDone, 1000)) return false;
+    native_emmc_reads += count;
+    return true;
+  }
+
   bool readBlock(uint64_t lba, uint8_t *out) {
     for (unsigned attempt = 0; attempt < 3; attempt++) {
       w32(rStatus, 0xFFFFFFFF);
@@ -266,12 +285,21 @@ struct Card {
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
+  // One CMD18 per run; after a failed multi-block command (counted, lines reset) the run is read block by block
   bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out) {
+    if (count > 1 && multiOk) {
+      if (host.readMulti(lba, count, out)) return true;
+      native_emmc_errors++;
+      native_emmc_multi_failures++;
+      host.resetLines();
+      if (native_emmc_multi_failures >= 8) multiOk = false;     // keep the proven path if CMD18 keeps failing
+    }
     for (uint32_t i = 0; i < count; i++) {
       if (!host.readBlock(lba + i, out + static_cast<uint64_t>(i) * kBlock)) return false;
     }
     return true;
   }
+  bool multiOk = true;
   // Writes of a writable window (its device checks the range)
   bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in) {
     for (uint32_t i = 0; i < count; i++) {
@@ -360,6 +388,7 @@ bool Card::findPartitions()
 //   92 int32: root Apple autherr, root owner decision, root accepted, SystemOS stage, SystemOS status, Data stage,
 //      Data status, boot manifest status, nprocs, flush type (0 = periodic, else haltRestart type + 1), text ok
 //   136 panic region copy: first block, bytes (0 = none)  144 uint64 Data window block writes
+//   152 uint64 failed CMD18 runs (8 failures switch back to single-block reads)
 void Card::mirror(bool framebuffer)
 {
   guamp_msgbuf *ring = msgbufp;
@@ -395,6 +424,7 @@ void Card::mirror(bool framebuffer)
   uint32_t panicWords[2] = { kPanicFirstBlock, panicCopied };
   memcpy(header + 136, panicWords, sizeof(panicWords));
   memcpy(header + 144, &native_emmc_window_writes, sizeof(native_emmc_window_writes));
+  memcpy(header + 152, &native_emmc_multi_failures, sizeof(native_emmc_multi_failures));
   // The header goes out even when a block of the text failed: it carries the progress words
   writeLogBlock(0, header);
   native_emmc_mirrors++;
