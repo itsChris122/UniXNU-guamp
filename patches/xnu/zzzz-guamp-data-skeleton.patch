@@ -1,0 +1,120 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 124ba0a..a105798 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7757,6 +7757,107 @@ native_staged_apps_walk(proc_t p, user_addr_t scratch, vnode_t source, char *pat
+ 		kfree_data(pending.pool, NATIVE_STAGED_APPS_POOL);
+ 	}
+ }
++/* guamp: the Data volume is created empty on Linux (strumenti/crea-dati-emmc.py), not by a restore. tzinit failed with ENOENT
++ * on /var/db/timezone and every core dump on /var/cores, so the /private/var skeleton a restore leaves is created here, after
++ * the Data mount and before launchd: missing directories only (EEXIST is fine), with the owner and mode of the table.
++ * Counters for the boot log: created, failed, last error. */
++volatile int native_guamp_skeleton_created = 0;
++volatile int native_guamp_skeleton_failed = 0;
++volatile int native_guamp_skeleton_error = 0;
++static const struct {
++	const char *path;
++	int mode;
++	uid_t owner;
++} native_guamp_skeleton[] = {
++	{"/private/var/db", 0755, 0},
++	{"/private/var/db/timezone", 0755, 0},
++	{"/private/var/db/dslocal", 0755, 0},
++	{"/private/var/db/dslocal/nodes", 0755, 0},
++	{"/private/var/db/dslocal/nodes/Default", 0755, 0},
++	{"/private/var/db/dslocal/nodes/Default/users", 0755, 0},
++	{"/private/var/db/dslocal/nodes/Default/groups", 0755, 0},
++	{"/private/var/db/dslocal/nodes/Default/config", 0755, 0},
++	{"/private/var/cores", 01775, 0},
++	{"/private/var/logs", 0755, 0},
++	{"/private/var/run", 0755, 0},
++	{"/private/var/tmp", 01777, 0},
++	{"/private/var/vm", 0755, 0},
++	{"/private/var/root", 0755, 0},
++	{"/private/var/root/Library", 0755, 0},
++	{"/private/var/root/Library/Preferences", 0755, 0},
++	{"/private/var/root/Library/Caches", 0755, 0},
++	{"/private/var/preferences", 0755, 0},
++	{"/private/var/Keychains", 0755, 0},
++	{"/private/var/keybags", 0755, 0},
++	{"/private/var/keybags/backup", 0755, 0},
++	{"/private/var/MobileAsset", 0755, 0},
++	{"/private/var/MobileSoftwareUpdate", 0755, 0},
++	{"/private/var/folders", 0755, 0},
++	{"/private/var/empty", 0555, 0},
++	{"/private/var/installd", 0755, 0},
++	{"/private/var/hardware", 0755, 0},
++	{"/private/var/wireless", 0755, 0},
++	{"/private/var/networkd", 0755, 0},
++	{"/private/var/protected", 0755, 0},
++	{"/private/var/PersonaVolumes", 0755, 0},
++	{"/private/var/preboot", 0755, 0},
++	{"/private/var/Library", 0755, 0},
++	{"/private/var/containers", 0755, 0},
++	{"/private/var/containers/Data", 0755, 0},
++	{"/private/var/containers/Data/System", 0755, 0},
++	{"/private/var/containers/Data/Application", 0755, 0},
++	{"/private/var/containers/Shared", 0755, 0},
++	{"/private/var/containers/Shared/SystemGroup", 0755, 0},
++	{"/private/var/containers/Bundle", 0755, 0},
++	{"/private/var/containers/Bundle/Application", 0755, 0},
++	{"/private/var/mobile", 0755, 501},
++	{"/private/var/mobile/Library", 0755, 501},
++	{"/private/var/mobile/Library/Preferences", 0755, 501},
++	{"/private/var/mobile/Library/Caches", 0755, 501},
++	{"/private/var/mobile/Library/Logs", 0755, 501},
++	{"/private/var/mobile/Containers", 0755, 501},
++	{"/private/var/mobile/Documents", 0755, 501},
++	{"/private/var/mobile/Media", 0755, 501},
++	{"/private/var/mobile/tmp", 01777, 501},
++};
++static void
++native_guamp_data_skeleton(proc_t p, user_addr_t scratch)
++{
++	vfs_context_t ctx = vfs_context_current();
++	for (size_t i = 0; i < sizeof(native_guamp_skeleton) / sizeof(native_guamp_skeleton[0]); i++) {
++		const char *path = native_guamp_skeleton[i].path;
++		struct mkdir_args request = {.path = scratch + 0xa00, .mode = native_guamp_skeleton[i].mode & 0777};
++		int32_t result = 0;
++		int error = copyout(path, request.path, strlen(path) + 1);
++		if (!error) {
++			error = mkdir(p, &request, &result);
++		}
++		if (error == EEXIST) {
++			continue;
++		}
++		vnode_t vp = NULLVP;
++		if (!error) {
++			error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++		}
++		if (!error) {
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_uid, native_guamp_skeleton[i].owner);
++			VATTR_SET(&va, va_gid, native_guamp_skeleton[i].owner);
++			VATTR_SET(&va, va_mode, native_guamp_skeleton[i].mode);
++			error = vnode_setattr(vp, &va, ctx);
++			vnode_put(vp);
++		}
++		if (error) {
++			native_guamp_skeleton_failed++;
++			native_guamp_skeleton_error = error;
++		} else {
++			native_guamp_skeleton_created++;
++		}
++	}
++	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
++	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
++}
+ static void
+ native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
+ {
+@@ -7881,6 +7982,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ 	if (!error) native_owner_data_stage = 4;
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
++	if (!error) native_guamp_data_skeleton(p, scratch);
+ done:
+ 	if (data_root) vnode_put(data_root);
+ 	native_owner_data_status = error;
