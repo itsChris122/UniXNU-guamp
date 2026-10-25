@@ -88,11 +88,17 @@ constexpr uint16_t kChgStatus1 = 0x1006, kChgStatus2 = 0x1007, kChgStatus7 = 0x1
 // Float voltage: left at the hardware default (low) without a driver, which held the charger in INHIBIT (status 6) with a
 // charged battery. SMB5 code = (mV - 3600) / 10; on the SMB2 encoding (3487.5 + 7.5 mV per code) the same code is lower.
 constexpr unsigned kFvMv = 4350;
+// Type-C mode (SMB5 TYPEC block 0x1500, TYPE_C_MODE_CFG at +0x44: bit 0 disable command, bit 1 sink only, bit 2 source
+// only). A Type-C wall charger only turns VBUS on after it sees the sink's Rd on CC: on the wall charger USBIN showed
+// under-voltage and TYPEC no attach, while the legacy A-to-C cable of the PC always carries VBUS. Sink only: the phone
+// never supplies power here.
+constexpr uint16_t kTypecModeCfg = 0x1544;
+constexpr uint8_t kTypecSinkOnly = 0x02;
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
 volatile uint32_t gButtons, gErrors;
-volatile uint8_t gChg[8];
+volatile uint8_t gChg[8], gTypecMode;
 
 uint32_t readButtons() {
   uint8_t pon = 0, vup = 1;
@@ -166,7 +172,10 @@ void thread(void *, wait_result_t) {
     if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
       // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
       // APSD result stayed 0 and the charger DISABLED. On every new plug-in: unsuspend the input, rerun APSD, configure.
-      uint8_t usbinRt = 0, typecRt = 0;
+      uint8_t usbinRt = 0, typecRt = 0, typecMode = 0;
+      read8(kPmi632, kTypecModeCfg, &typecMode);
+      if (typecMode != kTypecSinkOnly) write8(kPmi632, kTypecModeCfg, kTypecSinkOnly);
+      gTypecMode = typecMode;
       read8(kPmi632, 0x1310, &usbinRt);
       read8(kPmi632, 0x1510, &typecRt);
       gChg[6] = usbinRt; gChg[7] = typecRt;
@@ -179,8 +188,8 @@ void thread(void *, wait_result_t) {
       if (present && !configured) configured = true;
       if (!present) configured = false;
       if (tick % 1200 == 0)
-        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
-              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], iclCode, fccCode, gErrors,
+        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
+              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, iclCode, fccCode, gErrors,
               touch::gStep, touch::gError, touch::gEvents);
     }
     IOSleep(25);

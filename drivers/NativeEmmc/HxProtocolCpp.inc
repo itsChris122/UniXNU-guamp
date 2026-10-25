@@ -156,8 +156,10 @@ int hx_interface_on(struct hx_chip *c)
 {
     uint8_t dummy[4], a, b;
     if (hx_bus_read(c, HX_BUS_RDATA, dummy, 4)) return HX_ERR_BUS;   // wakes the bus
+    for (unsigned k = 0; k < 4; ++k) c->dbg_dummy[k] = dummy[k];
     for (unsigned i = 0; i < 10; ++i) {
         if (burst(c, 0) || hx_bus_read(c, HX_BUS_CONTI, &a, 1) || hx_bus_read(c, HX_BUS_INCR4, &b, 1)) return HX_ERR_BUS;
+        c->dbg_conti = a; c->dbg_incr4 = b;
         if (a == 0x31 && b == 0x10) return HX_OK;
         sleep_ms(c, 1);
     }

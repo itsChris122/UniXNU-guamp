@@ -92,6 +92,7 @@ struct hx_chip {
     uint8_t rx_num, tx_num, max_pt;
     uint16_t x_res, y_res;
     int xy_reverse, int_is_edge;
+    uint8_t dbg_dummy[4], dbg_conti, dbg_incr4;   // last interface_on replies, for the boot log
 };
 
 struct hx_zf_part {uint32_t sram, size, offset;};
