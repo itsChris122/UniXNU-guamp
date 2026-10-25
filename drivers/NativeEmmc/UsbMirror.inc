@@ -288,8 +288,7 @@ struct Mirror {
     if (now - lastStatus < interval) return;
     lastStatus = now;
     IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu errors %llu ended %llu"
-          " events %llu, ep1 trb %08x cmd %08x
-", native_usb_stage, native_usb_configured, native_usb_speed, inBusy ? 1 : 0,
+          " events %llu, ep1 trb %08x cmd %08x\n", native_usb_stage, native_usb_configured, native_usb_speed, inBusy ? 1 : 0,
           native_usb_bytes, native_usb_frames, native_usb_errors, native_usb_ended, native_usb_events,
           trb(kEp1Trb)->ctrl, r(DEPCMD + 0x10 * kEp1In));
   }
