@@ -121,6 +121,10 @@ void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, u
   read8(kPmi632, kApsdStatus, &apsd); read8(kPmi632, kApsdResult, &result); read8(kPmi632, kFvCfg, &fv);
   gChg[0] = s1; gChg[1] = s2; gChg[2] = s7; gChg[3] = apsd; gChg[4] = result; gChg[5] = fv;
   if (!configure) return;
+  // Input current by source (APSD_RESULT_STATUS of qcom_smbx.c: bit 0 SDP, 1 CDP, 2 DCP, 3 OCP, 4 float): a PC port (SDP)
+  // or an unknown source gets 500 mA; asking 1.5 A of a PC port collapsed VBUS (USBIN under-voltage) and the charger
+  // stayed DISABLED until the next plug-in.
+  if (!(result & 0x0e)) iclMa = iclMa < 500 ? iclMa : 500;
   *iclCode = static_cast<uint8_t>(iclMa / 50 > 0xff ? 0xff : iclMa / 50);
   *fccCode = static_cast<uint8_t>(fccMa / 50 > 0xff ? 0xff : fccMa / 50);
   write8(kPmi632, kFvCfg, static_cast<uint8_t>((kFvMv - 3600) / 10));
@@ -158,7 +162,7 @@ void thread(void *, wait_result_t) {
   if (fccMa > 3000) fccMa = 3000;
   uint32_t stable = 0, last = 0, sent = 0;
   uint8_t iclCode = 0, fccCode = 0;
-  bool configured = false;
+  bool configured = false, apsdRequested = false;
   for (unsigned tick = 0;; ++tick) {
     uint32_t now = readButtons();
     stable = now == last ? stable + 1 : 0;
@@ -179,14 +183,16 @@ void thread(void *, wait_result_t) {
       read8(kPmi632, 0x1310, &usbinRt);
       read8(kPmi632, 0x1510, &typecRt);
       gChg[6] = usbinRt; gChg[7] = typecRt;
-      bool present = (usbinRt & 0x10) != 0 || (gChg[3] & 0x01) != 0;
-      if (present && !configured) {
+      bool present = (usbinRt & 0x10) != 0;
+      if (present && !configured && !apsdRequested) {
         write8(kPmi632, kUsbinCmdIl, 0x00);
-        write8(kPmi632, 0x1341, 0x01);         // CMD_APSD: rerun source detection
+        write8(kPmi632, 0x1341, 0x01);         // CMD_APSD: rerun source detection, configure on a later tick
+        apsdRequested = true;
       }
-      charger(present && !configured, iclMa, fccMa, &iclCode, &fccCode);
-      if (present && !configured) configured = true;
-      if (!present) configured = false;
+      bool apsdDone = (gChg[3] & 0x01) != 0;
+      charger(present && !configured && apsdRequested && apsdDone, iclMa, fccMa, &iclCode, &fccCode);
+      if (present && !configured && apsdRequested && apsdDone) configured = true;
+      if (!present) { configured = false; apsdRequested = false; }
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, iclCode, fccCode, gErrors,
