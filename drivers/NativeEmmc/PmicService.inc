@@ -92,7 +92,7 @@ constexpr unsigned kFvMv = 4350;
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
 volatile uint32_t gButtons, gErrors;
-volatile uint8_t gChg[6];
+volatile uint8_t gChg[8];
 
 uint32_t readButtons() {
   uint8_t pon = 0, vup = 1;
@@ -164,13 +164,24 @@ void thread(void *, wait_result_t) {
       IOLog("GuampPmic: buttons %x\n", now);
     }
     if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
-      bool present = (gChg[3] & 0x01) != 0 || gChg[4] != 0;
+      // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
+      // APSD result stayed 0 and the charger DISABLED. On every new plug-in: unsuspend the input, rerun APSD, configure.
+      uint8_t usbinRt = 0, typecRt = 0;
+      read8(kPmi632, 0x1310, &usbinRt);
+      read8(kPmi632, 0x1510, &typecRt);
+      gChg[6] = usbinRt; gChg[7] = typecRt;
+      bool present = (usbinRt & 0x10) != 0 || (gChg[3] & 0x01) != 0;
+      if (present && !configured) {
+        write8(kPmi632, kUsbinCmdIl, 0x00);
+        write8(kPmi632, 0x1341, 0x01);         // CMD_APSD: rerun source detection
+      }
       charger(present && !configured, iclMa, fccMa, &iclCode, &fccCode);
       if (present && !configured) configured = true;
       if (!present) configured = false;
       if (tick % 1200 == 0)
-        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, ICL code %u FCC code %u, SPMI errors %u (last %08x)\n",
-              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], iclCode, fccCode, gErrors, gArb.last_status);
+        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
+              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], iclCode, fccCode, gErrors,
+              touch::gStep, touch::gError, touch::gEvents);
     }
     IOSleep(25);
   }

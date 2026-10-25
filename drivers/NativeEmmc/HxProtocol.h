@@ -102,6 +102,7 @@ struct hx_fw {
     unsigned count;                 // partitions, entry 0 = the firmware itself
     struct hx_zf_part part[HX_ZF_MAX_PARTS];
     uint32_t cfg_base, cfg_size;    // the packed config window (entries 1..count-1)
+    int overlay;                    // first non-empty code overlay entry (SRAM 0x2xxxxxxx after the firmware), -1 if none
 };
 
 struct hx_point {int x, y, w;};

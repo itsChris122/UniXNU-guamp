@@ -137,6 +137,10 @@ def main():
             *([('unique-chip-id', u64(args.unique_chip_id)), ('chip-id', u32(args.chip_id))]
               if args.unique_chip_id is not None else []),
             ('osenvironment', b'main\0'),
+            # Himax touch firmware (vendor/firmware/hlt_Himax_firmware.bin, proprietary): only from the local
+            # tree, never committed; the kernel touch service reads it here (stage 4).
+            *([('guamp-touch-firmware', (ROOT/'local/hlt_Himax_firmware.bin').read_bytes())]
+              if (ROOT/'local/hlt_Himax_firmware.bin').exists() else []),
             *([('certificate-production-status', u32(0)), ('effective-production-status-ap', u32(0)),
                ('certificate-security-mode', u32(1)), ('effective-security-mode-sep', u32(1))] if ipad else []),
             *([('ephemeral-storage', u32(1))]

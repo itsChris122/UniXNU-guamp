@@ -174,10 +174,19 @@ void thread(void *param, wait_result_t) {
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
   if (!snapshot() || stage < 2 || !enable() || stage < 3 || !openBus() || stage < 4) return;
   gStep = 4;
-  if (!guamp_touch_firmware_size) { fail(4, -2); return; }
+  // The firmware is the board's vendor/firmware/hlt_Himax_firmware.bin (proprietary, kept out of the public sources):
+  // make-guamp-adt.py copies it from the local tree into the ADT as /chosen/guamp-touch-firmware.
+  const uint8_t *fwData = guamp_touch_firmware;
+  uint32_t fwSize = guamp_touch_firmware_size;
+  if (!fwSize) {
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);   // kept retained: the data stays in use
+    OSData *data = chosen ? OSDynamicCast(OSData, chosen->getProperty("guamp-touch-firmware")) : nullptr;
+    if (data) { fwData = static_cast<const uint8_t *>(data->getBytesNoCopy()); fwSize = data->getLength(); }
+  }
+  if (!fwSize) { fail(4, -2); return; }
   struct hx_fw fw;
-  int r = hx_fw_parse(&fw, guamp_touch_firmware, guamp_touch_firmware_size);
-  IOLog("GuampTouch: firmware %u bytes, %u partitions (rc %d)\n", guamp_touch_firmware_size, fw.count, r);
+  int r = hx_fw_parse(&fw, fwData, fwSize);
+  IOLog("GuampTouch: firmware %u bytes, %u partitions, overlay %d (rc %d)\n", fwSize, fw.count, fw.overlay, r);
   if (r) { fail(4, r); return; }
   r = hx_download(&gChip, &fw, gCfg);
   IOLog("GuampTouch: download rc %d stage %d cfg crc hw %08x sw %08x\n", r, gChip.stage, gChip.cfg_crc_hw, gChip.cfg_crc_sw);

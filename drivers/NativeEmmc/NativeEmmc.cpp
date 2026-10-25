@@ -959,8 +959,8 @@ static void usbProbe()
 }
 
 #include "UsbMirror.inc"
-#include "PmicService.inc"
 #include "TouchService.inc"
+#include "PmicService.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {

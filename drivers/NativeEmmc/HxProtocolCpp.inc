@@ -31,14 +31,19 @@ int hx_fw_parse(struct hx_fw *fw, const uint8_t *data, size_t size)
     fw->count = table[12];
     if (fw->count < 2 || fw->count > HX_ZF_MAX_PARTS || (size_t)(table - data) + 16u * fw->count > size) return HX_ERR_FW;
     uint32_t lo = 0xFFFFFFFFu, hi = 0, hi_size = 0;
+    fw->overlay = -1;
     for (unsigned i = 0; i < fw->count; ++i) {
         const uint8_t *e = table + 16u * i;
         struct hx_zf_part *p = &fw->part[i];
         p->sram = rd_le32(e);
         p->size = rd_le32(e + 4);
         p->offset = rd_le32(e + 8);
+        if (i && !p->size) continue;                 // empty entry (the guamp image has an empty overlay slot)
         if (!p->size || p->offset > size || p->size > size - p->offset) return HX_ERR_FW;
         if (i == 0) continue;
+        // Code overlays (HX_CODE_OVERLAY: sorting, gesture, border) load into instruction SRAM like the firmware itself,
+        // not into the config window; the first one (sorting, normal touch) is written after the config.
+        if (p->sram >= 0x20000000u) { if (fw->overlay < 0) fw->overlay = (int)i; continue; }
         p->sram &= ~3u;                          // config windows are word aligned (the vendor rounds down the same way)
         if (p->sram < lo) lo = p->sram;
         if (p->sram >= hi) {hi = p->sram; hi_size = p->size;}
@@ -57,6 +62,7 @@ int hx_fw_config(const struct hx_fw *fw, uint8_t *out, size_t cap)
     for (size_t i = 0; i < fw->cfg_size; ++i) out[i] = 0;
     for (unsigned i = 1; i < fw->count; ++i) {
         const struct hx_zf_part *p = &fw->part[i];
+        if (!p->size || p->sram >= 0x20000000u) continue;
         uint32_t at = p->sram - fw->cfg_base;
         if (at > fw->cfg_size || p->size > fw->cfg_size - at) return HX_ERR_FW;
         copy(out + at, fw->data + p->offset, p->size);
@@ -248,6 +254,16 @@ int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg)
         if (sram_crc(c, fw->cfg_base, fw->cfg_size, &c->cfg_crc_hw)) return HX_ERR_BUS;
     } while (c->cfg_crc_hw != c->cfg_crc_sw && ++tries < 4);
     if (c->cfg_crc_hw != c->cfg_crc_sw) return HX_ERR_CRC;
+    if (fw->overlay > 0) {
+        const struct hx_zf_part *o = &fw->part[fw->overlay];
+        uint32_t crc = 1;
+        tries = 0;
+        do {
+            if (hx_reg_write(c, o->sram, fw->data + o->offset, o->size)) return HX_ERR_BUS;
+            if (sram_crc(c, o->sram, o->size, &crc)) return HX_ERR_BUS;
+        } while (crc && ++tries < 3);
+        if (crc) return HX_ERR_CRC;
+    }
     c->stage = 13;
     if (hx_reg_write32(c, HX_ADDR_SET_FRAME, 1)) return HX_ERR_BUS;               // n frame = 1 (firmware_update_0f)
     if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;            // reload enabled (reload_disable(0))

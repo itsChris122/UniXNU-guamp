@@ -256,12 +256,20 @@ struct Mirror {
   }
 
   // Queue one bulk IN transfer of the staged bytes; waits for the previous one (polling events meanwhile)
-  bool send(uint32_t bytes) {
-    uint64_t end = Host::deadline(500);
-    while (inBusy) {
+  // Waits up to ms for the previous IN transfer to complete. A transfer the host has not read yet stays queued in the
+  // controller: clearing inBusy on a timeout (as before) made every later DEPSTRTXFER fail on the still active endpoint,
+  // so a viewer that opened the pipe a little late never got a byte. The staging buffer is only rewritten once idle.
+  bool idle(uint32_t ms) {
+    uint64_t end = Host::deadline(ms);
+    while (inBusy && native_usb_configured) {
       pollEvents();
-      if (mach_absolute_time() > end || !native_usb_configured) { inBusy = false; native_usb_errors++; return false; }
+      if (mach_absolute_time() > end) return false;
     }
+    return native_usb_configured;
+  }
+
+  bool send(uint32_t bytes) {
+    if (!idle(500)) { native_usb_errors++; return false; }
     inBusy = true;
     if (!startTransfer(kEp1In, kEp1Trb, kStage, bytes, TRBCTL_NORMAL, ep1InResource)) { inBusy = false; return false; }
     native_usb_bytes += bytes;
@@ -281,6 +289,7 @@ struct Mirror {
     if (!ring || !ring->msg_bufc || ring->msg_size <= 0) return;
     uint32_t size = static_cast<uint32_t>(ring->msg_size), head = static_cast<uint32_t>(ring->msg_bufx) % size;
     while (logPos != head && native_usb_configured) {
+      if (!idle(500)) return;
       uint32_t n = 0, at = 16;
       while (logPos != head && n < kStageBytes - 32) {
         mem[kStage + at + n] = static_cast<uint8_t>(ring->msg_bufc[logPos]);
@@ -293,6 +302,7 @@ struct Mirror {
 
   void sendFrame(volatile const uint8_t *fb) {
     if (!fb || !shadow) return;
+    if (!idle(500)) return;
     uint32_t at = header(0, 1, 16, 0);
     uint32_t info[4] = {kFbWidth, kFbHeight, kFbRowBytes, 1};
     for (int i = 0; i < 16; i++) mem[kStage + at + i] = reinterpret_cast<uint8_t *>(info)[i];
@@ -310,6 +320,7 @@ struct Mirror {
         y++;
       }
       if (y >= kFbHeight) break;
+      if (!idle(500)) return;
       uint32_t first = y, rows = 0, off = 16;
       while (y < kFbHeight && rows < rowsPerMessage) {
         for (uint32_t i = 0; i < kFbRowBytes; i += 8) {
@@ -322,6 +333,7 @@ struct Mirror {
       header(0, 2, rows * kFbRowBytes, first);
       if (!send(off)) return;
     }
+    if (!idle(500)) return;
     header(0, 4, 0, ++frame);
     send(16);
     native_usb_frames++;
