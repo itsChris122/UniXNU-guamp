@@ -72,7 +72,7 @@ extern task_t kernel_task;
 char native_emmc_last_proc[32];
 // Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
-uint64_t guamp_emmc_active = 0, guamp_emmc_mirror = 0, guamp_emmc_flush = 0;
+uint64_t guamp_emmc_active = 0, guamp_emmc_mirror = 0, guamp_emmc_flush_ticks = 0;
 uint64_t guamp_emmc_queue = 0, guamp_emmc_read_bytes = 0, guamp_emmc_write_bytes = 0;
 // Where a read run spends its time: waiting for the gate, command (until command complete), data (until transfer
 // complete), copy out of the DMA buffer; runs = DMA read runs measured. Printed per 10 s as microseconds per run.
@@ -681,7 +681,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   const uint64_t mirrorBegan = mach_absolute_time();
   card.mirror(card.sequence % kFbEvery == 0);
   guamp_emmc_mirror += mach_absolute_time() - mirrorBegan;
-  const uint64_t active = guamp_emmc_active, mirror = guamp_emmc_mirror, flush = guamp_emmc_flush;
+  const uint64_t active = guamp_emmc_active, mirror = guamp_emmc_mirror, flush = guamp_emmc_flush_ticks;
   const uint64_t queue = guamp_emmc_queue, readBytes = guamp_emmc_read_bytes, writeBytes = guamp_emmc_write_bytes;
   const uint64_t sampleTime = mach_absolute_time();
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
@@ -869,7 +869,7 @@ IOReturn NativeEmmc::doSynchronizeCache()
   const uint64_t activeBegan = mach_absolute_time();
   guamp_emmc_queue += activeBegan - queuedAt;
   bool ok = card.host.flushCache();
-  guamp_emmc_flush += mach_absolute_time() - activeBegan;
+  guamp_emmc_flush_ticks += mach_absolute_time() - activeBegan;
   IOLockUnlock(card.gate);
   return ok ? kIOReturnSuccess : kIOReturnIOError;
 }

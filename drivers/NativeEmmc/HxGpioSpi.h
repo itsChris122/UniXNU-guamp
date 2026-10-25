@@ -28,7 +28,7 @@ static inline int hx_gpio_transfer(struct hx_gpio_spi *s, const uint8_t *tx, uin
             s->delay(s->ctx, 2);
             s->write(s->ctx, 1, phase ? idle : idle ^ 1);
             s->delay(s->ctx, 2);
-            input = (uint8_t)((input << 1) | (s->read(s->ctx) & 1));
+            input = (uint8_t)(((unsigned)input << 1) | (s->read(s->ctx) & 1u));
             if (!phase) s->write(s->ctx, 1, idle);
         }
         if (rx) rx[i] = input;
