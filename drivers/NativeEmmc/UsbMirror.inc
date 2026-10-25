@@ -16,6 +16,14 @@
 
 extern "C" {
 volatile uint32_t native_usb_stage = 0, native_usb_speed = 0, native_usb_configured = 0;
+// Touches from the viewer (bulk OUT 0x01): "GTCH", count, then count x {x u16, y u16, id u8} in frame pixels. They go
+// to iOS like the Himax ones (TouchState.cpp of the display archive: native_touch_* and native_touch_published).
+extern "C" {
+extern volatile uint32_t native_touch_seq, native_touch_count;
+extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
+void native_touch_published(void);
+}
+uint64_t native_usb_touches = 0;
 uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0, native_usb_ended = 0;
 }
 
@@ -90,13 +98,14 @@ struct Mirror {
   uint32_t memPhys = 0;
   // Layout of the DMA block: events (4 KiB), EP0 TRB + buffer, EP1 IN TRB, bulk IN staging (64 KiB)
   static constexpr uint32_t kEvents = 0, kEventBytes = 4096, kEp0Trb = 4096, kEp0Buf = 4096 + 64, kEp1Trb = 8192,
+                            kEp1OutTrb = 8192 + 64, kOutBuf = 8192 + 512, kOutBytes = 512,
                             kStage = 12288, kStageBytes = 65536, kDmaBytes = kStage + kStageBytes;
   uint32_t eventPos = 0;
   uint8_t setup[8] = {};
   bool ep0DataIn = false, inBusy = false, running = false;
   unsigned stuck = 0;
   uint64_t lastStatus = 0;
-  uint32_t ep0Resource[2] = {}, ep1InResource = 0;
+  uint32_t ep0Resource[2] = {}, ep1InResource = 0, ep1OutResource = 0;
   uint16_t address = 0;
   uint8_t pendingAddress = 0xFF;
   uint32_t logPos = 0;                                 // next message buffer byte to send
@@ -195,6 +204,7 @@ struct Mirror {
         w(DALEPENA, r(DALEPENA) | (1u << kEp1In) | (1u << kEp1Out));
         native_usb_configured = 1;
         native_usb_stage = 6;
+        receive();
         logPos = 0;                                               // a new host gets the whole log again
         if (shadow) memset(shadow, 0xA5, kFbBytes);              // and a whole frame
       }
@@ -228,7 +238,37 @@ struct Mirror {
       return;
     }
     if (ep == kEp1In && type == 1) { inBusy = false; return; }
+    if (ep == kEp1Out && type == 1) {
+      uint32_t got = kOutBytes - (trb(kEp1OutTrb)->size & 0xFFFFFF);
+      touch(mem + kOutBuf, got);
+      receive();
+      return;
+    }
     (void)event;
+  }
+
+  void receive() { startTransfer(kEp1Out, kEp1OutTrb, kOutBuf, kOutBytes, TRBCTL_NORMAL, ep1OutResource); }
+
+  void touch(volatile const uint8_t *b, uint32_t n) {
+    if (n < 5 || b[0] != 'G' || b[1] != 'T' || b[2] != 'C' || b[3] != 'H') return;
+    unsigned count = b[4];
+    if (count > 12 || n < 5 + count * 5) return;
+    native_touch_seq = native_touch_seq + 1;
+    __asm__ volatile("dmb ish" ::: "memory");
+    native_touch_count = count;
+    for (unsigned i = 0; i < count; i++) {
+      volatile const uint8_t *t = b + 5 + i * 5;
+      int x = t[0] | (t[1] << 8), y = t[2] | (t[3] << 8);
+      if (x >= kFbWidth) x = kFbWidth - 1;
+      if (y >= kFbHeight) y = kFbHeight - 1;
+      native_touch_xs[i] = x * 30479 / (kFbWidth - 1);       // the scale TouchService.inc publishes in
+      native_touch_ys[i] = y * 20319 / (kFbHeight - 1);
+      native_touch_ids[i] = t[4];
+    }
+    __asm__ volatile("dmb ish" ::: "memory");
+    native_touch_seq = native_touch_seq + 1;
+    native_touch_published();
+    native_usb_touches++;
   }
 
   void deviceEvent(uint32_t event) {
@@ -287,9 +327,9 @@ struct Mirror {
     nanoseconds_to_absolutetime(30ULL * 1000 * 1000 * 1000, &interval);
     if (now - lastStatus < interval) return;
     lastStatus = now;
-    IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu errors %llu ended %llu"
+    IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu errors %llu ended %llu touches %llu"
           " events %llu, ep1 trb %08x cmd %08x\n", native_usb_stage, native_usb_configured, native_usb_speed, inBusy ? 1 : 0,
-          native_usb_bytes, native_usb_frames, native_usb_errors, native_usb_ended, native_usb_events,
+          native_usb_bytes, native_usb_frames, native_usb_errors, native_usb_ended, native_usb_touches, native_usb_events,
           trb(kEp1Trb)->ctrl, r(DEPCMD + 0x10 * kEp1In));
   }
 
