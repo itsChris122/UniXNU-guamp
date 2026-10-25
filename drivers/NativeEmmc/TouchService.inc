@@ -46,11 +46,23 @@ void pinWrite(unsigned gpio, uint32_t off, uint32_t v) { wr(gTlmm, gt_pin(gpio) 
 uint32_t pinRead(unsigned gpio, uint32_t off) { return rd(gTlmm, gt_pin(gpio) + off); }
 // gGpioCs: chip select driven as a plain GPIO around each frame (the pads showed the GENI CS lane never high).
 bool gGpioCs = false;
+// Optional comparison with Motorola himax_spi_read: TX header, then RX-only,
+// with CS held across both transfers. Existing full-duplex path stays default.
+bool gSplitRead = false;
+int wireXfer(const uint8_t *tx, uint8_t *rx, size_t len) {
+  if (gSplitRead && tx && rx && len > 3 && tx[0] == HX_SPI_READ) {
+    memset(rx, 0, 3);                                            // protocol ignores header RX bytes
+    int r = geni_spi_transfer(&gSpi, tx, nullptr, 3, 1);          // keep hardware CS asserted
+    if (r) return r;
+    return geni_spi_transfer(&gSpi, nullptr, rx + 3, len - 3, 0);
+  }
+  return geni_spi_transfer(&gSpi, tx, rx, len, 0);
+}
 int busXfer(void *, const uint8_t *tx, uint8_t *rx, size_t len) {
-  if (!gGpioCs) return geni_spi_transfer(&gSpi, tx, rx, len, 0);
+  if (!gGpioCs) return wireXfer(tx, rx, len);
   pinWrite(GT_GPIO_SPI_D, 4, 0);                                   // CS low
   IODelay(2);
-  int r = geni_spi_transfer(&gSpi, tx, rx, len, 0);
+  int r = wireXfer(tx, rx, len);
   IODelay(2);
   pinWrite(GT_GPIO_SPI_D, 4, 2);                                   // CS high
   IODelay(10);
@@ -117,6 +129,10 @@ uint32_t gSeenHigh, gSeenLow, gSamples;   // pad sampling (one thread)
 
 bool openBus() {
   gStep = 3;
+  unsigned splitRead = 0;
+  PE_parse_boot_argn("guamp-touch-split-read", &splitRead, sizeof(splitRead));
+  gSplitRead = splitRead == 1;
+  IOLog("GuampTouch: read framing %s\n", gSplitRead ? "TX header + RX, continuous CS" : "full duplex");
   gSpi.poll_limit = 400000;
   gSpi.poll_only = 1;
   int r = geni_spi_init(&gSpi);
@@ -184,17 +200,19 @@ bool openBus() {
     geni_spi_set_clock(&gSpi, 1000000, static_cast<unsigned>(gLevelHz[0]), 0);   // level 0 (19.2 MHz) / 19
     gFrame[0] = HX_SPI_READ; gFrame[1] = HX_BUS_RDATA;
     for (unsigned i = 2; i < 4096; i++) gFrame[i] = static_cast<uint8_t>(i * 37);
-    int pr = geni_spi_transfer(&gSpi, gFrame, gRx, 4096, 0);
+    memset(gRx, 0xA5, 4096);                                    // distinguish unwritten RX bytes on a failed transfer
+    int pr = busXfer(nullptr, gFrame, gRx, 4096);
     geni_spi_sample_hook = nullptr;
     unsigned nonzero = 0;
     for (unsigned i = 0; i < 4096; i++) nonzero += gRx[i] != 0;
-    IOLog("GuampTouch: pads during 4 KiB at 1 MHz (rc %d, %u samples, %u rx bytes not 0): high %02x low %02x (bits gpio6 7 71 80 irq67)\n",
+    IOLog("GuampTouch: pads during 4 KiB at 1 MHz (rc %d, %u samples, %u rx bytes not 0; RX valid only if rc 0): high %02x low %02x (bits gpio6 7 71 80 irq67)\n",
           pr, gSamples, nonzero, gSeenHigh, gSeenLow);
     // Same read with a pull-up on the MISO pad: 0xff back = nobody drives MISO (the chip is not answering), 0x00 = the
     // line is held low (another driver, or the pad is not MISO).
     const uint32_t misoCtl = pinRead(GT_GPIO_SPI_A, 0);
     pinWrite(GT_GPIO_SPI_A, 0, (misoCtl & ~3u) | 3u);
-    pr = geni_spi_transfer(&gSpi, gFrame, gRx, 64, 0);
+    memset(gRx, 0xA5, 64);
+    pr = busXfer(nullptr, gFrame, gRx, 64);
     pinWrite(GT_GPIO_SPI_A, 0, misoCtl);
     IOLog("GuampTouch: with MISO pull-up (rc %d): rx %02x %02x %02x %02x ... %02x %02x\n", pr, gRx[0], gRx[1], gRx[2], gRx[3], gRx[62], gRx[63]);
   }

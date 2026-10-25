@@ -958,6 +958,8 @@ static void usbProbe()
   }
 }
 
+#include "GuampGpuProbe.inc"
+#include "GuampCpuFreqProbe.inc"
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
@@ -1069,6 +1071,8 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   publishWindows();
   usbProbe();
   usbMirrorStart();
+  guamp_cpu_freq::start();
+  guamp_gpu::start();
   pmic::start();
   touch::start();
 }
