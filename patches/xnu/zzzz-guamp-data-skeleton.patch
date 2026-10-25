@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 124ba0a..a105798 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7757,6 +7757,107 @@ native_staged_apps_walk(proc_t p, user_addr_t scratch, vnode_t source, char *pat
+@@ -7757,6 +7757,109 @@ native_staged_apps_walk(proc_t p, user_addr_t scratch, vnode_t source, char *pat
  		kfree_data(pending.pool, NATIVE_STAGED_APPS_POOL);
  	}
  }
@@ -43,7 +43,9 @@ index 124ba0a..a105798 100644
 +	{"/private/var/MobileSoftwareUpdate", 0755, 0},
 +	{"/private/var/folders", 0755, 0},
 +	{"/private/var/empty", 0555, 0},
-+	{"/private/var/installd", 0755, 0},
++	{"/private/var/installd", 0755, 33},           /* _installd: system app installs need its staging dir */
++	{"/private/var/installd/Library", 0755, 33},
++	{"/private/var/installd/Library/Caches", 0755, 33},
 +	{"/private/var/hardware", 0755, 0},
 +	{"/private/var/wireless", 0755, 0},
 +	{"/private/var/networkd", 0755, 0},
@@ -82,7 +84,7 @@ index 124ba0a..a105798 100644
 +			error = mkdir(p, &request, &result);
 +		}
 +		if (error == EEXIST) {
-+			continue;
++			error = 0;   /* existing directories get the owner and mode of the table too */
 +		}
 +		vnode_t vp = NULLVP;
 +		if (!error) {
@@ -110,7 +112,7 @@ index 124ba0a..a105798 100644
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7881,6 +7982,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+@@ -7881,6 +7984,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
  	if (!error) native_owner_data_stage = 4;
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
