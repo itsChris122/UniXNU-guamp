@@ -11,7 +11,7 @@
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
 #include "GeniSpiCpp.inc"
-#include "HxProtocol.c"
+#include "HxProtocolCpp.inc"
 
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count;

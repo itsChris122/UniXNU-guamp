@@ -258,7 +258,7 @@ struct Mirror {
     native_touch_count = count;
     for (unsigned i = 0; i < count; i++) {
       volatile const uint8_t *t = b + 5 + i * 5;
-      int x = t[0] | (t[1] << 8), y = t[2] | (t[3] << 8);
+      uint32_t x = t[0] | (t[1] << 8), y = t[2] | (t[3] << 8);
       if (x >= kFbWidth) x = kFbWidth - 1;
       if (y >= kFbHeight) y = kFbHeight - 1;
       native_touch_xs[i] = x * 30479 / (kFbWidth - 1);       // the scale TouchService.inc publishes in
