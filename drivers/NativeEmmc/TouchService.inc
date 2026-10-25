@@ -6,6 +6,7 @@
 // Boot argument guamp-touch=<n>: 1 read only, 2 clocks and pins, 3 SPI and chip id, 4 firmware, start and events.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
 
+#include <IOKit/IODeviceTreeSupport.h>   // gIODTPlane
 #include "GeniSpi.h"
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
