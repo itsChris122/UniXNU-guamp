@@ -93,7 +93,10 @@ constexpr unsigned kFvMv = 4350;
 // under-voltage and TYPEC no attach, while the legacy A-to-C cable of the PC always carries VBUS. Sink only: the phone
 // never supplies power here.
 constexpr uint16_t kTypecModeCfg = 0x1544;
-constexpr uint8_t kTypecSinkOnly = 0x02;
+constexpr uint8_t kTypecSinkOnly = 0x10;   // value Linux (TWRP smb5) keeps: try-sink DRP; the UEFI left 0x02
+// 0x154a: Linux 0x03, UEFI left 0x0f (after the first unplug the Type-C state machine never attached again)
+constexpr uint16_t kTypecCfg4a = 0x154a;
+constexpr uint8_t kTypecCfg4aLinux = 0x03;
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
@@ -133,7 +136,7 @@ void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, u
   write8(kPmi632, kChgEnableCmd, 1);       // charging enable command
   write8(kPmi632, kFccCfg, *fccCode);
   write8(kPmi632, kIclCfg, *iclCode);
-  write8(kPmi632, kIclOptions, 0x02);      // USB 5/1 high current mode: the configured limit applies
+  write8(kPmi632, kIclOptions, 0x03);      // value Linux (TWRP) keeps
   write8(kPmi632, kUsbinCmdIl, 0x00);      // input not suspended
 }
 
@@ -180,6 +183,9 @@ void thread(void *, wait_result_t) {
       uint8_t usbinRt = 0, typecRt = 0, typecMode = 0;
       read8(kPmi632, kTypecModeCfg, &typecMode);
       if (typecMode != kTypecSinkOnly) write8(kPmi632, kTypecModeCfg, kTypecSinkOnly);
+      uint8_t cfg4a = 0;
+      read8(kPmi632, kTypecCfg4a, &cfg4a);
+      if (cfg4a != kTypecCfg4aLinux) write8(kPmi632, kTypecCfg4a, kTypecCfg4aLinux);
       gTypecMode = typecMode;
       read8(kPmi632, 0x1310, &usbinRt);
       read8(kPmi632, 0x1510, &typecRt);

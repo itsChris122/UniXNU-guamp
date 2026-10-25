@@ -86,6 +86,9 @@ bool enable() {
   pinWrite(GT_GPIO_RESET, 4, 2u);
   pinWrite(GT_GPIO_RESET, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 0) | GT_PIN_OE);
   pinWrite(GT_GPIO_IRQ, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 3));
+  IOLog("GuampTouch: pins after config: gpio6 %08x gpio7 %08x gpio71 %08x gpio80 %08x gpio66 %08x/%08x gpio67 %08x/%08x\n",
+        pinRead(GT_GPIO_SPI_A, 0), pinRead(GT_GPIO_SPI_B, 0), pinRead(GT_GPIO_SPI_C, 0), pinRead(GT_GPIO_SPI_D, 0),
+        pinRead(GT_GPIO_RESET, 0), pinRead(GT_GPIO_RESET, 4), pinRead(GT_GPIO_IRQ, 0), pinRead(GT_GPIO_IRQ, 4));
   gWrap = mapPhysical(GT_QUP_WRAPPER_BASE, 0x2000);
   gSe = mapPhysical(GT_SE_BASE, GT_SE_SIZE);
   if (!gWrap || !gSe) { fail(2, -12); return false; }
@@ -143,6 +146,13 @@ bool openBus() {
           v / 4, modes[m], r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3], gChip.dbg_conti,
           gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0], gChip.central_state);
   }
+  // GENI state after the last attempt: output control, CPHA/CPOL, demux, trans cfg, IO pin levels (GENI_IOS 0x908)
+  IOLog("GuampTouch: geni out %08x cpha %08x cpol %08x demux %08x inv %08x trans %08x ios %08x clk %08x sel %08x\n",
+        seRd(const_cast<uint8_t *>(gSe), GENI_OUTPUT_CTRL), seRd(const_cast<uint8_t *>(gSe), SE_SPI_CPHA),
+        seRd(const_cast<uint8_t *>(gSe), SE_SPI_CPOL), seRd(const_cast<uint8_t *>(gSe), SE_SPI_DEMUX_SEL),
+        seRd(const_cast<uint8_t *>(gSe), SE_SPI_DEMUX_OUTPUT_INV), seRd(const_cast<uint8_t *>(gSe), SE_SPI_TRANS_CFG),
+        seRd(const_cast<uint8_t *>(gSe), 0x908), seRd(const_cast<uint8_t *>(gSe), GENI_SER_M_CLK_CFG),
+        seRd(const_cast<uint8_t *>(gSe), SE_GENI_CLK_SEL));
   if (r) { fail(32, r); return false; }
   return true;
 }
