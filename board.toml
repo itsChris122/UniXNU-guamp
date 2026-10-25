@@ -159,6 +159,7 @@ kernel_args = [
   "sheng-touch-hid=1",
   "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
   "guamp-emmc-reset=0",                # NativeEmmc: no timed reset (the user watches live); a panic still flushes and resets
+  "-no_corpses",                       # no corpses: ReportCrash wrote no reports and 5 stuck corpses kept the crashed tasks memory
   "guamp-usb-mirror=1",                # NativeEmmc UsbMirror.inc: live screen and log over USB (strumenti/specchio-ios.py)
   "guamp-emmc-dma=1",                   # NativeEmmc: ADMA2 reads if they match PIO (PIO: 2.4 MB/s, driver 92% busy)
   "guamp-emmc-dmaw=1",                  # NativeEmmc: CMD25 + ADMA2 writes if a kpan write test reads back identical
@@ -168,7 +169,7 @@ kernel_args = [
 [payload.adt]
 tool = "scripts/make-guamp-adt.py"
 chip_id = "0x1bc"                    # SM6115
-owned_memory_size = "0xB0000000"            # 2.75 GiB DarwinBoot window inside the free 0x80000000-0x13FC00000 run (RAM log moved to the top of DRAM; 1.875 GiB thrashed the page cache)
+owned_memory_size = "0xB8000000"            # 2.875 GiB DarwinBoot window in the free 0x80000000-0x13FC00000 run (0xB0000000 worked; try the largest that fits)
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Kryo 260: Silver cluster 0x0-0x3, Gold cluster 0x100-0x103 (Affinity1 numbering)
 cpu_regs = "0x0,0x1,0x2,0x3"                  # Silver cluster only: the BCM2837 kernel config has MAX_CPUS 4, one cluster
