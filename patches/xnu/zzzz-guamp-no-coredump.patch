@@ -1,0 +1,14 @@
+diff -ru a/bsd/kern/kern_core.c b/bsd/kern/kern_core.c
+--- a/bsd/kern/kern_core.c
++++ b/bsd/kern/kern_core.c
+@@ -121,7 +121,9 @@
+ #ifdef SECURE_KERNEL
+ __XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
+ #else
+-__XNU_PRIVATE_EXTERN int do_coredump = 1;       /* default: dump cores */
++/* guamp: no user core dumps by default (sysctl kern.coredump=1 turns them on): a crashing watchdogd wrote a 1.4 GB core
++ * to /private/var/cores during the first boot, the bulk of the Data writes, on a 4 GB Data volume. */
++__XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
+ #endif /* SECURE_KERNEL */
+ __XNU_PRIVATE_EXTERN int sugid_coredump = 0; /* default: but not SGUID binaries */
+ 
