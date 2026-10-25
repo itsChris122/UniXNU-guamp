@@ -72,6 +72,8 @@ extern task_t kernel_task;
 char native_emmc_last_proc[32];
 // Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
+uint64_t guamp_emmc_active = 0, guamp_emmc_mirror = 0, guamp_emmc_flush = 0;
+uint64_t guamp_emmc_queue = 0, guamp_emmc_read_bytes = 0, guamp_emmc_write_bytes = 0;
 // Where a read run spends its time: waiting for the gate, command (until command complete), data (until transfer
 // complete), copy out of the DMA buffer; runs = DMA read runs measured. Printed per 10 s as microseconds per run.
 uint64_t native_emmc_t_lock = 0, native_emmc_t_cmd = 0, native_emmc_t_data = 0, native_emmc_t_copy = 0, native_emmc_t_runs = 0;
@@ -676,18 +678,34 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
 {
   Card &card = gCard;
   IOLockLock(card.gate);
+  const uint64_t mirrorBegan = mach_absolute_time();
   card.mirror(card.sequence % kFbEvery == 0);
+  guamp_emmc_mirror += mach_absolute_time() - mirrorBegan;
+  const uint64_t active = guamp_emmc_active, mirror = guamp_emmc_mirror, flush = guamp_emmc_flush;
+  const uint64_t queue = guamp_emmc_queue, readBytes = guamp_emmc_read_bytes, writeBytes = guamp_emmc_write_bytes;
+  const uint64_t sampleTime = mach_absolute_time();
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
   IOLockUnlock(card.gate);
   static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0, lastTime = 0;
   if (card.sequence % 10 == 0) {
-    uint64_t now = mach_absolute_time(), busy = native_emmc_busy, requests = native_emmc_requests;
+    uint64_t now = sampleTime, busy = native_emmc_busy, requests = native_emmc_requests;
     uint64_t busyNs = 0, spanNs = 0;
     absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
     absolutetime_to_nanoseconds(now - lastTime, &spanNs);
-    IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, driver busy %llu%%\n",
+    IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, aggregate request latency %llu%%\n",
           requests - lastRequests, requests > lastRequests ? (reads - lastReads) / (requests - lastRequests) : 0,
           spanNs ? busyNs * 100 / spanNs : 0);
+    static uint64_t lastActive = 0, lastMirror = 0, lastFlush = 0, lastQueue = 0, lastReadBytes = 0, lastWriteBytes = 0;
+    uint64_t ticks[4] = {active - lastActive, mirror - lastMirror, flush - lastFlush, queue - lastQueue};
+    uint64_t ns[4] = {};
+    for (unsigned i = 0; i < 4; ++i) absolutetime_to_nanoseconds(ticks[i], &ns[i]);
+    IOLog("NativeEmmc perf: request-active %llu%% mirror-active %llu%% flush-active %llu%%; read %llu KiB/s write %llu KiB/s; queue-sum %llu ms\n",
+          spanNs ? ns[0] * 100 / spanNs : 0, spanNs ? ns[1] * 100 / spanNs : 0,
+          spanNs ? ns[2] * 100 / spanNs : 0,
+          spanNs ? (readBytes - lastReadBytes) * 1000000000ULL / spanNs / 1024 : 0,
+          spanNs ? (writeBytes - lastWriteBytes) * 1000000000ULL / spanNs / 1024 : 0, ns[3] / 1000000);
+    lastActive = active; lastMirror = mirror; lastFlush = flush; lastQueue = queue;
+    lastReadBytes = readBytes; lastWriteBytes = writeBytes;
     lastBusy = busy; lastRequests = requests; lastTime = now;
     IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
           reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
@@ -823,11 +841,15 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
     uint64_t waitFrom = mach_absolute_time();
     IOLockLock(card.gate);
-    if (!write) native_emmc_t_lock += mach_absolute_time() - waitFrom;
+    const uint64_t activeBegan = mach_absolute_time();
+    guamp_emmc_queue += activeBegan - waitFrom;
+    if (!write) native_emmc_t_lock += activeBegan - waitFrom;
     bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
                     : card.readBlocks(first + block + done, n, card.bounce) &&
                           buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
+    guamp_emmc_active += mach_absolute_time() - activeBegan;
+    if (ok) { if (write) guamp_emmc_write_bytes += bytes; else guamp_emmc_read_bytes += bytes; }
     IOLockUnlock(card.gate);
     if (!ok) { status = kIOReturnIOError; break; }
     done += n;
@@ -842,8 +864,12 @@ IOReturn NativeEmmc::doSynchronizeCache()
   Card &card = gCard;
   if (!card.online) return kIOReturnNotReady;
   if (!writable) return kIOReturnSuccess;
+  const uint64_t queuedAt = mach_absolute_time();
   IOLockLock(card.gate);
+  const uint64_t activeBegan = mach_absolute_time();
+  guamp_emmc_queue += activeBegan - queuedAt;
   bool ok = card.host.flushCache();
+  guamp_emmc_flush += mach_absolute_time() - activeBegan;
   IOLockUnlock(card.gate);
   return ok ? kIOReturnSuccess : kIOReturnIOError;
 }

@@ -12,6 +12,7 @@
 #include "GuampTouchBoard.h"
 #include "GeniSpiCpp.inc"
 #include "HxProtocolCpp.inc"
+#include "HxGpioSpi.h"
 
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count;
@@ -46,6 +47,14 @@ void pinWrite(unsigned gpio, uint32_t off, uint32_t v) { wr(gTlmm, gt_pin(gpio) 
 uint32_t pinRead(unsigned gpio, uint32_t off) { return rd(gTlmm, gt_pin(gpio) + off); }
 // gGpioCs: chip select driven as a plain GPIO around each frame (the pads showed the GENI CS lane never high).
 bool gGpioCs = false;
+bool gBitbang = false;
+struct hx_gpio_spi gGpioSpi;
+void gpioSpiWrite(void *, unsigned lane, unsigned level) {
+  static const unsigned pins[3] = {GT_GPIO_SPI_B, GT_GPIO_SPI_C, GT_GPIO_SPI_D};
+  pinWrite(pins[lane], 4, level ? 2u : 0u);
+}
+unsigned gpioSpiRead(void *) { return pinRead(GT_GPIO_SPI_A, 4) & 1u; }
+void gpioSpiDelay(void *, unsigned us) { IODelay(us); }
 // Optional comparison with Motorola himax_spi_read: TX header, then RX-only,
 // with CS held across both transfers. Existing full-duplex path stays default.
 bool gSplitRead = false;
@@ -59,6 +68,7 @@ int wireXfer(const uint8_t *tx, uint8_t *rx, size_t len) {
   return geni_spi_transfer(&gSpi, tx, rx, len, 0);
 }
 int busXfer(void *, const uint8_t *tx, uint8_t *rx, size_t len) {
+  if (gBitbang) return hx_gpio_transfer(&gGpioSpi, tx, rx, len);
   if (!gGpioCs) return wireXfer(tx, rx, len);
   pinWrite(GT_GPIO_SPI_D, 4, 0);                                   // CS low
   IODelay(2);
@@ -182,6 +192,35 @@ bool openBus() {
     IOLog("GuampTouch: reset %u mode %u identify rc %d stage %d dummy %02x%02x%02x%02x conti %02x incr4 %02x id %02x %02x %02x %02x central %02x\n",
           v / 4, modes[m], r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3], gChip.dbg_conti,
           gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0], gChip.central_state);
+  }
+  unsigned gpioFallback = 0;
+  PE_parse_boot_argn("guamp-touch-bitbang", &gpioFallback, sizeof(gpioFallback));
+  if (r && gpioFallback == 1) {
+    static const unsigned pins[4] = {GT_GPIO_SPI_A, GT_GPIO_SPI_B, GT_GPIO_SPI_C, GT_GPIO_SPI_D};
+    uint32_t savedCfg[4] = {}, savedIo[4] = {};
+    for (unsigned i = 0; i < 4; ++i) { savedCfg[i] = pinRead(pins[i], 0); savedIo[i] = pinRead(pins[i], 4) & 2u; }
+    pinWrite(GT_GPIO_SPI_D, 4, 2); pinWrite(GT_GPIO_SPI_B, 4, 0); pinWrite(GT_GPIO_SPI_C, 4, 0);
+    const uint32_t gpioCfg = gt_pin_cfg(0, GT_DRIVE_6MA, 0);
+    pinWrite(GT_GPIO_SPI_A, 0, gpioCfg);
+    for (unsigned i = 1; i < 4; ++i) pinWrite(pins[i], 0, gpioCfg | GT_PIN_OE);
+    gGpioSpi.ctx = nullptr; gGpioSpi.write = gpioSpiWrite; gGpioSpi.read = gpioSpiRead; gGpioSpi.delay = gpioSpiDelay;
+    gBitbang = true;
+    gChip.reset_low_ms = 20; gChip.reset_high_ms = 100; gChip.reset_invert = 0; gChip.reset_skip = 0;
+    for (unsigned i = 0; i < 4 && r; ++i) {
+      gGpioSpi.mode = modes[i];
+      r = hx_identify(&gChip);
+      IOLog("GuampTouch: GPIO SPI mode %u rc %d conti %02x incr4 %02x id %02x %02x %02x %02x\n",
+            gGpioSpi.mode, r, gChip.dbg_conti, gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0]);
+    }
+    if (r) {
+      gBitbang = false;
+      pinWrite(GT_GPIO_SPI_D, 4, 2);
+      for (unsigned i = 1; i < 4; ++i) pinWrite(pins[i], 4, savedIo[i]);
+      for (unsigned i = 0; i < 4; ++i) pinWrite(pins[i], 0, savedCfg[i]);
+      IOLog("GuampTouch: GPIO SPI did not identify; previous pin state restored\n");
+    } else {
+      IOLog("GuampTouch: GPIO SPI identified chip; retaining GPIO transport for firmware and events\n");
+    }
   }
   // Pad levels while a 4 KiB read runs at 1 MHz (TLMM in bit of each pin, sampled on every FIFO poll): which of
   // gpio6/7/71/80 (lanes 0..3: MISO, MOSI, CLK, CS) and the IRQ line ever read high and low. A lane that never moves is
