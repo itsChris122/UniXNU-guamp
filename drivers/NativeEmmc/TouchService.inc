@@ -102,7 +102,7 @@ bool enable() {
   return true;
 }
 
-volatile uint32_t gSeenHigh, gSeenLow, gSamples;
+uint32_t gSeenHigh, gSeenLow, gSamples;   // pad sampling (one thread)
 
 bool openBus() {
   gStep = 3;
