@@ -166,6 +166,7 @@ kernel_args = [
   "guamp-emmc-div=2",                   # NativeEmmc: SD clock base/4 (~48 MHz, HS max 52) if it reads back correctly (proven: 8 = base/16, 4 = base/8)
   "guamp-emmc-ddr=1",                   # NativeEmmc: DDR52 (8-bit dual data rate) if it reads back identical to SDR
   "guamp-emmc-cached=1",                # NativeEmmc: cacheable DMA buffer with cache maintenance (uncached copy cost 570 us per run)
+  "guamp-touch=3",                      # GuampTouch (NativeEmmc TouchService.inc): clocks, pins, SPI loopback, chip id; 4 needs the firmware object
 ]
 
 [payload.adt]

@@ -960,6 +960,7 @@ static void usbProbe()
 
 #include "UsbMirror.inc"
 #include "PmicService.inc"
+#include "TouchService.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1069,6 +1070,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   usbProbe();
   usbMirrorStart();
   pmic::start();
+  touch::start();
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start

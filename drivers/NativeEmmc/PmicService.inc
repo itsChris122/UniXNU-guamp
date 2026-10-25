@@ -84,7 +84,10 @@ constexpr uint16_t kPonRtSts = 0x0810, kVolUpStatus = 0xc408;
 // SMB5 charger (PMI632 0x1000 block, offsets of qcom_smbx.c relative to it)
 constexpr uint16_t kChgStatus1 = 0x1006, kChgStatus2 = 0x1007, kChgStatus7 = 0x100d, kChgEnableCmd = 0x1042,
                    kFccCfg = 0x1061, kApsdStatus = 0x1307, kApsdResult = 0x1308, kUsbinCmdIl = 0x1340,
-                   kIclOptions = 0x1366, kIclCfg = 0x1370, kWdogPet = 0x1643;
+                   kIclOptions = 0x1366, kIclCfg = 0x1370, kWdogPet = 0x1643, kFvCfg = 0x1070;
+// Float voltage: left at the hardware default (low) without a driver, which held the charger in INHIBIT (status 6) with a
+// charged battery. SMB5 code = (mV - 3600) / 10; on the SMB2 encoding (3487.5 + 7.5 mV per code) the same code is lower.
+constexpr unsigned kFvMv = 4350;
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
@@ -108,11 +111,15 @@ void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, u
   write8(kPmi632, kWdogPet, 1);
   uint8_t s1 = 0, s2 = 0, s7 = 0, apsd = 0, result = 0;
   read8(kPmi632, kChgStatus1, &s1); read8(kPmi632, kChgStatus2, &s2); read8(kPmi632, kChgStatus7, &s7);
-  read8(kPmi632, kApsdStatus, &apsd); read8(kPmi632, kApsdResult, &result);
-  gChg[0] = s1; gChg[1] = s2; gChg[2] = s7; gChg[3] = apsd; gChg[4] = result;
+  uint8_t fv = 0;
+  read8(kPmi632, kApsdStatus, &apsd); read8(kPmi632, kApsdResult, &result); read8(kPmi632, kFvCfg, &fv);
+  gChg[0] = s1; gChg[1] = s2; gChg[2] = s7; gChg[3] = apsd; gChg[4] = result; gChg[5] = fv;
   if (!configure) return;
   *iclCode = static_cast<uint8_t>(iclMa / 50 > 0xff ? 0xff : iclMa / 50);
   *fccCode = static_cast<uint8_t>(fccMa / 50 > 0xff ? 0xff : fccMa / 50);
+  write8(kPmi632, kFvCfg, static_cast<uint8_t>((kFvMv - 3600) / 10));
+  write8(kPmi632, kChgEnableCmd, 0);       // off and on again: the charger re-evaluates inhibit with the new float voltage
+  IODelay(1000);
   write8(kPmi632, kChgEnableCmd, 1);       // charging enable command
   write8(kPmi632, kFccCfg, *fccCode);
   write8(kPmi632, kIclCfg, *iclCode);
@@ -162,8 +169,8 @@ void thread(void *, wait_result_t) {
       if (present && !configured) configured = true;
       if (!present) configured = false;
       if (tick % 1200 == 0)
-        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, ICL code %u FCC code %u, SPMI errors %u (last %08x)\n",
-              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], iclCode, fccCode, gErrors, gArb.last_status);
+        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, ICL code %u FCC code %u, SPMI errors %u (last %08x)\n",
+              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], iclCode, fccCode, gErrors, gArb.last_status);
     }
     IOSleep(25);
   }
