@@ -165,6 +165,7 @@ kernel_args = [
   "guamp-emmc-dmaw=1",                  # NativeEmmc: CMD25 + ADMA2 writes if a kpan write test reads back identical
   "guamp-emmc-div=2",                   # NativeEmmc: SD clock base/4 (~48 MHz, HS max 52) if it reads back correctly (proven: 8 = base/16, 4 = base/8)
   "guamp-emmc-ddr=1",                   # NativeEmmc: DDR52 (8-bit dual data rate) if it reads back identical to SDR
+  "guamp-emmc-cached=1",                # NativeEmmc: cacheable DMA buffer with cache maintenance (uncached copy cost 570 us per run)
 ]
 
 [payload.adt]

@@ -311,11 +311,28 @@ public:
   volatile uint32_t *dmaTable = nullptr;
   uint32_t dmaDataPhys = 0, dmaTablePhys = 0;
   static constexpr uint32_t kDmaBytes = kBounceBlocks * kBlock, kDmaChunk = 32768;
+  // Cached DMA buffer (guamp-emmc-cached=1): reading the uncached buffer cost ~570 us per 5.6 KB run, three times the
+  // transfer itself; with a cacheable buffer the lines are cleaned before the controller reads them and invalidated
+  // before the CPU reads what it wrote, and the copies run at memory speed.
+  bool dmaCached = false;
+  static void cacheOp(const volatile void *p, uint32_t len, int op) {   // 0 clean, 1 clean+invalidate, 2 invalidate
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t line = 4u << ((ctr >> 16) & 15), a = reinterpret_cast<uintptr_t>(p) & ~(line - 1),
+              end = reinterpret_cast<uintptr_t>(p) + len;
+    for (; a < end; a += line) {
+      if (op == 0) __asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+      else if (op == 1) __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+      else __asm__ volatile("dc ivac, %0" :: "r"(a) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+  }
 
-  bool setupDma() {
-    dmaBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) |
-        static_cast<IOOptionBits>(kIOMapInhibitCache), kDmaBytes + 4096, 0xFFFFF000ULL);
+  bool setupDma(bool cached) {
+    dmaCached = cached;
+    IOOptionBits options = static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
+    if (!cached) options |= static_cast<IOOptionBits>(kIOMapInhibitCache);
+    dmaBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, options, kDmaBytes + 4096, 0xFFFFF000ULL);
     if (!dmaBuffer) return false;
     uint8_t *virt = static_cast<uint8_t *>(dmaBuffer->getBytesNoCopy());
     uint64_t phys = dmaBuffer->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
@@ -339,6 +356,10 @@ public:
       dmaTable[2 * descriptors + 1] = dmaDataPhys + at;
     }
     __asm__ volatile("dsb sy" ::: "memory");
+    if (dmaCached) {
+      cacheOp(dmaTable, descriptors * 8, 0);
+      cacheOp(dmaData, bytes, 1);        // no dirty line may be written back over what the controller stores
+    }
     w32(rStatus, 0xFFFFFFFF);
     w32(rAdmaAddr, dmaTablePhys);
     w32(rAdmaAddr + 4, 0);
@@ -356,9 +377,14 @@ public:
     w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
     if (!ok) return false;
     __asm__ volatile("dsb sy" ::: "memory");
-    for (uint32_t i = 0; i < bytes; i += 8) {
-      uint64_t word = *reinterpret_cast<volatile uint64_t *>(dmaData + i);
-      memcpy(out + i, &word, 8);
+    if (dmaCached) {
+      cacheOp(dmaData, bytes, 2);        // lines speculatively refilled during the transfer
+      memcpy(out, const_cast<const uint8_t *>(dmaData), bytes);
+    } else {
+      for (uint32_t i = 0; i < bytes; i += 8) {
+        uint64_t word = *reinterpret_cast<volatile uint64_t *>(dmaData + i);
+        memcpy(out + i, &word, 8);
+      }
     }
     native_emmc_t_cmd += t1 - t0;
     native_emmc_t_data += t2 - t1;
@@ -373,10 +399,14 @@ public:
   bool writeDma(uint64_t lba, uint32_t count, const uint8_t *in) {
     uint32_t bytes = count * kBlock;
     if (!dmaData || !count || bytes > kDmaBytes) return false;
-    for (uint32_t i = 0; i < bytes; i += 8) {
-      uint64_t word;
-      memcpy(&word, in + i, 8);
-      *reinterpret_cast<volatile uint64_t *>(dmaData + i) = word;
+    if (dmaCached) {
+      memcpy(const_cast<uint8_t *>(dmaData), in, bytes);
+    } else {
+      for (uint32_t i = 0; i < bytes; i += 8) {
+        uint64_t word;
+        memcpy(&word, in + i, 8);
+        *reinterpret_cast<volatile uint64_t *>(dmaData + i) = word;
+      }
     }
     unsigned descriptors = 0;
     for (uint32_t at = 0; at < bytes; at += kDmaChunk, descriptors++) {
@@ -386,6 +416,10 @@ public:
       dmaTable[2 * descriptors + 1] = dmaDataPhys + at;
     }
     __asm__ volatile("dsb sy" ::: "memory");
+    if (dmaCached) {
+      cacheOp(dmaTable, descriptors * 8, 0);
+      cacheOp(dmaData, bytes, 0);
+    }
     if (!waitIdle(5000)) native_emmc_stuck_busy++;
     w32(rStatus, 0xFFFFFFFF);
     w32(rAdmaAddr, dmaTablePhys);
@@ -979,14 +1013,14 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   uint32_t dma = 0;
   if (PE_parse_boot_argn("guamp-emmc-dma", &dma, sizeof(dma)) && dma) {
     uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
-    bool ok = reference && check && card.host.setupDma() && card.readBlocks(1, 33, reference);
+    bool ok = reference && check && card.host.setupDma([] { uint32_t c = 0; return PE_parse_boot_argn("guamp-emmc-cached", &c, sizeof(c)) && c; }()) && card.readBlocks(1, 33, reference);
     for (unsigned pass = 0; ok && pass < 3; pass++) {
       memset(check, 0, 33 * kBlock);
       ok = card.host.readDma(1, 33, check) && !memcmp(reference, check, 33 * kBlock);
     }
     if (!ok) card.host.resetLines();
     native_emmc_dma = ok ? 1 : 0;
-    IOLog("NativeEmmc: ADMA2 reads %s\n", ok ? "verified, in use" : "refused, PIO");
+    IOLog("NativeEmmc: ADMA2 reads %s (%s buffer)\n", ok ? "verified, in use" : "refused, PIO", card.host.dmaCached ? "cached" : "uncached");
     // Boot argument guamp-emmc-dmaw=1: CMD25 + ADMA2 writes, kept only if a write of 64 blocks to a free kpan area
     // (between the framebuffer copy and the panic copy) reads back identical through PIO, three times with different data
     uint32_t dmaw = 0;
