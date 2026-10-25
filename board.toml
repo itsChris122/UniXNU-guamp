@@ -158,9 +158,10 @@ kernel_args = [
   "offline-hid-home=1",
   "sheng-touch-hid=1",
   "sheng-pmgr=2",                       # publish the original ApplePMGR nub: AMFI panics "No PMGR?" without it
-  "guamp-emmc-reset=900",              # NativeEmmc: PSCI reset after 900 log mirrors (~1.3 s each); launchd boot tasks start ~400 s
+  "guamp-emmc-reset=0",                # NativeEmmc: no timed reset (the user watches live); a panic still flushes and resets
   "guamp-usb-mirror=1",                # NativeEmmc UsbMirror.inc: live screen and log over USB (strumenti/specchio-ios.py)
   "guamp-emmc-dma=1",                   # NativeEmmc: ADMA2 reads if they match PIO (PIO: 2.4 MB/s, driver 92% busy)
+  "guamp-emmc-dmaw=1",                  # NativeEmmc: CMD25 + ADMA2 writes if a kpan write test reads back identical
   "guamp-emmc-div=4",                   # NativeEmmc: SD clock base/8 if it reads back correctly (proven: 8 = base/16)
 ]
 

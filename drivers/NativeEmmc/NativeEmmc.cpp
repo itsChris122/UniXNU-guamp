@@ -74,6 +74,8 @@ char native_emmc_last_proc[32];
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
 // ADMA2 reads (boot argument guamp-emmc-dma=1): 1 when verified and in use, and the failed DMA runs
 uint32_t native_emmc_dma = 0;
+uint32_t native_emmc_dma_write = 0;                 // CMD25 + ADMA2 writes in use (guamp-emmc-dmaw=1, self-tested)
+uint64_t native_emmc_dma_write_failures = 0, native_emmc_dma_write_runs = 0;
 uint64_t native_emmc_dma_failures = 0;
 int native_emmc_last_pid = -1;
 void proc_selfname(char *, int);
@@ -101,6 +103,7 @@ constexpr uint32_t kFbBytes = kFbRowBytes * kFbHeight;
 constexpr uint32_t kLogFirstBlock = 1, kLogMaxBlocks = 1023, kFbFirstBlock = 1024;
 constexpr uint32_t kFbEvery = 5;      // mirror passes per framebuffer copy
 constexpr uint32_t kPanicFirstBlock = 12288, kPanicBytes = 64 * 1024;   // panic region copy in kpan
+constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for the DMA write self test
 
 // SDHCI registers
 enum : uint32_t {
@@ -344,6 +347,42 @@ public:
     return true;
   }
 
+  // CMD25 (auto CMD12) of count blocks from in through the DMA buffer. Single-block CMD24 in PIO wrote one 32-bit word
+  // at a time and waited for the card after every block (~300 MB of Data writes during the first boot setup).
+  bool writeDma(uint64_t lba, uint32_t count, const uint8_t *in) {
+    uint32_t bytes = count * kBlock;
+    if (!dmaData || !count || bytes > kDmaBytes) return false;
+    for (uint32_t i = 0; i < bytes; i += 8) {
+      uint64_t word;
+      memcpy(&word, in + i, 8);
+      *reinterpret_cast<volatile uint64_t *>(dmaData + i) = word;
+    }
+    unsigned descriptors = 0;
+    for (uint32_t at = 0; at < bytes; at += kDmaChunk, descriptors++) {
+      uint32_t length = bytes - at < kDmaChunk ? bytes - at : kDmaChunk;
+      bool last = at + length >= bytes;
+      dmaTable[2 * descriptors] = (length << 16) | 0x20 | (last ? 0x2 : 0) | 0x1;   // tran, end, valid
+      dmaTable[2 * descriptors + 1] = dmaDataPhys + at;
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (!waitIdle(5000)) native_emmc_stuck_busy++;
+    w32(rStatus, 0xFFFFFFFF);
+    w32(rAdmaAddr, dmaTablePhys);
+    w32(rAdmaAddr + 4, 0);
+    w8(rHostCtl, static_cast<uint8_t>((r8(rHostCtl) & ~0x18) | 0x10));     // ADMA2, 32-bit
+    w16(rBlockSize, kBlock);
+    w16(rBlockCount, static_cast<uint16_t>(count));
+    w32(rArg, static_cast<uint32_t>(lba));
+    w16(rXfer, (1 << 5) | (1 << 2) | (1 << 1) | (1 << 0));                 // multi, auto CMD12, count, DMA; write
+    w16(rCmd, (25 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
+    bool ok = !wait(sCmdDone, 100) && !wait(sXferDone, 5000);
+    w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
+    // Transfer complete comes after the auto CMD12 busy; the card may still be programming its cache
+    if (ok && !waitIdle(5000)) { native_emmc_stuck_busy++; ok = false; }
+    if (ok) native_emmc_writes += count;
+    return ok;
+  }
+
   bool readBlock(uint64_t lba, uint8_t *out) {
     for (unsigned attempt = 0; attempt < 3; attempt++) {
       w32(rStatus, 0xFFFFFFFF);
@@ -434,6 +473,13 @@ struct Card {
   bool multiOk = true;
   // Writes of a writable window (its device checks the range)
   bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in) {
+    if (native_emmc_dma_write) {
+      native_emmc_dma_write_runs++;
+      if (host.writeDma(lba, count, in)) { native_emmc_window_writes += count; return true; }
+      native_emmc_errors++;
+      host.recover();
+      if (++native_emmc_dma_write_failures >= 8) native_emmc_dma_write = 0;   // back to single-block PIO for good
+    }
     for (uint32_t i = 0; i < count; i++) {
       if (!host.writeBlock(lba + i, in + static_cast<uint64_t>(i) * kBlock)) return false;
       native_emmc_window_writes++;
@@ -592,8 +638,9 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
           reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     lastReads = reads;
     if (native_emmc_errors)
-      IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes\n",
-            native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes);
+      IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes, DMA write runs %llu (failed %llu)\n",
+            native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes,
+            native_emmc_dma_write_runs, native_emmc_dma_write_failures);
   }
   if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
   uint64_t when = 0;
@@ -885,6 +932,25 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     if (!ok) card.host.resetLines();
     native_emmc_dma = ok ? 1 : 0;
     IOLog("NativeEmmc: ADMA2 reads %s\n", ok ? "verified, in use" : "refused, PIO");
+    // Boot argument guamp-emmc-dmaw=1: CMD25 + ADMA2 writes, kept only if a write of 64 blocks to a free kpan area
+    // (between the framebuffer copy and the panic copy) reads back identical through PIO, three times with different data
+    uint32_t dmaw = 0;
+    if (ok && PE_parse_boot_argn("guamp-emmc-dmaw", &dmaw, sizeof(dmaw)) && dmaw && card.logBlocks >= kDmaWriteTestBlock + 64) {
+      uint8_t *pattern = static_cast<uint8_t *>(IOMallocZero(64 * kBlock)), *back = static_cast<uint8_t *>(IOMallocZero(64 * kBlock));
+      bool good = pattern && back;
+      for (unsigned pass = 0; good && pass < 3; pass++) {
+        for (uint32_t i = 0; i < 64 * kBlock; i++) pattern[i] = static_cast<uint8_t>(i * 131 + pass * 29 + (i >> 9));
+        memset(back, 0, 64 * kBlock);
+        good = card.host.writeDma(card.logFirst + kDmaWriteTestBlock, 64, pattern);
+        for (uint32_t b = 0; good && b < 64; b++) good = card.host.readBlock(card.logFirst + kDmaWriteTestBlock + b, back + b * kBlock);
+        good = good && !memcmp(pattern, back, 64 * kBlock);
+      }
+      if (!good) card.host.recover();
+      native_emmc_dma_write = good ? 1 : 0;
+      IOLog("NativeEmmc: ADMA2 writes %s" "\n", good ? "verified, in use" : "refused, single-block PIO");
+      if (pattern) IOFree(pattern, 64 * kBlock);
+      if (back) IOFree(back, 64 * kBlock);
+    }
     if (reference) IOFree(reference, 33 * kBlock);
     if (check) IOFree(check, 33 * kBlock);
   }
