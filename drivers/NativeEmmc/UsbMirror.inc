@@ -16,7 +16,7 @@
 
 extern "C" {
 volatile uint32_t native_usb_stage = 0, native_usb_speed = 0, native_usb_configured = 0;
-uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0;
+uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0, native_usb_ended = 0;
 }
 
 namespace usbm {
@@ -94,6 +94,8 @@ struct Mirror {
   uint32_t eventPos = 0;
   uint8_t setup[8] = {};
   bool ep0DataIn = false, inBusy = false, running = false;
+  unsigned stuck = 0;
+  uint64_t lastStatus = 0;
   uint32_t ep0Resource[2] = {}, ep1InResource = 0;
   uint16_t address = 0;
   uint8_t pendingAddress = 0xFF;
@@ -263,9 +265,33 @@ struct Mirror {
     uint64_t end = Host::deadline(ms);
     while (inBusy && native_usb_configured) {
       pollEvents();
-      if (mach_absolute_time() > end) return false;
+      if (!inBusy) break;
+      if (mach_absolute_time() > end) {
+        // Nobody read it for 4 timeouts in a row: end the transfer, so a stuck one does not stop the mirror for good
+        if (++stuck >= 4) {
+          command(kEp1In, CMD_ENDTRANSFER | (1u << 11), 0, 0, 0, ep1InResource);   // ForceRM
+          native_usb_ended++;
+          inBusy = false; stuck = 0;
+        }
+        return false;
+      }
+      IOSleep(1);   // do not spin a core while the host is not reading
     }
+    stuck = 0;
     return native_usb_configured;
+  }
+
+  // One status row in the kernel log every 30 s (the mirror's own log, also in the kpan)
+  void status() {
+    uint64_t now = mach_absolute_time(), interval = 0;
+    nanoseconds_to_absolutetime(30ULL * 1000 * 1000 * 1000, &interval);
+    if (now - lastStatus < interval) return;
+    lastStatus = now;
+    IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu errors %llu ended %llu"
+          " events %llu, ep1 trb %08x cmd %08x
+", native_usb_stage, native_usb_configured, native_usb_speed, inBusy ? 1 : 0,
+          native_usb_bytes, native_usb_frames, native_usb_errors, native_usb_ended, native_usb_events,
+          trb(kEp1Trb)->ctrl, r(DEPCMD + 0x10 * kEp1In));
   }
 
   bool send(uint32_t bytes) {
@@ -405,6 +431,7 @@ void thread(void *, wait_result_t)
   uint64_t lastFrame = 0;
   for (;;) {
     m.pollEvents();
+    m.status();
     if (native_usb_configured) {
       m.sendLog();
       uint64_t now = mach_absolute_time(), interval = 0;
