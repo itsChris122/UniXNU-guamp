@@ -1,13 +1,13 @@
 diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1882,6 +1882,57 @@
+@@ -1882,6 +1882,59 @@
  	}
  }
  
 +#if defined(__arm64__)
-+#include <arm/thread.h>
-+#include <kdp/kdp_dyld.h>
++/* thread_getstatus: the machine-independent way BSD code reads user registers (kern_core.c declares it the same way) */
++extern kern_return_t thread_getstatus(thread_t act, int flavor, thread_state_t tstate, mach_msg_type_number_t *count);
 +/*
 + * guamp: one log line per crashing process (the ones the kernel would turn into a corpse). Corpses are off
 + * (-no_corpses) and ReportCrash wrote no reports, so this is the only record of where a daemon died: exception code
@@ -18,15 +18,17 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +static void
 +guamp_exit_trace(proc_t p, int rv, mach_exception_data_type_t code, mach_exception_data_type_t subcode)
 +{
-+	arm_saved_state_t *state = find_user_regs(current_thread());
-+	if (p != current_proc() || state == NULL || !is_saved_state64(state)) {
++	arm_thread_state64_t ts;
++	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
++	if (p != current_proc() ||
++	    thread_getstatus(current_thread(), ARM_THREAD_STATE64, (thread_state_t)&ts, &count) != KERN_SUCCESS) {
 +		printf("guamp exit: %s[%d] rv 0x%x code 0x%llx sub 0x%llx (no user state)\n", p->p_comm, proc_getpid(p), rv,
 +		    (uint64_t)code, (uint64_t)subcode);
 +		return;
 +	}
 +	char bt[16 * 13 + 1] = "";
 +	size_t used = 0;
-+	uint64_t frame = get_saved_state_fp(state);
++	uint64_t frame = ts.__fp;
 +	for (unsigned depth = 0; depth < 16 && frame && !(frame & 15) && used + 14 < sizeof(bt); depth++) {
 +		uint64_t pair[2];
 +		if (copyin((user_addr_t)frame, pair, sizeof(pair))) {
@@ -49,9 +51,9 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +		}
 +	}
 +	printf("guamp exit: %s[%d] rv 0x%x code 0x%llx sub 0x%llx PC %llx LR %llx SP %llx X0 %llx X1 %llx slide %llx image %llx %s bt%s\n",
-+	    p->p_comm, proc_getpid(p), rv, (uint64_t)code, (uint64_t)subcode, (uint64_t)get_saved_state_pc(state),
-+	    (uint64_t)get_saved_state_lr(state), (uint64_t)get_saved_state_sp(state), (uint64_t)get_saved_state_reg(state, 0),
-+	    (uint64_t)get_saved_state_reg(state, 1), (uint64_t)info.sharedCacheSlide, image.imageLoadAddress,
++	    p->p_comm, proc_getpid(p), rv, (uint64_t)code, (uint64_t)subcode, (uint64_t)ts.__pc,
++	    (uint64_t)ts.__lr, (uint64_t)ts.__sp, (uint64_t)ts.__x[0],
++	    (uint64_t)ts.__x[1], (uint64_t)info.sharedCacheSlide, image.imageLoadAddress,
 +	    path, bt);
 +}
 +#endif /* __arm64__ */
@@ -59,7 +61,7 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -2037,6 +2088,11 @@
+@@ -2037,6 +2090,11 @@
  
  
  	/* stash the usage into corpse data if making_corpse == true */
