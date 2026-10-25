@@ -28,7 +28,7 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +	}
 +	char bt[16 * 13 + 1] = "";
 +	size_t used = 0;
-+	uint64_t frame = ts.__fp;
++	uint64_t frame = ts.fp;
 +	for (unsigned depth = 0; depth < 16 && frame && !(frame & 15) && used + 14 < sizeof(bt); depth++) {
 +		uint64_t pair[2];
 +		if (copyin((user_addr_t)frame, pair, sizeof(pair))) {
@@ -51,9 +51,9 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +		}
 +	}
 +	printf("guamp exit: %s[%d] rv 0x%x code 0x%llx sub 0x%llx PC %llx LR %llx SP %llx X0 %llx X1 %llx slide %llx image %llx %s bt%s\n",
-+	    p->p_comm, proc_getpid(p), rv, (uint64_t)code, (uint64_t)subcode, (uint64_t)ts.__pc,
-+	    (uint64_t)ts.__lr, (uint64_t)ts.__sp, (uint64_t)ts.__x[0],
-+	    (uint64_t)ts.__x[1], (uint64_t)info.sharedCacheSlide, image.imageLoadAddress,
++	    p->p_comm, proc_getpid(p), rv, (uint64_t)code, (uint64_t)subcode, (uint64_t)ts.pc,
++	    (uint64_t)ts.lr, (uint64_t)ts.sp, (uint64_t)ts.x[0],
++	    (uint64_t)ts.x[1], (uint64_t)info.sharedCacheSlide, image.imageLoadAddress,
 +	    path, bt);
 +}
 +#endif /* __arm64__ */
