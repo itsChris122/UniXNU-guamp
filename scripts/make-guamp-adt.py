@@ -35,6 +35,9 @@ PANIC_BASE = 0x13FD00000
 PANIC_SIZE = 0x100000
 
 
+# Himax touch firmware, local only (gitignored local/ of the device repository; the build copies the tree without it)
+TOUCH_FIRMWARE = Path.home() / 'moto/UniXNU-guamp/local/hlt_Himax_firmware.bin'
+
 def node(name, properties=(), children=()):
     properties = [('name', name.encode() + b'\0'), *properties]
     result = struct.pack('<II', len(properties), len(children))
@@ -139,8 +142,8 @@ def main():
             ('osenvironment', b'main\0'),
             # Himax touch firmware (vendor/firmware/hlt_Himax_firmware.bin, proprietary): only from the local
             # tree, never committed; the kernel touch service reads it here (stage 4).
-            *([('guamp-touch-firmware', (ROOT/'local/hlt_Himax_firmware.bin').read_bytes())]
-              if (ROOT/'local/hlt_Himax_firmware.bin').exists() else []),
+            *([('guamp-touch-firmware', TOUCH_FIRMWARE.read_bytes())]
+              if TOUCH_FIRMWARE.exists() else []),
             *([('certificate-production-status', u32(0)), ('effective-production-status-ap', u32(0)),
                ('certificate-security-mode', u32(1)), ('effective-security-mode-sep', u32(1))] if ipad else []),
             *([('ephemeral-storage', u32(1))]
