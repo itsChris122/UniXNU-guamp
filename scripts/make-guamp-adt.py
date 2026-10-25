@@ -187,7 +187,7 @@ def main():
             ('model', b'motorola,guamp\0'),
             *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
                ('artwork-device-idiom', b'pad\0'),
-               ('artwork-device-subtype', u32(2732)),
+               ('artwork-device-subtype', u32(2436)),   # iPhone X geometry (as Cowabunga does with ArtworkDeviceSubType); iPad Pro 12.9 is 2732
                ('artwork-scale-factor', u32(2)),
                ('artwork-display-gamut', b'P3\0'),
                ('compatible-device-fallback', b'iPad6,7\0'),
