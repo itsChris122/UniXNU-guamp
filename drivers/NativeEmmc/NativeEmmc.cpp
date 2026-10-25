@@ -2,7 +2,7 @@
 //
 // eMMC storage for guamp (Moto G9 Play, SM6115): SDHC1, Qualcomm sdhci-msm-v5 at 0x04744000.
 //
-// Polled PIO only (no DMA, no interrupts), one 512-byte block per command. The sequence was proven on the
+// Polled PIO with optional, verified ADMA2 transfers (no interrupts). The sequence was proven on the
 // phone before XNU (strumenti/guampPkg-extra/patch-darwinboot-emmctest.py): after ExitBootServices the
 // firmware leaves the host fully reset (bus power off, 1-bit, legacy timing) while the card is still in
 // the transfer state at HS200/HS400, so the card is brought back to HS timing with an 8-bit SDR bus at a
@@ -72,6 +72,10 @@ extern task_t kernel_task;
 char native_emmc_last_proc[32];
 // Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
+// Exclusive service time under the card gate; request latency above includes concurrent lock waits.
+uint64_t guamp_emmc_active = 0, guamp_emmc_mirror = 0, guamp_emmc_flush_ticks = 0;
+uint64_t guamp_emmc_queue = 0, guamp_emmc_read_bytes = 0, guamp_emmc_write_bytes = 0;
+uint64_t guamp_emmc_mirror_peak = 0, guamp_emmc_log_bytes = 0;
 // Where a read run spends its time: waiting for the gate, command (until command complete), data (until transfer
 // complete), copy out of the DMA buffer; runs = DMA read runs measured. Printed per 10 s as microseconds per run.
 uint64_t native_emmc_t_lock = 0, native_emmc_t_cmd = 0, native_emmc_t_data = 0, native_emmc_t_copy = 0, native_emmc_t_runs = 0;
@@ -105,7 +109,6 @@ constexpr uint64_t kFbPhys = 0x5C000000;
 constexpr uint32_t kFbWidth = 720, kFbHeight = 1600, kFbRowBytes = 2880;
 constexpr uint32_t kFbBytes = kFbRowBytes * kFbHeight;
 constexpr uint32_t kLogFirstBlock = 1, kLogMaxBlocks = 1023, kFbFirstBlock = 1024;
-constexpr uint32_t kFbEvery = 5;      // mirror passes per framebuffer copy
 constexpr uint32_t kPanicFirstBlock = 12288, kPanicBytes = 64 * 1024;   // panic region copy in kpan
 constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for the DMA write self test
 
@@ -491,6 +494,9 @@ struct Card {
   uint8_t *fbShadow = nullptr;             // last mirrored framebuffer
   volatile uint8_t *fb = nullptr;
   uint32_t sequence = 0, fbSequence = 0, resetAfter = 0, flushType = 0;
+  // USB mirroring is independent. Avoid a byte-by-byte scan of the uncached 4.6 MB framebuffer
+  // while holding the disk gate during normal operation; panic/restart still saves it.
+  uint32_t logIntervalMs = 5000, fbEvery = 0;
   thread_call_t mirrorCall = nullptr;
   bool online = false;
 
@@ -544,7 +550,9 @@ struct Card {
   // Log writes, confined to the log partition
   bool writeLogBlock(uint64_t index, const uint8_t *in) {
     if (!logBlocks || index >= logBlocks) return false;
-    return host.writeBlock(logFirst + index, in);
+    bool ok = host.writeBlock(logFirst + index, in);
+    if (ok) guamp_emmc_log_bytes += kBlock;
+    return ok;
   }
   // Writes the blocks of source that differ from shadow; false on a write error
   bool mirrorRange(uint64_t firstBlock, const volatile uint8_t *source, uint8_t *copy, uint32_t bytes) {
@@ -676,22 +684,45 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
 {
   Card &card = gCard;
   IOLockLock(card.gate);
-  card.mirror(card.sequence % kFbEvery == 0);
+  const uint64_t mirrorBegan = mach_absolute_time();
+  if (card.logIntervalMs) card.mirror(card.fbEvery && card.sequence % card.fbEvery == 0);
+  const uint64_t mirrorTicks = mach_absolute_time() - mirrorBegan;
+  guamp_emmc_mirror += mirrorTicks;
+  if (mirrorTicks > guamp_emmc_mirror_peak) guamp_emmc_mirror_peak = mirrorTicks;
+  const uint64_t now = mach_absolute_time();
+  static uint64_t lastTime = 0;
+  static bool sampling = false;
+  uint64_t spanNs = 0;
+  if (sampling) absolutetime_to_nanoseconds(now - lastTime, &spanNs);
+  const bool report = sampling && spanNs >= 10000000000ULL;
+  const uint64_t active = guamp_emmc_active, mirror = guamp_emmc_mirror, flush = guamp_emmc_flush_ticks;
+  const uint64_t queue = guamp_emmc_queue, readBytes = guamp_emmc_read_bytes, writeBytes = guamp_emmc_write_bytes;
+  const uint64_t logBytes = guamp_emmc_log_bytes, mirrorPeak = guamp_emmc_mirror_peak;
+  if (report || !sampling) guamp_emmc_mirror_peak = 0;
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
   IOLockUnlock(card.gate);
-  static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0, lastTime = 0;
-  if (card.sequence % 10 == 0) {
-    uint64_t now = mach_absolute_time(), busy = native_emmc_busy, requests = native_emmc_requests;
-    uint64_t busyNs = 0, spanNs = 0;
+  static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0;
+  static uint64_t lastActive = 0, lastMirror = 0, lastFlush = 0, lastQueue = 0;
+  static uint64_t lastReadBytes = 0, lastWriteBytes = 0, lastLogBytes = 0;
+  const uint64_t busy = __atomic_load_n(&native_emmc_busy, __ATOMIC_RELAXED);
+  const uint64_t requests = __atomic_load_n(&native_emmc_requests, __ATOMIC_RELAXED);
+  if (report) {
+    uint64_t busyNs = 0;
     absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
-    absolutetime_to_nanoseconds(now - lastTime, &spanNs);
-    IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, driver busy %llu%%\n",
+    IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, aggregate request latency %llu%%\n",
           requests - lastRequests, requests > lastRequests ? (reads - lastReads) / (requests - lastRequests) : 0,
           spanNs ? busyNs * 100 / spanNs : 0);
-    lastBusy = busy; lastRequests = requests; lastTime = now;
-    IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
-          reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
-    lastReads = reads;
+    uint64_t ns[5] = {}, ticks[5] = {active - lastActive, mirror - lastMirror, flush - lastFlush,
+                                   queue - lastQueue, mirrorPeak};
+    for (unsigned i = 0; i < 5; ++i) absolutetime_to_nanoseconds(ticks[i], &ns[i]);
+    IOLog("NativeEmmc perf: request-active %llu%% mirror-active %llu%% flush-active %llu%%; read %llu KiB/s write %llu KiB/s; queue-sum %llu ms\n",
+          ns[0] * 100 / spanNs, ns[1] * 100 / spanNs, ns[2] * 100 / spanNs,
+          (readBytes - lastReadBytes) * 1000000000ULL / spanNs / 1024,
+          (writeBytes - lastWriteBytes) * 1000000000ULL / spanNs / 1024, ns[3] / 1000000);
+    IOLog("NativeEmmc perf: sample %llu ms, log-saved %llu KiB, mirror-max %llu us\n",
+          spanNs / 1000000, (logBytes - lastLogBytes) / 1024, ns[4] / 1000);
+    IOLog("NativeEmmc: %llu reads (+%llu in %llu ms), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
+          reads, reads - lastReads, spanNs / 1000000, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     static uint64_t lastLock = 0, lastCmd = 0, lastData = 0, lastCopy = 0, lastRuns = 0;
     uint64_t runs = native_emmc_t_runs - lastRuns;
     if (runs) {
@@ -708,9 +739,15 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
             native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes,
             native_emmc_dma_write_runs, native_emmc_dma_write_failures);
   }
+  if (report || !sampling) {
+    lastBusy = busy; lastRequests = requests; lastTime = now; lastReads = reads;
+    lastActive = active; lastMirror = mirror; lastFlush = flush; lastQueue = queue;
+    lastReadBytes = readBytes; lastWriteBytes = writeBytes; lastLogBytes = logBytes;
+    sampling = true;
+  }
   if (card.resetAfter && card.sequence >= card.resetAfter) psci(0x84000009);   // SYSTEM_RESET
   uint64_t when = 0;
-  clock_interval_to_deadline(1, kSecondScale, &when);
+  clock_interval_to_deadline(card.logIntervalMs ? card.logIntervalMs : 1000, kMillisecondScale, &when);
   thread_call_enter_delayed(card.mirrorCall, when);
 }
 
@@ -811,23 +848,30 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   if (!card.online) return kIOReturnNotReady;
   uint64_t started = mach_absolute_time();
   if (!write) {
-    native_emmc_requests++;
+    __atomic_fetch_add(&native_emmc_requests, 1ULL, __ATOMIC_RELAXED);
     native_emmc_last_pid = proc_selfpid();
     proc_selfname(native_emmc_last_proc, sizeof(native_emmc_last_proc));
   }
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
-  // The gate is taken per bounce-buffer run, so a long request does not starve the log mirror
+  // The gate is taken per bounce-buffer run, so requests can share the card.
   while (done < count) {
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
     uint64_t waitFrom = mach_absolute_time();
     IOLockLock(card.gate);
-    if (!write) native_emmc_t_lock += mach_absolute_time() - waitFrom;
+    const uint64_t activeBegan = mach_absolute_time();
+    guamp_emmc_queue += activeBegan - waitFrom;
+    if (!write) native_emmc_t_lock += activeBegan - waitFrom;
     bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
                     : card.readBlocks(first + block + done, n, card.bounce) &&
                           buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
+    guamp_emmc_active += mach_absolute_time() - activeBegan;
+    if (ok) {
+      if (write) guamp_emmc_write_bytes += bytes;
+      else guamp_emmc_read_bytes += bytes;
+    }
     IOLockUnlock(card.gate);
     if (!ok) { status = kIOReturnIOError; break; }
     done += n;
@@ -843,7 +887,9 @@ IOReturn NativeEmmc::doSynchronizeCache()
   if (!card.online) return kIOReturnNotReady;
   if (!writable) return kIOReturnSuccess;
   IOLockLock(card.gate);
+  const uint64_t began = mach_absolute_time();
   bool ok = card.host.flushCache();
+  guamp_emmc_flush_ticks += mach_absolute_time() - began;
   IOLockUnlock(card.gate);
   return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
@@ -1063,6 +1109,15 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     }
   }
   PE_parse_boot_argn("guamp-emmc-reset", &card.resetAfter, sizeof(card.resetAfter));
+  // Legacy comparison: guamp-emmc-log-ms=1000 guamp-emmc-fb-every=5.
+  // log-ms=0 disables only the periodic kpan writes; forced panic/restart flushes remain.
+  uint32_t logMs = card.logIntervalMs, fbEvery = card.fbEvery;
+  if (PE_parse_boot_argn("guamp-emmc-log-ms", &logMs, sizeof(logMs)) &&
+      (!logMs || (logMs >= 100 && logMs <= 60000))) card.logIntervalMs = logMs;
+  if (PE_parse_boot_argn("guamp-emmc-fb-every", &fbEvery, sizeof(fbEvery)) && fbEvery <= 3600)
+    card.fbEvery = fbEvery;
+  IOLog("NativeEmmc: periodic kpan log %u ms, framebuffer every %u passes (0=off); panic/restart capture retained\n",
+        card.logIntervalMs, card.fbEvery);
   card.mirrorCall = thread_call_allocate(mirrorEntry, nullptr);
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
   publish(0, card.capacity, "user area");
