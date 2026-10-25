@@ -72,6 +72,10 @@ extern task_t kernel_task;
 char native_emmc_last_proc[32];
 // Time inside doAsyncReadWrite (mach absolute units) and the number of read requests: is the driver the bottleneck?
 uint64_t native_emmc_busy = 0, native_emmc_requests = 0;
+// Where a read run spends its time: waiting for the gate, command (until command complete), data (until transfer
+// complete), copy out of the DMA buffer; runs = DMA read runs measured. Printed per 10 s as microseconds per run.
+uint64_t native_emmc_t_lock = 0, native_emmc_t_cmd = 0, native_emmc_t_data = 0, native_emmc_t_copy = 0, native_emmc_t_runs = 0;
+uint32_t native_emmc_ddr = 0;                      // DDR52 (8-bit dual data rate) in use (guamp-emmc-ddr=1, self-tested)
 // ADMA2 reads (boot argument guamp-emmc-dma=1): 1 when verified and in use, and the failed DMA runs
 uint32_t native_emmc_dma = 0;
 uint32_t native_emmc_dma_write = 0;                 // CMD25 + ADMA2 writes in use (guamp-emmc-dmaw=1, self-tested)
@@ -271,6 +275,15 @@ public:
     return true;
   }
 
+  // DDR52: card EXT_CSD BUS_WIDTH 6 (8-bit dual data rate, needs HS_TIMING 1, set by init) and host UHS mode DDR50
+  // (Host Control 2 bits 2:0 = 4); back to 8-bit SDR (BUS_WIDTH 2, mode 0) when off. The data lines then carry a bit on
+  // both clock edges at the same SD clock, so block data moves twice as fast; commands stay single data rate.
+  bool setDdr(bool on) {
+    bool ok = command(6, (3u << 24) | (183u << 16) | ((on ? 6u : 2u) << 8), true);
+    w16(rHostCtl2, static_cast<uint16_t>((r16(rHostCtl2) & ~7) | (on ? 4 : 0)));
+    return ok;
+  }
+
   // CMD18 with block count and auto CMD12, at the same proven clock: one command per run instead of per block
   bool readMulti(uint64_t lba, uint32_t count, uint8_t *out) {
     w32(rStatus, 0xFFFFFFFF);
@@ -334,8 +347,12 @@ public:
     w16(rBlockCount, static_cast<uint16_t>(count));
     w32(rArg, static_cast<uint32_t>(lba));
     w16(rXfer, (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0));
+    uint64_t t0 = mach_absolute_time();
     w16(rCmd, (18 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
-    bool ok = !wait(sCmdDone, 100) && !wait(sXferDone, 2000);
+    bool ok = !wait(sCmdDone, 100);
+    uint64_t t1 = mach_absolute_time();
+    ok = ok && !wait(sXferDone, 2000);
+    uint64_t t2 = mach_absolute_time();
     w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
     if (!ok) return false;
     __asm__ volatile("dsb sy" ::: "memory");
@@ -343,6 +360,10 @@ public:
       uint64_t word = *reinterpret_cast<volatile uint64_t *>(dmaData + i);
       memcpy(out + i, &word, 8);
     }
+    native_emmc_t_cmd += t1 - t0;
+    native_emmc_t_data += t2 - t1;
+    native_emmc_t_copy += mach_absolute_time() - t2;
+    native_emmc_t_runs++;
     native_emmc_reads += count;
     return true;
   }
@@ -637,6 +658,17 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
     IOLog("NativeEmmc: %llu reads (+%llu in 10 s), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
           reads, reads - lastReads, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
     lastReads = reads;
+    static uint64_t lastLock = 0, lastCmd = 0, lastData = 0, lastCopy = 0, lastRuns = 0;
+    uint64_t runs = native_emmc_t_runs - lastRuns;
+    if (runs) {
+      uint64_t us[4] = {}, d[4] = {native_emmc_t_lock - lastLock, native_emmc_t_cmd - lastCmd, native_emmc_t_data - lastData,
+                                   native_emmc_t_copy - lastCopy};
+      for (unsigned i = 0; i < 4; i++) { absolutetime_to_nanoseconds(d[i], &us[i]); us[i] /= 1000 * runs; }
+      IOLog("NativeEmmc: per read run (us): gate wait %llu, command %llu, data %llu, copy %llu; %llu runs, divider %u, %s" "\n",
+            us[0], us[1], us[2], us[3], runs, card.host.divider, native_emmc_ddr ? "DDR52" : "SDR");
+    }
+    lastLock = native_emmc_t_lock; lastCmd = native_emmc_t_cmd; lastData = native_emmc_t_data; lastCopy = native_emmc_t_copy;
+    lastRuns = native_emmc_t_runs;
     if (native_emmc_errors)
       IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes, DMA write runs %llu (failed %llu)\n",
             native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes,
@@ -755,7 +787,9 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   while (done < count) {
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
+    uint64_t waitFrom = mach_absolute_time();
     IOLockLock(card.gate);
+    if (!write) native_emmc_t_lock += mach_absolute_time() - waitFrom;
     bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
                     : card.readBlocks(first + block + done, n, card.bounce) &&
@@ -917,6 +951,27 @@ static void startLater(thread_call_param_t, thread_call_param_t)
       card.host.setClock(8);
     }
     IOLog("NativeEmmc: clock divider %u requested, %u in use\n", wanted, card.host.divider);
+    if (reference) IOFree(reference, 33 * kBlock);
+    if (check) IOFree(check, 33 * kBlock);
+  }
+  // Boot argument guamp-emmc-ddr=1: DDR52, kept only if the GPT header and entries read back identical to SDR (single
+  // blocks and a CMD18 run, four passes); otherwise back to SDR with the card and host lines recovered
+  uint32_t ddr = 0;
+  if (PE_parse_boot_argn("guamp-emmc-ddr", &ddr, sizeof(ddr)) && ddr) {
+    uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
+    bool ok = reference && check && card.readBlocks(1, 33, reference) && card.host.setDdr(true);
+    for (unsigned pass = 0; ok && pass < 4; pass++) {
+      memset(check, 0, 33 * kBlock);
+      ok = (pass & 1 ? card.readBlocks(1, 33, check) : card.host.readBlock(1, check)) &&
+           !memcmp(reference, check, (pass & 1 ? 33 : 1) * kBlock);
+    }
+    if (!ok) {
+      card.host.recover();
+      card.host.setDdr(false);
+      card.host.recover();
+    }
+    native_emmc_ddr = ok ? 1 : 0;
+    IOLog("NativeEmmc: DDR52 %s" "\n", ok ? "verified, in use" : "refused, SDR");
     if (reference) IOFree(reference, 33 * kBlock);
     if (check) IOFree(check, 33 * kBlock);
   }

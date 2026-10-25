@@ -163,7 +163,8 @@ kernel_args = [
   "guamp-usb-mirror=1",                # NativeEmmc UsbMirror.inc: live screen and log over USB (strumenti/specchio-ios.py)
   "guamp-emmc-dma=1",                   # NativeEmmc: ADMA2 reads if they match PIO (PIO: 2.4 MB/s, driver 92% busy)
   "guamp-emmc-dmaw=1",                  # NativeEmmc: CMD25 + ADMA2 writes if a kpan write test reads back identical
-  "guamp-emmc-div=4",                   # NativeEmmc: SD clock base/8 if it reads back correctly (proven: 8 = base/16)
+  "guamp-emmc-div=2",                   # NativeEmmc: SD clock base/4 (~48 MHz, HS max 52) if it reads back correctly (proven: 8 = base/16, 4 = base/8)
+  "guamp-emmc-ddr=1",                   # NativeEmmc: DDR52 (8-bit dual data rate) if it reads back identical to SDR
 ]
 
 [payload.adt]
