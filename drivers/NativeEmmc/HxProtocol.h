@@ -93,6 +93,8 @@ struct hx_chip {
     uint16_t x_res, y_res;
     int xy_reverse, int_is_edge;
     uint8_t dbg_dummy[4], dbg_conti, dbg_incr4;   // last interface_on replies, for the boot log
+    unsigned reset_low_ms, reset_high_ms;          // 0: vendor timing (20 ms low, 50 ms high)
+    int reset_invert, reset_skip;                  // reset line active high / do not touch it
 };
 
 struct hx_zf_part {uint32_t sram, size, offset;};

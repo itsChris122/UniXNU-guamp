@@ -163,6 +163,7 @@ void thread(void *, wait_result_t) {
   uint32_t stable = 0, last = 0, sent = 0;
   uint8_t iclCode = 0, fccCode = 0;
   bool configured = false, apsdRequested = false;
+  unsigned absentTicks = 0, typecResets = 0;
   for (unsigned tick = 0;; ++tick) {
     uint32_t now = readButtons();
     stable = now == last ? stable + 1 : 0;
@@ -184,6 +185,16 @@ void thread(void *, wait_result_t) {
       read8(kPmi632, 0x1510, &typecRt);
       gChg[6] = usbinRt; gChg[7] = typecRt;
       bool present = (usbinRt & 0x10) != 0;
+      // After the first unplug the PMIC never saw VBUS again (USBIN under-voltage, TYPEC no attach), not even on the PC
+      // port that carried the USB data: try a Type-C state machine reset (disable command, then sink only again) every
+      // 15 s while nothing is detected.
+      if (!present && ++absentTicks % 3 == 0) {
+        write8(kPmi632, kTypecModeCfg, kTypecSinkOnly | 0x01);
+        IOSleep(100);
+        write8(kPmi632, kTypecModeCfg, kTypecSinkOnly);
+        typecResets = typecResets + 1;
+      }
+      if (present) absentTicks = 0;
       if (present && !configured && !apsdRequested) {
         write8(kPmi632, kUsbinCmdIl, 0x00);
         write8(kPmi632, 0x1341, 0x01);         // CMD_APSD: rerun source detection, configure on a later tick
@@ -193,6 +204,23 @@ void thread(void *, wait_result_t) {
       charger(present && !configured && apsdRequested && apsdDone, iclMa, fccMa, &iclCode, &fccCode);
       if (present && !configured && apsdRequested && apsdDone) configured = true;
       if (!present) { configured = false; apsdRequested = false; }
+      if (tick % 1200 == 0) {
+        // Register dump: USBIN 0x1300-0x130f and 0x1340-0x134f, TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f
+        static const uint16_t blocks[5] = {0x1300, 0x1340, 0x1500, 0x1540, 0x1600};
+        char text[5 * 33 + 8];
+        unsigned at = 0;
+        for (unsigned b = 0; b < 5; ++b) {
+          for (unsigned k = 0; k < 16; ++k) {
+            uint8_t v = 0;
+            read8(kPmi632, static_cast<uint16_t>(blocks[b] + k), &v);
+            static const char hexd[] = "0123456789abcdef";
+            text[at++] = hexd[v >> 4]; text[at++] = hexd[v & 15];
+          }
+          text[at++] = ' ';
+        }
+        text[at] = 0;
+        IOLog("GuampPmic: regs 1300 1340 1500 1540 1600: %s typec resets %u\n", text, typecResets);
+      }
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, iclCode, fccCode, gErrors,

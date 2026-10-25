@@ -128,13 +128,19 @@ bool openBus() {
   gChip.bus = &gBus; gChip.frame = gFrame; gChip.rx = gRx;
   // The DT says spi-cpha (mode 1); the first boot got no answer in that mode, so every mode is tried and logged with
   // the raw replies of the wake-up exchange (dummy read of 0x08, read back of 0x13/0x0D after writing 0x31/0x10).
+  // Reset variants (in-cell panel: the touch reset may be shared with or gated by the display): none, vendor timing,
+  // long timing, inverted polarity; each with every SPI mode.
   static const unsigned modes[4] = {GENI_SPI_CPHA, 0, GENI_SPI_CPHA | GENI_SPI_CPOL, GENI_SPI_CPOL};
+  static const struct {unsigned low, high; int invert, skip;} resets[4] = {{0, 0, 0, 1}, {0, 0, 0, 0}, {50, 300, 0, 0}, {20, 100, 1, 0}};
   r = HX_ERR_CHIP;
-  for (unsigned m = 0; m < 4 && r; ++m) {
+  for (unsigned v = 0; v < 4 * 4 && r; ++v) {
+    const unsigned m = v % 4;
     geni_spi_setup(&gSpi, modes[m], 0);
+    gChip.reset_low_ms = resets[v / 4].low; gChip.reset_high_ms = resets[v / 4].high;
+    gChip.reset_invert = resets[v / 4].invert; gChip.reset_skip = resets[v / 4].skip;
     r = hx_identify(&gChip);
-    IOLog("GuampTouch: mode %u identify rc %d stage %d dummy %02x%02x%02x%02x conti %02x incr4 %02x id %02x %02x %02x %02x central %02x\n",
-          modes[m], r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3], gChip.dbg_conti,
+    IOLog("GuampTouch: reset %u mode %u identify rc %d stage %d dummy %02x%02x%02x%02x conti %02x incr4 %02x id %02x %02x %02x %02x central %02x\n",
+          v / 4, modes[m], r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3], gChip.dbg_conti,
           gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0], gChip.central_state);
   }
   if (r) { fail(32, r); return false; }

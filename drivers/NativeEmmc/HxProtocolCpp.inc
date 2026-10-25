@@ -145,11 +145,11 @@ int hx_reg_read32(struct hx_chip *c, uint32_t addr, uint32_t *value)
 
 void hx_pin_reset(struct hx_chip *c)
 {
-    if (!c->bus->reset) return;
-    c->bus->reset(c->bus->ctx, 0);
-    sleep_ms(c, 20);
-    c->bus->reset(c->bus->ctx, 1);
-    sleep_ms(c, 50);
+    if (!c->bus->reset || c->reset_skip) return;
+    c->bus->reset(c->bus->ctx, c->reset_invert ? 1 : 0);
+    sleep_ms(c, c->reset_low_ms ? c->reset_low_ms : 20);
+    c->bus->reset(c->bus->ctx, c->reset_invert ? 0 : 1);
+    sleep_ms(c, c->reset_high_ms ? c->reset_high_ms : 50);
 }
 
 int hx_interface_on(struct hx_chip *c)
