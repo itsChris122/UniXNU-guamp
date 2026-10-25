@@ -44,7 +44,18 @@ volatile int gError;
 void fail(unsigned step, int code) { if (!gError) { gStep = step; gError = code ? code : -1; } IOLog("GuampTouch: step %u failed (%d)\n", step, code); }
 void pinWrite(unsigned gpio, uint32_t off, uint32_t v) { wr(gTlmm, gt_pin(gpio) + off, v); }
 uint32_t pinRead(unsigned gpio, uint32_t off) { return rd(gTlmm, gt_pin(gpio) + off); }
-int busXfer(void *, const uint8_t *tx, uint8_t *rx, size_t len) { return geni_spi_transfer(&gSpi, tx, rx, len, 0); }
+// gGpioCs: chip select driven as a plain GPIO around each frame (the pads showed the GENI CS lane never high).
+bool gGpioCs = false;
+int busXfer(void *, const uint8_t *tx, uint8_t *rx, size_t len) {
+  if (!gGpioCs) return geni_spi_transfer(&gSpi, tx, rx, len, 0);
+  pinWrite(GT_GPIO_SPI_D, 4, 0);                                   // CS low
+  IODelay(2);
+  int r = geni_spi_transfer(&gSpi, tx, rx, len, 0);
+  IODelay(2);
+  pinWrite(GT_GPIO_SPI_D, 4, 2);                                   // CS high
+  IODelay(10);
+  return r;
+}
 void busSleep(void *, unsigned ms) { IOSleep(ms ? ms : 1); }
 void busReset(void *, int level) { pinWrite(GT_GPIO_RESET, 4, level ? 2u : 0u); }
 
@@ -136,10 +147,18 @@ bool openBus() {
   // Reset variants (in-cell panel: the touch reset may be shared with or gated by the display): none, vendor timing,
   // long timing, inverted polarity; each with every SPI mode.
   static const unsigned modes[4] = {GENI_SPI_CPHA, 0, GENI_SPI_CPHA | GENI_SPI_CPOL, GENI_SPI_CPOL};
-  static const struct {unsigned low, high; int invert, skip;} resets[4] = {{0, 0, 0, 1}, {0, 0, 0, 0}, {50, 300, 0, 0}, {20, 100, 1, 0}};
+  static const struct {unsigned low, high; int invert, skip;} resets[5] = {{0, 0, 0, 1}, {0, 0, 0, 0}, {50, 300, 0, 0}, {20, 100, 1, 0},
+                                                                       {0, 0, 0, 0}};   // 4: vendor timing, GPIO chip select
   r = HX_ERR_CHIP;
-  for (unsigned v = 0; v < 4 * 4 && r; ++v) {
+  IOLog("GuampTouch: idle pads gpio6 %u gpio7 %u gpio71 %u gpio80 %u irq %u\n", pinRead(GT_GPIO_SPI_A, 4) & 1,
+        pinRead(GT_GPIO_SPI_B, 4) & 1, pinRead(GT_GPIO_SPI_C, 4) & 1, pinRead(GT_GPIO_SPI_D, 4) & 1, pinRead(GT_GPIO_IRQ, 4) & 1);
+  for (unsigned v = 0; v < 5 * 4 && r; ++v) {
     const unsigned m = v % 4;
+    if (v == 16) {                                                  // GPIO chip select: gpio80 as output, idle high
+      pinWrite(GT_GPIO_SPI_D, 4, 2);
+      pinWrite(GT_GPIO_SPI_D, 0, 0x280);                            // func 0 (GPIO), output enable, 6 mA
+      gGpioCs = true;
+    }
     geni_spi_setup(&gSpi, modes[m], 0);
     gChip.reset_low_ms = resets[v / 4].low; gChip.reset_high_ms = resets[v / 4].high;
     gChip.reset_invert = resets[v / 4].invert; gChip.reset_skip = resets[v / 4].skip;
