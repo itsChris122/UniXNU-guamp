@@ -16,8 +16,10 @@ extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 void native_touch_published(void);
-extern const uint8_t guamp_touch_firmware[] __attribute__((weak_import));
-extern const uint32_t guamp_touch_firmware_size __attribute__((weak_import));
+// Empty weak defaults: a generated firmware object (strong symbols) replaces them; the kernel links statically, so an
+// undefined weak import does not link.
+__attribute__((weak)) extern const uint8_t guamp_touch_firmware[1] = {0};
+__attribute__((weak)) extern const uint32_t guamp_touch_firmware_size = 0;
 extern int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 }
 
@@ -172,7 +174,7 @@ void thread(void *param, wait_result_t) {
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
   if (!snapshot() || stage < 2 || !enable() || stage < 3 || !openBus() || stage < 4) return;
   gStep = 4;
-  if (!&guamp_touch_firmware || !&guamp_touch_firmware_size || !guamp_touch_firmware_size) { fail(4, -2); return; }
+  if (!guamp_touch_firmware_size) { fail(4, -2); return; }
   struct hx_fw fw;
   int r = hx_fw_parse(&fw, guamp_touch_firmware, guamp_touch_firmware_size);
   IOLog("GuampTouch: firmware %u bytes, %u partitions (rc %d)\n", guamp_touch_firmware_size, fw.count, r);
