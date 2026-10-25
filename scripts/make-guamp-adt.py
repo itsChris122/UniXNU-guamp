@@ -164,7 +164,9 @@ def main():
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])]
           if len(cpus) > 1 else []),
         # pmap_bootstrap() asserts /defaults; no suspend on this board
-        node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560))]),
+        # vmm-present (kern.hv_vmm_present): the original watchdogd exits normally in a VM without a watchdog service and
+        # stops with SIGTRAP otherwise; it is a critical daemon, so the trap panicked the boot (UniXNU-qemu does the same)
+        node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
         # DT has /filesystems/DoNotUseSEP ("insecure boot"): no SEP here to wrap the volume keys
