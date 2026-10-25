@@ -292,6 +292,9 @@ static int transfer_dma(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size
     return status;
 }
 
+// Called on every poll of a FIFO transfer when set (pad sampling diagnostics of the owner).
+void (*geni_spi_sample_hook)(void) = nullptr;
+
 int geni_spi_transfer(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size_t len, int keep_cs) {
     if (!s || !len || len > GENI_TRANS_LEN_MASK || (!tx && !rx) || !s->cur_speed_hz) return GENI_ERR_PARAM;
     if (s->cur_bpw != 8) {
@@ -315,6 +318,7 @@ int geni_spi_transfer(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size_t
     if (tx && handle_tx(s, &x)) wr(s, SE_GENI_TX_WATERMARK_REG, s->tx_wm);
     int status = GENI_ERR_TIMEOUT;
     for (unsigned n = 0; n < s->poll_limit; n++) {
+        if (geni_spi_sample_hook) geni_spi_sample_hook();
         uint32_t st = rd(s, SE_GENI_M_IRQ_STATUS);
         if (!st) {
             if (s->se.delay_us) s->se.delay_us(s->se.ctx, 1);

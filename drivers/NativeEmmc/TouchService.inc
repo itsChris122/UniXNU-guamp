@@ -11,7 +11,7 @@
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
 #include "GeniSpiCpp.inc"
-#include "HxProtocolCpp.inc"
+#include "HxProtocol.c"
 
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count;
@@ -102,6 +102,8 @@ bool enable() {
   return true;
 }
 
+volatile uint32_t gSeenHigh, gSeenLow, gSamples;
+
 bool openBus() {
   gStep = 3;
   gSpi.poll_limit = 400000;
@@ -145,6 +147,37 @@ bool openBus() {
     IOLog("GuampTouch: reset %u mode %u identify rc %d stage %d dummy %02x%02x%02x%02x conti %02x incr4 %02x id %02x %02x %02x %02x central %02x\n",
           v / 4, modes[m], r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3], gChip.dbg_conti,
           gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0], gChip.central_state);
+  }
+  // Pad levels while a 4 KiB read runs at 1 MHz (TLMM in bit of each pin, sampled on every FIFO poll): which of
+  // gpio6/7/71/80 (lanes 0..3: MISO, MOSI, CLK, CS) and the IRQ line ever read high and low. A lane that never moves is
+  // not driven: the CS lane decides whether the chip is selected at all, the MISO lane whether it answers. Only after
+  // a failed identify (the clock stays at 1 MHz).
+  if (r) {
+    static const unsigned pins[5] = {GT_GPIO_SPI_A, GT_GPIO_SPI_B, GT_GPIO_SPI_C, GT_GPIO_SPI_D, GT_GPIO_IRQ};
+    gSeenHigh = gSeenLow = 0; gSamples = 0;
+    geni_spi_sample_hook = [] {
+      for (unsigned i = 0; i < 5; i++) {
+        if (pinRead(pins[i], 4) & 1) gSeenHigh |= 1u << i; else gSeenLow |= 1u << i;
+      }
+      gSamples++;
+    };
+    geni_spi_setup(&gSpi, GENI_SPI_CPHA, 0);
+    geni_spi_set_clock(&gSpi, 1000000, static_cast<unsigned>(gLevelHz[0]), 0);   // level 0 (19.2 MHz) / 19
+    gFrame[0] = HX_SPI_READ; gFrame[1] = HX_BUS_RDATA;
+    for (unsigned i = 2; i < 4096; i++) gFrame[i] = static_cast<uint8_t>(i * 37);
+    int pr = geni_spi_transfer(&gSpi, gFrame, gRx, 4096, 0);
+    geni_spi_sample_hook = nullptr;
+    unsigned nonzero = 0;
+    for (unsigned i = 0; i < 4096; i++) nonzero += gRx[i] != 0;
+    IOLog("GuampTouch: pads during 4 KiB at 1 MHz (rc %d, %u samples, %u rx bytes not 0): high %02x low %02x (bits gpio6 7 71 80 irq67)\n",
+          pr, gSamples, nonzero, gSeenHigh, gSeenLow);
+    // Same read with a pull-up on the MISO pad: 0xff back = nobody drives MISO (the chip is not answering), 0x00 = the
+    // line is held low (another driver, or the pad is not MISO).
+    const uint32_t misoCtl = pinRead(GT_GPIO_SPI_A, 0);
+    pinWrite(GT_GPIO_SPI_A, 0, (misoCtl & ~3u) | 3u);
+    pr = geni_spi_transfer(&gSpi, gFrame, gRx, 64, 0);
+    pinWrite(GT_GPIO_SPI_A, 0, misoCtl);
+    IOLog("GuampTouch: with MISO pull-up (rc %d): rx %02x %02x %02x %02x ... %02x %02x\n", pr, gRx[0], gRx[1], gRx[2], gRx[3], gRx[62], gRx[63]);
   }
   // GENI state after the last attempt: output control, CPHA/CPOL, demux, trans cfg, IO pin levels (GENI_IOS 0x908)
   IOLog("GuampTouch: geni out %08x cpha %08x cpol %08x demux %08x inv %08x trans %08x ios %08x clk %08x sel %08x\n",
