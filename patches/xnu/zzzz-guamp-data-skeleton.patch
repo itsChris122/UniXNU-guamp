@@ -16,7 +16,7 @@ index 124ba0a..a105798 100644
 +static const struct {
 +	const char *path;
 +	int mode;
-+	uid_t owner;
++	uid_t owner; int force;   /* force: also on an existing directory (the owner iOS itself gives it) */
 +} native_guamp_skeleton[] = {
 +	{"/private/var/db", 0755, 0},
 +	{"/private/var/db/timezone", 0755, 0},
@@ -36,19 +36,19 @@ index 124ba0a..a105798 100644
 +	{"/private/var/root/Library/Preferences", 0755, 0},
 +	{"/private/var/root/Library/Caches", 0755, 0},
 +	{"/private/var/preferences", 0755, 0},
-+	{"/private/var/Keychains", 0755, 0},
++	{"/private/var/Keychains", 0755, 64, 1},   /* _securityd: keychain-2.db (sqlite 14 while root owned) */
 +	{"/private/var/keybags", 0755, 0},
 +	{"/private/var/keybags/backup", 0755, 0},
 +	{"/private/var/MobileAsset", 0755, 0},
 +	{"/private/var/MobileSoftwareUpdate", 0755, 0},
 +	{"/private/var/folders", 0755, 0},
 +	{"/private/var/empty", 0555, 0},
-+	{"/private/var/installd", 0755, 33},           /* _installd: system app installs need its staging dir */
-+	{"/private/var/installd/Library", 0755, 33},
-+	{"/private/var/installd/Library/Caches", 0755, 33},
++	{"/private/var/installd", 0755, 33, 1},           /* _installd: system app installs need its staging dir */
++	{"/private/var/installd/Library", 0755, 33, 1},
++	{"/private/var/installd/Library/Caches", 0755, 33, 1},
 +	{"/private/var/hardware", 0755, 0},
-+	{"/private/var/wireless", 0755, 0},
-+	{"/private/var/networkd", 0755, 0},
++	{"/private/var/wireless", 0755, 25, 1},
++	{"/private/var/networkd", 0755, 24, 1},
 +	{"/private/var/protected", 0755, 0},
 +	{"/private/var/PersonaVolumes", 0755, 0},
 +	{"/private/var/preboot", 0755, 0},
@@ -61,7 +61,7 @@ index 124ba0a..a105798 100644
 +	{"/private/var/containers/Shared/SystemGroup", 0755, 0},
 +	{"/private/var/containers/Bundle", 0755, 0},
 +	{"/private/var/containers/Bundle/Application", 0755, 0},
-+	{"/private/var/mobile", 0755, 501},
++	{"/private/var/mobile", 0711, 501, 1},
 +	{"/private/var/mobile/Library", 0755, 501},
 +	{"/private/var/mobile/Library/Preferences", 0755, 501},
 +	{"/private/var/mobile/Library/Caches", 0755, 501},
@@ -83,12 +83,12 @@ index 124ba0a..a105798 100644
 +		if (!error) {
 +			error = mkdir(p, &request, &result);
 +		}
-+		int existed = (error == EEXIST);   /* existing ones keep their attributes, except the _installd ones */
++		int existed = (error == EEXIST);   /* existing ones keep their attributes, except the forced ones */
 +		if (existed) {
 +			error = 0;
 +		}
 +		vnode_t vp = NULLVP;
-+		if (!error && (!existed || native_guamp_skeleton[i].owner == 33)) {
++		if (!error && (!existed || native_guamp_skeleton[i].force)) {
 +			error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
 +		}
 +		if (!error && vp != NULLVP) {
