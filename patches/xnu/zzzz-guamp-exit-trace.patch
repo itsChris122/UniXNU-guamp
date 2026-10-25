@@ -1,0 +1,73 @@
+diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1882,6 +1882,57 @@
+ 	}
+ }
+ 
++#if defined(__arm64__)
++#include <arm/thread.h>
++#include <kdp/kdp_dyld.h>
++/*
++ * guamp: one log line per crashing process (the ones the kernel would turn into a corpse). Corpses are off
++ * (-no_corpses) and ReportCrash wrote no reports, so this is the only record of where a daemon died: exception code
++ * and subcode, the user registers of the dying thread, the shared cache slide, a frame pointer backtrace and the main
++ * image. Runs on the exiting thread of the process itself, before the task is torn down; copyin failures only shorten
++ * the line.
++ */
++static void
++guamp_exit_trace(proc_t p, int rv, mach_exception_data_type_t code, mach_exception_data_type_t subcode)
++{
++	arm_saved_state_t *state = find_user_regs(current_thread());
++	if (p != current_proc() || state == NULL || !is_saved_state64(state)) {
++		printf("guamp exit: %s[%d] rv 0x%x code 0x%llx sub 0x%llx (no user state)\n", p->p_comm, proc_getpid(p), rv,
++		    (uint64_t)code, (uint64_t)subcode);
++		return;
++	}
++	char bt[16 * 13 + 1] = "";
++	size_t used = 0;
++	uint64_t frame = get_saved_state_fp(state);
++	for (unsigned depth = 0; depth < 16 && frame && !(frame & 15) && used + 14 < sizeof(bt); depth++) {
++		uint64_t pair[2];
++		if (copyin((user_addr_t)frame, pair, sizeof(pair))) {
++			break;
++		}
++		used += (size_t)snprintf(bt + used, sizeof(bt) - used, " %llx", pair[1]);
++		if (pair[0] <= frame || pair[0] - frame > 1048576) {
++			break;
++		}
++		frame = pair[0];
++	}
++	struct user64_dyld_all_image_infos info = {};
++	struct user64_dyld_image_info image = {};
++	char path[96] = "";
++	size_t copied = 0;
++	if (!copyin(task_get_all_image_info_addr(current_task()), &info, sizeof(info)) && info.infoArrayCount && info.infoArray &&
++	    !copyin(info.infoArray, &image, sizeof(image))) {
++		if (copyinstr(image.imageFilePath, path, sizeof(path), &copied)) {
++			path[0] = 0;
++		}
++	}
++	printf("guamp exit: %s[%d] rv 0x%x code 0x%llx sub 0x%llx PC %llx LR %llx SP %llx X0 %llx X1 %llx slide %llx image %llx %s bt%s\n",
++	    p->p_comm, proc_getpid(p), rv, (uint64_t)code, (uint64_t)subcode, (uint64_t)get_saved_state_pc(state),
++	    (uint64_t)get_saved_state_lr(state), (uint64_t)get_saved_state_sp(state), (uint64_t)get_saved_state_reg(state, 0),
++	    (uint64_t)get_saved_state_reg(state, 1), (uint64_t)info.sharedCacheSlide, image.imageLoadAddress,
++	    path, bt);
++}
++#endif /* __arm64__ */
++
+ void
+ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ {
+@@ -2037,6 +2088,11 @@
+ 
+ 
+ 	/* stash the usage into corpse data if making_corpse == true */
++#if defined(__arm64__)
++	if (create_corpse == TRUE) {
++		guamp_exit_trace(p, rv, code, subcode);
++	}
++#endif
+ 	if (create_corpse == TRUE) {
+ 		kr = task_mark_corpse(task);
+ 		if (kr != KERN_SUCCESS) {
