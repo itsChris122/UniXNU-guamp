@@ -148,6 +148,8 @@ void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, u
   write8(kPmi632, kUsbinCmdIl, 0x00);      // input not suspended
 }
 
+#include "GuampChargeReplug.inc"
+
 void sinkFromHid(void (*sink)(void *, uint32_t), void *context) {
   gSink = nullptr;
   __asm__ volatile("dmb ish" ::: "memory");
@@ -176,6 +178,9 @@ void thread(void *, wait_result_t) {
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
   if (iclMa > 3000) iclMa = 3000;
   if (fccMa > 3000) fccMa = 3000;
+  unsigned chargeReplug = 0;
+  PE_parse_boot_argn("guamp-charge-replug", &chargeReplug, sizeof(chargeReplug));
+  IOLog("GuampCharge: reconnect controller %s\n", chargeReplug == 1 ? "enabled" : "legacy");
   uint32_t stable = 0, last = 0, sent = 0;
   uint8_t iclCode = 0, fccCode = 0;
   bool configured = false, apsdRequested = false;
@@ -190,7 +195,9 @@ void thread(void *, wait_result_t) {
       if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, now);
       IOLog("GuampPmic: buttons %x, HID sink %s\n", now, gSink ? "attached" : "absent");
     }
+    if (chargeReplug == 1 && tick % 10 == 0) chargeReplugPoll(iclMa, fccMa, &iclCode, &fccCode);
     if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
+      if (chargeReplug != 1) {
       // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
       // APSD result stayed 0 and the charger DISABLED. On every new plug-in: unsuspend the input, rerun APSD, configure.
       uint8_t usbinRt = 0, typecRt = 0, typecMode = 0;
@@ -223,6 +230,7 @@ void thread(void *, wait_result_t) {
       charger(present && !configured && apsdRequested && apsdDone, iclMa, fccMa, &iclCode, &fccCode);
       if (present && !configured && apsdRequested && apsdDone) configured = true;
       if (!present) { configured = false; apsdRequested = false; }
+      }
       batteryPoll();
       if (tick % 1200 == 0) {
         // Register dump: USBIN 0x1300-0x130f and 0x1340-0x134f, TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f

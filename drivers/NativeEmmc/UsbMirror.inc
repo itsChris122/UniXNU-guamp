@@ -250,6 +250,32 @@ struct Mirror {
   void receive() { startTransfer(kEp1Out, kEp1OutTrb, kOutBuf, kOutBytes, TRBCTL_NORMAL, ep1OutResource); }
 
   void touch(volatile const uint8_t *b, uint32_t n) {
+    if (n == 12 && b[0] == 'G' && b[1] == 'R' && b[2] == 'S' && b[3] == 'P') {
+      unsigned enabled = 0;
+      PE_parse_boot_argn("guamp-usb-respring", &enabled, sizeof(enabled));
+      uint32_t pid = guampRespringPid(b, n, enabled == 1);
+      if (!pid) { IOLog("GuampUsb: respring refused (disabled or malformed)\n"); return; }
+      proc_t process = proc_find(static_cast<int>(pid));
+      if (!process) { IOLog("GuampUsb: respring refused (process absent)\n"); return; }
+      char name[32] = {};
+      proc_name(static_cast<int>(pid), name, sizeof(name));
+      if (strcmp(name, "SpringBoard")) {
+        proc_rele(process);
+        IOLog("GuampUsb: respring refused (target is not SpringBoard)\n");
+        return;
+      }
+      static uint64_t lastRequest = 0;
+      uint64_t now = mach_absolute_time(), interval = 0;
+      nanoseconds_to_absolutetime(10000000000ULL, &interval);
+      if (lastRequest && now - lastRequest < interval) {
+        proc_rele(process); IOLog("GuampUsb: respring rate limited\n"); return;
+      }
+      lastRequest = now;
+      IOLog("GuampUsb: user-requested SpringBoard restart, pid %u\n", pid);
+      proc_signal(static_cast<int>(pid), SIGKILL);
+      proc_rele(process);
+      return;
+    }
     if (n < 5 || b[0] != 'G' || b[1] != 'T' || b[2] != 'C' || b[3] != 'H') return;
     unsigned count = b[4];
     if (count > 12 || n < 5 + count * 5) return;

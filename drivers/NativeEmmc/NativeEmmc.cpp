@@ -33,6 +33,10 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include "GuampBatteryCore.h"
+#include "GuampChargeReplugCore.h"
+#include "GuampUsbRespring.h"
+#include <sys/proc.h>
+#include <sys/signal.h>
 #include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
