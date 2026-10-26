@@ -146,6 +146,7 @@ void sinkFromHid(void (*sink)(void *, uint32_t), void *context) {
   gSinkContext = context;
   __asm__ volatile("dmb ish" ::: "memory");
   gSink = sink;
+  IOLog("GuampPmic: HID button sink %s\n", sink ? "attached" : "detached");
 }
 
 void thread(void *, wait_result_t) {
@@ -175,7 +176,7 @@ void thread(void *, wait_result_t) {
       sent = now;
       gButtons = now;
       if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, now);
-      IOLog("GuampPmic: buttons %x\n", now);
+      IOLog("GuampPmic: buttons %x, HID sink %s\n", now, gSink ? "attached" : "absent");
     }
     if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
       // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
