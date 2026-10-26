@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,219 @@
+@@ -7858,6 +7858,220 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -163,8 +163,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		if (!error) error = copyout(backup, scratch + 0xc00, strlen(backup) + 1);
 +		if (!error) {
 +			int32_t result = 0;
-+			struct renamex_np_args rn = {.from = scratch + 0xa00, .to = scratch + 0xc00, .flags = RENAME_EXCL};
-+			error = renamex_np(p, &rn, &result);
++			struct renameatx_np_args rn = {.fromfd = AT_FDCWD, .from = scratch + 0xa00,
++			    .tofd = AT_FDCWD, .to = scratch + 0xc00, .flags = RENAME_EXCL};
++			error = renameatx_np(p, &rn, &result);
 +		}
 +		if (!error) {
 +			archived++;
@@ -221,7 +222,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8196,7 @@
+@@ -7983,6 +8197,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
