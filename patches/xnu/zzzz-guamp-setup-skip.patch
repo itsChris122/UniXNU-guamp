@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,220 @@
+@@ -7858,6 +7858,219 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -85,17 +85,15 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	int closed = sys_close(p, &cl, &result);
 +	return error ? error : closed;
 +}
-+/* Board-owned, opt-in cache cycle, before launchd. Never unlink a cache or overwrite its backup.
-+ * A unique guamp-ui-cache-cycle=N is required for each new identity/layout trial.
-+ * Rename with RENAME_EXCL archives the exact old file/directory atomically.
-+ * IconState.plist and SpringBoard preferences are deliberately excluded. */
-+#ifndef CODEX_CACHE_HOST_TEST
-+#include <sys/stdio.h>
++/* PC-only cache invalidation. A verified host receipt and explicit file plan are required.
++ * No cache is copied or renamed on the phone. IconState/preferences are excluded. */
++#ifndef CODEX_CACHE_PC_HOST_TEST
++#include <pexpert/device_tree.h>
 +#endif
-+uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_archived,
++uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_deleted,
 +    native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed;
 +static int
-+native_guamp_ui_cache_marker(proc_t p, user_addr_t scratch, const char *path)
++native_guamp_ui_pc_done(proc_t p, user_addr_t scratch, const char *path)
 +{
 +	int32_t result = 0;
 +	int error = copyout(path, scratch + 0xa00, strlen(path) + 1);
@@ -110,14 +108,10 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	}
 +	return error;
 +}
-+
-+static void
-+native_guamp_ui_cache_cycle(proc_t p, user_addr_t scratch)
++static bool
++native_guamp_ui_pc_allowed(const char *path)
 +{
-+	unsigned cycle = 0;
-+	if (!PE_parse_boot_argn("guamp-ui-cache-cycle", &cycle, sizeof(cycle)) || !cycle) return;
-+	native_guamp_ui_cache_cycle_id = cycle;
-+	static const char *const paths[] = {
++	static const char *const bases[] = {
 +		"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
 +		"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
 +		"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
@@ -126,67 +120,72 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		"/private/var/mobile/Library/Caches/com.apple.UIStatusBar",
 +		"/private/var/mobile/Library/Caches/com.apple.controlcenter",
 +	};
-+	char marker[128], backup[512];
-+	snprintf(marker, sizeof(marker), "/private/var/db/codex-ui-cache-%u.done", cycle);
-+	int error = native_guamp_ui_cache_marker(p, scratch, marker);
-+	if (error == EEXIST) {
-+		native_guamp_ui_cache_completed = 1;
-+		printf("guamp-ui-cache: cycle %u already completed; preserving current caches\n", cycle);
++	if (strstr(path, "..") || strstr(path, "IconState")) return false;
++	for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
++		size_t n = strlen(bases[i]);
++		if (!strncmp(path, bases[i], n) &&
++		    (path[n] == 0 || path[n] == '/' || !strncmp(path + n, ".codex-ui-slot-", 15))) return true;
++	}
++	return false;
++}
++static void
++native_guamp_ui_cache_cycle(proc_t p, user_addr_t scratch)
++{
++	unsigned cycle = 0;
++	if (!PE_parse_boot_argn("guamp-ui-cache-pc", &cycle, sizeof(cycle)) || !cycle) return;
++	native_guamp_ui_cache_cycle_id = cycle;
++	DTEntry chosen;
++	const void *receipt = NULL, *plan = NULL;
++	unsigned receipt_size = 0, plan_size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "ui-cache-pc-receipt", &receipt, &receipt_size) != kSuccess || receipt_size != 65 ||
++	    ((const char *)receipt)[64] != 0 ||
++	    SecureDTGetProperty(chosen, "ui-cache-pc-files", &plan, &plan_size) != kSuccess || !plan_size || plan_size > 8192) {
++		native_guamp_ui_cache_error = EINVAL;
++		printf("guamp-ui-cache-PC: missing host backup receipt/plan; no files changed\n");
 +		return;
 +	}
-+	if (error != ENOENT) {
-+		native_guamp_ui_cache_error = error;
-+		printf("guamp-ui-cache: cycle %u marker check failed %d; no caches changed\n", cycle, error);
-+		return;
-+	}
-+	unsigned archived = 0, absent = 0;
-+	/* Refuse an occupied generation before moving any cache in this cycle. */
-+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-+		snprintf(backup, sizeof(backup), "%s.codex-ui-slot-%u.bak", paths[i], cycle & 1u);
-+		error = native_guamp_ui_cache_marker(p, scratch, backup);
-+		if (error != ENOENT) {
-+			native_guamp_ui_cache_error = error;
-+			printf("guamp-ui-cache: cycle %u backup slot %u occupied/unreadable (%d); export to PC first, no caches changed\n",
-+			    cycle, cycle & 1u, error);
++	for (unsigned i = 0; i < 64; i++) {
++		char c = ((const char *)receipt)[i];
++		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
++			native_guamp_ui_cache_error = EINVAL;
 +			return;
 +		}
 +	}
-+	error = 0;
-+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-+		/* Exactly two cache-backup generations. A reused slot is refused until exported and cleared. */
-+		snprintf(backup, sizeof(backup), "%s.codex-ui-slot-%u.bak", paths[i], cycle & 1u);
-+		if (strlen(paths[i]) >= 512 || strlen(backup) >= 512) {
-+			error = ENAMETOOLONG;
-+			break;
++	const char *start = plan, *end = start + plan_size;
++	unsigned count = 0;
++	for (const char *s = start; s < end;) {
++		size_t n = strnlen(s, (size_t)(end - s));
++		if (!n || n >= (size_t)(end - s) || n >= 512 || ++count > 64 || !native_guamp_ui_pc_allowed(s)) {
++			native_guamp_ui_cache_error = EINVAL;
++			printf("guamp-ui-cache-PC: invalid file plan; no files changed\n");
++			return;
 +		}
-+		error = copyout(paths[i], scratch + 0xa00, strlen(paths[i]) + 1);
-+		if (!error) error = copyout(backup, scratch + 0xc00, strlen(backup) + 1);
++		s += n + 1;
++	}
++	char marker[128];
++	snprintf(marker, sizeof(marker), "/private/var/db/codex-ui-cache-pc-%u.done", cycle);
++	int error = native_guamp_ui_pc_done(p, scratch, marker);
++	if (error == EEXIST) { native_guamp_ui_cache_completed = 1; return; }
++	if (error != ENOENT) { native_guamp_ui_cache_error = error; return; }
++	for (const char *s = start; s < end;) {
++		size_t n = strlen(s);
++		error = copyout(s, scratch + 0xa00, n + 1);
 +		if (!error) {
 +			int32_t result = 0;
-+			struct renameatx_np_args rn = {.fromfd = AT_FDCWD, .from = scratch + 0xa00,
-+			    .tofd = AT_FDCWD, .to = scratch + 0xc00, .flags = RENAME_EXCL};
-+			error = renameatx_np(p, &rn, &result);
++			struct unlink_args ua = {.path = scratch + 0xa00};
++			error = unlink(p, &ua, &result);
 +		}
-+		if (!error) {
-+			archived++;
-+			printf("guamp-ui-cache: cycle %u archived %s -> %s\n", cycle, paths[i], backup);
-+		} else if (error == ENOENT) {
-+			absent++;
-+			printf("guamp-ui-cache: cycle %u absent %s\n", cycle, paths[i]);
-+			error = 0;
-+		} else {
-+			printf("guamp-ui-cache: cycle %u archive failed %d at %s; old backup never overwritten\n", cycle, error, paths[i]);
-+			break;
-+		}
++		if (!error) native_guamp_ui_cache_deleted++;
++		else if (error == ENOENT) { native_guamp_ui_cache_absent++; error = 0; }
++		printf("guamp-ui-cache-PC: %s status %d\n", s, error);
++		if (error) break;
++		s += n + 1;
 +	}
 +	if (!error) {
-+		static const uint8_t note[] = "Cache invalidation completed before launchd; regeneration must be verified separately.\n";
++		static const uint8_t note[] = "PC backup receipt supplied; file invalidation complete.\n";
 +		error = native_guamp_write_file(p, scratch, marker, note, sizeof(note) - 1, 0, 0600, 0);
 +	}
-+	printf("guamp-ui-cache: cycle %u archived %u absent %u error %d; regeneration not yet verified\n",
-+	    cycle, archived, absent, error);
-+	native_guamp_ui_cache_archived = archived;
-+	native_guamp_ui_cache_absent = absent;
 +	native_guamp_ui_cache_error = error;
 +	native_guamp_ui_cache_completed = !error;
 +}
@@ -222,7 +221,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8197,7 @@
+@@ -7983,6 +8196,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);

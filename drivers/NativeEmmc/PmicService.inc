@@ -15,7 +15,8 @@
 
 extern "C" {
 extern uint32_t cs_text_fixup_parsed, cs_text_fixup_applied;
-extern uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_archived,
+extern uint32_t cs_text_fixup_chunk_calls, cs_text_fixup_name_matches, cs_text_fixup_byte_mismatches;
+extern uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_deleted,
     native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed;
 }
 namespace pmic {
@@ -234,8 +235,8 @@ void thread(void *, wait_result_t) {
         IOLog("GuampPmic: regs 1300 1340 1500 1540 1600: %s typec resets %u\n", text, typecResets);
       }
       if (tick % 1200 == 0) {
-        IOLog("GuampUi: text-fixups configured %u applied %u; cache cycle %u archived %u absent %u error %u invalidation-complete %u\n",
-              cs_text_fixup_parsed, cs_text_fixup_applied, native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_archived,
+        IOLog("GuampUi: text-fixups configured %u applied %u chunks %u file-matches %u byte-mismatches %u; cache-PC cycle %u deleted %u absent %u error %u invalidation-complete %u\n",
+              cs_text_fixup_parsed, cs_text_fixup_applied, cs_text_fixup_chunk_calls, cs_text_fixup_name_matches, cs_text_fixup_byte_mismatches, native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_deleted,
               native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed);
       }
       if (tick % 1200 == 0)

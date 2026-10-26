@@ -1,0 +1,20 @@
+--- a/osfmk/vm/vm_fault.c
++++ b/osfmk/vm/vm_fault.c
+@@ -7970,6 +7970,17 @@
+ 	if (tainted) {
+ 		*tainted_p = tainted;
+ 	}
++#if __arm64__
++	extern uint32_t cs_text_fixup_parsed, cs_text_fixup_chunk_calls;
++	if (cs_text_fixup_parsed && validated && tainted == 0 &&
++	    chunk_offset == 0 && chunk_size == PAGE_SIZE) {
++		os_atomic_inc(&cs_text_fixup_chunk_calls, relaxed);
++		if (cs_text_fixup_page(vnode, object->paging_offset + offset,
++		    (void *)phystokv((pmap_paddr_t)VM_PAGE_GET_PHYS_PAGE(page) << PAGE_SHIFT)) != 0) {
++			cache_sync_page(VM_PAGE_GET_PHYS_PAGE(page));
++		}
++	}
++#endif
+ }
+ 
+ static void

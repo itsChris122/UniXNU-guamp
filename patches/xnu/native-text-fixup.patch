@@ -2,7 +2,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 index 22c5bf1..05c6504 100644
 --- a/bsd/kern/ubc_subr.c
 +++ b/bsd/kern/ubc_subr.c
-@@ -6043,6 +6043,172 @@ cs_validate_hash(
+@@ -6043,6 +6043,175 @@ cs_validate_hash(
  	return validated;
  }
  
@@ -34,6 +34,7 @@ index 22c5bf1..05c6504 100644
 +static uint32_t cs_text_fixup_count;
 +uint32_t cs_text_fixup_parsed;
 +uint32_t cs_text_fixup_applied;
++uint32_t cs_text_fixup_chunk_calls, cs_text_fixup_name_matches, cs_text_fixup_byte_mismatches;
 +
 +static int
 +cs_text_fixup_hex(char c)
@@ -153,14 +154,16 @@ index 22c5bf1..05c6504 100644
 +	uint32_t written = 0;
 +	for (uint32_t i = 0; i < cs_text_fixup_count; i++) {
 +		const struct cs_text_fixup *f = &cs_text_fixups[i];
-+		if (f->offset < page_offset || f->offset + f->length > page_offset + PAGE_SIZE) {
++		if (vp == NULLVP || vp->v_name == NULL || strcmp(vp->v_name, f->name) != 0) {
 +			continue;
 +		}
-+		if (vp == NULLVP || vp->v_name == NULL || strcmp(vp->v_name, f->name) != 0) {
++		os_atomic_inc(&cs_text_fixup_name_matches, relaxed);
++		if (f->offset < page_offset || f->offset + f->length > page_offset + PAGE_SIZE) {
 +			continue;
 +		}
 +		uint8_t *at = (uint8_t *)kva + (f->offset - page_offset);
 +		if (memcmp(at, f->original, f->length) != 0) {
++			os_atomic_inc(&cs_text_fixup_byte_mismatches, relaxed);
 +			continue;
 +		}
 +		memcpy(at, f->replacement, f->length);
