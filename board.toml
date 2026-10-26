@@ -42,6 +42,7 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py NativeEmmc",
   "build-arm-driver.py ArmDTPlatform",
+  "guamp-smp-variant.py",           # exact pinned opt-in GICR SGI delivery
   "build-arm-driver.py ArmCpu",
   "build-arm-driver.py NativeAES",
   "build-native-aes-bindings.py",

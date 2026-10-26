@@ -1,0 +1,57 @@
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -970,6 +970,16 @@
+  * @result returns KERN_OPERATION_TIMED_OUT if synchronization times out and
+  * proceed_on_sync_failure is false.
+  */
++/* guamp: bounded, read-only SMP evidence for the native CPU load logger. */
++uint32_t guamp_smp_signal_flags(unsigned int cpu);
++uint32_t
++guamp_smp_signal_flags(unsigned int cpu)
++{
++    if (cpu > (unsigned int)ml_get_max_cpu_number()) { return UINT32_MAX; }
++    cpu_data_t *data = CpuDataEntries[cpu].cpu_data_vaddr;
++    return data ? os_atomic_load(&data->cpu_signal, relaxed) : UINT32_MAX;
++}
++
+ kern_return_t
+ DebuggerXCallEnter(
+ 	boolean_t proceed_on_sync_failure, bool is_stackshot)
+@@ -979,6 +989,10 @@
+ 	int max_cpu;
+ 	cpu_data_t      *target_cpu_datap;
+ 	cpu_data_t      *cpu_data_ptr = getCpuDatap();
++
++	unsigned int guamp_guard = 0;
++	PE_parse_boot_argn("guamp-smp-snapshot-guard", &guamp_guard, sizeof(guamp_guard));
++	bool guamp_refuse_incoherent_snapshot = false;
+ 
+ 	/* Check for nested debugger entry. */
+ 	cpu_data_ptr->debugger_active++;
+@@ -1025,6 +1039,13 @@
+ 				os_atomic_inc(&debug_cpus_spinning, relaxed);
+ 			} else if (proceed_on_sync_failure) {
+ 				kprintf("cpu_signal failed in DebuggerXCallEnter\n");
++			} else if (guamp_guard == 1 && is_stackshot && processor_array[cpu] != PROCESSOR_NULL &&
++			    processor_array[cpu]->state > PROCESSOR_PENDING_OFFLINE) {
++				/* An online but unsignallable CPU can still mutate the snapshot's task/thread lists.
++				 * Refuse this diagnostic capture; do not suppress the count/bounds invariants. */
++				guamp_refuse_incoherent_snapshot = true;
++				kprintf("GuampSmp: snapshot refused, online CPU %d signal 0x%x status %d\n",
++				    cpu, target_cpu_datap->cpu_signal, ret);
+ 			}
+ 		}
+ 
+@@ -1046,6 +1067,12 @@
+ 		while ((debugger_sync != 0) && (max_mabs_time == 0 || current_mabs_time < max_mabs_time)) {
+ 			current_mabs_time = mach_absolute_time();
+ 		}
++	}
++
++	if (guamp_refuse_incoherent_snapshot) {
++		/* Use the ordinary synchronization cleanup, including already signalled CPUs. */
++		DebuggerXCallReturn();
++		return KERN_OPERATION_TIMED_OUT;
+ 	}
+ 
+ 	if (!proceed_on_sync_failure && (max_mabs_time > 0 && current_mabs_time >= max_mabs_time)) {
