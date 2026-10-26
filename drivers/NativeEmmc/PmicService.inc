@@ -16,6 +16,8 @@
 extern "C" {
 extern uint32_t cs_text_fixup_parsed, cs_text_fixup_applied;
 extern uint32_t cs_text_fixup_chunk_calls, cs_text_fixup_name_matches, cs_text_fixup_byte_mismatches;
+extern uint32_t native_guamp_home_reset_id, native_guamp_home_reset_deleted,
+    native_guamp_home_reset_absent, native_guamp_home_reset_error, native_guamp_home_reset_completed;
 extern uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_deleted,
     native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed;
 }
@@ -245,6 +247,9 @@ void thread(void *, wait_result_t) {
         IOLog("GuampUi: text-fixups configured %u applied %u chunks %u file-matches %u byte-mismatches %u; cache-PC cycle %u deleted %u absent %u error %u invalidation-complete %u\n",
               cs_text_fixup_parsed, cs_text_fixup_applied, cs_text_fixup_chunk_calls, cs_text_fixup_name_matches, cs_text_fixup_byte_mismatches, native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_deleted,
               native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed);
+        IOLog("GuampHome: reset %u deleted %u absent %u error %u complete %u\n",
+              native_guamp_home_reset_id, native_guamp_home_reset_deleted, native_guamp_home_reset_absent,
+              native_guamp_home_reset_error, native_guamp_home_reset_completed);
       }
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",

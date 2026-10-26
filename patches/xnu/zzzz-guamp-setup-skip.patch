@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,221 @@
+@@ -7858,6 +7858,306 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -192,9 +192,94 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	native_guamp_ui_cache_completed = !error;
 +}
 +
++/* Explicit Home/Control Center reset requested by the owner. Separate from
++ * routine cache invalidation. Exact files only, after verified PC backup.
++ * Invoked before setup skip reseeds its minimal watchdog/setup preferences. */
++uint32_t native_guamp_home_reset_id, native_guamp_home_reset_deleted,
++    native_guamp_home_reset_absent, native_guamp_home_reset_error, native_guamp_home_reset_completed;
++static bool
++native_guamp_home_reset_allowed(const char *path)
++{
++	static const char *const files[] = {
++		"/private/var/mobile/Library/SpringBoard/IconState.plist",
++		"/private/var/mobile/Library/SpringBoard/DesiredIconState.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.springboard.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.controlcenter.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.control-center.plist",
++		"/private/var/mobile/Library/ControlCenter/ModuleConfiguration.plist",
++	};
++	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		if (!strcmp(path, files[i])) return true;
++	}
++	return false;
++}
++static void
++native_guamp_home_reset(proc_t p, user_addr_t scratch)
++{
++	unsigned cycle = 0;
++	if (!PE_parse_boot_argn("guamp-home-reset", &cycle, sizeof(cycle)) || !cycle) return;
++	native_guamp_home_reset_id = cycle;
++	DTEntry chosen;
++	const void *receipt = NULL, *plan = NULL;
++	unsigned receipt_size = 0, plan_size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "ui-home-reset-receipt", &receipt, &receipt_size) != kSuccess ||
++	    receipt_size != 65 || ((const char *)receipt)[64] != 0 ||
++	    SecureDTGetProperty(chosen, "ui-home-reset-files", &plan, &plan_size) != kSuccess ||
++	    !plan_size || plan_size > 4096) {
++		native_guamp_home_reset_error = EINVAL;
++		printf("guamp-home-reset: missing PC backup receipt/plan; no files changed\n");
++		return;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		char c = ((const char *)receipt)[i];
++		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
++			native_guamp_home_reset_error = EINVAL;
++			return;
++		}
++	}
++	const char *start = plan, *end = start + plan_size;
++	unsigned count = 0;
++	for (const char *s = start; s < end;) {
++		size_t n = strnlen(s, (size_t)(end - s));
++		if (!n || n >= (size_t)(end - s) || n >= 512 || ++count > 6 || !native_guamp_home_reset_allowed(s)) {
++			native_guamp_home_reset_error = EINVAL;
++			printf("guamp-home-reset: invalid plan; no files changed\n");
++			return;
++		}
++		s += n + 1;
++	}
++	char marker[128];
++	snprintf(marker, sizeof(marker), "/private/var/db/codex-home-reset-%u.done", cycle);
++	int error = native_guamp_ui_pc_done(p, scratch, marker);
++	if (error == EEXIST) { native_guamp_home_reset_completed = 1; return; }
++	if (error != ENOENT) { native_guamp_home_reset_error = error; return; }
++	for (const char *s = start; s < end;) {
++		size_t n = strlen(s);
++		error = copyout(s, scratch + 0xa00, n + 1);
++		if (!error) {
++			int32_t result = 0;
++			struct unlink_args ua = {.path = scratch + 0xa00};
++			error = unlink(p, &ua, &result);
++		}
++		if (!error) native_guamp_home_reset_deleted++;
++		else if (error == ENOENT) { native_guamp_home_reset_absent++; error = 0; }
++		printf("guamp-home-reset: %s status %d\n", s, error);
++		if (error) break;
++		s += n + 1;
++	}
++	if (!error) {
++		static const uint8_t note[] = "Home reset complete. Original files backed up on PC.\n";
++		error = native_guamp_write_file(p, scratch, marker, note, sizeof(note) - 1, 0, 0600, 0);
++	}
++	native_guamp_home_reset_error = error;
++	native_guamp_home_reset_completed = !error;
++}
++
 +static void
 +native_guamp_setup_skip(proc_t p, user_addr_t scratch)
 +{
++	native_guamp_home_reset(p, scratch);
 +	static const char *const dirs[] = {"/private/var/db/com.apple.xpc.launchd"};
 +	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 +		int32_t result = 0;
@@ -223,7 +308,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8198,7 @@
+@@ -7983,6 +8283,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
