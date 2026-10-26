@@ -31,6 +31,8 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/pwr_mgt/IOPMPowerSource.h>
+#include "GuampBatteryCore.h"
 #include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>

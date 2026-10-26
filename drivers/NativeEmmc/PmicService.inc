@@ -84,6 +84,8 @@ int write8(unsigned sid, uint16_t addr, uint8_t v) {
   return waitDone(SPMI_CHNLS, chan);
 }
 
+#include "GuampBatteryService.inc"
+
 // --- board ---------------------------------------------------------------------------------------------------------
 constexpr unsigned kPm6125 = 0, kPmi632 = 2;
 constexpr uint16_t kPonRtSts = 0x0810, kVolUpStatus = 0xc408;
@@ -165,6 +167,10 @@ void thread(void *, wait_result_t) {
   int r = init();
   IOLog("GuampPmic: SPMI arbiter version %08x, %u APIDs, init %d\n", gArb.version, gArb.apids, r);
   if (r) return;
+  unsigned battery = 0;
+  PE_parse_boot_argn("guamp-battery", &battery, sizeof(battery));
+  gBatteryEnabled = battery == 1;
+  IOLog("GuampBattery: read-only gauge and power-source publisher %s\n", gBatteryEnabled ? "enabled" : "disabled");
   unsigned iclMa = 1500, fccMa = 2000;
   PE_parse_boot_argn("guamp-icl-ma", &iclMa, sizeof(iclMa));
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
@@ -217,6 +223,7 @@ void thread(void *, wait_result_t) {
       charger(present && !configured && apsdRequested && apsdDone, iclMa, fccMa, &iclCode, &fccCode);
       if (present && !configured && apsdRequested && apsdDone) configured = true;
       if (!present) { configured = false; apsdRequested = false; }
+      batteryPoll();
       if (tick % 1200 == 0) {
         // Register dump: USBIN 0x1300-0x130f and 0x1340-0x134f, TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f
         static const uint16_t blocks[5] = {0x1300, 0x1340, 0x1500, 0x1540, 0x1600};
