@@ -4,6 +4,12 @@
 #define GUAMP_BATTERY_CORE_H
 #include <stdint.h>
 namespace guamp_battery {
+inline bool fullAtProfileVoltage(bool external, unsigned chargerState, unsigned uv) {
+  // The existing conservative charger ceiling can terminate below the pack's
+  // full voltage. A termination code alone must never turn a saved 94% into 100%.
+  // JK50-SWD profile: CC/CV threshold 4.390 V, maximum 4.400 V.
+  return external && chargerState == 5 && uv >= 4390000 && uv <= 4600000;
+}
 inline bool decode(unsigned subtype, uint16_t voltage, uint16_t current,
                    unsigned &uv, int &appleUa) {
   if ((subtype != 3 && subtype != 4) || voltage == 0x8000 || current == 0x8000) return false;
@@ -24,7 +30,7 @@ struct Balance {
     charge = full * (percent <= 100 ? percent : 100) / 100;
     lastNs = ns; lastUa = ua; ready = fullMah != 0; interrupted = false;
   }
-  bool sample(uint64_t ns, int ua, bool terminated) {
+  bool sample(uint64_t ns, int ua, bool fullVerified) {
     if (!ready) return false;
     bool integrated = false;
     if (!interrupted && ns >= lastNs) {
@@ -35,7 +41,7 @@ struct Balance {
         integrated = true;
       }
     }
-    if (terminated) charge = full;
+    if (fullVerified) charge = full;
     if (charge < 0) charge = 0;
     if (charge > full) charge = full;
     lastNs = ns; lastUa = ua; interrupted = false;

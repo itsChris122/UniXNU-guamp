@@ -29,7 +29,7 @@ public:
     setAtCriticalLevel(!external && percent <= 3);
     number("InstantAmperage", static_cast<uint64_t>(static_cast<int64_t>(ua / 1000)));
     number("DesignCapacity", 5029);
-    flag("FullyCharged", external && state == 5);
+    flag("FullyCharged", percent >= 99 && guamp_battery::fullAtProfileVoltage(external, state, uv));
     flag("AppleRawExternalConnected", external);
     flag("GuampLevelEstimated", true);
     flag("GuampSampleValid", true);
@@ -87,7 +87,7 @@ static void batteryPoll() {
       IOLog("GuampBattery: initial %u%% from saved QG SOC (not a live hardware percentage); integration estimate, QG subtype %u\n", soc, subtype);
     }
   } else if (!error) {
-    if (!gBalance.sample(ns, ua, (usb & 0x10) && (chargerState & 7) == 5)) ++gBatterySkipped;
+    if (!gBalance.sample(ns, ua, guamp_battery::fullAtProfileVoltage((usb & 0x10) != 0, chargerState & 7, uv))) ++gBatterySkipped;
   }
   if (error) {
     ++gBatteryErrors;
