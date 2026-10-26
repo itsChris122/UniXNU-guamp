@@ -33,6 +33,7 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include "GuampBatteryCore.h"
+#include "GuampPerf.inc"
 #include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -384,7 +385,8 @@ public:
     __asm__ volatile("dsb sy" ::: "memory");
     if (dmaCached) {
       cacheOp(dmaData, bytes, 2);        // lines speculatively refilled during the transfer
-      memcpy(out, const_cast<const uint8_t *>(dmaData), bytes);
+      if (out != const_cast<const uint8_t *>(dmaData))
+        memcpy(out, const_cast<const uint8_t *>(dmaData), bytes);
     } else {
       for (uint32_t i = 0; i < bytes; i += 8) {
         uint64_t word = *reinterpret_cast<volatile uint64_t *>(dmaData + i);
@@ -501,6 +503,7 @@ struct Card {
   uint32_t logIntervalMs = 5000, fbEvery = 0;
   thread_call_t mirrorCall = nullptr;
   bool online = false;
+  bool directRead = false;   // opt-in: use the existing cached DMA buffer under the same card gate
 
   uint8_t *seen = nullptr;                 // one bit per 4 KiB page of the user area
   void notePages(uint64_t lba, uint32_t count) {
@@ -709,6 +712,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   const uint64_t busy = __atomic_load_n(&native_emmc_busy, __ATOMIC_RELAXED);
   const uint64_t requests = __atomic_load_n(&native_emmc_requests, __ATOMIC_RELAXED);
   if (report) {
+    guampPerfSample();
     uint64_t busyNs = 0;
     absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
     IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, aggregate request latency %llu%%\n",
@@ -865,10 +869,13 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     const uint64_t activeBegan = mach_absolute_time();
     guamp_emmc_queue += activeBegan - waitFrom;
     if (!write) native_emmc_t_lock += activeBegan - waitFrom;
+    uint8_t *readBuffer = card.bounce;
+    if (!write && card.directRead && native_emmc_dma && card.host.dmaCached && card.host.dmaData && bytes <= Host::kDmaBytes)
+      readBuffer = const_cast<uint8_t *>(card.host.dmaData);
     bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
-                    : card.readBlocks(first + block + done, n, card.bounce) &&
-                          buffer->writeBytes(done * kBlock, card.bounce, bytes) == bytes;
+                    : card.readBlocks(first + block + done, n, readBuffer) &&
+                          buffer->writeBytes(done * kBlock, readBuffer, bytes) == bytes;
     guamp_emmc_active += mach_absolute_time() - activeBegan;
     if (ok) {
       if (write) guamp_emmc_write_bytes += bytes;
@@ -1099,6 +1106,10 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
   if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
   card.seen = static_cast<uint8_t *>(IOMallocZero((card.capacity + 63) / 64));
+  { unsigned direct = 0;
+    card.directRead = PE_parse_boot_argn("guamp-emmc-direct-read", &direct, sizeof(direct)) && direct == 1;
+    IOLog("NativeEmmc: direct cached read buffer %s (opt-in, writes unchanged)\n", card.directRead ? "enabled" : "disabled");
+  }
   card.online = true;
   if (!guamp_panic_base) {
     void *region = IOMallocZero(kPanicBytes);
