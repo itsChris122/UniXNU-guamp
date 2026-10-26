@@ -13,6 +13,11 @@
 #include "GuampSpmi.h"
 #include "GuampPmicBoard.h"
 
+extern "C" {
+extern uint32_t cs_text_fixup_parsed, cs_text_fixup_applied;
+extern uint32_t native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_archived,
+    native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed;
+}
 namespace pmic {
 // --- SPMI arbiter v5 (copy of GuampSpmi.c in C++ form, host-tested there) --------------------------------------
 volatile uint8_t *gCore, *gCnfg, *gObs, *gChn;
@@ -227,6 +232,11 @@ void thread(void *, wait_result_t) {
         }
         text[at] = 0;
         IOLog("GuampPmic: regs 1300 1340 1500 1540 1600: %s typec resets %u\n", text, typecResets);
+      }
+      if (tick % 1200 == 0) {
+        IOLog("GuampUi: text-fixups configured %u applied %u; cache cycle %u archived %u absent %u error %u invalidation-complete %u\n",
+              cs_text_fixup_parsed, cs_text_fixup_applied, native_guamp_ui_cache_cycle_id, native_guamp_ui_cache_archived,
+              native_guamp_ui_cache_absent, native_guamp_ui_cache_error, native_guamp_ui_cache_completed);
       }
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
