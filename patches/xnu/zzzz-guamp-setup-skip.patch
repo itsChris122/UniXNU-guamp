@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,219 @@
+@@ -7858,6 +7858,221 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -120,7 +120,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		"/private/var/mobile/Library/Caches/com.apple.UIStatusBar",
 +		"/private/var/mobile/Library/Caches/com.apple.controlcenter",
 +	};
-+	if (strstr(path, "..") || strstr(path, "IconState")) return false;
++	for (const char *part = path; *part; part++) {
++		if ((part[0] == '.' && part[1] == '.') || !strncmp(part, "IconState", 9)) return false;
++	}
 +	for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
 +		size_t n = strlen(bases[i]);
 +		if (!strncmp(path, bases[i], n) &&
@@ -221,7 +223,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8196,7 @@
+@@ -7983,6 +8198,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
