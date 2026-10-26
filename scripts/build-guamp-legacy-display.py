@@ -232,6 +232,7 @@ run([str(touch_source) if str(arg)==str(source) else str(touch_obj) if str(arg)=
 # The display backend, its probe, the key store and the HID input: sheng's boot process, log, reset, touch panel, CPU
 # frequency and GPU power objects stay out (they drive sheng hardware or need its kit and NativeAdreno).
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
+print(run(['python3',ROOT/'scripts/guamp-hid-variant.py'],text=True),end='')
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid_dir=ROOT/'build/native-hid-input'
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
