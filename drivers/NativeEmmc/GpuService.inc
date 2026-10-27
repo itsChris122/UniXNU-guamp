@@ -24,6 +24,7 @@
 #include "GuampGpuM1.h"
 #include "GuampGpuM2.h"
 #include "GuampGpuBlit.h"
+#include "GuampGpuG2.h"
 #include "GuampRpmCore.h"
 #include "GuampExt4.inc"
 
@@ -165,6 +166,7 @@ out:
 }
 
 gm2_ring gRing;
+gm2_mem gMem;   // the CP buffers of run(), kept for gpug2 recovery (gm2_cp_start again)
 bool gReady;   // the CP took the fence-only submission: submit() may be used
 
 // PM4 packets from the guamp-gpu-m1 thread after run(); returns the gm2_submit result codes.
@@ -246,6 +248,7 @@ void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmu
   // buf stays allocated: the CP keeps the ring and microcode addresses
   if (!c.consumed || !c.wrote) return;
   gRing = {mem.ring, mem.ringPhys, kRingDwords, c.wptr, 0, mem.scratch, mem.scratchPhys};
+  gMem = mem;
   uint32_t waited = 0;
   const int e = gm2_submit(&io, &gRing, nullptr, 0, 200000, &waited);
   gReady = e == GM2_SUBMIT_OK;
@@ -306,6 +309,10 @@ void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmu
 
 namespace rpm {   // GuampRpm.inc
 int set(uint32_t type, uint32_t id, uint32_t key, uint32_t value, unsigned which, unsigned timeoutMs);
+}
+
+namespace gpug2 {   // below gpum1
+void run(volatile uint8_t *gpucc, unsigned level);
 }
 
 namespace gpum1 {
@@ -413,6 +420,9 @@ void thread(void *, wait_result_t) {
     gm_do_reads(&io, &st);
   }
   if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2, smmuMode, smmuCb);
+  unsigned g2 = 0;
+  PE_parse_boot_argn("guamp-gpu-g2", &g2, sizeof(g2));
+  if (g2 == 1 || g2 == 2) gpug2::run(gBase[GM_GPUCC], g2);
   else if (m2) IOLog("GuampGpu: M2 RESULT smmu - sqe - cp - stop M1 (GPU %s)\n", st.gpuRead ? "counter stuck" : "not read");
   if (st.stop) IOLog("GuampGpu: stopped at %s, GPU block %s\n", st.stop, st.mapped ? "mapped, not read" : "not touched");
   if (off == 1) {
@@ -439,3 +449,136 @@ void start() {
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
 }  // namespace gpum1
+
+// G2 (guamp-gpu-g2=1|2, GuampGpuG2.h), after M3 left the CP ready (gpum2::gReady), on the same thread:
+//   1. GPU clock on XO measured (CP countable 0 against the always-on counter) and one fence timed
+//   2. the GPU interrupt (INTID 209, level) through armcpu_spi_attach: RBBM_INT_0_MASK = A6XX_INT_MASK, then a fence
+//      whose CACHE_FLUSH_TS must raise it (counters in the log; the handler acks and counts only)
+//   3. RPM vote VDD_CX (smpa3 "vlvl") LOW_SVS, active set; only when acked: PLL1 at 640 MHz, gfx3d RCG to PLL1_OUT_AUX
+//      / 2 = 320 MHz (the lowest OPP over XO), clock measured, fence timed. A fence timeout there puts the RCG back on
+//      XO, turns PLL1 off and recovers the CP. Without the ack the GPU stays on XO.
+//   4. guamp-gpu-g2=2 also runs one forced recovery (RBBM soft reset + CP restart with the M2 buffers) and a fence.
+// "GuampGpu: G2 RESULT ..." summarizes. Never above 320 MHz.
+extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
+namespace gpug2 {
+volatile uint8_t *gCc;
+gg2_irq_stats gIrq;
+
+uint32_t rd(void *, unsigned block, uint32_t off) {
+  return *reinterpret_cast<volatile uint32_t *>((block == GG2_GPUCC ? gCc : gpum2::gGpu) + off);
+}
+void wr(void *, unsigned block, uint32_t off, uint32_t v) {
+  *reinterpret_cast<volatile uint32_t *>((block == GG2_GPUCC ? gCc : gpum2::gGpu) + off) = v;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+void udelay(void *, unsigned us) { IODelay(us); }
+const gg2_io kIo = {nullptr, rd, wr, udelay};
+
+void irq(void *) { gg2_irq_service(&kIo, &gIrq); }
+
+// One fence-only submission; returns the gm2_submit code, the wait in *us.
+int fence(uint32_t *us) {
+  const gm2_io io = {nullptr, gpum2::rd, gpum2::wr, gpum2::udelay, gpum2::flush};
+  return gm2_submit(&io, &gpum2::gRing, nullptr, 0, 200000, us);
+}
+
+// gm2_cp_start again on the M2 buffers (it begins with the RBBM soft reset); the ring restarts after ME_INIT.
+bool recover(const char *why) {
+  const gm2_io io = {nullptr, gpum2::rd, gpum2::wr, gpum2::udelay, gpum2::flush};
+  gm2_cp c;
+  gm2_cp_start(&io, &gpum2::gMem, &c);
+  gpum2::gRing.wptr = c.wptr;
+  gpum2::gReady = c.consumed && c.wrote;
+  gg2_gw(&kIo, GG2_RBBM_INT_0_MASK, GG2_INT_MASK);
+  IOLog("GuampGpu: G2 recovery (%s): reset read %08x, wptr %u rptr %u after %u us, me_init %s mem_write %s, rbbm status "
+        "%08x cp hw_fault %08x\n", why, c.resetRead, c.wptr, c.rptr, c.waitedUs, c.consumed ? "consumed" : "stuck",
+        c.wrote ? "ok" : "none", c.status, c.hwFault);
+  return gpum2::gReady;
+}
+
+void run(volatile uint8_t *gpucc, unsigned level) {
+  gCc = gpucc;
+  if (!gpum2::gReady || !gCc || !gpum2::gGpu) {
+    IOLog("GuampGpu: G2 RESULT clock - irq - recovery - stop %s\n", gpum2::gReady ? "map" : "M3 not ready");
+    return;
+  }
+  uint32_t cyc = 0, aon = 0, us = 0;
+  const uint64_t xoHz = gg2_measure_hz(&kIo, 1000, &cyc, &aon);
+  int e = fence(&us);
+  IOLog("GuampGpu: G2 clock on XO: %llu Hz (%u cycles / %u aon ticks), gfx rcg %08x/%08x, fence %s after %u us\n",
+        static_cast<unsigned long long>(xoHz), cyc, aon, gg2_cr(&kIo, GG2_GFX_CMD), gg2_cr(&kIo, GG2_GFX_CFG),
+        gm2_submit_err(e), us);
+
+  // Interrupt
+  const char *irqState = "none";
+  uint32_t readback = 0;
+  uint64_t router = 0;
+  if (!&armcpu_spi_attach) irqState = "no attach";
+  else if (armcpu_spi_attach(GG2_GPU_INTID, false, irq, nullptr, &readback, &router)) irqState = "attach failed";
+  else {
+    gg2_gw(&kIo, GG2_RBBM_INT_CLEAR_CMD, 0xffffffffu);
+    gg2_gw(&kIo, GG2_RBBM_INT_0_MASK, GG2_INT_MASK);
+    const uint32_t before = gIrq.fence;
+    e = fence(&us);
+    IOSleep(5);
+    irqState = gIrq.fence != before ? "fence irq ok" : "no fence irq";
+    char names[192];
+    gm2_int_names(gIrq.last, names, sizeof(names));
+    IOLog("GuampGpu: G2 irq %u: readback %08x router %llx, mask %08x, fence %s after %u us, irqs %u (fence %u, last %08x "
+          "%s, spurious %u, other %u): %s\n", GG2_GPU_INTID, readback, static_cast<unsigned long long>(router),
+          gg2_gr(&kIo, GG2_RBBM_INT_0_MASK), gm2_submit_err(e), us, gIrq.total, gIrq.fence, gIrq.last, names,
+          gIrq.spurious, gIrq.other, irqState);
+  }
+
+  // Voltage, PLL1, 320 MHz
+  const char *clock = "xo";
+  uint64_t hz = xoHz;
+  const int vote = rpm::set(RPM_RES_SMPA, 3, 0x6c766c76u /* "vlvl" */, 64 /* LOW_SVS */, RPM_SET_ACTIVE, 500);
+  if (vote) {
+    IOLog("GuampGpu: G2 VDD_CX LOW_SVS vote failed (%s): GPU stays on XO\n", rpm_err_name(vote));
+    clock = "xo (no cx vote)";
+  } else {
+    gg2_pll p;
+    const bool pll = gg2_pll1_up(&kIo, &kGg2Pll1, &p);
+    IOLog("GuampGpu: G2 pll1 mode %08x->%08x l %02x->%02x alpha %08x user %08x->%08x status %08x, %s, lock %s after %u us, "
+          "%llu Hz%s%s\n", p.mode0, p.modeAfter, p.l0, p.lAfter, p.alpha0, p.user0, p.userAfter, p.status,
+          p.reconfigured ? "configured" : "already running", p.locked ? "ok" : "NO", p.waitedUs,
+          static_cast<unsigned long long>(p.hz), p.why ? ": " : "", p.why ? p.why : "");
+    if (!pll) {
+      clock = "xo (pll1)";
+    } else {
+      gg2_rcg r;
+      const bool rcg = gg2_gfx_set(&kIo, GG2_SRC_PLL1_AUX, 4, &r);
+      hz = gg2_measure_hz(&kIo, 1000, &cyc, &aon);
+      e = fence(&us);
+      IOLog("GuampGpu: G2 gfx rcg %08x/%08x -> %08x/%08x after %u us (%s), expected %llu Hz, measured %llu Hz (%u cycles / "
+            "%u aon), fence %s after %u us\n", r.cmd0, r.cfg0, r.cmd, r.cfg, r.waitedUs, rcg ? "ok" : "FAILED",
+            static_cast<unsigned long long>(gg2_rcg_hz(r.cfg, p.hz)), static_cast<unsigned long long>(hz), cyc, aon,
+            gm2_submit_err(e), us);
+      if (rcg && e == GM2_SUBMIT_OK) {
+        clock = "320M";
+      } else {
+        gg2_rcg back;
+        gg2_gfx_set(&kIo, GG2_SRC_XO, 0, &back);
+        gg2_pll1_down(&kIo);
+        clock = "xo (back)";
+        if (e != GM2_SUBMIT_OK) recover("fence timeout at 320 MHz");
+        hz = gg2_measure_hz(&kIo, 1000, &cyc, &aon);
+      }
+    }
+  }
+
+  // Forced recovery test
+  const char *recovery = "-";
+  if (level == 2 && gpum2::gReady) {
+    const bool ok = recover("guamp-gpu-g2=2 test");
+    e = ok ? fence(&us) : GM2_SUBMIT_FULL;
+    recovery = ok && e == GM2_SUBMIT_OK ? "ok" : "FAILED";
+    IOLog("GuampGpu: G2 fence after recovery %s after %u us, irqs %u fence %u\n", gm2_submit_err(e), us, gIrq.total,
+          gIrq.fence);
+  }
+  IOLog("GuampGpu: G2 RESULT clock %s %llu Hz irq %s (%u, fence %u, hw_error %u, ahb %u, hang %u%s) recovery %s submit %s\n",
+        clock, static_cast<unsigned long long>(hz), irqState, gIrq.total, gIrq.fence, gIrq.hwError, gIrq.ahbError,
+        gIrq.hang, gIrq.masked ? ", MASKED: storm" : "", recovery, gpum2::gReady ? "ready" : "off");
+}
+}  // namespace gpug2
