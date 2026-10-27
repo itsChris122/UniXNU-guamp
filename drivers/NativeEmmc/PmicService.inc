@@ -19,6 +19,8 @@
 // guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
 // instead of sink only; guamp-chg-recover=0 turns off the stuck-input recovery (weak-adapter steps, re-detection);
 // guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
+//   torch     the camera flash LED (PMI632 slave 3, 0xd300) as a torch, GuampTorch.inc: opt-in guamp-torch=1, driven
+//             only by the GuampTorch IOKit service / guamp_torch_request() (no button), applied by this thread.
 // Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, SPMI errors.
 
 #include <stdarg.h>
@@ -109,6 +111,8 @@ constexpr uint16_t kPonRtSts = 0x0810, kVolUpStatus = 0xc408;
 constexpr uint16_t kChgEnableCmd = 0x1042, kTypecModeCfg = 0x1544, kAiclOptions = 0x1380, kBatifPullUp = 0x1286,
                    kJeitaEnCfg = 0x1090, kChgPauseCmd = 0x1043, kIclStatus = 0x1107, kAiclStatus = 0x110a,
                    kPowerPath = 0x110b;
+
+#include "GuampTorch.inc"
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
@@ -294,6 +298,7 @@ void thread(void *, wait_result_t) {
   ChargeBus chargeBus;
   uint32_t stable = 0, last = 0, sent = 0;
   const bool ringer = ringerInit();
+  const bool torchRuns = torch::init();
   bool keyLast = false, keyStable = false;
   unsigned keyCount = 0;
   uint32_t sinkSeen = gSinkGeneration;
@@ -382,6 +387,7 @@ void thread(void *, wait_result_t) {
               gCharge.fccCode, gErrors,
               touch::gStep, touch::gError, touch::gEvents);
     }
+    if (torchRuns) torch::poll(tick);
     IOSleep(25);
   }
 }
@@ -397,3 +403,11 @@ void start() {
 
 // NativeHidInput registers its button sink here (weak import on its side)
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) { pmic::sinkFromHid(sink, context); }
+
+// Torch request from any thread (in-kernel callers; user space uses the GuampTorch service): level in permille of
+// guamp-torch-ma, 0 = off. The PMIC thread applies the newest one within 25 ms; ignored unless guamp-torch=1 and the
+// flash peripheral checked out.
+extern "C" void guamp_torch_request(uint32_t permille) { pmic::torch::request(permille); }
+// Current torch state in mA (0 = off), for property readback.
+extern "C" uint32_t guamp_torch_current_ma() { return pmic::torch::gMa; }
+extern "C" int guamp_torch_available() { return pmic::torch::gReady ? 1 : 0; }

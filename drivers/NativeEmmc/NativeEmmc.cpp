@@ -31,6 +31,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include "GuampBatteryCore.h"
 #include "GuampPerf.inc"
@@ -39,6 +40,7 @@
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <kern/thread.h>
+#include <kern/task.h>
 #include <libkern/OSKextLib.h>
 #include <libkern/crypto/sha2.h>
 #include <pexpert/pexpert.h>
@@ -1330,6 +1332,7 @@ extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *u
 // kPE* values). A panic may stop the machine while the gate is held, so a panic flush does not wait for it.
 extern "C" void guamp_emmc_flush(unsigned type)
 {
+  pmic::torch::shutdown(type >= kPEPanicRestartCPU && type != kPEPagingOff);   // flash LED off first, gate or not
   Card &card = gCard;
   if (!card.online || !card.gate) return;
   bool panic = type >= kPEPanicRestartCPU && type != kPEPagingOff;

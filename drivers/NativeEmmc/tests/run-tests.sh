@@ -11,6 +11,11 @@ rc=0
 echo "== kernel glue: arm64-apple-ios, -Werror, integer registers only"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 \
   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/glue_check.cpp" -o "$WORK/glue.o" && echo "glue: compiled" || rc=1
+clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 \
+  -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/torch_glue_check.cpp" -o "$WORK/torch_glue.o" && echo "torch glue: compiled" || rc=1
+echo "== torch core (GuampTorchCore.h)"
+clang++ $FLAGS "$HERE/torch_host.cpp" -o "$WORK/torch_host" && "$WORK/torch_host" || rc=1
+g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/torch_host.cpp" -o "$WORK/torch_host_gcc" && "$WORK/torch_host_gcc" >/dev/null || rc=1
 echo "== host build (clang and gcc)"
 clang++ $FLAGS "$HERE/wifi_host.cpp" -o "$WORK/wifi_host" || exit 1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/wifi_host.cpp" -o "$WORK/wifi_host_gcc" || rc=1
