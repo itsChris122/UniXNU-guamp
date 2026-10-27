@@ -1,0 +1,16 @@
+--- a/libkern/os/log.c	2026-10-27 15:17:11.082750641 +0100
++++ b/libkern/os/log.c	2026-10-27 15:17:11.094750641 +0100
+@@ -704,7 +704,12 @@
+ 	if (newlogline && (msgbufp->msg_size > MSGBUF_TIMESTAMP_THRESHOLD)) {
+ 		clock_sec_t secs;
+ 		clock_usec_t microsecs;
+-		absolutetime_to_microtime(timestamp, &secs, &microsecs);
++		/* guamp: the timebase keeps counting across warm resets and fastboot boot; print time since the first line of this boot. */
++		static uint64_t guamp_log_base;
++		if (!guamp_log_base) {
++			guamp_log_base = timestamp ? timestamp : 1;
++		}
++		absolutetime_to_microtime(timestamp > guamp_log_base ? timestamp - guamp_log_base : 0, &secs, &microsecs);
+ 		printf_log_locked(FALSE, "[%5lu.%06u]: ", (unsigned long)secs, microsecs);
+ 	}
+ 
