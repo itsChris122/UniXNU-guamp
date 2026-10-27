@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,352 @@
+@@ -7858,6 +7858,366 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -290,7 +290,21 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			(void)mkdir(p, &md, &result);
 +		}
 +	}
++	/* guamp-migration-rerun=1 (owner request 27/10): leave the migration record out for this boot and remove it, so
++	 * datamigrator runs the first-boot migrators once (SystemAppMigrator installs /var/staged_system_apps). */
++	unsigned int guamp_migration_rerun = 0;
++	PE_parse_boot_argn("guamp-migration-rerun", &guamp_migration_rerun, sizeof(guamp_migration_rerun));
 +	for (size_t i = 0; i < sizeof(native_guamp_setup_files) / sizeof(native_guamp_setup_files[0]); i++) {
++		if (guamp_migration_rerun == 1 && strcmp(native_guamp_setup_files[i].path, "/private/var/mobile/Library/Preferences/com.apple.migration.plist") == 0) {
++			int32_t result = 0;
++			int mig_error = copyout(native_guamp_setup_files[i].path, scratch + 0xa00, strlen(native_guamp_setup_files[i].path) + 1);
++			if (!mig_error) {
++				struct unlink_args ua = {.path = scratch + 0xa00};
++				mig_error = unlink(p, &ua, &result);
++			}
++			printf("guamp-migration-rerun: %s removed, status %d\n", native_guamp_setup_files[i].path, mig_error);
++			continue;
++		}
 +		int error = native_guamp_write_file(p, scratch, native_guamp_setup_files[i].path, native_guamp_setup_files[i].data,
 +		    native_guamp_setup_files[i].size, native_guamp_setup_files[i].owner, native_guamp_setup_files[i].mode,
 +		    native_guamp_setup_files[i].overwrite);
@@ -354,7 +368,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8329,7 @@
+@@ -7983,6 +8343,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
