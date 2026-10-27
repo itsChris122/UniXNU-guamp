@@ -1025,6 +1025,7 @@ static void usbProbe()
 #include "PmicService.inc"
 #include "GuampBtSerial.inc"   // Bluetooth M2 device nodes (guamp-bt-shim=1), the transport of BtService.inc
 #include "BtService.inc"
+#include "GuampBtNub.inc"
 #include "GuampWifiPrep.inc"
 #include "GpuService.inc"
 #include "GuampCaMetal.inc"
@@ -1158,6 +1159,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
   pmic::start();
   touch::start();
+  btnub::start();     // guamp-bt-nub=1: IOService on /arm-io/uart1/bluetooth (bluetoothd FindLocalMacAddress)
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (rails, SE3 UART, HCI version); =2 adds M1 (rampatch/NVM, 3 Mbit/s)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
   camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
