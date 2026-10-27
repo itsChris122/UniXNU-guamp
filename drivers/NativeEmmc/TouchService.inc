@@ -429,6 +429,10 @@ void publish(const struct hx_report &r) {
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
+  // guamp-touch-delay=<s>: start later, so the USB mirror (it connects after the first seconds) sees every line.
+  unsigned delay = 0;
+  PE_parse_boot_argn("guamp-touch-delay", &delay, sizeof(delay));
+  if (delay && delay <= 600) IOSleep(delay * 1000);
   if (!snapshot() || stage < 2 || !enable() || stage < 3) return;
   if (!openBus()) {
     // The boot-time panel line is gone from kpan and the USB mirror connects later: repeat it once a minute for 15 minutes.
