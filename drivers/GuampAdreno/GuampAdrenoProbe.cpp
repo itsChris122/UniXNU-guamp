@@ -107,11 +107,23 @@ struct Session {
 };
 Session gSession;
 
+// Stuck-core breadcrumb (GuampPerf.inc in NativeEmmc): the GPU register about to be accessed, published before the access.
+extern "C" volatile uint32_t guamp_mmio_tag[3];
+void mmioTag(uint32_t tag, uint32_t dword) {
+  guamp_mmio_tag[0] = tag;
+  guamp_mmio_tag[1] = dword;
+  guamp_mmio_tag[2] = guamp_mmio_tag[2] + 1;
+  __asm__ volatile("dmb ish" ::: "memory");
+}
 void gw(const Session &s, uint32_t dword, uint32_t value) {
+  mmioTag('a', dword);
   *reinterpret_cast<volatile uint32_t *>(s.gpu + dword * 4) = value;
   __asm__ volatile("dsb sy" ::: "memory");
 }
-uint32_t gr(const Session &s, uint32_t dword) {return *reinterpret_cast<volatile uint32_t *>(s.gpu + dword * 4);}
+uint32_t gr(const Session &s, uint32_t dword) {
+  mmioTag('A', dword);
+  return *reinterpret_cast<volatile uint32_t *>(s.gpu + dword * 4);
+}
 void gw64(const Session &s, uint32_t dword, uint64_t value) {gw(s, dword, uint32_t(value)); gw(s, dword + 1, uint32_t(value >> 32));}
 
 // NativeAdreno's register, cache and clock callbacks: GPU registers by dword index through the caller's uncached window.
@@ -352,15 +364,13 @@ int naCp(Session &s, const GuampAdrenoStart *in) {
 // GPU left in secure mode shows up as faults of the user submissions.
 // guamp: reading 0xF400 stalled the core on the phone (TrustZone-protected here), so it is skipped unless guamp-adreno-secvid=1.
 void naSecureFallback(Session &s) {
+  // Write only: kgsl never reads it back (adreno.c), and a read stalls the core here. guamp-adreno-secvid=1 writes 0.
   if (bootArg("guamp-adreno-secvid", 0) != 1) {
-    IOLog("GuampAdreno: secvid trust cntl not touched (protected on guamp; guamp-adreno-secvid=1 to try)\n");
+    IOLog("GuampAdreno: secvid trust cntl not touched (protected on guamp; guamp-adreno-secvid=1 writes 0 without reading)\n");
     return;
   }
-  const uint32_t before = gr(s, 0xF400);
   gw(s, 0xF400, 0);
-  const uint32_t after = gr(s, 0xF400);
-  IOLog("GuampAdreno: secvid trust cntl %08x -> %08x%s (no zap shader)\n", before, after,
-        after == 0 ? " (unsecured)" : " (write ignored)");
+  IOLog("GuampAdreno: secvid trust cntl written 0 (not read back: a read stalls the core)\n");
 }
 
 // The GPU interrupt line, then one CP_NOP fence that must raise it.

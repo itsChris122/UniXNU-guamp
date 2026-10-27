@@ -74,11 +74,13 @@ struct Fake {
   uint64_t ringPhys = 0, scratchPhys = 0;
   uint32_t ringDwords = 1024;
   bool execute = true, secvidLocked = false;
+  unsigned secvidReads = 0;   // must stay 0: a CPU read of RBBM_SECVID_TRUST_CNTL stalls the core on guamp
   bool smmuIgnore = false, bypassBecomesFault = false;   // firmware behaviours seen on qcom SMMUs
   unsigned writes = 0, flushes = 0, smmuWrites = 0, resetWrites = 0;
 };
 static uint32_t frd(void *c, unsigned b, uint32_t off) {
   Fake *f = static_cast<Fake *>(c);
+  if (b == GM2_GPU && off / 4 == GM2_RBBM_SECVID_TRUST_CNTL) f->secvidReads++;
   return b == GM2_GPU ? f->gpu.at(off / 4) : f->smmu.at(off / 4);
 }
 static void fwr(void *c, unsigned b, uint32_t off, uint32_t v) {
@@ -315,7 +317,10 @@ static void testCp(bool execute, bool locked) {
   CHECK(f.ring[10] == static_cast<uint32_t>(f.scratchPhys + 16));
   CHECK(c.consumed == execute && c.wrote == execute && c.rptr == (execute ? 13u : 0u));
   CHECK(execute ? c.waitedUs == 0 : c.waitedUs == GM2_POLL_STEPS * GM2_POLL_STEP_US);
-  CHECK(c.secvidBefore == 1 && c.secvidAfter == (locked ? 1u : 0u));
+  // never read (a CPU read of 0xF400 stalls on guamp); written only when gm2_secvid_write() is set
+  CHECK(c.secvidBefore == GM2_SECVID_NOT_READ && c.secvidAfter == GM2_SECVID_NOT_READ);
+  CHECK(f.gpu[GM2_RBBM_SECVID_TRUST_CNTL] == ((gm2_secvid_write() && !locked) ? 0u : 1u));
+  CHECK(f.secvidReads == 0);
   CHECK(f.writes < 1000 && f.flushes >= 3);
 }
 
@@ -373,6 +378,10 @@ int main() {
   testSmmu();
   testCp(true, false);
   testCp(false, true);
+  gm2_secvid_write() = true;   // opt-in: the posted write of 0, still never read
+  testCp(true, false);
+  testCp(true, true);
+  gm2_secvid_write() = false;
   testSmmuSetup();
   testSubmit(true);
   testSubmit(false);

@@ -297,6 +297,13 @@ struct gm2_cp {
   bool consumed, wrote, softReset;
 };
 
+// RBBM_SECVID_TRUST_CNTL is write-only for this driver (see the end of gm2_cp_start_ex): never read, written only on request.
+#define GM2_SECVID_NOT_READ 0xffffffffu
+static inline bool &gm2_secvid_write() {
+  static bool on = false;
+  return on;
+}
+
 // --- step trace: a GPU register access that never completes stalls the CPU, so its own log line may never come.
 // Every access below first stores its step and register in the owner's progress words (printed every 10 s by an
 // other thread) and calls the owner's log hook; a step at or after stopAt is not performed (guamp-gpu-m2-stop).
@@ -338,8 +345,17 @@ static inline bool gm2_step(uint32_t step, uint32_t reg) {
 }
 #define GM2_STEP(n, reg) do { if (!gm2_step((n), (reg))) { c->stoppedAt = (n); return; } } while (0)
 
-static inline void gm2_w(const gm2_io *io, uint32_t reg, uint32_t v) { io->wr(io->ctx, GM2_GPU, reg * 4u, v); }
-static inline uint32_t gm2_r(const gm2_io *io, uint32_t reg) { return io->rd(io->ctx, GM2_GPU, reg * 4u); }
+#ifndef GUAMP_MMIO_TAG
+#define GUAMP_MMIO_TAG(t, r) ((void)0)   // the kernel build defines it in GuampPerf.inc (stuck-core breadcrumb)
+#endif
+static inline void gm2_w(const gm2_io *io, uint32_t reg, uint32_t v) {
+  GUAMP_MMIO_TAG('m', reg);
+  io->wr(io->ctx, GM2_GPU, reg * 4u, v);
+}
+static inline uint32_t gm2_r(const gm2_io *io, uint32_t reg) {
+  GUAMP_MMIO_TAG('M', reg);
+  return io->rd(io->ctx, GM2_GPU, reg * 4u);
+}
 static inline void gm2_wm(const gm2_io *io, uint32_t step, uint32_t reg, uint32_t v) {
   gm2_mark(step, reg);
   gm2_w(io, reg, v);
@@ -453,11 +469,14 @@ static inline void gm2_cp_start_ex(const gm2_io *io, const gm2_mem *m, gm2_cp *c
   gm2_mark(GM2_STEP_STATUS_READS, GM2_CP_STATUS_1);
   c->cpStatus1 = gm2_r(io, GM2_CP_STATUS_1);
 
-  // adreno_set_unsecured_mode without a zap shader: the direct write (ignored if the secure world owns it)
+  // adreno_set_unsecured_mode without a zap shader writes RBBM_SECVID_TRUST_CNTL = 0 (kgsl adreno.c, write only, never read
+  // back). On guamp a CPU read of 0xF400 never completes (GuampAdreno, 27/10: the core stalled on it; protected by the secure
+  // world), so this register is never read: both fields stay GM2_SECVID_NOT_READ, and the posted write is issued only when the
+  // caller opts in through gm2_secvid_write() (default off).
   GM2_STEP(GM2_STEP_SECVID, GM2_RBBM_SECVID_TRUST_CNTL);
-  c->secvidBefore = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
-  gm2_w(io, GM2_RBBM_SECVID_TRUST_CNTL, 0);
-  c->secvidAfter = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
+  c->secvidBefore = GM2_SECVID_NOT_READ;
+  c->secvidAfter = GM2_SECVID_NOT_READ;
+  if (gm2_secvid_write()) gm2_w(io, GM2_RBBM_SECVID_TRUST_CNTL, 0);
 }
 // The recovery form (gpug2): with the soft reset, as a6xx_soft_reset before a restart.
 static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) { gm2_cp_start_ex(io, m, c, true); }
