@@ -49,6 +49,9 @@ static void start()
 // One line per report for the first few minutes: the USB mirror connects after the framebuffer is published.
 // Every report: frames copied since the previous one and the CPU copy cost (mean / maximum since the previous report,
 // microseconds per frame), with the scanout mapping mode (guamp-fb-wc=1: write-combining).
+// scripts/guamp-canvas-variant.py (always applied to the legacy display): source mapping and read-probe counters.
+extern "C" volatile uint64_t guamp_copy_split[8];
+
 static void copyLog()
 {
   static uint64_t lastN = 0, lastSum = 0, lastBytes = 0, lastMax = 0;
@@ -68,6 +71,20 @@ static void copyLog()
         "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
         max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
         guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+  {
+    // Mapping (and, with guamp-fast-copy=1, cache maintenance) per frame and the read-only probe of guamp-copy-probe=N.
+    static uint64_t lastMaps = 0, lastMapTicks = 0, lastProbes = 0, lastProbeTicks = 0;
+    const uint64_t maps = guamp_copy_split[0], mapTicks = guamp_copy_split[1];
+    const uint64_t probes = guamp_copy_split[2], probeTicks = guamp_copy_split[3];
+    if (maps != lastMaps || probes != lastProbes)
+      IOLog("GuampDisplay: source map %llu us/frame (%llu frames), cache mode %llu, cacheable %llu, refused %llu; "
+            "read probe %llu us/frame over %llu KiB (%llu frames)\n",
+            maps > lastMaps ? (mapTicks - lastMapTicks) / (maps - lastMaps) * 1000000 / f : 0, maps - lastMaps,
+            guamp_copy_split[4], guamp_copy_split[5], guamp_copy_split[7],
+            probes > lastProbes ? (probeTicks - lastProbeTicks) / (probes - lastProbes) * 1000000 / f : 0,
+            guamp_copy_split[6] >> 10, probes - lastProbes);
+    lastMaps = maps; lastMapTicks = mapTicks; lastProbes = probes; lastProbeTicks = probeTicks;
+  }
   lastN = n; lastSum = sum; lastBytes = bytes; lastMax = max;
   lastAccepted = accepted; lastRejected = rejected;
 }

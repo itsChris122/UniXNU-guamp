@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '310081e050a8321fda160998d7c9dfab798721482f6734a79cead87f8aea67fa'
+PATCHED_SHA256 = 'f7fb3d130e691ab2079fc3485cc85cb61929351267be0e19c96102e9fbd141f2'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -249,6 +249,46 @@ EDITS.append((r'''            installBootDimensions((uint32_t)video.v_width,(uin
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,gopWidth,gopHeight);
+'''))
+# 9. guamp-fast-copy=1: the swapped surface is read through a cacheable kernel mapping (cleaned and invalidated by VA first, so
+#    lines the render server's CPU left dirty reach memory and no stale line is read), instead of the descriptor's default mode.
+#    guamp-copy-probe=N: the first N frames also time a read-only pass over the mapped surface, which splits the copy cost into
+#    reading the source and the rest (scaling and the scanout stores). guamp_copy_split: [0] frames mapped, [1] map + cache
+#    maintenance ticks, [2] probed frames, [3] probe ticks, [4] mapping cache mode (kIOMapCacheMask >> kIOMapCacheShift),
+#    [5] 1 when the cacheable mapping was used, [6] probe bytes, [7] fast mappings refused (default mapping used instead).
+EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}',
+              'extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}\n'
+              'extern "C" {volatile uint64_t guamp_copy_split[8];volatile uint64_t guamp_copy_probe_sink;}\n'
+              'extern "C" void flush_dcache64(addr64_t,unsigned,int);'))
+EDITS.append(('        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);\n',
+r'''        static int fastCopy=-1;static unsigned probeBudget=0;
+        if(fastCopy<0){unsigned v=0;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;
+            PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;}
+        uint64_t mapStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapStart));
+        IOMemoryMap *source=nullptr;
+        if(fastCopy) {
+            source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
+            if(source && source->getVirtualAddress() && source->getLength()>=allocation && source->getLength()<=0xffffffffull)
+                flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
+            else {OSSafeReleaseNULL(source);guamp_copy_split[7]=guamp_copy_split[7]+1;}
+        }
+        guamp_copy_split[5]=source?1:0;
+        if(!source)source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        if(source) {
+            uint64_t mapEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapEnd));
+            guamp_copy_split[0]=guamp_copy_split[0]+1;guamp_copy_split[1]=guamp_copy_split[1]+(mapEnd-mapStart);
+            guamp_copy_split[4]=(source->getMapOptions()&kIOMapCacheMask)>>kIOMapCacheShift;
+            if(probeBudget && source->getVirtualAddress()) {
+                --probeBudget;
+                const uint64_t *word=reinterpret_cast<const uint64_t *>(source->getVirtualAddress());
+                const uint64_t words=((source->getLength()<allocation?source->getLength():allocation)/32)*4;
+                uint64_t sum=0,probeStart,probeEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeStart));
+                for(uint64_t i=0;i<words;i+=4)sum+=word[i]^word[i+1]^word[i+2]^word[i+3];
+                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeEnd));
+                guamp_copy_probe_sink=sum;guamp_copy_split[2]=guamp_copy_split[2]+1;
+                guamp_copy_split[3]=guamp_copy_split[3]+(probeEnd-probeStart);guamp_copy_split[6]=words*8;
+            }
+        }
 '''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
