@@ -5,6 +5,15 @@
 // _UIStatusBarVisualProvider_Fallback (red, rdar://45025538). The panel is the built-in one: on first publish,
 // before backboardd enumerates, record what the framebuffer published and clear "external".
 // guamp-display-internal=0 only records.
+// Display copy counters of package/LegacyDisplayProbe.cpp (CPU copy of each swapped frame into the GOP scanout, counter
+// ticks) and the swap counters; weak because a kernel without the legacy display probe has none of them.
+extern "C" volatile uint64_t native_legacy_copy_n __attribute__((weak_import));
+extern "C" volatile uint64_t native_legacy_copy_sum __attribute__((weak_import));
+extern "C" volatile uint64_t native_legacy_copy_max __attribute__((weak_import));
+extern "C" volatile uint64_t native_legacy_copy_bytes_sum __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_swap_accepted_count __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_swap_rejected_count __attribute__((weak_import));
+extern "C" unsigned int guamp_fb_wc_enabled __attribute__((weak_import));
 namespace dispext {
 static volatile uint32_t gSeen = 0, gExternalBefore = 0, gBuiltIn = 0, gForced = 0;
 static bool gForce = true;
@@ -37,9 +46,35 @@ static void start()
 }
 
 // One line per report for the first few minutes: the USB mirror connects after the framebuffer is published.
+// Every report: frames copied since the previous one and the CPU copy cost (mean / maximum since the previous report,
+// microseconds per frame), with the scanout mapping mode (guamp-fb-wc=1: write-combining).
+static void copyLog()
+{
+  static uint64_t lastN = 0, lastSum = 0, lastBytes = 0, lastMax = 0;
+  static uint32_t lastAccepted = 0, lastRejected = 0;
+  if (!&native_legacy_copy_n) return;
+  const uint64_t n = native_legacy_copy_n, sum = native_legacy_copy_sum, bytes = native_legacy_copy_bytes_sum;
+  const uint64_t max = native_legacy_copy_max;
+  const uint32_t accepted = &native_legacy_swap_accepted_count ? native_legacy_swap_accepted_count : 0;
+  const uint32_t rejected = &native_legacy_swap_rejected_count ? native_legacy_swap_rejected_count : 0;
+  uint64_t f = 0;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+  if (!f) f = 19200000;
+  const uint64_t frames = n - lastN;
+  const uint64_t meanUs = frames ? (sum - lastSum) / frames * 1000000 / f : 0;
+  const uint64_t kib = frames ? ((bytes - lastBytes) / frames) >> 10 : 0;
+  IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
+        "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
+        max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
+        &guamp_fb_wc_enabled && guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+  lastN = n; lastSum = sum; lastBytes = bytes; lastMax = max;
+  lastAccepted = accepted; lastRejected = rejected;
+}
+
 static void log()
 {
   static unsigned reports = 0;
+  copyLog();
   if (reports++ >= 30) return;
   IOLog("GuampDisplay: IOMFB seen %u external-before %u (0 absent 1 true 2 false 3 other) builtin %u forced %u\n",
         gSeen, gExternalBefore, gBuiltIn, gForced);
