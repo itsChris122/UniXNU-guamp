@@ -1,0 +1,63 @@
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -980,6 +980,22 @@
+     return data ? os_atomic_load(&data->cpu_signal, relaxed) : UINT32_MAX;
+ }
+ 
++/*
++ * guamp: a core stalled forever on an MMIO access that never completes (a TrustZone-protected GPU register) never
++ * acknowledges SIGPdebug. Every later stackshot then halts all other cores for two debug_ack_timeout waits (enter and
++ * return). guamp-stuck-cpu=1 (default): after a timeout the silent cores are recorded and later non-panic debugger entries
++ * (stackshots) skip them; a core that clears its pending SIGPdebug (it answered after all) is taken back. Panics
++ * (proceed_on_sync_failure) keep the original behaviour.
++ */
++static uint64_t guamp_stuck_cpus;
++static int guamp_stuck_mode = -1;
++uint64_t guamp_stuck_cpu_mask(void);
++uint64_t
++guamp_stuck_cpu_mask(void)
++{
++	return os_atomic_load(&guamp_stuck_cpus, relaxed);
++}
++
+ kern_return_t
+ DebuggerXCallEnter(
+ 	boolean_t proceed_on_sync_failure, bool is_stackshot)
+@@ -993,6 +1009,11 @@
+ 	unsigned int guamp_guard = 0;
+ 	PE_parse_boot_argn("guamp-smp-snapshot-guard", &guamp_guard, sizeof(guamp_guard));
+ 	bool guamp_refuse_incoherent_snapshot = false;
++	if (guamp_stuck_mode < 0) {
++		unsigned int guamp_stuck_arg = 1;
++		PE_parse_boot_argn("guamp-stuck-cpu", &guamp_stuck_arg, sizeof(guamp_stuck_arg));
++		guamp_stuck_mode = guamp_stuck_arg == 1;
++	}
+ 
+ 	/* Check for nested debugger entry. */
+ 	cpu_data_ptr->debugger_active++;
+@@ -1033,6 +1054,14 @@
+ 				continue;
+ 			}
+ 
++			if (guamp_stuck_mode == 1 && !proceed_on_sync_failure && cpu < 64 &&
++			    (os_atomic_load(&guamp_stuck_cpus, relaxed) & (1ULL << cpu))) {
++				if (os_atomic_load(&target_cpu_datap->cpu_signal, relaxed) & SIGPdebug) {
++					continue;   /* still silent: not waited for again */
++				}
++				os_atomic_andnot(&guamp_stuck_cpus, 1ULL << cpu, relaxed);
++				kprintf("GuampStuck: cpu %d answered its debugger IPI, synchronised again\n", cpu);
++			}
+ 			kern_return_t ret = cpu_signal(target_cpu_datap, SIGPdebug, (void *)NULL, NULL);
+ 			if (ret == KERN_SUCCESS) {
+ 				os_atomic_inc(&debugger_sync, relaxed);
+@@ -1099,6 +1128,10 @@
+ 			}
+ 
+ 			kprintf("%s>Debugger synch pending on cpu %d\n", __FUNCTION__, cpu);
++			if (guamp_stuck_mode == 1 && cpu < 64 && !(os_atomic_load(&guamp_stuck_cpus, relaxed) & (1ULL << cpu))) {
++				os_atomic_or(&guamp_stuck_cpus, 1ULL << cpu, relaxed);
++				kprintf("GuampStuck: cpu %d does not answer debugger IPIs: later stackshots skip it (guamp-stuck-cpu=0 to keep waiting)\n", cpu);
++			}
+ 		}
+ 
+ 		if (debugger_sync == 0) {

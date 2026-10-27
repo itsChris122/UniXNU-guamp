@@ -15,6 +15,13 @@ extern "C" volatile uint32_t guamp_timer_sequence[8];
 extern "C" unsigned int guamp_ram_nc_enabled;
 extern "C" volatile uint64_t guamp_irq_trace[8][3][14];
 extern "C" volatile uint32_t guamp_irq_trace_sequence[8];
+// Last risky MMIO access before it is issued: [0] tag ('A'/'a' GuampAdrenoProbe read/write, 'M'/'m' GuampGpuM2 read/write),
+// [1] register (dword index), [2] sequence. A core stalled on an access that never completes leaves it here; the stuck-core
+// line below prints it. The store is ordered before the access (dmb), so it is visible while that core hangs.
+extern "C" volatile uint32_t guamp_mmio_tag[3];
+volatile uint32_t guamp_mmio_tag[3];
+#define GUAMP_MMIO_TAG(t, r)                                   do {                                                           guamp_mmio_tag[0] = (t);                                     guamp_mmio_tag[1] = (r);                                     guamp_mmio_tag[2] = guamp_mmio_tag[2] + 1;                   __asm__ volatile("dmb ish" ::: "memory");                  } while (0)
+extern "C" uint64_t guamp_stuck_cpu_mask(void);   // zzzz-guamp-stuck-cpu.patch (osfmk/arm/model_dep.c)
 extern "C" volatile uint32_t guamp_gpu_step[3];   // GpuService.inc: last GPU access step, register, sequence
 extern "C" kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);
 extern "C" void proc_iterate(unsigned int, int (*)(struct proc *, void *), void *, int (*)(struct proc *, void *), void *);
@@ -167,6 +174,27 @@ static void guampPerfSample() {
       for (unsigned d = 0; d < 2; ++d)
         if (guamp_cpufreq_summary[d][0]) IOLog("GuampCpufreq: %s\n", guamp_cpufreq_summary[d]);
     if (guamp_gpu_step[2]) IOLog("GuampGpu: progress step %u reg %x seq %u\n", guamp_gpu_step[0], guamp_gpu_step[1], guamp_gpu_step[2]);
+    // Per-core heartbeat: a core whose timer and IPI counts (ArmCpu) did not move over the sample is quiet; the debugger mask
+    // marks cores that never answered a stackshot IPI. Printed while anything is wrong (first 3 times, then every minute).
+    {
+      static uint32_t lastBeat[8];
+      static unsigned reports = 0;
+      uint32_t quiet = 0;
+      const unsigned cores = basicResult == KERN_SUCCESS && basic.max_cpus > 0 && basic.max_cpus <= 8 ? basic.max_cpus : 0;
+      for (unsigned cpu = 0; cpu < cores; ++cpu) {
+        const uint32_t beat = armcpu_core_timer[cpu] + armcpu_core_sgi[cpu];
+        if (beat == lastBeat[cpu]) quiet |= 1u << cpu;
+        lastBeat[cpu] = beat;
+      }
+      const uint64_t silent = guamp_stuck_cpu_mask();
+      if (quiet || silent) {
+        reports = reports + 1;
+        if (reports <= 3 || reports % 6 == 0)
+          IOLog("GuampStuck: quiet cores %02x (timer+IPI unchanged for 10 s), debugger-silent %02llx, last MMIO %c reg %x seq %u\n",
+                quiet, static_cast<unsigned long long>(silent), guamp_mmio_tag[0] ? static_cast<char>(guamp_mmio_tag[0]) : '-',
+                guamp_mmio_tag[1], guamp_mmio_tag[2]);
+      }
+    }
     IOLog("GuampRamCache: managed IO RAM to Normal NC %u; MMIO/native WB policy retained\n", guamp_ram_nc_enabled);
     IOLog("GuampSmp: IPI pending-mode %u sent %llu received %llu; GIC group %x enabled %x ctl %x typer %x\n",
           armcpu_ipi_pending_mode, armcpu_ipi_sent, armcpu_ipi_interrupts,
