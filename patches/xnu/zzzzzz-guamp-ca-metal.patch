@@ -1,0 +1,144 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 3edb139..de01d3a 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7675,6 +7675,112 @@ native_guamp_cc_reset(proc_t p, user_addr_t scratch)
+ 	native_guamp_cc_reset_done = !error;
+ 	printf("guamp-cc-reset: cycle %u: %u found, %u deleted, status %d\n", cycle, found, native_guamp_cc_reset_deleted, error);
+ }
++/* guamp-ca-metal (owner request 27/10): whether the render server may composite through the native Metal device.
++ * 0 (default) software: the plugin's publish marker is parked as NativeAdrenoMetal.publish.off and guamp_ca_metal_enabled stays 0,
++ * so NativeAdreno does not offer IOAcceleratorES to the render server and QuartzCore keeps CA::OGL::SWContext.
++ * 1 Metal: the marker is restored (when the addon carries one) and guamp_ca_metal_enabled = 1.
++ * 2 Metal with a boot watchdog: /private/var/ngpu/ca-metal.state counts the Metal boots not yet confirmed good. The count is raised
++ *   here, before launchd, and cleared by the runtime monitor (GuampCaMetal.inc) after a healthy render server session, so a hang, a
++ *   panic or a crash loop with Metal leaves it raised; from GUAMP_CA_METAL_MAX on the boot falls back to software by itself.
++ *   guamp-ca-metal-reset=1 clears the count first. Never panics: every failure only records its status. */
++unsigned int guamp_ca_metal_mode = 0;
++volatile int guamp_ca_metal_enabled = 0;
++volatile int guamp_ca_metal_attempts = -1;
++volatile int guamp_ca_metal_status = -1;
++#define GUAMP_CA_METAL_MAX 3
++static int native_guamp_write_file(proc_t p, user_addr_t scratch, const char *path, const uint8_t *data, size_t size, uid_t owner,
++    int mode, int overwrite);
++static int
++native_guamp_ca_metal_read(proc_t p, user_addr_t scratch, const char *path, char *buf, size_t size)
++{
++	int32_t result = 0;
++	user_ssize_t got = 0;
++	int error = copyout(path, scratch + 0xa00, strlen(path) + 1);
++	if (error) {
++		return error;
++	}
++	struct open_args op = {.path = scratch + 0xa00, .flags = O_RDONLY | O_NOFOLLOW, .mode = 0};
++	error = open(p, &op, &result);
++	if (error) {
++		return error;
++	}
++	int fd = result;
++	struct read_args rd = {.fd = fd, .cbuf = scratch + 0xb00, .nbyte = size - 1};
++	error = read(p, &rd, &got);
++	if (!error && got > 0) {
++		error = copyin(scratch + 0xb00, buf, (size_t)got);
++	}
++	buf[!error && got > 0 ? got : 0] = 0;
++	struct close_args cl = {.fd = fd};
++	(void)sys_close(p, &cl, &result);
++	return error;
++}
++/* Moves the plugin's publish marker between its active and parked names; ENOENT when the addon carries neither (tests only). */
++static int
++native_guamp_ca_metal_marker(proc_t p, user_addr_t scratch, int publish)
++{
++	static const char active[] = "/private/var/ngpu/addons/NativeAdrenoMetal.publish";
++	static const char parked[] = "/private/var/ngpu/addons/NativeAdrenoMetal.publish.off";
++	int32_t result = 0;
++	const char *from = publish ? parked : active, *to = publish ? active : parked;
++	int error = copyout(from, scratch + 0xa00, strlen(from) + 1);
++	if (!error) {
++		error = copyout(to, scratch + 0xc00, strlen(to) + 1);
++	}
++	if (!error) {
++		struct rename_args rn = {.from = scratch + 0xa00, .to = scratch + 0xc00};
++		error = rename(p, &rn, &result);
++	}
++	return error;
++}
++static void
++native_guamp_ca_metal_decide(proc_t p, user_addr_t scratch)
++{
++	static const char state[] = "/private/var/ngpu/ca-metal.state";
++	unsigned int reset = 0;
++	PE_parse_boot_argn("guamp-ca-metal", &guamp_ca_metal_mode, sizeof(guamp_ca_metal_mode));
++	PE_parse_boot_argn("guamp-ca-metal-reset", &reset, sizeof(reset));
++	if (guamp_ca_metal_mode > 2) {
++		guamp_ca_metal_mode = 0;
++	}
++	int enable = guamp_ca_metal_mode != 0, error = 0;
++	if (guamp_ca_metal_mode == 2) {
++		char text[32] = {0};
++		int attempts = 0;
++		error = reset ? ENOENT : native_guamp_ca_metal_read(p, scratch, state, text, sizeof(text));
++		if (!error && strncmp(text, "attempts ", 9) == 0) {
++			for (const char *c = text + 9; *c >= '0' && *c <= '9' && attempts < 1000; c++) {
++				attempts = attempts * 10 + (*c - '0');
++			}
++		}
++		guamp_ca_metal_attempts = attempts;
++		if (attempts >= GUAMP_CA_METAL_MAX) {
++			enable = 0;
++		} else {
++			char note[32];
++			int len = snprintf(note, sizeof(note), "attempts %d\n", attempts + 1);
++			error = native_guamp_write_file(p, scratch, state, (const uint8_t *)note, (size_t)len, 0, 0644, 1);
++			if (error) {
++				enable = 0;   /* without a persistent count a Metal hang would repeat on every boot */
++			}
++		}
++	}
++	int marker = native_guamp_ca_metal_marker(p, scratch, enable);
++	guamp_ca_metal_enabled = enable;
++	int prefs[2] = {-1, -1};
++	if (enable) {
++		/* backboardd must not ask for the AGX deep/compressed framebuffer (sheng add-gpu-plugin-data.py): domain backboardd for
++		 * mobile and root, written only when absent (a whole-file write would drop its other settings; .GlobalPreferences untouched). */
++		static const uint8_t ca_prefs[143] = {0x62,0x70,0x6c,0x69,0x73,0x74,0x30,0x30,0xd3,0x01,0x02,0x03,0x04,0x04,0x04,0x5f,0x10,0x17,0x43,0x41,0x45,0x6e,0x61,0x62,0x6c,0x65,0x44,0x65,0x65,0x70,0x46,0x72,0x61,0x6d,0x65,0x62,0x75,0x66,0x66,0x65,0x72,0x5f,0x10,0x1e,0x43,0x41,0x45,0x6e,0x61,0x62,0x6c,0x65,0x46,0x72,0x61,0x6d,0x65,0x62,0x75,0x66,0x66,0x65,0x72,0x43,0x6f,0x6d,0x70,0x72,0x65,0x73,0x73,0x69,0x6f,0x6e,0x5f,0x10,0x1c,0x43,0x41,0x45,0x6e,0x61,0x62,0x6c,0x65,0x49,0x4f,0x53,0x75,0x72,0x66,0x61,0x63,0x65,0x43,0x6f,0x6d,0x70,0x72,0x65,0x73,0x73,0x69,0x6f,0x6e,0x08,0x08,0x0f,0x29,0x4a,0x69,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x6a};
++		prefs[0] = native_guamp_write_file(p, scratch, "/private/var/mobile/Library/Preferences/backboardd.plist", ca_prefs,
++		    sizeof(ca_prefs), 501, 0600, 0);
++		prefs[1] = native_guamp_write_file(p, scratch, "/private/var/root/Library/Preferences/backboardd.plist", ca_prefs,
++		    sizeof(ca_prefs), 0, 0600, 0);
++	}
++	guamp_ca_metal_status = error;
++	printf("guamp-ca-metal: mode %u attempts %d -> %s (state status %d, marker %d, backboardd prefs %d/%d)\n",
++	    guamp_ca_metal_mode, guamp_ca_metal_attempts, enable ? "Metal" : "software", error, marker, prefs[0], prefs[1]);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -7697,6 +7803,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	if (enabled != 1) {
+ 		return;
+ 	}
++	native_guamp_ca_metal_decide(p, scratch);   /* before the Extensions view: the marker's name is final when it is mounted */
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
+ 	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9714,6 +9714,15 @@
+ 	           AT_FDCWD, uap->to, UIO_USERSPACE, 0);
+ }
+ 
++/* guamp-ca-metal (GuampCaMetal.inc): the runtime watchdog parks the Metal plugin's publish marker from a kernel thread. */
++int guamp_kernel_rename(const char *from, const char *to);
++int
++guamp_kernel_rename(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from),
++	           AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
++
+ int
+ renameatx_np(__unused proc_t p, struct renameatx_np_args *uap, __unused int32_t *retval)
+ {

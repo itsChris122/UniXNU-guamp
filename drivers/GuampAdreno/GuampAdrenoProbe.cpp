@@ -34,6 +34,8 @@
 #include "GuampAdreno.h"
 
 extern "C" {
+// GuampCaMetal.inc (NativeEmmc): the render server gate learns that the Metal device is up (1) or unusable (0).
+void guamp_ca_metal_gpu_ready(int ok);
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -582,6 +584,7 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   s.gpu = in->gpu;
   IOLog("GuampAdreno: start level %u: rbbm status %08x, sqe %u bytes\n", in->level, gr(s, 0x210), in->sqeBytes);
   int result = GuampAdrenoOk;
+  bool tested = false;
   do {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}
@@ -589,11 +592,14 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     naSecureFallback(s);
     if ((result = naIrq(s))) break;
     if ((result = naPublish(s))) break;
-    const bool tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
+    tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
     IOLog("GuampAdreno: self test %s\n", tested ? "ok" : "FAILED (the stages go on)");
     if (in->level >= 2) result = naAccelerator();
   } while (false);
   IOLog("GuampAdreno: RESULT %d (level %u, context step %u, irqs %u, idle sleeps %llu spins %llu)\n", result, in->level,
         gContextStep, gIrqCount, native_gpu_idle_sleeps, native_gpu_idle_spins);
+  // guamp-ca-metal (GuampCaMetal.inc): the render server chose its renderer long before this point; with the gate open it is
+  // restarted once on the device just published, or the plugin's marker is parked when the device is not usable.
+  if (in->level >= 2) guamp_ca_metal_gpu_ready(result == GuampAdrenoOk && tested);
   return result;
 }

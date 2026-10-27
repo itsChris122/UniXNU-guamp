@@ -1027,7 +1027,7 @@ static void usbProbe()
 #include "BtService.inc"
 #include "GuampWifiPrep.inc"
 #include "GpuService.inc"
-// #include "GuampCaMetal.inc"   // off until its weak_import symbols have static-link stand-ins
+#include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
 
@@ -1160,7 +1160,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   touch::start();
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (rails, SE3 UART, HCI version); =2 adds M1 (rampatch/NVM, 3 Mbit/s)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
-  // camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
+  camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start

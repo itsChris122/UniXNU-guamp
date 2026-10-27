@@ -536,6 +536,7 @@ void native_legacy_display_late_probe(void) {
                         activeLegacyDisplay=display;activeGOPNub=nub;native_legacy_stage=10;
                         {
                             unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);
+                            {unsigned g=0;if(PE_parse_boot_argn("guamp-gop-presenter",&g,sizeof g) && g==1)gpu=1;}   // guamp alias
                             if(gpu==1) {
                                 IOService *handoff=native_gop_presenter_create();
                                 // Not a child of the display subsystem's node: the original display code enumerates that node's children (int-075/077:
