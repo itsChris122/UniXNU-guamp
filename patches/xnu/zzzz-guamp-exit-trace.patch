@@ -1,7 +1,6 @@
-diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1882,6 +1882,59 @@
+@@ -1876,6 +1876,93 @@
  	}
  }
  
@@ -15,6 +14,25 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 + * image. Runs on the exiting thread of the process itself, before the task is torn down; copyin failures only shorten
 + * the line.
 + */
++
++/* Read the current process's EL0 translation, not its contents. Preserve PAR
++ * and DAIF; IRQ/FIQ are masked only for this short, nonblocking sysreg sequence. */
++static void
++guamp_user_translation(const char *label, uint64_t address)
++{
++    if (address < 4096 || address >= (1ULL << 48)) { return; }
++    uint64_t daif, previous_par, par, sctlr, mair, tcr, ttbr;
++    __asm__ volatile (
++        "mrs %0, daif\nmsr daifset, #3\nmrs %1, par_el1\n"
++        "at s1e0r, %7\nisb\nmrs %2, par_el1\n"
++        "mrs %3, sctlr_el1\nmrs %4, mair_el1\nmrs %5, tcr_el1\nmrs %6, ttbr0_el1\n"
++        "msr par_el1, %1\nmsr daif, %0\nisb"
++        : "=&r"(daif), "=&r"(previous_par), "=&r"(par), "=&r"(sctlr),
++          "=&r"(mair), "=&r"(tcr), "=&r"(ttbr) : "r"(address) : "memory");
++    printf("GuampMap: %s va %llx PAR %llx attr %02llx SCTLR %llx MAIR %llx TCR %llx TTBR0 %llx\n",
++        label, address, par, (par >> 56) & 255, sctlr, mair, tcr, ttbr);
++}
++
 +static void
 +guamp_exit_trace(proc_t p, int rv, mach_exception_data_type_t code, mach_exception_data_type_t subcode)
 +{
@@ -26,6 +44,21 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +		    (uint64_t)code, (uint64_t)subcode);
 +		return;
 +	}
++
++    if (strcmp(p->p_comm, "backboardd") == 0 && (rv == 10 || rv == 11)) {
++        arm_exception_state64_t exception;
++        mach_msg_type_number_t exception_count = ARM_EXCEPTION_STATE64_COUNT;
++        kern_return_t status = thread_getstatus(current_thread(), ARM_EXCEPTION_STATE64,
++            (thread_state_t)&exception, &exception_count);
++        if (status == KERN_SUCCESS) {
++            printf("GuampMap: saved exception ESR %x FAR %llx kind %x\n",
++                exception.esr, exception.far, exception.exception);
++        } else { printf("GuampMap: saved exception unavailable %d\n", status); }
++        guamp_user_translation("fault", (uint64_t)subcode);
++        if (ts.x[0] != (uint64_t)subcode) { guamp_user_translation("x0", ts.x[0]); }
++        if (ts.x[1] != (uint64_t)subcode && ts.x[1] != ts.x[0]) { guamp_user_translation("x1", ts.x[1]); }
++    }
++
 +	char bt[16 * 13 + 1] = "";
 +	size_t used = 0;
 +	uint64_t frame = ts.fp;
@@ -61,7 +94,7 @@ diff -ru a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -2037,6 +2090,11 @@
+@@ -2027,6 +2114,11 @@
  
  
  	/* stash the usage into corpse data if making_corpse == true */

@@ -1,0 +1,61 @@
+--- a/osfmk/arm/rtclock.c
++++ b/osfmk/arm/rtclock.c
+@@ -369,6 +369,58 @@
+ 	timer_intr(user_mode, pc);
+ }
+ 
++
++/* guamp: take at most about one register snapshot per second on the core
++ * actually handling this timer. No log, allocation, frequency or CVAL changes here. */
++volatile uint64_t guamp_timer_snapshot[8][17];
++volatile uint32_t guamp_timer_sequence[8];
++void guamp_native_timer_intr(unsigned int cpu, unsigned int mode);
++void
++guamp_native_timer_intr(unsigned int cpu, unsigned int mode)
++{
++    static uint32_t calls[8];
++    static uint64_t last[8];
++    uint64_t now = 0, frequency = 0;
++    cpu_data_t *data = getCpuDatap();
++    bool sample = false;
++    if (cpu < 8) {
++        ++calls[cpu];
++        if (calls[cpu] == 1 || (calls[cpu] & 255U) == 0) {
++            now = __builtin_arm_rsr64("CNTVCT_EL0");
++            frequency = __builtin_arm_rsr64("CNTFRQ_EL0");
++            sample = calls[cpu] == 1 || now - last[cpu] >= frequency;
++        }
++    }
++    if (sample) {
++        __atomic_add_fetch(&guamp_timer_sequence[cpu], 1, __ATOMIC_ACQ_REL);
++        last[cpu] = now;
++        guamp_timer_snapshot[cpu][0] = now;
++        guamp_timer_snapshot[cpu][1] = frequency;
++        guamp_timer_snapshot[cpu][2] = __builtin_arm_rsr64("CNTV_CTL_EL0");
++        guamp_timer_snapshot[cpu][3] = __builtin_arm_rsr64("CNTV_CVAL_EL0");
++        guamp_timer_snapshot[cpu][4] = __builtin_arm_rsr64("SCTLR_EL1");
++        guamp_timer_snapshot[cpu][5] = __builtin_arm_rsr64("MAIR_EL1");
++        guamp_timer_snapshot[cpu][6] = __builtin_arm_rsr64("TCR_EL1");
++        guamp_timer_snapshot[cpu][7] = data->rtcPop;
++        guamp_timer_snapshot[cpu][8] = data->cpu_decrementer;
++        guamp_timer_snapshot[cpu][14] = data->cpu_number;
++        guamp_timer_snapshot[cpu][16] = __builtin_arm_rsr64("MPIDR_EL1");
++    }
++    /* Match sleh_fiq(): a serviced timer must no longer advertise its old
++     * positive decrementer. Keep rtcPop and all timer-queue deadline logic native. */
++    if (mode == 1) { data->cpu_decrementer = -1; }
++    rtclock_intr(0);
++    if (sample) {
++        guamp_timer_snapshot[cpu][9] = __builtin_arm_rsr64("CNTVCT_EL0");
++        guamp_timer_snapshot[cpu][10] = __builtin_arm_rsr64("CNTV_CTL_EL0");
++        guamp_timer_snapshot[cpu][11] = __builtin_arm_rsr64("CNTV_CVAL_EL0");
++        guamp_timer_snapshot[cpu][12] = data->rtcPop;
++        guamp_timer_snapshot[cpu][13] = data->cpu_decrementer;
++        guamp_timer_snapshot[cpu][15] = mode;
++        __atomic_add_fetch(&guamp_timer_sequence[cpu], 1, __ATOMIC_RELEASE);
++    }
++}
++
+ static int
+ deadline_to_decrementer(uint64_t deadline,
+     uint64_t now)
