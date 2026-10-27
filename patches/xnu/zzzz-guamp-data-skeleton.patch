@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 124ba0a..a105798 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7757,6 +7757,110 @@ native_staged_apps_walk(proc_t p, user_addr_t scratch, vnode_t source, char *pat
+@@ -7757,6 +7757,111 @@ native_staged_apps_walk(proc_t p, user_addr_t scratch, vnode_t source, char *pat
  		kfree_data(pending.pool, NATIVE_STAGED_APPS_POOL);
  	}
  }
@@ -66,6 +66,7 @@ index 124ba0a..a105798 100644
 +	{"/private/var/mobile/Library/Preferences", 0755, 501},
 +	{"/private/var/mobile/Library/Caches", 0755, 501},
 +	{"/private/var/mobile/Library/Logs", 0755, 501},
++	{"/private/var/mobile/Library/Logs/CrashReporter", 0755, 501},   /* PowerlogCore PLKQueue opens it; abort if missing */
 +	{"/private/var/mobile/Containers", 0755, 501},
 +	{"/private/var/mobile/Documents", 0755, 501},
 +	{"/private/var/mobile/Media", 0755, 501},
@@ -113,7 +114,7 @@ index 124ba0a..a105798 100644
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7881,6 +7985,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+@@ -7881,6 +7986,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
  	if (!error) native_owner_data_stage = 4;
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
