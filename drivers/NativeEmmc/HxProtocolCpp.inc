@@ -344,6 +344,7 @@ int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *o
         const uint8_t *p = buf + 4 * i;
         int x = p[0] << 8 | p[1], y = p[2] << 8 | p[3];
         if (x > x_max || y > y_max) continue;                                         // 0xFFFF: slot not in use
+        if (!x && !y) continue;                                                       // HX83102D leaves unused slots at 0,0
         out->slot[out->count] = (int)i;
         out->point[out->count].x = x;
         out->point[out->count].y = y;
