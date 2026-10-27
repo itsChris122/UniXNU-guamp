@@ -1,0 +1,69 @@
+diff -ru a/bsd/kern/stackshot.c b/bsd/kern/stackshot.c
+--- a/bsd/kern/stackshot.c
++++ b/bsd/kern/stackshot.c
+@@ -503,6 +503,41 @@ stackshot_kern_return_to_bsd_error(kern_return_t kr)
+  *				ESRCH if the target PID isn't found
+  *				returns KERN_SUCCESS on success
+  */
++/*
++ * guamp: every user stackshot halts all cores (DebuggerXCallEnter). guamp-stackshot-log=1 logs who asks (first 40
++ * requests, then every 50th); guamp-stackshot=0 refuses user requests with EPERM (ReportCrash, tailspind, spindump and
++ * osanalyticshelper treat a failed stackshot as "no stackshot").
++ */
++static int guamp_stackshot_mode = -1;
++static unsigned guamp_stackshot_log = 0;
++static uint32_t guamp_stackshot_count = 0;
++
++static void
++guamp_stackshot_args(void)
++{
++	if (guamp_stackshot_mode >= 0) {
++		return;
++	}
++	int mode = 1;
++	unsigned log = 0;
++	PE_parse_boot_argn("guamp-stackshot", &mode, sizeof(mode));
++	PE_parse_boot_argn("guamp-stackshot-log", &log, sizeof(log));
++	guamp_stackshot_log = log;
++	guamp_stackshot_mode = mode ? 1 : 0;
++}
++
++static void
++guamp_stackshot_report(struct proc *p, int target, uint64_t flags, int error, bool refused)
++{
++	guamp_stackshot_count = guamp_stackshot_count + 1;
++	const uint32_t n = guamp_stackshot_count;
++	if (!guamp_stackshot_log || (n > 40 && n % 50)) {
++		return;
++	}
++	printf("guamp-stackshot: %u %s[%d] target %d flags 0x%llx -> %d%s\n", n, p->p_comm, proc_getpid(p),
++	    target, flags, error, refused ? " (refused, guamp-stackshot=0)" : "");
++}
++
+ int
+ stack_snapshot_with_config(struct proc *p, struct stack_snapshot_with_config_args *uap, __unused int *retval)
+ {
+@@ -533,6 +568,8 @@ stack_snapshot_with_config(struct proc *p, struct stack_snapshot_with_config_arg
+ 		goto err;
+ 	}
+ 
++	guamp_stackshot_args();
++
+ 	switch (uap->stackshot_config_version) {
+ 	case STACKSHOT_CONFIG_TYPE:
+ 		if (uap->stackshot_config_size != sizeof(stackshot_config_t)) {
+@@ -545,8 +582,14 @@ stack_snapshot_with_config(struct proc *p, struct stack_snapshot_with_config_arg
+ 			error = EFAULT;
+ 			break;
+ 		}
++		if (!guamp_stackshot_mode) {
++			error = EPERM;
++			guamp_stackshot_report(p, config.sc_pid, config.sc_flags, error, true);
++			break;
++		}
+ 		kr = kern_stack_snapshot_internal(uap->stackshot_config_version, &config, sizeof(stackshot_config_t), TRUE);
+ 		error = stackshot_kern_return_to_bsd_error(kr);
++		guamp_stackshot_report(p, config.sc_pid, config.sc_flags, error, false);
+ 		progress = (error == 0) ? STACKSHOT_SUCCEEDED : STACKSHOT_ATTEMPTED;
+ 		break;
+ 	default:
