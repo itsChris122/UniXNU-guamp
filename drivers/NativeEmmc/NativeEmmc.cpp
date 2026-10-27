@@ -1018,6 +1018,7 @@ static void usbProbe()
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
+#include "BtService.inc"
 #include "GuampWifiPrep.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
@@ -1144,6 +1145,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   dispext::start();
   pmic::start();
   touch::start();
+  bt::start();        // guamp-bt=1: Bluetooth M0 probe (SPMI rails, SE3 UART, HCI version), own thread
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
