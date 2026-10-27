@@ -1,0 +1,35 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2171,11 +2171,16 @@
+  *	avail_end	PA of last managed physical page
+  */
+ 
++/* guamp: immutable after bootstrap; read by native diagnostic logger. */
++unsigned int guamp_ram_nc_enabled = 0;
++
+ void
+ pmap_bootstrap(
+ 	vm_offset_t vstart)
+ {
+ 	vm_map_offset_t maxoffset;
++
++    PE_parse_boot_argn("guamp-ram-nc", &guamp_ram_nc_enabled, sizeof(guamp_ram_nc_enabled));
+ 
+ 	lck_grp_init(&pmap_lck_grp, "pmap", LCK_GRP_ATTR_NULL);
+ 
+@@ -5813,6 +5818,15 @@
+ wimg_to_pte(unsigned int wimg, __unused pmap_paddr_t pa)
+ {
+ 	pt_entry_t pte;
++
++    /* Observed EL0 pixel buffers had Device attr00 and alignment faults on
++     * Kryo260 while SCTLR.A was clear. Keep this pure PTE constructor free
++     * of logging/side effects. Only managed RAM with IO semantics changes;
++     * preserve the native NC policy, NX/PNX, cache maintenance and TLB paths.
++     * Reserved/unmanaged memory and MMIO retain the original policy. */
++    if (guamp_ram_nc_enabled == 1 && (wimg & VM_WIMG_MASK) == VM_WIMG_IO && pa_valid(pa)) {
++        wimg = (wimg & ~VM_WIMG_MASK) | VM_WIMG_WCOMB;
++    }
+ 
+ 	switch (wimg & (VM_WIMG_MASK)) {
+ 	case VM_WIMG_IO:

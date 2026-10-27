@@ -10,6 +10,7 @@ extern "C" volatile uint64_t armcpu_ipi_sent, armcpu_ipi_interrupts;
 extern "C" uint32_t guamp_smp_signal_flags(unsigned int);
 extern "C" volatile uint64_t guamp_timer_snapshot[8][17];
 extern "C" volatile uint32_t guamp_timer_sequence[8];
+extern "C" unsigned int guamp_ram_nc_enabled;
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
   static uint32_t previous[CPU_STATE_MAX] = {};
@@ -41,6 +42,7 @@ static void guampPerfSample() {
           delta[CPU_STATE_IDLE] * 100 / total, delta[CPU_STATE_NICE] * 100 / total,
           basicResult == KERN_SUCCESS ? basic.avail_cpus : 0,
           basicResult == KERN_SUCCESS ? basic.max_cpus : 0, basicResult);
+    IOLog("GuampRamCache: managed IO RAM to Normal NC %u; MMIO/native WB policy retained\n", guamp_ram_nc_enabled);
     IOLog("GuampSmp: IPI pending-mode %u sent %llu received %llu; GIC group %x enabled %x ctl %x typer %x\n",
           armcpu_ipi_pending_mode, armcpu_ipi_sent, armcpu_ipi_interrupts,
           armcpu_gic_boot[0], armcpu_gic_boot[1], armcpu_gic_boot[2], armcpu_gic_boot[3]);
