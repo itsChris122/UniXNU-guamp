@@ -3,6 +3,7 @@
 #include <kern/host.h>
 #include <mach/host_info.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 extern "C" kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" kern_return_t host_info(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8], armcpu_smp_step[8], armcpu_smp_fail[8];
@@ -20,14 +21,44 @@ extern "C" task_t proc_task(struct proc *);
 extern "C" int proc_pid(struct proc *);
 extern "C" char *proc_best_name(struct proc *);
 extern "C" uint64_t get_task_phys_footprint(task_t);
+extern "C" uint64_t get_task_cpu_time(task_t);   // cpu_time ledger, absolute time units
 
-// guamp-perf=1 memory line every sample, the largest footprints every third sample (read only).
-struct GuampMemTop { uint64_t bytes[6]; int pid[6]; char name[6][20]; unsigned procs; uint64_t total; };
+// guamp-perf=1 memory line every sample, the largest footprints and CPU users every third sample (read only).
+struct GuampMemTop {
+  uint64_t bytes[6]; int pid[6]; char name[6][20]; unsigned procs; uint64_t total;
+  uint64_t cpu[6]; int cpuPid[6]; char cpuName[6][20]; uint64_t cpuTotal;
+};
+// CPU time seen per pid at the previous walk (pids above the table size are not tracked).
+static uint64_t guampCpuLast[2048];
+static uint8_t guampCpuSeen[2048];
+static void guampCpuTopInsert(GuampMemTop *top, struct proc *p, int pid, uint64_t delta) {
+  unsigned slot = 6;
+  while (slot > 0 && top->cpu[slot - 1] < delta) slot = slot - 1;
+  if (slot >= 6) return;
+  for (unsigned i = 5; i > slot; i = i - 1) {
+    top->cpu[i] = top->cpu[i - 1];
+    top->cpuPid[i] = top->cpuPid[i - 1];
+    memcpy(top->cpuName[i], top->cpuName[i - 1], sizeof(top->cpuName[i]));
+  }
+  top->cpu[slot] = delta;
+  top->cpuPid[slot] = pid;
+  const char *name = proc_best_name(p);
+  strlcpy(top->cpuName[slot], name ? name : "?", sizeof(top->cpuName[slot]));
+}
 static int guampMemTopVisit(struct proc *p, void *arg) {
   GuampMemTop *top = static_cast<GuampMemTop *>(arg);
   task_t task = proc_task(p);
   if (!task) return 0;
   const uint64_t bytes = get_task_phys_footprint(task);
+  const int pid = proc_pid(p);
+  if (pid >= 0 && pid < 2048) {
+    const uint64_t cpu = get_task_cpu_time(task);
+    const uint64_t delta = guampCpuSeen[pid] && cpu >= guampCpuLast[pid] ? cpu - guampCpuLast[pid] : 0;
+    guampCpuLast[pid] = cpu;
+    guampCpuSeen[pid] = 1;
+    top->cpuTotal += delta;
+    guampCpuTopInsert(top, p, pid, delta);
+  }
   top->procs = top->procs + 1;
   top->total += bytes;
   unsigned slot = 6;
@@ -80,6 +111,20 @@ static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
         top.procs, top.total >> 20, top.name[0], top.pid[0], top.bytes[0] >> 20, top.name[1], top.pid[1], top.bytes[1] >> 20,
         top.name[2], top.pid[2], top.bytes[2] >> 20, top.name[3], top.pid[3], top.bytes[3] >> 20,
         top.name[4], top.pid[4], top.bytes[4] >> 20, top.name[5], top.pid[5], top.bytes[5] >> 20);
+  // Per-process CPU since the previous walk, in permille of one core over the walk interval.
+  static uint64_t lastWalk = 0;
+  const uint64_t now = mach_absolute_time();
+  const uint64_t span = lastWalk && now > lastWalk ? now - lastWalk : 0;
+  lastWalk = now;
+  if (!span) return;
+  unsigned long long pm[6];
+  for (unsigned i = 0; i < 6; ++i) pm[i] = top.cpu[i] * 1000 / span;
+  IOLog("GuampCpu: all processes %llu%% of one core; top %s[%d] %llu.%llu, %s[%d] %llu.%llu, %s[%d] %llu.%llu, "
+        "%s[%d] %llu.%llu, %s[%d] %llu.%llu, %s[%d] %llu.%llu %% of one core\n",
+        (unsigned long long)(top.cpuTotal * 100 / span),
+        top.cpuName[0], top.cpuPid[0], pm[0] / 10, pm[0] % 10, top.cpuName[1], top.cpuPid[1], pm[1] / 10, pm[1] % 10,
+        top.cpuName[2], top.cpuPid[2], pm[2] / 10, pm[2] % 10, top.cpuName[3], top.cpuPid[3], pm[3] / 10, pm[3] % 10,
+        top.cpuName[4], top.cpuPid[4], pm[4] / 10, pm[4] % 10, top.cpuName[5], top.cpuPid[5], pm[5] / 10, pm[5] % 10);
 }
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
