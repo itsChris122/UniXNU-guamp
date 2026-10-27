@@ -158,6 +158,25 @@ static void testUnit() {
   {  // the answer seen on the phone after writing 0x0e into data[2]: HCI_Reset Command Complete with bit 7 set, SLEEP_IND
     const uint8_t seen[] = {0x84, 0x8e, 0x84, 0x81, 0x83, 0x8c, 0x80, 0xfe}, fine[] = {0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00};
     CHECK(bt_seven_bit_event(seen, sizeof seen) && !bt_seven_bit_event(fine, sizeof fine) && !bt_seven_bit_event(seen, 5), "");
+    // the same garbage as noise before real 8-bit events (NOP Command Complete, vendor 92 01, HCI_Reset complete):
+    // skipped byte by byte, then every event found
+    const uint8_t mix[] = {0x84, 0x8e, 0x84, 0x81, 0x83, 0x8c, 0x80, 0xfe, 0x04, 0x0e, 0x04, 0x01, 0x00, 0x00, 0x00,
+                           0x04, 0xff, 0x02, 0x92, 0x01, 0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00};
+    size_t pm = 0;
+    unsigned skm = 0, slm = 0, gm = 0, resetOk = 0;
+    bt_event em;
+    while (bt_h4_next_ibs_ex(mix, sizeof mix, &pm, &em, &skm, nullptr, nullptr, &slm)) {
+      gm++;
+      uint16_t op = 0; const uint8_t *ret = nullptr; uint8_t rl = 0;
+      if (!bt_cmd_complete(&em, &op, &ret, &rl) && op == 0x0c03 && rl >= 1 && ret[0] == 0) resetOk++;
+    }
+    CHECK(gm == 3 && skm == 8 && slm == 1 && resetOk == 1 && pm == sizeof mix, "events %u skipped %u sleep %u reset %u", gm, skm,
+          slm, resetOk);
+    // guamp-bt-nvm-ibs=0: the HCI tag goes out as shipped (no baud byte either on this NVM)
+    std::vector<uint8_t> n6 = n2;
+    bt_tlv_nvm o6 = {};
+    CHECK(bt_tlv_nvm_fix_ex(n6.data(), n6.size(), 0x0e, 0u, 0, &o6) == 0 && o6.hci_after[0] == o6.hci_before[0] &&
+          o6.hci_after[1] == o6.hci_before[1] && o6.hci_after[2] == o6.hci_before[2], "");
   }
   CHECK(bt_qca_baud_of_code(0x0e) == 3000000 && bt_qca_baud_of_code(0x11) == 3200000 && bt_qca_baud_of_code(0x00) == 115200 &&
         bt_qca_baud_of_code(0x22) == 0 && bt_qca_baud_of_code(bt_qca_baud_code(921600)) == 921600, "");

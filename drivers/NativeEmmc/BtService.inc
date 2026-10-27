@@ -373,7 +373,7 @@ int waitEvent(const char *what, uint16_t op, unsigned kind, unsigned timeoutMs, 
           gCapLen ? text : "none");
     if (bt_seven_bit_event(gCap, gCapLen))
       IOLog("GuampBt: %s: the answer has bit 7 set on every byte: the controller sends 7-bit characters (NVM HCI tag "
-            "line-format byte changed?)\n", what);
+            "data[0]: try guamp-bt-nvm-ibs=0)\n", what);
   }
   return found;
 }
@@ -632,6 +632,7 @@ int download(const char *what, const char *name, const FwFile &f, unsigned mode)
 
 const char *gDownload = "-", *gBaud = "-", *gAfter = "-", *gBdaddr = "-";
 unsigned gBaudRate = 115200;
+bool gNvmIbs = true;                                  // in-band sleep on in the NVM as sent (HCI tag data[0] bit 7)
 
 // Host side only: RX stopped, flow control off, new rate, RX on again (as in switchBaud), buffer forgotten.
 bool hostRate(unsigned baud) {
@@ -705,13 +706,17 @@ bool m1() {
   bt_tlv_nvm nv = {};
   // guamp-bt-nvm-baud: HCI tag bytes that get the baud code, 0 none, 1 data[1], 2 data[2] (btqca.c for WCN3950), 3
   // both; absent: bt_tlv_nvm_baud_fields_auto (the Linux byte only if it holds a rate code: none on the guamp NVM).
+  // guamp-bt-nvm-ibs: 1 = Linux's data[0] |= 0x80 (in-band sleep); default 0 on the WCN3950 family (product 0x0f):
+  // with it the patched controller came back from HCI_Reset sending 7-bit characters and ignored every later command.
   bt_tlv_nvm probe = {};
-  bt_tlv_nvm_fix_fields(cfg.data, cfg.size, code, 0u, &probe);   // only the idempotent edits (IBS, deep sleep)
+  bt_tlv_nvm_fix_ex(cfg.data, cfg.size, code, 0u, 0, &probe);   // reads the tags; only the idempotent deep-sleep edit
   unsigned fields = bt_tlv_nvm_baud_fields_auto(probe.hci_before, newLayout);
   if (PE_parse_boot_argn("guamp-bt-nvm-baud", &fields, sizeof(fields)) && fields > 3) fields = 0;
-  const int nr = bt_tlv_nvm_fix_fields(cfg.data, cfg.size, code, fields, &nv);
-  for (unsigned k = 0; k < 3; ++k) nv.hci_before[k] = probe.hci_before[k];   // as shipped (the probe already set bit 7)
+  unsigned ibs = family == 3950 ? 0u : 1u;
+  PE_parse_boot_argn("guamp-bt-nvm-ibs", &ibs, sizeof(ibs));
+  const int nr = bt_tlv_nvm_fix_ex(cfg.data, cfg.size, code, fields, ibs ? 1 : 0, &nv);
   nv.sleep_before = probe.sleep_before;
+  gNvmIbs = ibs != 0 || (nv.hci_after[0] & 0x80) != 0;
   IOLog("GuampBt: fw: WCN%u %s patch %04x product %04x rom %04x mode %u (%u segments)%s; %s type %u, %u tags, hci %02x %02x %02x -> "
         "%02x %02x %02x, deep sleep %02x -> %02x, BD tag %s%s\n", family, tlv, ph.patch_ver, ph.product, ph.rom_build, ph.mode,
         bt_tlv_segments(patch.size), pr ? " NOT A TLV PATCH" : match ? "" : " NOT FOR THIS CONTROLLER", nvm, nv.type, nv.tags,
@@ -735,7 +740,7 @@ bool m1() {
     IOSleep(10);                                           // "Give the controller some time to get ready to receive the NVM"
     e = download("nvm", nvm, cfg, BT_QCA_SKIP_NONE);
     gDownload = e ? "fail-nvm" : "ok";
-    gIbs = !e;
+    gIbs = !e && gNvmIbs;
   } else {
     gDownload = "fail-patch";
   }
@@ -750,9 +755,9 @@ bool m1() {
   const int lr = r ? -1 : command("Read_Local_Version after", BT_OP_READ_LOCAL_VERSION, nullptr, 0, 0, 1000, &ev, false, true);
   const bool lvOk = !lr && !bt_decode_local_version(&ev, &lv);
   IOLog("GuampBt: after download: HCI_Reset %s (status %02x) at %u, local version %s HCI %s (%u) rev %04x LMP %u subver %04x "
-        "manufacturer %04x; NVM baud field %u, IBS sleep %u wake-ack rx %u wake sent %u\n", r ? "no reply" : rst ? "error" : "ok",
+        "manufacturer %04x; NVM baud field %u, NVM IBS %u, IBS sleep %u wake-ack rx %u wake sent %u\n", r ? "no reply" : rst ? "error" : "ok",
         rst, gBaudRate, lvOk ? "ok" : "FAILED", bt_hci_version_name(lv.hci_ver), lv.hci_ver, lv.hci_rev, lv.lmp_ver,
-        lv.lmp_subver, lv.manufacturer, fields, gIbsSleeps, gIbsAcksRx, gIbsWakeSent);
+        lv.lmp_subver, lv.manufacturer, fields, gNvmIbs ? 1u : 0u, gIbsSleeps, gIbsAcksRx, gIbsWakeSent);
   if (r || rst) return false;
 
   const uint8_t sub = BT_QCA_EDL_VER_REQ;

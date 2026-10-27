@@ -94,7 +94,10 @@ struct bt_tlv_nvm {
 };
 // Applies Linux's NVM edits in place. fields: which HCI tag bytes get the baud code, bit 0 data[1] (Linux from
 // WCN3991 on), bit 1 data[2] (Linux before, WCN3950 included). 0 ok, -1 malformed (Linux -EINVAL: no download).
-static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code, unsigned fields, struct bt_tlv_nvm *o) {
+// set_ibs: data[0] |= 0x80 (Linux). On the guamp WCN3950 (ROM 0102) that edit, the only byte the NVM then differs in,
+// left the controller answering the post-download HCI_Reset with 7-bit characters (84 8e 84 81 83 8c 80 = 04 0e 04
+// 01 03 0c 00 | 0x80, then SLEEP_IND) and deaf to 8-bit commands: the caller decides.
+static inline int bt_tlv_nvm_fix_ex(uint8_t *f, size_t n, uint8_t baud_code, unsigned fields, int set_ibs, struct bt_tlv_nvm *o) {
     o->tags = 0; o->type = 0; o->has_bdaddr = o->has_hci = o->has_sleep = 0;
     if (n < 4) return -1;
     size_t at = 0;
@@ -122,7 +125,7 @@ static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code,
         } else if (id == BT_QCA_TAG_HCI) {
             if (len < 3) return -1;
             for (unsigned k = 0; k < 3; ++k) o->hci_before[k] = d[k];
-            d[0] = (uint8_t)(d[0] | 0x80);
+            if (set_ibs) d[0] = (uint8_t)(d[0] | 0x80);
             if (fields & 1u) d[1] = baud_code;
             if (fields & 2u) d[2] = baud_code;
             for (unsigned k = 0; k < 3; ++k) o->hci_after[k] = d[k];
@@ -138,6 +141,9 @@ static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code,
         idx += 12 + (size_t)len;
     }
     return 0;
+}
+static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code, unsigned fields, struct bt_tlv_nvm *o) {
+    return bt_tlv_nvm_fix_ex(f, n, baud_code, fields, 1, o);
 }
 // Which HCI tag bytes may take the baud code (guamp-bt-nvm-baud absent): the Linux byte, but only when the file
 // holds a rate code there. On the guamp WCN3950 NVM (15 11 22) data[2] = 0x22 is no rate: writing 0x0e there made
