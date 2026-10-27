@@ -40,9 +40,10 @@ static inline size_t bt_h4_cmd(uint8_t *out, size_t cap, uint16_t opcode, const 
 struct bt_event {uint8_t code, len; const uint8_t *p;};
 // Next complete H4 event in buf[*pos..len). Bytes that cannot start a packet are skipped (counted in *skipped); ACL
 // and SCO packets are stepped over whole. 1 = event in *ev and *pos past it, 0 = need more bytes (*pos at the start of
-// the incomplete packet). wake (optional) counts the skipped bytes that are IBS WAKE_INDs.
-static inline int bt_h4_next_ibs(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped,
-                                 unsigned *wake) {
+// the incomplete packet). wake / ack / sleep (optional) count the skipped bytes that are IBS WAKE_IND / WAKE_ACK /
+// SLEEP_IND.
+static inline int bt_h4_next_ibs_ex(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped,
+                                    unsigned *wake, unsigned *ack, unsigned *sleep) {
     size_t at = *pos;
     while (at < len) {
         const uint8_t t = buf[at];
@@ -70,10 +71,16 @@ static inline int bt_h4_next_ibs(const uint8_t *buf, size_t len, size_t *pos, st
         }
         if (skipped) *skipped += 1;
         if (wake && t == BT_IBS_WAKE_IND) *wake += 1;
+        if (ack && t == BT_IBS_WAKE_ACK) *ack += 1;
+        if (sleep && t == BT_IBS_SLEEP_IND) *sleep += 1;
         at += 1;
     }
     *pos = at;
     return 0;
+}
+static inline int bt_h4_next_ibs(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped,
+                                 unsigned *wake) {
+    return bt_h4_next_ibs_ex(buf, len, pos, ev, skipped, wake, NULL, NULL);
 }
 static inline int bt_h4_next(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped) {
     return bt_h4_next_ibs(buf, len, pos, ev, skipped, NULL);

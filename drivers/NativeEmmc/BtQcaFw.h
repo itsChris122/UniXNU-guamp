@@ -39,13 +39,18 @@
 #define BT_QCA_SOC_WCN3991 0x40014320u
 #define BT_QCA_SEG_PKT_MAX (4u + 2u + BT_QCA_TLV_SEG_MAX)   // H4 01, opcode, length, {0x1E, len, 243 bytes}
 
+// enum qca_baudrate, indexed by code.
+static const unsigned kBtQcaBauds[19] = {115200, 57600, 38400, 19200, 9600, 230400, 250000, 460800, 500000, 720000,
+                                         921600, 1000000, 1250000, 2000000, 3000000, 4000000, 1600000, 3200000, 3500000};
 // enum qca_baudrate code for a UART speed (qca_get_baudrate_value); 0xff = not a speed the controller knows.
 static inline uint8_t bt_qca_baud_code(unsigned baud) {
-    static const unsigned k[] = {115200, 57600, 38400, 19200, 9600, 230400, 250000, 460800, 500000, 720000, 921600,
-                                 1000000, 1250000, 2000000, 3000000, 4000000, 1600000, 3200000, 3500000};
-    for (unsigned i = 0; i < sizeof k / sizeof k[0]; ++i)
-        if (k[i] == baud) return i <= 17u ? (uint8_t)i : 0xff;   // qca_set_baudrate refuses codes above 3200000
+    for (unsigned i = 0; i < sizeof kBtQcaBauds / sizeof kBtQcaBauds[0]; ++i)
+        if (kBtQcaBauds[i] == baud) return i <= 17u ? (uint8_t)i : 0xff;   // qca_set_baudrate refuses codes above 3200000
     return 0xff;
+}
+// UART speed of an enum qca_baudrate code, 0 for a byte that is no rate code (e.g. the 0x22 of the guamp NVM).
+static inline unsigned bt_qca_baud_of_code(uint8_t code) {
+    return code < sizeof kBtQcaBauds / sizeof kBtQcaBauds[0] ? kBtQcaBauds[code] : 0u;
 }
 
 // File names (no "qca/" prefix) for the controller of the EDL version reply. Returns the family: 3950 or 3990.
@@ -87,9 +92,9 @@ struct bt_tlv_nvm {
     uint8_t bdaddr[6];                   // tag 2 as stored (little endian)
     uint8_t hci_before[3], hci_after[3], sleep_before, sleep_after;
 };
-// Applies Linux's NVM edits in place. new_layout: WCN3991 and later (baud code in data[1]). 0 ok, -1 malformed
-// (Linux -EINVAL: the download is not attempted).
-static inline int bt_tlv_nvm_fix(uint8_t *f, size_t n, uint8_t baud_code, int new_layout, struct bt_tlv_nvm *o) {
+// Applies Linux's NVM edits in place. fields: which HCI tag bytes get the baud code, bit 0 data[1] (Linux from
+// WCN3991 on), bit 1 data[2] (Linux before, WCN3950 included). 0 ok, -1 malformed (Linux -EINVAL: no download).
+static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code, unsigned fields, struct bt_tlv_nvm *o) {
     o->tags = 0; o->type = 0; o->has_bdaddr = o->has_hci = o->has_sleep = 0;
     if (n < 4) return -1;
     size_t at = 0;
@@ -118,7 +123,8 @@ static inline int bt_tlv_nvm_fix(uint8_t *f, size_t n, uint8_t baud_code, int ne
             if (len < 3) return -1;
             for (unsigned k = 0; k < 3; ++k) o->hci_before[k] = d[k];
             d[0] = (uint8_t)(d[0] | 0x80);
-            d[new_layout ? 1 : 2] = baud_code;
+            if (fields & 1u) d[1] = baud_code;
+            if (fields & 2u) d[2] = baud_code;
             for (unsigned k = 0; k < 3; ++k) o->hci_after[k] = d[k];
             o->has_hci = 1;
         } else if (id == BT_QCA_TAG_DEEP_SLEEP) {
@@ -132,6 +138,10 @@ static inline int bt_tlv_nvm_fix(uint8_t *f, size_t n, uint8_t baud_code, int ne
         idx += 12 + (size_t)len;
     }
     return 0;
+}
+// The Linux layout: new_layout = WCN3991 and later (baud code in data[1]), else data[2].
+static inline int bt_tlv_nvm_fix(uint8_t *f, size_t n, uint8_t baud_code, int new_layout, struct bt_tlv_nvm *o) {
+    return bt_tlv_nvm_fix_fields(f, n, baud_code, new_layout ? 1u : 2u, o);
 }
 
 static inline unsigned bt_tlv_segments(size_t n) {return (unsigned)((n + BT_QCA_TLV_SEG_MAX - 1) / BT_QCA_TLV_SEG_MAX);}

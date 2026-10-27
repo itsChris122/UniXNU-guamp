@@ -128,6 +128,15 @@ static void testUnit() {
   CHECK(diff == 3, "%u bytes changed", diff);                      // 0x15->0x95, 0x22->0x0e, sleep 00->01
   std::vector<uint8_t> n2 = orig;
   CHECK(bt_tlv_nvm_fix(n2.data(), n2.size(), 0x0e, 1, &o) == 0 && o.hci_after[1] == 0x0e && o.hci_after[2] == 0x22, "");
+  {  // guamp-bt-nvm-baud=3: both HCI bytes; =2 equals the Linux WCN3950 layout
+    std::vector<uint8_t> n3 = n2, n4 = n2;
+    bt_tlv_nvm o3 = {}, o4 = {};
+    CHECK(bt_tlv_nvm_fix_fields(n3.data(), n3.size(), 0x11, 3u, &o3) == 0 && o3.hci_after[1] == 0x11 && o3.hci_after[2] == 0x11, "");
+    CHECK(bt_tlv_nvm_fix_fields(n4.data(), n4.size(), 0x11, 2u, &o4) == 0 && o4.hci_after[2] == 0x11 &&
+          o4.hci_after[1] == o4.hci_before[1], "");
+  }
+  CHECK(bt_qca_baud_of_code(0x0e) == 3000000 && bt_qca_baud_of_code(0x11) == 3200000 && bt_qca_baud_of_code(0x00) == 115200 &&
+        bt_qca_baud_of_code(0x22) == 0 && bt_qca_baud_of_code(bt_qca_baud_code(921600)) == 921600, "");
   std::vector<uint8_t> bad = orig;
   bad[8 + 12 + 6 + 2] = 0x40;                                      // HCI tag length runs past the set
   CHECK(bt_tlv_nvm_fix(bad.data(), bad.size(), 0, 0, &o) == -1, "");
@@ -185,6 +194,13 @@ static void testUnit() {
   unsigned skipped = 0, wake = 0, got = 0;
   while (bt_h4_next_ibs(s, sizeof s, &pos, &e, &skipped, &wake)) got++;
   CHECK(got == 2 && skipped == 3 && wake == 2 && pos == sizeof s, "got %u skipped %u wake %u", got, skipped, wake);
+  {  // the extended counters: SLEEP_IND and WAKE_ACK bytes between packets
+    const uint8_t s2[] = {0xfe, 0xfc, 0xfc, 0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00, 0xfe};
+    size_t p2 = 0;
+    unsigned sk2 = 0, w2 = 0, a2 = 0, sl2 = 0, g2 = 0;
+    while (bt_h4_next_ibs_ex(s2, sizeof s2, &p2, &e, &sk2, &w2, &a2, &sl2)) g2++;
+    CHECK(g2 == 1 && sk2 == 4 && w2 == 0 && a2 == 2 && sl2 == 2 && p2 == sizeof s2, "got %u skipped %u ack %u sleep %u", g2, sk2, a2, sl2);
+  }
 
   // baud math without DFS: the RCG entry with an exact divider
   bt_uart_clock c;

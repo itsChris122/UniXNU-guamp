@@ -77,6 +77,13 @@ uint8_t gRx[640];
 size_t gRxLen, gRxPos;
 unsigned gIbsAcks;
 bool gIbs;                                           // set once the M1 NVM (in-band sleep enabled) is in the controller
+// IBS state seen from the controller: a SLEEP_IND makes it asleep until its WAKE_IND / WAKE_ACK or an event; a
+// command to an asleep controller is preceded by a WAKE_IND (hci_qca.c qca_enqueue when IBS is on).
+bool gAsleep;
+unsigned gIbsSleeps, gIbsAcksRx, gIbsWakeSent;
+// Bytes read since the last command was sent (what the controller really answered, independent of gRx compaction).
+uint8_t gCap[96];
+size_t gCapLen;
 volatile uint32_t gStep;
 
 // --- step 1: supplies ---------------------------------------------------------------------------------------------
@@ -308,14 +315,22 @@ void rxPump() {
     gRxPos = 0;
   }
   if (gRxLen == sizeof gRx) gRxLen = gRxPos = 0;     // stuck on a packet larger than the buffer: drop, resynchronise
-  gRxLen += geni_uart_read(&gUart, gRx + gRxLen, sizeof gRx - gRxLen);
+  const size_t got = geni_uart_read(&gUart, gRx + gRxLen, sizeof gRx - gRxLen);
+  for (size_t i = 0; i < got && gCapLen < sizeof gCap; ++i) gCap[gCapLen++] = gRx[gRxLen + i];
+  gRxLen += got;
 }
 bool nextEvent(bt_event *ev, RxStats *st) {
-  unsigned wake = 0;
-  const bool got = bt_h4_next_ibs(gRx, gRxLen, &gRxPos, ev, &st->skipped, gIbs ? &wake : nullptr) != 0;
+  unsigned wake = 0, ack = 0, sleep = 0;
+  const bool got = bt_h4_next_ibs_ex(gRx, gRxLen, &gRxPos, ev, &st->skipped, gIbs ? &wake : nullptr, &ack, &sleep) != 0;
+  if (gIbs) {
+    gIbsSleeps += sleep;
+    gIbsAcksRx += ack;
+    if (sleep) gAsleep = true;
+    if (wake || ack || got) gAsleep = false;
+  }
   for (; wake; --wake) {
-    const uint8_t ack = BT_IBS_WAKE_ACK;
-    if (!geni_uart_write(&gUart, &ack, 1, 20000)) gIbsAcks = gIbsAcks + 1;
+    const uint8_t a = BT_IBS_WAKE_ACK;
+    if (!geni_uart_write(&gUart, &a, 1, 20000)) gIbsAcks = gIbsAcks + 1;
   }
   if (got) st->events = st->events + 1;
   return got;
@@ -343,10 +358,34 @@ int waitEvent(const char *what, uint16_t op, unsigned kind, unsigned timeoutMs, 
     if (found == GENI_ERR_TIMEOUT) IOSleep(1);
   }
   if (!quiet || found) hexLine(what, gRx, gRxLen);
-  if (found == GENI_ERR_TIMEOUT)
+  if (found == GENI_ERR_TIMEOUT) {
     IOLog("GuampBt: %s: no reply in %u ms (%u bytes, %u events, %u bytes skipped, dropped %u, CTS gpio8 level %u)\n", what,
           timeoutMs, static_cast<unsigned>(gRxLen), st.events, st.skipped, gUart.rx_dropped, pinRead(8, 4) & 1u);
+    char text[32 * 3 + 8];                             // what came in after the command (not limited like hexLine)
+    bt_hex(text, sizeof text, gCap, gCapLen, 32);
+    IOLog("GuampBt: %s: received after the command %u bytes: %s\n", what, static_cast<unsigned>(gCapLen),
+          gCapLen ? text : "none");
+  }
   return found;
+}
+// IBS wake (hci_qca.c: WAKE_IND, the controller answers WAKE_ACK). Waits up to 30 ms for the ack without consuming
+// events (only peeks at the skipped bytes before the next one). True when acked.
+bool wake(const char *what) {
+  const uint8_t ind = BT_IBS_WAKE_IND;
+  const int tx = geni_uart_write(&gUart, &ind, 1, 20000);
+  gIbsWakeSent = gIbsWakeSent + 1;
+  unsigned ms = 0, ack = 0;
+  for (; !tx && ms < 30 && !ack; ++ms) {
+    rxPump();
+    size_t p = gRxPos;
+    unsigned sk = 0;
+    bt_event e;
+    bt_h4_next_ibs_ex(gRx, gRxLen, &p, &e, &sk, nullptr, &ack, nullptr);
+    if (!ack) IOSleep(1);
+  }
+  IOLog("GuampBt: %s: WAKE_IND tx %d, WAKE_ACK %s in %u ms\n", what, tx, ack ? "seen" : "none", ms);
+  if (ack) gAsleep = false;
+  return ack != 0;
 }
 int sendPacket(const char *what, const uint8_t *pkt, size_t n) {
   const int r = geni_uart_write(&gUart, pkt, n, 200000);
@@ -360,6 +399,8 @@ int command(const char *what, uint16_t op, const uint8_t *params, uint8_t plen, 
   uint8_t pkt[16];
   const size_t n = bt_h4_cmd(pkt, sizeof pkt, op, params, plen);
   if (fresh) gRxLen = gRxPos = 0;
+  if (gIbs && gAsleep) wake(what);
+  gCapLen = 0;
   const int r = sendPacket(what, pkt, n);
   return r ? r : waitEvent(what, op, kind, timeoutMs, out, quiet);
 }
@@ -582,6 +623,50 @@ int download(const char *what, const char *name, const FwFile &f, unsigned mode)
 
 const char *gDownload = "-", *gBaud = "-", *gAfter = "-", *gBdaddr = "-";
 unsigned gBaudRate = 115200;
+
+// Host side only: RX stopped, flow control off, new rate, RX on again (as in switchBaud), buffer forgotten.
+bool hostRate(unsigned baud) {
+  rxPump();
+  geni_uart_flow(&gUart, 0);
+  const int stop = geni_uart_rx_stop(&gUart, 2000);
+  const bool ok = setBaud(baud);
+  const int start = geni_uart_rx_start(&gUart);
+  geni_uart_flow(&gUart, 1);
+  gRxLen = gRxPos = 0;
+  if (stop || start) IOLog("GuampBt: host %u baud: rx stop %d start %d\n", baud, stop, start);
+  return ok && !start;
+}
+
+// The patched controller did not answer HCI_Reset at the download rate. Linux gets the Command Complete right away
+// (qca_uart_setup -> qca_send_reset, IBS still off on the host). Two causes are checked, each logged:
+//  - IBS: the NVM switched in-band sleep on; a WAKE_IND first, then HCI_Reset again at the same rate.
+//  - rate: the HCI tag's baud byte is applied at reset. Which byte the WCN3950 reads is not certain: btqca.c writes
+//    data[2] before WCN3991, but this NVM ships 15 11 22 (0x11 = 3200000, 0x22 no rate code). The rates of every
+//    HCI tag byte (as sent and as shipped) and 115200 are tried on the host side, HCI_Reset at each.
+// 0 when a reset was answered (gBaudRate then is the working rate), else GENI_ERR_TIMEOUT with the host back at rate.
+int resetRecover(const bt_tlv_nvm &nv, unsigned rate, bt_event *ev) {
+  gAsleep = true;                                      // forces the WAKE_IND in command()
+  int r = command("HCI_Reset after wake", BT_OP_RESET, nullptr, 0, 0, 500, ev, false, true);
+  IOLog("GuampBt: recovery: WAKE_IND + HCI_Reset at %u: %s\n", rate, r ? "no reply" : "answered");
+  if (!r) return 0;
+  unsigned rates[6], n = 0;
+  const uint8_t codes[4] = {nv.hci_after[1], nv.hci_after[2], nv.hci_before[1], nv.hci_before[2]};
+  for (unsigned k = 0; k < 5; ++k) {
+    const unsigned b = k < 4 ? bt_qca_baud_of_code(codes[k]) : 115200u;
+    bool dup = !b || b == rate;
+    for (unsigned j = 0; j < n; ++j) dup = dup || rates[j] == b;
+    if (!dup) rates[n++] = b;
+  }
+  for (unsigned i = 0; i < n; ++i) {
+    if (!hostRate(rates[i])) { IOLog("GuampBt: recovery: host cannot run %u baud\n", rates[i]); continue; }
+    gAsleep = true;
+    r = command("HCI_Reset at another rate", BT_OP_RESET, nullptr, 0, 0, 500, ev, false, true);
+    IOLog("GuampBt: recovery: HCI_Reset at %u (host): %s\n", rates[i], r ? "no reply" : "ANSWERED, the controller moved here");
+    if (!r) { gBaudRate = rates[i]; gBaud = "moved"; return 0; }
+  }
+  hostRate(rate);
+  return GENI_ERR_TIMEOUT;
+}
 char gAfterText[48] = "-";
 // The M1 sequence (btqca.c qca_uart_setup after qca_set_speed). True when the patched controller answered HCI_Reset.
 bool m1() {
@@ -609,7 +694,11 @@ bool m1() {
   const int pr = bt_tlv_patch_parse(patch.data, patch.size, &ph);
   const bool match = !pr && ph.product == (gQv.product_id & 0xffff) && ph.rom_build == gQv.rom_ver;
   bt_tlv_nvm nv = {};
-  const int nr = bt_tlv_nvm_fix(cfg.data, cfg.size, code, newLayout, &nv);
+  // guamp-bt-nvm-baud: HCI tag bytes that get the baud code, 1 data[1], 2 data[2] (btqca.c for WCN3950, default), 3 both
+  unsigned fields = newLayout ? 1u : 2u;
+  PE_parse_boot_argn("guamp-bt-nvm-baud", &fields, sizeof(fields));
+  if (fields < 1 || fields > 3) fields = newLayout ? 1u : 2u;
+  const int nr = bt_tlv_nvm_fix_fields(cfg.data, cfg.size, code, fields, &nv);
   IOLog("GuampBt: fw: WCN%u %s patch %04x product %04x rom %04x mode %u (%u segments)%s; %s type %u, %u tags, hci %02x %02x %02x -> "
         "%02x %02x %02x, deep sleep %02x -> %02x, BD tag %s%s\n", family, tlv, ph.patch_ver, ph.product, ph.rom_build, ph.mode,
         bt_tlv_segments(patch.size), pr ? " NOT A TLV PATCH" : match ? "" : " NOT FOR THIS CONTROLLER", nvm, nv.type, nv.tags,
@@ -642,13 +731,15 @@ bool m1() {
 
   bt_event ev;
   int r = command("HCI_Reset after", BT_OP_RESET, nullptr, 0, 0, 2000, &ev, false, true);
+  if (r == GENI_ERR_TIMEOUT) r = resetRecover(nv, baud, &ev);
   const uint8_t rst = !r && ev.len > 3 ? ev.p[3] : 0xff;
   bt_local_version lv = {};
   const int lr = r ? -1 : command("Read_Local_Version after", BT_OP_READ_LOCAL_VERSION, nullptr, 0, 0, 1000, &ev, false, true);
   const bool lvOk = !lr && !bt_decode_local_version(&ev, &lv);
-  IOLog("GuampBt: after download: HCI_Reset %s (status %02x), local version %s HCI %s (%u) rev %04x LMP %u subver %04x "
-        "manufacturer %04x\n", r ? "no reply" : rst ? "error" : "ok", rst, lvOk ? "ok" : "FAILED", bt_hci_version_name(lv.hci_ver),
-        lv.hci_ver, lv.hci_rev, lv.lmp_ver, lv.lmp_subver, lv.manufacturer);
+  IOLog("GuampBt: after download: HCI_Reset %s (status %02x) at %u, local version %s HCI %s (%u) rev %04x LMP %u subver %04x "
+        "manufacturer %04x; NVM baud field %u, IBS sleep %u wake-ack rx %u wake sent %u\n", r ? "no reply" : rst ? "error" : "ok",
+        rst, gBaudRate, lvOk ? "ok" : "FAILED", bt_hci_version_name(lv.hci_ver), lv.hci_ver, lv.hci_rev, lv.lmp_ver,
+        lv.lmp_subver, lv.manufacturer, fields, gIbsSleeps, gIbsAcksRx, gIbsWakeSent);
   if (r || rst) return false;
 
   const uint8_t sub = BT_QCA_EDL_VER_REQ;
