@@ -3,7 +3,8 @@
 // charging comes back after an unplug/replug: plug-in/unplug edges (smblib_usb_plugin_locked, typec_src_removal),
 // BC1.2 source detection (APSD, smblib_apsd_enable/smblib_rerun_apsd), the Type-C sink role (smblib_force_dr_mode),
 // the input current limit (smblib_set_icl_current, high-current mode), the weak-adapter AICL work-around of
-// usbin_uv_irq_handler (WEAK_ADAPTER_WA is set for PMI632) and input suspend recovery.
+// usbin_uv_irq_handler (WEAK_ADAPTER_WA is set for PMI632), input suspend recovery, and a Type-C recovery for a
+// source that shows Rp on CC but never turns VBUS on (C-to-C replug on a PC): CC terminations off, then on again.
 // No hardware access of its own: every register access goes through Bus, so the whole sequence also runs on the host
 // (batteria/test-replug.cpp, simulated PMI632). Bus provides
 //   int rd(uint16_t addr, uint8_t *v); int wr(uint16_t addr, uint8_t v);   0 = success (PMI632, SPMI slave 2)
@@ -23,8 +24,10 @@ constexpr uint16_t kStatus1 = 0x1006, kStatus2 = 0x1007, kStatus7 = 0x100d, kChg
                    kApsdStatus = 0x1307, kApsdResult = 0x1308, kUsbinRt = 0x1310, kUsbinCmdIl = 0x1340, kCmdApsd = 0x1341,
                    kCmdIclOverride = 0x1342, kTypeCCfg = 0x1358, kUsbinOptions1 = 0x1362, kUsbinLoadCfg = 0x1365,
                    kIclOptions = 0x1366, kIclCfg = 0x1370, kAiclOptions = 0x1380, kAicl5v = 0x1381, kAiclCont = 0x1384,
-                   kTypecSnkStatus = 0x1506, kTypecStateMachine = 0x1509, kTypecMisc = 0x150b, kTypecLegacy = 0x150d,
-                   kTypecModeCfg = 0x1544, kTypecDebugAccessSink = 0x154a,
+                   kTypecSnkStatus = 0x1506, kTypecSrcStatus = 0x1508, kTypecStateMachine = 0x1509,
+                   kTypecStatus0a = 0x150a, kTypecMisc = 0x150b, kTypecLegacy = 0x150d, kTypecStatus0e = 0x150e,
+                   kTypecRt = 0x1510, kTypecModeCfg = 0x1544, kTypecCcoutControl = 0x1548,
+                   kTypecDebugAccessSink = 0x154a, kTypecExitStateCfg = 0x1550, kTypecDebounceOption = 0x1562,
                    kWdogPet = 0x1643, kAiclCmd = 0x1644, kAiclRerunTime = 0x1661;
 }
 constexpr unsigned kFvMv = 4350, kFvMaxMv = 4400, kIclMaxMa = 3000, kFccMaxMa = 3000, kSdpMa = 500;
@@ -82,8 +85,12 @@ inline const char *stateName(uint8_t s1) {
 }
 
 struct Snapshot {
-  uint8_t s1, s2, s7, apsd, result, usbin, pp, icl, aicl, cmdIl, sm, misc, snk, legacy, fv;
+  uint8_t s1, s2, s7, apsd, result, usbin, pp, icl, aicl, cmdIl, sm, misc, snk, legacy, fv, src, sm2, cc, typecRt;
   bool present() const { return (usbin & 0x10) != 0; }
+  // A source on CC without VBUS. TYPEC 0x1509 bits 3:0 are the sink state machine (logs: 1 with nothing plugged and
+  // 0x150e ff, 3 attached, 2 = waiting for VBUS); 0x150b bit 3 tCC debounce done, bit 4 VBUS error (Rp seen, VBUS never
+  // valid). After a C-to-C replug on the PC it stayed at 0x1509 02, 0x150b 18, USBIN 26 (UV, VASHDN, no plug-in).
+  bool partnerWithoutVbus() const { return !present() && ((sm & 0x0f) >= 2 || (misc & 0x18)); }
   bool apsdDone() const { return (apsd & 0x01) != 0; }
   bool hwSuspended() const { return (pp & 0x40) != 0 && !(cmdIl & 0x01); }
   bool typecAttached() const { return (sm & 0x20) != 0; }
@@ -108,6 +115,11 @@ struct Controller {
   Phase phase = kAbsent;
   bool started = false, present = false, attached = false, suspended = false, aiclMax = false;
   uint64_t phaseAt = 0, stuckSince = 0, lastRecovery = 0, maxSince = 0, absentSince = 0, lastTypecReset = 0;
+  // Type-C recovery without VBUS: CC terminations off (disable command) from ccOffAt until ccOnAt, non-blocking
+  uint64_t ccOnAt = 0, noVbusSince = 0;
+  unsigned ccRecoveries = 0;
+  bool roleDrp = false;   // DRP try.SNK for this connection (alternate recovery attempts), back to the default on unplug
+  uint32_t lastTypecKey = 0xffffffffu;
   unsigned apsdReruns = 0, aicl5vMv = kAicl5vDefaultMv, aiclContMv = kAiclContDefaultMv;
   unsigned plugins = 0, unplugs = 0, weakSteps = 0, redetects = 0, suspendRecoveries = 0, typecResets = 0, errors = 0;
   uint8_t iclCode = 0, fccCode = 0, lastIcl = 0xff, lastAicl = 0xff, lastResult = 0xff;
@@ -139,6 +151,12 @@ struct Controller {
     if (!e) e = masked(b, reg::kTypeCCfg, 0x80, 0x00, &cc);           // BC1.2 not gated on CC (no debug accessory)
     if (!e) e = masked(b, reg::kUsbinOptions1, 0x08, 0x08, &bc12);    // BC1.2 source detection on (smblib_apsd_enable)
     if (!e) e = masked(b, reg::kTypecDebugAccessSink, 0x1f, 0x03, &dbg);
+    // smb5_configure_typec / smblib_set_prop_pr_swap_in_progress outside a role swap: CC threshold 1.6 V in source
+    // mode, no sink exit on CC alone, no VSAFE0V bypass, normal tCC debounce, CC-out not software driven (TWRP 06/00/00)
+    uint8_t exitCfg = 0, debounce = 0, ccout = 0;
+    if (!e) e = masked(b, reg::kTypecExitStateCfg, 0x0d, 0x04, &exitCfg);
+    if (!e) e = masked(b, reg::kTypecDebounceOption, 0x04, 0x00, &debounce);
+    if (!e) e = masked(b, reg::kTypecCcoutControl, 0x01, 0x00, &ccout);
     bool same = true;
     for (unsigned k = 0; k < 12 && !e; k = k + 1) {
       e = b.rd(static_cast<uint16_t>(reg::kJeitaThresholds + k), &th[k]);
@@ -160,8 +178,9 @@ struct Controller {
     }
     text[24] = 0;
     b.log("GuampChg: Linux config (%s), before: AICL-opt %02x rerun %02x therm-pull %02x JEITA-en %02x pause %02x "
-          "TypeC-cfg %02x BC1.2 %02x dbg-sink %02x JEITA thresholds %s%s\n",
-          when, aiclOpt, rerun, pull, jeita, pause, cc, bc12, dbg, text, same ? " (Linux)" : " -> Linux 45/0/60/-20/71 C");
+          "TypeC-cfg %02x BC1.2 %02x dbg-sink %02x exit %02x debounce %02x ccout %02x JEITA thresholds %s%s\n",
+          when, aiclOpt, rerun, pull, jeita, pause, cc, bc12, dbg, exitCfg, debounce, ccout, text,
+          same ? " (Linux)" : " -> Linux 45/0/60/-20/71 C");
     return 0;
   }
 
@@ -170,7 +189,9 @@ struct Controller {
         {reg::kStatus1, &s.s1}, {reg::kStatus2, &s.s2}, {reg::kStatus7, &s.s7}, {reg::kApsdStatus, &s.apsd},
         {reg::kApsdResult, &s.result}, {reg::kUsbinRt, &s.usbin}, {reg::kPowerPath, &s.pp}, {reg::kIclStatus, &s.icl},
         {reg::kAiclStatus, &s.aicl}, {reg::kUsbinCmdIl, &s.cmdIl}, {reg::kTypecStateMachine, &s.sm},
-        {reg::kTypecMisc, &s.misc}, {reg::kTypecSnkStatus, &s.snk}, {reg::kTypecLegacy, &s.legacy}, {reg::kFv, &s.fv}};
+        {reg::kTypecMisc, &s.misc}, {reg::kTypecSnkStatus, &s.snk}, {reg::kTypecLegacy, &s.legacy}, {reg::kFv, &s.fv},
+        {reg::kTypecSrcStatus, &s.src}, {reg::kTypecStatus0a, &s.sm2}, {reg::kTypecStatus0e, &s.cc},
+        {reg::kTypecRt, &s.typecRt}};
     for (const auto &r : list) {
       int e = b.rd(r.a, r.v);
       if (e) return e;
@@ -246,6 +267,17 @@ struct Controller {
     return e;
   }
 
+  // Type-C disable command (CC terminations off) now, the role back on at the first poll after ms + offMs
+  template <class Bus> void typecOff(Bus &b, uint64_t ms, uint8_t role, unsigned offMs, const char *why) {
+    lastTypecReset = ms;
+    int e = b.wr(reg::kTypecModeCfg, static_cast<uint8_t>(role | 0x01));
+    if (e) { fail(b, "Type-C disable", e); return; }
+    ccOnAt = ms + offMs;
+    typecResets = typecResets + 1;
+    if (why && (typecResets == 1 || typecResets % 20 == 0))
+      b.log("GuampChg: Type-C off for %u ms (%s), reset %u\n", offMs, why, typecResets);
+  }
+
   template <class Bus> void beginDetection(Bus &b, uint64_t ms, bool rerun, const char *why) {
     phase = kDetecting;
     phaseAt = ms;
@@ -263,10 +295,18 @@ struct Controller {
     int e = b.wr(reg::kWdogPet, 1);
     uint8_t mode = 0;
     if (!e) e = b.rd(reg::kTypecModeCfg, &mode);
-    const uint8_t wantMode = typecMode(mode, typecDrp);
-    if (!e && mode != wantMode) {
+    const bool drp = typecDrp || roleDrp;
+    bool justOn = false;
+    const uint8_t wantMode = typecMode(mode, drp);
+    if (!e && ccOnAt) {
+      if (ms < ccOnAt) return;   // CC terminations still off: the partner must see a detach
+      ccOnAt = 0;
+      justOn = true;
       e = b.wr(reg::kTypecModeCfg, wantMode);
-      if (!e) b.log("GuampChg: Type-C role %02x -> %02x (%s)\n", mode, wantMode, typecDrp ? "DRP try.SNK" : "sink only");
+      if (!e && ccRecoveries) b.log("GuampChg: Type-C on again, role %02x (%s)\n", wantMode, drp ? "DRP try.SNK" : "sink only");
+    } else if (!e && mode != wantMode) {
+      e = b.wr(reg::kTypecModeCfg, wantMode);
+      if (!e) b.log("GuampChg: Type-C role %02x -> %02x (%s)\n", mode, wantMode, drp ? "DRP try.SNK" : "sink only");
     }
     Snapshot s = {};
     if (!e) e = readSnapshot(b, s);
@@ -286,6 +326,17 @@ struct Controller {
               (s.legacy & 0x01) ? " (non-compliant)" : "", s.sm, s.misc);
       else
         b.log("GuampChg: Type-C detach, state %02x misc %02x\n", s.sm, s.misc);
+    }
+    const uint32_t typecKey = (static_cast<uint32_t>(s.sm) << 24) | (static_cast<uint32_t>(s.misc & 0x1b) << 16) |
+                              (static_cast<uint32_t>(s.snk & 0x0f) << 8);
+    if (typecKey != lastTypecKey && !justOn) {   // not in the poll that just turned CC back on (still settling)
+      if (lastTypecKey != 0xffffffffu || s.sm != 0x01)
+        b.log("GuampChg: Type-C state %02x%s misc %02x%s%s%s%s Rp %s src %02x 0a %02x 0e %02x legacy %02x rt %02x, USBIN %02x%s\n",
+              s.sm, (s.sm & 0x20) ? " ATTACHED" : (s.sm & 0x0f) == 2 ? " WAIT_VBUS" : (s.sm & 0x0f) == 1 ? " UNATTACHED" : "",
+              s.misc, (s.misc & 0x01) ? " CC_ATTACHED" : "", (s.misc & 0x02) ? " CC2" : "",
+              (s.misc & 0x08) ? " DEBOUNCED" : "", (s.misc & 0x10) ? " VBUS_ERROR" : "", rpName(s.snk), s.src, s.sm2,
+              s.cc, s.legacy, s.typecRt, s.usbin, s.present() ? " PLUGIN" : " no VBUS");
+      lastTypecKey = typecKey;
     }
     if (s.hwSuspended() != suspended) {
       suspended = s.hwSuspended();
@@ -322,20 +373,38 @@ struct Controller {
         absentSince = ms;
         lastResult = 0xff;
       }
-      // A Type-C state machine that stopped attaching after an unplug (UEFI 0x154a) gets a disable pulse every 15 s
-      if (ms - absentSince >= 15000 && ms - lastTypecReset >= 15000) {
-        lastTypecReset = ms;
-        e = b.wr(reg::kTypecModeCfg, static_cast<uint8_t>(wantMode | 0x01));
-        b.sleepMs(100);
-        int e2 = b.wr(reg::kTypecModeCfg, wantMode);
-        if (e || e2) fail(b, "Type-C reset", e ? e : e2);
-        else typecResets = typecResets + 1;
+      if (!s.partnerWithoutVbus()) {
+        noVbusSince = 0;
+        ccRecoveries = 0;
+        roleDrp = false;   // nothing on CC: back to the configured role
+        // A Type-C state machine that sees nothing at all (wall charger without attach) gets the disable command for
+        // one poll every 15 s
+        if (ms - absentSince >= 15000 && ms - lastTypecReset >= 15000) typecOff(b, ms, wantMode, 1000, "nothing on CC");
+        return;
+      }
+      // Rp on CC but VBUS never valid. The source only turns VBUS (back) on for a new attach: take the sink's Rd off
+      // for longer than the source's detach debounce and VBUS discharge (2 s, 3 s), alternating the sink-only role
+      // with Linux's DRP try.SNK; first after 5 s, then every 20 s, after 6 attempts every 60 s
+      if (!noVbusSince) noVbusSince = ms;
+      const uint64_t gap = ccRecoveries == 0 ? 5000 : ccRecoveries < 6 ? 20000 : 60000;
+      if (ms - noVbusSince >= 5000 && ms - lastTypecReset >= gap) {
+        ccRecoveries = ccRecoveries + 1;
+        if (!typecDrp) roleDrp = (ccRecoveries % 2) == 0;
+        b.log("GuampChg: Rp without VBUS for %u s (state %02x misc %02x 0e %02x, USBIN %02x): Type-C recovery %u, CC off "
+              "%u s, then %s\n",
+              static_cast<unsigned>((ms - noVbusSince) / 1000), s.sm, s.misc, s.cc, s.usbin, ccRecoveries,
+              (ccRecoveries % 2) ? 2u : 3u, (typecDrp || roleDrp) ? "DRP try.SNK" : "sink only");
+        typecOff(b, ms, typecMode(wantMode, typecDrp || roleDrp), (ccRecoveries % 2) ? 2000 : 3000, nullptr);
       }
       return;
     }
     if (!present) {
       present = true;
       plugins = plugins + 1;
+      if (ccRecoveries)
+        b.log("GuampChg: VBUS back after Type-C recovery %u (%s)\n", ccRecoveries, drp ? "DRP try.SNK" : "sink only");
+      noVbusSince = 0;
+      ccRecoveries = 0;
       e = edgeReset(b);
       if (e) fail(b, "plug-in reset", e);
       b.log("GuampChg: plug-in %u (%s), USBIN %02x, %s, Type-C %s Rp %s, APSD %02x result %02x\n", plugins,

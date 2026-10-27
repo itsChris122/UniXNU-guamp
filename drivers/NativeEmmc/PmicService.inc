@@ -143,7 +143,9 @@ struct ChargeBus {
 guamp_charge::Controller gCharge;
 
 // One line per 5 s poll when the decoded state changed, else every 30 s: charger state, the STATUS_2/7 bits Linux
-// defines, power path (DCDC 0x110b), ICL/AICL status, USBIN interrupt real-time bits and the gating configuration.
+// defines, power path (DCDC 0x110b), ICL/AICL status, USBIN interrupt real-time bits, the Type-C status (state machine
+// 0x1509, misc 0x150b, sink Rp 0x1506, 0x1508/0x150a/0x150e, legacy 0x150d, interrupt real-time 0x1510) and the gating
+// configuration.
 void chargerGatingLog(bool force) {
   static const char *const kState[8] = {"INHIBIT", "TRICKLE", "PRECHG", "FULLON", "TAPER", "TERM", "PAUSE", "DISABLED"};
   static uint32_t last = 0xffffffffu;
@@ -152,20 +154,27 @@ void chargerGatingLog(bool force) {
   read8(kPmi632, kAiclOptions, &aicl); read8(kPmi632, kJeitaEnCfg, &jeita); read8(kPmi632, kBatifPullUp, &pull);
   read8(kPmi632, kChgPauseCmd, &pause); read8(kPmi632, kChgEnableCmd, &en);
   const uint8_t s1 = gChg[0], s2 = gChg[1], s7 = gChg[2], usbin = gChg[6];
+  const guamp_charge::Snapshot &t = gCharge.snap;
   const uint32_t key = (static_cast<uint32_t>(s1 & 7) << 24) | (static_cast<uint32_t>(s7 & 0x3f) << 16) |
                        (static_cast<uint32_t>(pp & 0x5f) << 8) | (usbin & 0x1fu) | ((s2 & 2u) << 4);
-  if (!force && key == last) return;
+  const uint32_t typecKey = (static_cast<uint32_t>(t.sm) << 8) | (t.misc & 0x1bu);
+  static uint32_t lastTypec = 0xffffffffu;
+  if (!force && key == last && typecKey == lastTypec) return;
   last = key;
+  lastTypec = typecKey;
   IOLog("GuampChg: %s st1 %02x st2 %02x%s st7 %02x%s%s%s%s%s%s pp %02x%s%s%s icl %u mA aicl %02x%s usbin %02x%s%s%s%s%s "
-        "cfg aicl-opt %02x%s jeita %02x pull %02x pause %02x en %02x weak %u redetect %u suspend-toggle %u\n",
+        "typec sm %02x%s%s misc %02x%s%s%s rp %02x src %02x 0a %02x 0e %02x legacy %02x rt %02x mode %02x "
+        "cfg aicl-opt %02x%s jeita %02x pull %02x pause %02x en %02x weak %u redetect %u suspend-toggle %u cc-recover %u\n",
         kState[s1 & 7], s1, s2, (s2 & 0x02) ? " BAT_OV" : "", s7, (s7 & 0x20) ? " HOT_SOFT" : "",
         (s7 & 0x10) ? " COLD_SOFT" : "", (s7 & 0x08) ? " TOO_HOT" : "", (s7 & 0x04) ? " TOO_COLD" : "",
         (s7 & 0x02) ? " HOT_AFP" : "", (s7 & 0x01) ? " COLD_AFP" : "", pp, (pp & 0x40) ? " USBIN_SUSPENDED" : "",
         (pp & 0x10) ? " USE_USBIN" : "", (pp & 0x01) ? " VALID" : " NO_VALID_INPUT", static_cast<unsigned>(icl) * 50u,
         aiclSt, (aiclSt & 0x01) ? " DONE" : "", usbin, (usbin & 0x10) ? " PLUGIN" : "", (usbin & 0x08) ? " OV" : "",
-        (usbin & 0x04) ? " UV" : "", (usbin & 0x02) ? " VASHDN" : "", (usbin & 0x01) ? " COLLAPSE" : "", aicl,
-        (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "", jeita, pull, pause, en, gCharge.weakSteps, gCharge.redetects,
-        gCharge.suspendRecoveries);
+        (usbin & 0x04) ? " UV" : "", (usbin & 0x02) ? " VASHDN" : "", (usbin & 0x01) ? " COLLAPSE" : "", t.sm,
+        (t.sm & 0x20) ? " ATTACHED" : "", (t.sm & 0x0f) == 2 ? " WAIT_VBUS" : "", t.misc,
+        (t.misc & 0x01) ? " CC_ATTACHED" : "", (t.misc & 0x08) ? " DEBOUNCED" : "", (t.misc & 0x10) ? " VBUS_ERROR" : "",
+        t.snk, t.src, t.sm2, t.cc, t.legacy, t.typecRt, gTypecMode, aicl, (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "",
+        jeita, pull, pause, en, gCharge.weakSteps, gCharge.redetects, gCharge.suspendRecoveries, gCharge.ccRecoveries);
 }
 
 // --- ringer switch (Assistant key, TLMM GPIO 33) -------------------------------------------------------------------
@@ -303,12 +312,12 @@ void thread(void *, wait_result_t) {
       if (tick % 1200 == 0) {
         // Register dump: USBIN 0x1300-0x130f, 0x1340-0x134f, 0x1360-0x136f (ICL/APSD options), 0x1380-0x138f (AICL),
         // TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f and 0x1640-0x164f, CHGR 0x1090-0x109f (JEITA),
-        // BATIF 0x1280-0x128f (thermistor ADC)
-        static const uint16_t blocks[10] = {0x1300, 0x1340, 0x1360, 0x1380, 0x1500, 0x1540, 0x1600, 0x1640, 0x1090,
-                                            0x1280};
-        char text[10 * 33 + 8];
+        // BATIF 0x1280-0x128f (thermistor ADC), TYPEC 0x1550-0x157f (exit state, interrupt, debounce, uUSB/water)
+        static const uint16_t blocks[13] = {0x1300, 0x1340, 0x1360, 0x1380, 0x1500, 0x1540, 0x1600, 0x1640, 0x1090,
+                                            0x1280, 0x1550, 0x1560, 0x1570};
+        char text[13 * 33 + 8];
         unsigned at = 0;
-        for (unsigned b = 0; b < 10; ++b) {
+        for (unsigned b = 0; b < 13; ++b) {
           for (unsigned k = 0; k < 16; ++k) {
             uint8_t v = 0;
             read8(kPmi632, static_cast<uint16_t>(blocks[b] + k), &v);
@@ -318,7 +327,7 @@ void thread(void *, wait_result_t) {
           text[at++] = ' ';
         }
         text[at] = 0;
-        IOLog("GuampPmic: regs 1300 1340 1360 1380 1500 1540 1600 1640 1090 1280: %s typec resets %u plug %u unplug %u "
+        IOLog("GuampPmic: regs 1300 1340 1360 1380 1500 1540 1600 1640 1090 1280 1550 1560 1570: %s typec resets %u plug %u unplug %u "
               "errors %u\n", text, gCharge.typecResets, gCharge.plugins, gCharge.unplugs, gCharge.errors);
       }
       if (tick % 1200 == 0) {
