@@ -4,21 +4,27 @@
 //   buttons   Power and Volume Down from the PM6125 PON real-time status, Volume Up from PM6125 GPIO 5, polled every
 //             25 ms with a 2-sample debounce, sent to NativeHidInput's button sink (report 2: bit 1 Power, bit 2 Volume
 //             Up, bit 3 Volume Down) when the pressed set changes
-//   charger   PMI632 SMB5: pets the charger watchdog, enables charging and raises the USB input current limit and the
-//             fast charge current once a charger is detected; register offsets from Linux qcom_smbx.c (SMB2/SMB5 share
-//             them); the current codes assume 50 mA steps, so a 25 mA hardware step only halves them (never exceeds)
+//   charger   PMI632 SMB5, GuampChargeReplugCore.h polled every second: pets the charger watchdog, keeps the Type-C sink
+//             role, and on every plug-in (also at boot) runs source detection (APSD), the input current limit, FV, FCC
+//             and charge enable as Linux smb5-lib.c does; on unplug it resets AICL thresholds, ICL and input suspend;
+//             a cable that stays in without input current gets Linux's weak-adapter AICL steps, then a re-detection.
+//             One log line per transition (plug, unplug, APSD, Type-C attach/detach, ICL, AICL, suspend)
 //   ringer    the Assistant key (TLMM GPIO 33, active low) is the ring/silent switch: every debounced press toggles a
 //             latched state that starts at "ring"; it is report 2 bit 4 (Telephony page 0x0B usage 0x2E, level: 1 ring,
 //             0 silent). backboardd BKButtonHIDEventProcessor -processEvent:sender:dispatcher: routes a keyboard event
 //             with page 0x0B usage 0x2E to -_processRingerSwitchEvent:down: (down != 0 -> "tone1", 0 -> "silent") and
 //             SpringBoard -__handleHIDEvent: 0xB002E -> -_handleRingerSwitchEvent: (gated by MobileGestalt ringer-switch
 //             = ADT /buttons property function-button_ringerab, see make-guamp-adt.py) -> _updateRingerState:.
-// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 1500) and guamp-fcc-ma (default 2000);
+// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 1500, used for OCP/CDP/DCP only, SDP 500) and
+// guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
+// instead of sink only; guamp-chg-recover=0 turns off the stuck-input recovery (weak-adapter steps, re-detection);
 // guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
 // Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, SPMI errors.
 
+#include <stdarg.h>
 #include "GuampSpmi.h"
 #include "GuampPmicBoard.h"
+#include "GuampChargeReplugCore.h"
 
 extern "C" {
 extern uint32_t cs_text_fixup_parsed, cs_text_fixup_applied;
@@ -99,39 +105,10 @@ int write8(unsigned sid, uint16_t addr, uint8_t v) {
 // --- board ---------------------------------------------------------------------------------------------------------
 constexpr unsigned kPm6125 = 0, kPmi632 = 2;
 constexpr uint16_t kPonRtSts = 0x0810, kVolUpStatus = 0xc408;
-// SMB5 charger (PMI632 0x1000 block, offsets of qcom_smbx.c relative to it)
-constexpr uint16_t kChgStatus1 = 0x1006, kChgStatus2 = 0x1007, kChgStatus7 = 0x100d, kChgEnableCmd = 0x1042,
-                   kFccCfg = 0x1061, kApsdStatus = 0x1307, kApsdResult = 0x1308, kUsbinCmdIl = 0x1340,
-                   kIclOptions = 0x1366, kIclCfg = 0x1370, kWdogPet = 0x1643, kFvCfg = 0x1070;
-// Float voltage: left at the hardware default (low) without a driver, which held the charger in INHIBIT (status 6) with a
-// charged battery. SMB5 code = (mV - 3600) / 10; on the SMB2 encoding (3487.5 + 7.5 mV per code) the same code is lower.
-constexpr unsigned kFvMv = 4350;
-// Type-C mode (SMB5 TYPEC block 0x1500, TYPE_C_MODE_CFG at +0x44: bit 0 disable command, bit 1 sink only, bit 2 source
-// only). A Type-C wall charger only turns VBUS on after it sees the sink's Rd on CC: on the wall charger USBIN showed
-// under-voltage and TYPEC no attach, while the legacy A-to-C cable of the PC always carries VBUS. Sink only: the phone
-// never supplies power here.
-constexpr uint16_t kTypecModeCfg = 0x1544;
-constexpr uint8_t kTypecSinkOnly = 0x10;   // value Linux (TWRP smb5) keeps: try-sink DRP; the UEFI left 0x02
-// 0x154a: Linux 0x03, UEFI left 0x0f (after the first unplug the Type-C state machine never attached again)
-constexpr uint16_t kTypecCfg4a = 0x154a;
-constexpr uint8_t kTypecCfg4aLinux = 0x03;
-
-// Charge gating registers that Linux configures and the UEFI does not (smb5_init_hw in qpnp-smb5.c, mmi_init in
-// smb5-lib.c, guamp DT bengal-guamp-common-overlay.dtsi &pmi632_charger; values checked against the TWRP dump
-// analisi/pmic/twrp-pc.txt where Linux charges). BATTERY_CHARGER_STATUS_1 bits 2:0 = 6 is PAUSE_CHARGE (smb5-reg.h:
-// 0 inhibit .. 6 pause, 7 disable). It came with USBIN collapse/UV/VASHDN (0x1310 = 0x17/0x37) and the battery carrying
-// the whole system load: the input was suspended on collapse.
-//   0x1380 USBIN_AICL_OPTIONS_CFG mask 0x9c: AICL on, periodic AICL rerun on, ADC AICL off, SUSPEND_ON_COLLAPSE off
-//          (DT qcom,disable-suspend-on-collapse) -> 0x14 under the mask; TWRP 0x54
-//   0x1661 AICL_RERUN_TIME_CFG = 0x01 (12 s); TWRP 0x01
-//   0x1286 BATIF_ADC_INTERNAL_PULL_UP bits 1:0 = 01, 30 kOhm for the 10 kOhm NTC (guamp CONFIG_BAT_NTC_10K=y): the
-//          hardware JEITA comparators read 28 C as HOT_SOFT (STATUS_7 0x20) without it; TWRP 0x01, STATUS_7 0x00
-//   0x1090 JEITA_EN_CFG bits 3:0 = 0, no hardware soft-JEITA FCC/FV compensation (smblib_disable_hw_jeita); the
-//          hard-limit bits stay as the hardware has them (Motorola clears them too, but only because its mmi code does
-//          software JEITA, which this port does not); TWRP 0x00
-//   0x1043 CHARGING_PAUSE_CMD = 0; TWRP 0x00
-constexpr uint16_t kAiclOptions = 0x1380, kAiclRerunTime = 0x1661, kBatifPullUp = 0x1286, kJeitaEnCfg = 0x1090,
-                   kChgPauseCmd = 0x1043, kIclStatus = 0x1107, kAiclStatus = 0x110a, kPowerPath = 0x110b;
+// SMB5 charger registers for the status lines (smb5-reg.h; the controller's own list is guamp_charge::reg)
+constexpr uint16_t kChgEnableCmd = 0x1042, kTypecModeCfg = 0x1544, kAiclOptions = 0x1380, kBatifPullUp = 0x1286,
+                   kJeitaEnCfg = 0x1090, kChgPauseCmd = 0x1043, kIclStatus = 0x1107, kAiclStatus = 0x110a,
+                   kPowerPath = 0x110b;
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
@@ -151,27 +128,23 @@ uint32_t readButtons() {
   return mask;
 }
 
-// Read-modify-write of the bits in mask only; no write when they already hold the value. Returns the old value.
-uint8_t smbMasked(uint16_t addr, uint8_t mask, uint8_t value) {
-  uint8_t old = 0;
-  if (read8(kPmi632, addr, &old)) { gErrors = gErrors + 1; return 0; }
-  const uint8_t want = static_cast<uint8_t>((old & ~mask) | (value & mask));
-  if (want != old && write8(kPmi632, addr, want)) gErrors = gErrors + 1;
-  return old;
-}
-void chargerLinuxConfig(const char *when) {
-  const uint8_t aicl = smbMasked(kAiclOptions, 0x9c, 0x14);
-  const uint8_t rerun = smbMasked(kAiclRerunTime, 0xff, 0x01);
-  const uint8_t pull = smbMasked(kBatifPullUp, 0x03, 0x01);
-  const uint8_t jeita = smbMasked(kJeitaEnCfg, 0x0f, 0x00);
-  const uint8_t pause = smbMasked(kChgPauseCmd, 0x01, 0x00);
-  IOLog("GuampChg: Linux config (%s), before: AICL-opt %02x rerun %02x therm-pull %02x JEITA-en %02x pause-cmd %02x\n",
-        when, aicl, rerun, pull, jeita, pause);
-}
+// The charger controller's register access: SPMI slave 2, IOSleep, one IOLog line per call
+struct ChargeBus {
+  int rd(uint16_t addr, uint8_t *v) { return read8(kPmi632, addr, v); }
+  int wr(uint16_t addr, uint8_t v) { return write8(kPmi632, addr, v); }
+  void sleepMs(unsigned ms) { IOSleep(ms); }
+  __attribute__((format(printf, 2, 3))) void log(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    IOLogv(format, ap);
+    va_end(ap);
+  }
+};
+guamp_charge::Controller gCharge;
 
 // One line per 5 s poll when the decoded state changed, else every 30 s: charger state, the STATUS_2/7 bits Linux
 // defines, power path (DCDC 0x110b), ICL/AICL status, USBIN interrupt real-time bits and the gating configuration.
-void chargerGatingLog(bool force, unsigned recoveries) {
+void chargerGatingLog(bool force) {
   static const char *const kState[8] = {"INHIBIT", "TRICKLE", "PRECHG", "FULLON", "TAPER", "TERM", "PAUSE", "DISABLED"};
   static uint32_t last = 0xffffffffu;
   uint8_t pp = 0, icl = 0, aiclSt = 0, aicl = 0, jeita = 0, pull = 0, pause = 0, en = 0;
@@ -184,39 +157,15 @@ void chargerGatingLog(bool force, unsigned recoveries) {
   if (!force && key == last) return;
   last = key;
   IOLog("GuampChg: %s st1 %02x st2 %02x%s st7 %02x%s%s%s%s%s%s pp %02x%s%s%s icl %u mA aicl %02x%s usbin %02x%s%s%s%s%s "
-        "cfg aicl-opt %02x%s jeita %02x pull %02x pause %02x en %02x recover %u\n",
+        "cfg aicl-opt %02x%s jeita %02x pull %02x pause %02x en %02x weak %u redetect %u suspend-toggle %u\n",
         kState[s1 & 7], s1, s2, (s2 & 0x02) ? " BAT_OV" : "", s7, (s7 & 0x20) ? " HOT_SOFT" : "",
         (s7 & 0x10) ? " COLD_SOFT" : "", (s7 & 0x08) ? " TOO_HOT" : "", (s7 & 0x04) ? " TOO_COLD" : "",
         (s7 & 0x02) ? " HOT_AFP" : "", (s7 & 0x01) ? " COLD_AFP" : "", pp, (pp & 0x40) ? " USBIN_SUSPENDED" : "",
         (pp & 0x10) ? " USE_USBIN" : "", (pp & 0x01) ? " VALID" : " NO_VALID_INPUT", static_cast<unsigned>(icl) * 50u,
         aiclSt, (aiclSt & 0x01) ? " DONE" : "", usbin, (usbin & 0x10) ? " PLUGIN" : "", (usbin & 0x08) ? " OV" : "",
         (usbin & 0x04) ? " UV" : "", (usbin & 0x02) ? " VASHDN" : "", (usbin & 0x01) ? " COLLAPSE" : "", aicl,
-        (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "", jeita, pull, pause, en, recoveries);
-}
-
-void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, uint8_t *fccCode) {
-  write8(kPmi632, kWdogPet, 1);
-  uint8_t s1 = 0, s2 = 0, s7 = 0, apsd = 0, result = 0;
-  read8(kPmi632, kChgStatus1, &s1); read8(kPmi632, kChgStatus2, &s2); read8(kPmi632, kChgStatus7, &s7);
-  uint8_t fv = 0;
-  read8(kPmi632, kApsdStatus, &apsd); read8(kPmi632, kApsdResult, &result); read8(kPmi632, kFvCfg, &fv);
-  gChg[0] = s1; gChg[1] = s2; gChg[2] = s7; gChg[3] = apsd; gChg[4] = result; gChg[5] = fv;
-  if (!configure) return;
-  // Input current by source (APSD_RESULT_STATUS of qcom_smbx.c: bit 0 SDP, 1 CDP, 2 DCP, 3 OCP, 4 float): a PC port (SDP)
-  // or an unknown source gets 500 mA; asking 1.5 A of a PC port collapsed VBUS (USBIN under-voltage) and the charger
-  // stayed DISABLED until the next plug-in.
-  if (!(result & 0x0e)) iclMa = iclMa < 500 ? iclMa : 500;
-  chargerLinuxConfig("plug-in");
-  *iclCode = static_cast<uint8_t>(iclMa / 50 > 0xff ? 0xff : iclMa / 50);
-  *fccCode = static_cast<uint8_t>(fccMa / 50 > 0xff ? 0xff : fccMa / 50);
-  write8(kPmi632, kFvCfg, static_cast<uint8_t>((kFvMv - 3600) / 10));
-  write8(kPmi632, kChgEnableCmd, 0);       // off and on again: the charger re-evaluates inhibit with the new float voltage
-  IODelay(1000);
-  write8(kPmi632, kChgEnableCmd, 1);       // charging enable command
-  write8(kPmi632, kFccCfg, *fccCode);
-  write8(kPmi632, kIclCfg, *iclCode);
-  write8(kPmi632, kIclOptions, 0x03);      // value Linux (TWRP) keeps
-  write8(kPmi632, kUsbinCmdIl, 0x00);      // input not suspended
+        (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "", jeita, pull, pause, en, gCharge.weakSteps, gCharge.redetects,
+        gCharge.suspendRecoveries);
 }
 
 // --- ringer switch (Assistant key, TLMM GPIO 33) -------------------------------------------------------------------
@@ -287,11 +236,18 @@ void thread(void *, wait_result_t) {
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
   if (iclMa > 3000) iclMa = 3000;
   if (fccMa > 3000) fccMa = 3000;
+  unsigned typecDrp = 0, chgRecover = 1;
+  PE_parse_boot_argn("guamp-typec-drp", &typecDrp, sizeof(typecDrp));
+  PE_parse_boot_argn("guamp-chg-recover", &chgRecover, sizeof(chgRecover));
+  gCharge.iclMa = iclMa;
+  gCharge.fccMa = fccMa;
+  gCharge.typecDrp = typecDrp == 1;
+  gCharge.recover = chgRecover != 0;
+  IOLog("GuampChg: controller ICL %u mA (SDP %u) FCC %u mA FV %u mV, Type-C %s, recovery %s\n", iclMa,
+        guamp_charge::kSdpMa, fccMa, guamp_charge::kFvMv, gCharge.typecDrp ? "DRP try.SNK" : "sink only",
+        gCharge.recover ? "on" : "off");
+  ChargeBus chargeBus;
   uint32_t stable = 0, last = 0, sent = 0;
-  uint8_t iclCode = 0, fccCode = 0;
-  bool configured = false, apsdRequested = false;
-  unsigned absentTicks = 0, typecResets = 0, suspendRecoveries = 0, suspendHold = 0;
-  chargerLinuxConfig("boot");
   const bool ringer = ringerInit();
   bool keyLast = false, keyStable = false;
   unsigned keyCount = 0;
@@ -328,60 +284,31 @@ void thread(void *, wait_result_t) {
       sinkSeen = gSinkGeneration;
       if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, sent);
     }
-    if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
-      // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
-      // APSD result stayed 0 and the charger DISABLED. On every new plug-in: unsuspend the input, rerun APSD, configure.
-      uint8_t usbinRt = 0, typecRt = 0, typecMode = 0;
-      read8(kPmi632, kTypecModeCfg, &typecMode);
-      if (typecMode != kTypecSinkOnly) write8(kPmi632, kTypecModeCfg, kTypecSinkOnly);
-      uint8_t cfg4a = 0;
-      read8(kPmi632, kTypecCfg4a, &cfg4a);
-      if (cfg4a != kTypecCfg4aLinux) write8(kPmi632, kTypecCfg4a, kTypecCfg4aLinux);
-      gTypecMode = typecMode;
-      read8(kPmi632, 0x1310, &usbinRt);
+    if (tick % 40 == 0) {                         // every second: the charger controller
+      uint64_t ns = 0;
+      absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+      gCharge.poll(chargeBus, ns / 1000000u);
+      const guamp_charge::Snapshot &c = gCharge.snap;
+      gChg[0] = c.s1; gChg[1] = c.s2; gChg[2] = c.s7; gChg[3] = c.apsd; gChg[4] = c.result; gChg[5] = c.fv;
+      gChg[6] = c.usbin;
+    }
+    if (tick % 200 == 0) {                        // every 5 s: status line on change, battery, periodic dumps
+      uint8_t typecRt = 0, typecMode = 0;
       read8(kPmi632, 0x1510, &typecRt);
-      gChg[6] = usbinRt; gChg[7] = typecRt;
-      bool present = (usbinRt & 0x10) != 0;
-      // After the first unplug the PMIC never saw VBUS again (USBIN under-voltage, TYPEC no attach), not even on the PC
-      // port that carried the USB data: try a Type-C state machine reset (disable command, then sink only again) every
-      // 15 s while nothing is detected.
-      if (!present && ++absentTicks % 3 == 0) {
-        write8(kPmi632, kTypecModeCfg, kTypecSinkOnly | 0x01);
-        IOSleep(100);
-        write8(kPmi632, kTypecModeCfg, kTypecSinkOnly);
-        typecResets = typecResets + 1;
-      }
-      if (present) absentTicks = 0;
-      if (present && !configured && !apsdRequested) {
-        write8(kPmi632, kUsbinCmdIl, 0x00);
-        write8(kPmi632, 0x1341, 0x01);         // CMD_APSD: rerun source detection, configure on a later tick
-        apsdRequested = true;
-      }
-      bool apsdDone = (gChg[3] & 0x01) != 0;
-      charger(present && !configured && apsdRequested && apsdDone, iclMa, fccMa, &iclCode, &fccCode);
-      if (present && !configured && apsdRequested && apsdDone) configured = true;
-      if (!present) { configured = false; apsdRequested = false; }
-      // An input already suspended on collapse (before the AICL configuration above, e.g. by the boot chain) stays
-      // suspended until the suspend command toggles, which is what Linux's usb_icl vote 0 -> ICL does: at most once per
-      // 30 s, only with the cable in and our own suspend command off.
-      uint8_t powerPath = 0, cmdIl = 0;
-      if (suspendHold) suspendHold = suspendHold - 1;
-      if (present && !suspendHold && !read8(kPmi632, kPowerPath, &powerPath) && (powerPath & 0x40) &&
-          !read8(kPmi632, kUsbinCmdIl, &cmdIl) && !(cmdIl & 0x01)) {
-        write8(kPmi632, kUsbinCmdIl, 0x01);
-        IOSleep(20);                               // VASHDN deglitch, as usbin_uv_irq_handler
-        write8(kPmi632, kUsbinCmdIl, 0x00);
-        suspendRecoveries = suspendRecoveries + 1;
-        suspendHold = 6;
-      }
-      chargerGatingLog(tick % 1200 == 0, suspendRecoveries);
+      read8(kPmi632, kTypecModeCfg, &typecMode);
+      gChg[7] = typecRt;
+      gTypecMode = typecMode;
+      chargerGatingLog(tick % 1200 == 0);
       batteryPoll();
       if (tick % 1200 == 0) {
-        // Register dump: USBIN 0x1300-0x130f and 0x1340-0x134f, TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f
-        static const uint16_t blocks[5] = {0x1300, 0x1340, 0x1500, 0x1540, 0x1600};
-        char text[5 * 33 + 8];
+        // Register dump: USBIN 0x1300-0x130f, 0x1340-0x134f, 0x1360-0x136f (ICL/APSD options), 0x1380-0x138f (AICL),
+        // TYPEC 0x1500-0x150f and 0x1540-0x154f, MISC 0x1600-0x160f and 0x1640-0x164f, CHGR 0x1090-0x109f (JEITA),
+        // BATIF 0x1280-0x128f (thermistor ADC)
+        static const uint16_t blocks[10] = {0x1300, 0x1340, 0x1360, 0x1380, 0x1500, 0x1540, 0x1600, 0x1640, 0x1090,
+                                            0x1280};
+        char text[10 * 33 + 8];
         unsigned at = 0;
-        for (unsigned b = 0; b < 5; ++b) {
+        for (unsigned b = 0; b < 10; ++b) {
           for (unsigned k = 0; k < 16; ++k) {
             uint8_t v = 0;
             read8(kPmi632, static_cast<uint16_t>(blocks[b] + k), &v);
@@ -391,7 +318,8 @@ void thread(void *, wait_result_t) {
           text[at++] = ' ';
         }
         text[at] = 0;
-        IOLog("GuampPmic: regs 1300 1340 1500 1540 1600: %s typec resets %u\n", text, typecResets);
+        IOLog("GuampPmic: regs 1300 1340 1360 1380 1500 1540 1600 1640 1090 1280: %s typec resets %u plug %u unplug %u "
+              "errors %u\n", text, gCharge.typecResets, gCharge.plugins, gCharge.unplugs, gCharge.errors);
       }
       if (tick % 1200 == 0) {
         IOLog("GuampUi: text-fixups configured %u applied %u chunks %u file-matches %u byte-mismatches %u; cache-PC cycle %u deleted %u absent %u error %u invalidation-complete %u\n",
@@ -405,7 +333,8 @@ void thread(void *, wait_result_t) {
         IOLog("GuampPmic: ringer %s presses %u\n", gRingerState ? "ring" : "silent", gRingerPresses);
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
-              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, iclCode, fccCode, gErrors,
+              gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, gCharge.iclCode,
+              gCharge.fccCode, gErrors,
               touch::gStep, touch::gError, touch::gEvents);
     }
     IOSleep(25);
