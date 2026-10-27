@@ -357,7 +357,13 @@ void publish(const struct hx_report &r) {
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
-  if (!snapshot() || stage < 2 || !enable() || stage < 3 || !openBus() || stage < 4) return;
+  if (!snapshot() || stage < 2 || !enable() || stage < 3) return;
+  if (!openBus()) {
+    // The boot-time panel line is gone from kpan and the USB mirror connects later: repeat it once a minute for 15 minutes.
+    for (unsigned i = 0; i < 15 && gPanelProbe; ++i) { IOSleep(60000); panelProbe(); logPanel(); }
+    return;
+  }
+  if (stage < 4) return;
   gStep = 4;
   // The firmware is the board's vendor/firmware/hlt_Himax_firmware.bin (proprietary, kept out of the public sources):
   // make-guamp-adt.py copies it from the local tree into the ADT as /chosen/guamp-touch-firmware.
