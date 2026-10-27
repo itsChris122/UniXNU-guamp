@@ -56,3 +56,4 @@ CONFIG_XNU_SHENG_PMGR=y
 # the system display; QuartzCore's original CPU renderer draws (no Metal device). With it the AppleKeyStore stand-in and the
 # HID device (KeyStoreProbe/HidInputProbe). Archive: scripts/build-guamp-legacy-display.py (UniXNU-qemu's, reduced).
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+CONFIG_XNU_NATIVE_ADRENO=y

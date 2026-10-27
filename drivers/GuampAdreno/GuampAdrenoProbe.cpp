@@ -1,0 +1,455 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// guamp board probe of NativeAdreno on the Adreno 610 (SM6115 bengal: a6xx gen1, no GMU, the CPU owns the GPU's power domains).
+// Adapted from UniXNU-tb128fu package/GpuProbe.cpp stages 7 and 8 (xVanTuring, BSD-2-Clause-Patent; SM6225 khaje, the same
+// Adreno 610), with these differences:
+//   - power: NativeEmmc's GPU thread (GpuService.inc, GuampGpuM1.h + RPM votes) has already powered the GPU; this file never
+//     touches GCC/GPUCC
+//   - secure mode: no zap shader (it needs TrustZone PAS, which this port does not use). Mainline a6xx_hw_init's fallback when
+//     no zap shader exists is used instead: RBBM_SECVID_TRUST_CNTL = 0 written directly, then read back and logged
+//   - chip id 0x06010000 (bengal-gpu.dtsi qcom,chipid), the rest of the device facts as on tb128fu (A610: GMEM 128 + 4 KiB,
+//     UBWC 1.0, highest bank bit 14, bengal-gpu.dtsi qcom,ubwc-mode 1 / qcom,highest-bank-bit 14)
+// Default off: guamp-adreno=<level> (GuampAdreno.h). Every step logs a "GuampAdreno:" line before it touches hardware, so a bus
+// hang shows where it stopped.
+#include <IOKit/IOService.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOUserClient.h>
+#include <libkern/c++/OSSharedPtr.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
+#include <mach/kmod.h>
+#include <kern/thread.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
+#include "NativeAdrenoGpuContext.h"
+#include "NativeAdrenoRing.h"
+#include "NativeAdrenoCpInit.h"
+#include "NativeAdrenoIrq.h"
+#include "NativeAdrenoSubmit.h"
+#include "NativeAdrenoTimer.h"
+#include "NativeAdrenoABI.h"
+#include "GuampAdreno.h"
+
+extern "C" {
+// Fence waits that slept until a GPU interrupt or spun.
+volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
+boolean_t ml_get_interrupts_enabled(void);
+boolean_t ml_at_interrupt_context(void);
+int get_preemption_level(void);
+#include "AdrenoPM4.h"
+IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *, size_t, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                       void (*)(uint32_t), NativeAdrenoGmuContextReport *);
+IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
+NativeAdrenoVm *NativeAdrenoGpuContextVm();
+IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
+                               const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_pool_mib, native_adreno_wc_enabled,
+    native_adreno_written_imports_owned;
+// ArmCpu's SPI attach (also used by the touch service).
+int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
+// The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
+void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp")
+    __attribute__((weak_import));
+IOService *native_adreno_accelerator_allocate(void) __attribute__((weak_import));
+unsigned native_adreno_accelerator_instance_size(void) __attribute__((weak_import));
+kern_return_t OSKextLoadKextWithIdentifier(const char *);
+extern kmod_info_t g_kernel_kmod_info;
+
+// NativeAdrenoPublish.cpp hands scanout and present calls to the GOP presenter (NativeGOPPresenter.cpp on tb128fu). guamp's
+// legacy display has no GPU hand-off yet: these weak stand-ins answer "not ready / unsupported" until a presenter defines them.
+__attribute__((weak)) IOMemoryDescriptor *native_gop_handoff_memory(void) {return nullptr;}
+__attribute__((weak)) IOReturn native_gop_handoff_call(uint32_t, task_t, const void *, size_t, void *, size_t) {
+  return kIOReturnUnsupported;
+}
+}
+
+namespace {
+// kgsl_smmu (msm-arm-smmu-bengal.dtsi): base 0x59a0000, 0x10000; context banks at 0x8000 (IDR1 PAGESIZE 4K, NUMPAGENDXB 2,
+// as the M2 probe read: idr1 20000005).
+constexpr uint64_t kSmmu = 0x059A0000, kSmmuBytes = 0x10000;
+constexpr uint32_t kGpuIntid = 32 + 177;   // bengal-gpu.dtsi kgsl_3d0_irq: SPI 177, level high
+
+struct Region {OSSharedPtr<IOMemoryMap> keep; uintptr_t va = 0;};
+bool mapRegion(uint64_t phys, uint64_t length, Region &region) {
+  IODeviceMemory *memory = IODeviceMemory::withRange(phys, length);
+  if (!memory) return false;
+  region.keep = OSSharedPtr<IOMemoryMap>(memory->map(kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
+  memory->release();
+  region.va = region.keep ? static_cast<uintptr_t>(region.keep->getVirtualAddress()) : 0;
+  return region.va != 0;
+}
+uint32_t rd(const Region &r, uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(r.va + reg);}
+void wr(const Region &r, uint32_t reg, uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(r.va + reg) = value;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+bool poll(const Region &r, uint32_t reg, uint32_t mask, uint32_t want, unsigned us) {
+  for (unsigned i = 0; i <= us; i = i + 1) {
+    if ((rd(r, reg) & mask) == want) return true;
+    IODelay(1);
+  }
+  return false;
+}
+
+struct Session {
+  volatile uint8_t *gpu = nullptr;
+  Region smmu;
+  NativeAdrenoGmuContextReport report;
+  NativeAdrenoGpuBuffer nb[5];
+  OSSharedPtr<IOMemoryMap> nmap[5];
+  volatile uint8_t *ncpu[5];
+};
+Session gSession;
+
+void gw(const Session &s, uint32_t dword, uint32_t value) {
+  *reinterpret_cast<volatile uint32_t *>(s.gpu + dword * 4) = value;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+uint32_t gr(const Session &s, uint32_t dword) {return *reinterpret_cast<volatile uint32_t *>(s.gpu + dword * 4);}
+void gw64(const Session &s, uint32_t dword, uint64_t value) {gw(s, dword, uint32_t(value)); gw(s, dword + 1, uint32_t(value >> 32));}
+
+// NativeAdreno's register, cache and clock callbacks: GPU registers by dword index through the caller's uncached window.
+int naWrite(void *c, uint32_t reg, uint32_t value) {
+  if (reg >= 0x90000 / 4) return 1;
+  gw(*static_cast<Session *>(c), reg, value);
+  return 0;
+}
+int naRead(void *c, uint32_t reg, uint32_t *value) {
+  if (reg >= 0x90000 / 4) return 1;
+  *value = gr(*static_cast<Session *>(c), reg);
+  return 0;
+}
+int naBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+// The kernel buffers are Normal non-cacheable for the GPU and write-combined for the CPU: ordering only, no cache maintenance.
+int cachePublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+int cacheAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+uint64_t naNow(void *) {
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns / 1000;
+}
+// The GPU interrupt, as a6xx_irq: read RBBM_INT_0_STATUS and clear it through RBBM_INT_CLEAR_CMD first, so the level line drops
+// before the EOI. The same non-error status 100000 times in a row masks the GPU interrupts (the waiters then poll every 100 us).
+volatile bool gIrqAttached;
+volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+void gpuIrq(void *c) {
+  Session &s = *static_cast<Session *>(c);
+  const uint32_t status = gr(s, 0x201);
+  if (status) gw(s, 0x37, status);
+  gIrqRepeat = (status == gIrqLast && !(status & (1u << 20))) ? gIrqRepeat + 1 : 0;
+  gIrqLast = status;
+  gIrqSeen = gIrqSeen | status;
+  gIrqCount = gIrqCount + 1;
+  if (gIrqRepeat > 100000) {gw(s, 0x38, 0); gIrqMasked = 1;}
+  thread_wakeup(event_t(&gIrqCount));
+}
+int naIdle(void *) {
+  if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
+    assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 100, NSEC_PER_USEC);
+    thread_block(THREAD_CONTINUE_NULL);
+    native_gpu_idle_sleeps = native_gpu_idle_sleeps + 1;
+  } else {
+    IODelay(20);
+    native_gpu_idle_spins = native_gpu_idle_spins + 1;
+  }
+  return 0;
+}
+volatile uint32_t gContextStep;
+void naProgress(uint32_t step) {gContextStep = step;}
+int naTimerRead(void *c, uint32_t reg, uint32_t *value) {return naRead(c, reg, value);}
+
+NativeAdrenoRing *gRing;
+NativeAdrenoCpInit *gCpInit;
+NativeAdrenoSubmit *gSubmit;
+NativeAdrenoTimer *gTimer;
+NativeAdrenoRingIo gRio;
+NativeAdrenoRingCache gCache{nullptr, cachePublish, cacheAcquire};
+NativeAdrenoRingClock gClock{nullptr, naNow, naIdle};
+NativeAdrenoTimeIo gTimerIo;
+// Facts for the Vulkan driver: chip id 0x06010000 (bengal-gpu.dtsi), GMEM 128 KiB + 4 KiB at the 16 MiB window hw_init programs
+// (Linux's 1 MiB window would hold NativeAdreno's SQE buffer at 0x100000), the a6xx UCHE trap base, the client VA window above
+// the kernel buffers and below the 2 GiB aperture, UBWC 1.0 with highest bank bit 14, swizzle 7, macrotile mode 0.
+const NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06010000u, 0x21000u, 0x1000000ull, 0x1fffffffff000ull, 0x20000000ull,
+                                               0x60000000ull, 14, 7, 0, 1, NativeAdrenoDeviceClientIova, 0};
+
+uint32_t smmuBank0(const Session &s) {
+  // IDR1: PAGESIZE (bit 31) and NUMPAGENDXB (bits 30:28): the context banks start after 2^(NUMPAGENDXB + 1) pages.
+  const uint32_t id1 = rd(s.smmu, 0x24);
+  const uint32_t page = (id1 >> 31) ? 0x10000 : 0x1000;
+  return page << (((id1 >> 28) & 7) + 1);
+}
+
+unsigned bootArg(const char *name, unsigned fallback) {
+  unsigned value = fallback;
+  PE_parse_boot_argn(name, &value, sizeof value);
+  return value;
+}
+
+// The GPU's context: context bank 0 and stream-map slots 0 and 1 for SIDs 0 and 1 (bengal-gpu.dtsi gfx3d_user iommus
+// <&kgsl_smmu 0 1>: SID 0 mask 1), a 2 GiB aperture of 4 KiB pages, the five kernel buffers. The GPU SMMU walks are not coherent
+// (no dma-coherent on kgsl_smmu). tb128fu found that this firmware ignores fault writes to S2CR and turns a bypass write into
+// fault, while translate writes take: NativeAdreno only writes translate entries.
+bool naContext(Session &s) {
+  IOLog("GuampAdreno: context: smmu slots 0/1 before smr %08x %08x s2cr %08x %08x\n", rd(s.smmu, 0x800), rd(s.smmu, 0x804),
+        rd(s.smmu, 0xc00), rd(s.smmu, 0xc04));
+  for (unsigned i = 0; i < 2; i = i + 1) {wr(s.smmu, 0x800 + 4 * i, 0); wr(s.smmu, 0xc00 + 4 * i, 0x20000);}
+  native_adreno_smmu_coherent_walk = 0;
+  native_adreno_wc_enabled = 1;
+  // The A610 is not IO-coherent: render targets the GPU writes are cleaned when mapped and left alone afterwards.
+  native_adreno_written_imports_owned = 1;
+  // The BO pool, one contiguous block taken early. 4 GiB of RAM: 256 MiB by default (guamp-adreno-pool, 0 = scattered BOs only).
+  native_adreno_pool_mib = bootArg("guamp-adreno-pool", 256);
+  const IOReturn ctx = NativeAdrenoGpuContextBringup(reinterpret_cast<volatile uint8_t *>(s.smmu.va), kSmmuBytes, 0, 2, 0, 0, 1, 1,
+                                                     naProgress, &s.report);
+  IOLog("GuampAdreno: context bringup %x (step %u, output bits %u)\n", ctx, gContextStep, s.report.output_bits);
+  if (ctx) return false;
+  // CB0 ACTLR without CPRE (arm_mmu500_reset, MMU-500 errata 841119/826419), then TLBIALL, TLBSYNC and TLBSTATUS of that bank.
+  const uint32_t bank0 = smmuBank0(s);
+  const uint32_t actlr = rd(s.smmu, bank0 + 0x4);
+  wr(s.smmu, bank0 + 0x4, actlr & ~2u);
+  wr(s.smmu, bank0 + 0x618, 0);
+  wr(s.smmu, bank0 + 0x7f0, 0);
+  const bool synced = poll(s.smmu, bank0 + 0x7f4, 1, 0, 1000);
+  IOLog("GuampAdreno: context ready: cb0 at %x actlr %08x -> %08x, tlb sync %s, s2cr %08x %08x\n", bank0, actlr,
+        rd(s.smmu, bank0 + 0x4), synced ? "ok" : "timeout", rd(s.smmu, 0xc00), rd(s.smmu, 0xc04));
+  return true;
+}
+
+// Hardware clock gating of the A610 (kgsl adreno-gpulist.h a612_hwcg_regs, mainline a6xx_catalog.c a612_hwcg), then
+// RBBM_CLOCK_CNTL 0xAAA8AA82. Without a GMU only these RBBM registers are written.
+constexpr uint32_t kHwcg[][2] = {
+    {0x00B0, 0x22222222}, {0x00B4, 0x02222220}, {0x00B8, 0x00000081}, {0x00BC, 0x0000F3CF}, {0x00C0, 0x22222222}, {0x00C4, 0x22222222},
+    {0x00C8, 0x22222222}, {0x00CC, 0x00022222}, {0x00D0, 0x11111111}, {0x00D4, 0x11111111}, {0x00D8, 0x11111111}, {0x00DC, 0x00011111},
+    {0x00E0, 0x77777777}, {0x00E4, 0x77777777}, {0x00E8, 0x77777777}, {0x00EC, 0x00077777}, {0x00F0, 0x22222222}, {0x00F4, 0x01202222},
+    {0x00F8, 0x00002220}, {0x0100, 0x00040F00}, {0x0104, 0x05522022}, {0x0105, 0x00005555}, {0x0106, 0x00000011}, {0x0107, 0x00445044},
+    {0x0108, 0x04222222}, {0x0111, 0x00002222}, {0x0114, 0x02222222}, {0x0117, 0x00000002}, {0x011B, 0x00002222}, {0x0109, 0x00004000},
+    {0x0112, 0x00002222}, {0x0115, 0x00000200}, {0x011C, 0x00000000}, {0x010A, 0x00000000}, {0x0113, 0x00000000}, {0x0116, 0x04104004},
+    {0x011D, 0x00000000}, {0x010B, 0x22222222}, {0x0110, 0x00000004}, {0x010F, 0x00000002}, {0x0533, 0x00000182}, {0x0044, 0x00000000},
+    {0x0042, 0x00000000}, {0x0118, 0x00000222}, {0x0119, 0x00000111}, {0x011A, 0x00000555},
+};
+// CP register protection (mainline a6xx_catalog.c a630_protect, kgsl a630_protected_regs): A6XX_PROTECT_RDONLY / _NORDWR.
+constexpr uint32_t rdonly(uint32_t reg, uint32_t len) {return ((len & 0x3FFF) << 18) | (reg & 0x3FFFF);}
+constexpr uint32_t nordwr(uint32_t reg, uint32_t len) {return (1u << 31) | rdonly(reg, len);}
+constexpr uint32_t kProtect[32] = {
+    rdonly(0x00000, 0x04ff), rdonly(0x00501, 0x0005), rdonly(0x0050b, 0x02f4), nordwr(0x0050e, 0x0000), nordwr(0x00510, 0x0000),
+    nordwr(0x00534, 0x0000), nordwr(0x00800, 0x0082), nordwr(0x008a0, 0x0008), nordwr(0x008ab, 0x0024), rdonly(0x008de, 0x00ae),
+    nordwr(0x00900, 0x004d), nordwr(0x0098d, 0x0272), nordwr(0x00e00, 0x0001), nordwr(0x00e03, 0x000c), nordwr(0x03c00, 0x00c3),
+    rdonly(0x03cc4, 0x1fff), nordwr(0x08630, 0x01cf), nordwr(0x08e00, 0x0000), nordwr(0x08e08, 0x0000), nordwr(0x08e50, 0x001f),
+    nordwr(0x09624, 0x01db), nordwr(0x09e70, 0x0001), nordwr(0x09e78, 0x0187), nordwr(0x0a630, 0x01cf), nordwr(0x0ae02, 0x0000),
+    nordwr(0x0ae50, 0x032f), nordwr(0x0b604, 0x0000), nordwr(0x0be02, 0x0001), nordwr(0x0be20, 0x17df), nordwr(0x0f000, 0x0bff),
+    rdonly(0x0fc00, 0x1fff), nordwr(0x11c00, 0x0000),
+};
+
+// hw_init of mainline a6xx_gpu.c for the A610 (a610_family) with the kgsl a6xx_start values where they agree. Clock gating
+// (guamp-adreno-hwcg=0 leaves the clocks on) and CP register protection (guamp-adreno-protect=0 leaves it off).
+void naHwInit(Session &s) {
+  gw(s, 0x3C45, 0); (void)gr(s, 0x3C45);                               // GBIF_HALT
+  gw(s, 0x0016, 0); (void)gr(s, 0x0016);                               // RBBM_GBIF_HALT
+  gw(s, 0xF803, 0);                                                    // RBBM_SECVID_TSB_CNTL
+  gw64(s, 0xF800, 0); gw(s, 0xF802, 0);                                // TSB_TRUSTED_BASE, _SIZE: no trusted range
+  static const uint32_t addrMode[] = {0x842, 0xC01, 0x8601, 0x8E05, 0x9E01, 0xBE05, 0xA601, 0x9601, 0xE00, 0xAE01, 0xB601, 0xF810};
+  for (uint32_t reg : addrMode) gw(s, reg, 1);                         // *_ADDR_MODE_CNTL: 64-bit
+  if (bootArg("guamp-adreno-hwcg", 1) && gr(s, 0x00AE) != 0xAAA8AA82) {
+    for (const auto &reg : kHwcg) gw(s, reg[0], reg[1]);
+    gw(s, 0x00AE, 0xAAA8AA82);                                         // RBBM_CLOCK_CNTL
+  }
+  for (uint32_t reg = 0x3C03; reg <= 0x3C06; reg = reg + 1) gw(s, reg, 0x00071620);   // GBIF_QSB_SIDE0..3
+  gw(s, 0x0011, 0x3);                                                  // RBBM_GBIF_CLIENT_QOS_CNTL
+  gw(s, 0x050B, 0xffffffff);                                           // RBBM_PERFCTR_GPU_BUSY_MASKED
+  gw64(s, 0xE05, 0x1fffffffff000ull + 0xfc0);                          // UCHE_WRITE_RANGE_MAX
+  gw64(s, 0xE09, 0x1fffffffff000ull);                                  // UCHE_TRAP_BASE
+  gw64(s, 0xE07, 0x1fffffffff000ull);                                  // UCHE_WRITE_THRU_BASE
+  gw64(s, 0xE0B, kDeviceInfo.gmem_base);                               // UCHE_GMEM_RANGE_MIN
+  gw64(s, 0xE0D, kDeviceInfo.gmem_base + kDeviceInfo.gmem_bytes - 1);  // UCHE_GMEM_RANGE_MAX
+  gw(s, 0xE18, 0x804); gw(s, 0xE17, 0x4);                              // UCHE_FILTER_CNTL, UCHE_CACHE_WAYS
+  gw(s, 0x8C2, 0x00800060); gw(s, 0x8C1, 0x40201B16);                  // CP_ROQ_THRESHOLDS_2/_1
+  gw(s, 0x8C3, 48); gw(s, 0x90E, 47);                                  // CP_MEM_POOL_SIZE, CP_MEM_POOL_DBG_ADDR (A610)
+  gw(s, 0x9E00, 0x00080000);                                           // PC_DBG_ECO_CNTL: prim_fifo_threshold
+  gw(s, 0x98D, 1);                                                     // CP_AHB_CNTL: error response
+  gw(s, 0x500, 1);                                                     // RBBM_PERFCTR_CNTL
+  gw(s, 0x8D0, 0);                                                     // CP_PERFCTR_CP_SEL(0): PERF_CP_ALWAYS_COUNT
+  gw(s, 0x8E08, 0xb); gw(s, 0xB604, 0xb); gw(s, 0xAE02, 0xb);          // RB, TPL1, SP _NC_MODE_CNTL (UBWC 1.0, hbb 14)
+  gw(s, 0xE01, (1u << 23) | (1u << 21));                               // UCHE_MODE_CNTL
+  gw(s, 0x534, 0);                                                     // RBBM_NC_MODE_CNTL: macrotile mode 0
+  gw(s, 0x001F, (1u << 30) | 0x3FFFF);                                 // RBBM_INTERFACE_HANG_INT_CNTL (A610)
+  gw(s, 0xE19, (1u << 7) | 1u);                                        // UCHE_CLIENT_PF
+  if (bootArg("guamp-adreno-protect", 1)) {                            // a6xx_set_cp_protect
+    gw(s, 0x84F, (1u << 0) | (1u << 1) | (1u << 3));                   // CP_PROTECT_CNTL: enable, fault, last span unbounded
+    for (uint32_t i = 0; i < 32; i = i + 1) gw(s, 0x850 + i, kProtect[i]);
+  }
+  gw(s, 0x038, NativeAdrenoIrq::maskA6xx());                           // RBBM_INT_0_MASK: A6XX_INT_MASK
+}
+
+void cpState(const Session &s, const char *when) {
+  IOLog("GuampAdreno: %s: rbbm status %08x rptr %u wptr %u cp hw_fault %08x int %08x, rbbm int %08x, cb0 fsr %08x\n", when,
+        gr(s, 0x210), gr(s, 0x806), gr(s, 0x807), gr(s, 0x821), gr(s, 0x823), gr(s, 0x201), rd(s.smmu, smmuBank0(s) + 0x58));
+}
+
+// SQE, hw_init, ring 0 (A6XX forms), CP_ME_INIT, then a CP_MEM_WRITE into the scratch page that the CPU reads back.
+int naCp(Session &s, const GuampAdrenoStart *in) {
+  if (NativeAdrenoGpuContextBuffers(s.nb)) return GuampAdrenoBuffers;
+  for (unsigned i = 0; i < 5; i = i + 1) {
+    IODeviceMemory *m = IODeviceMemory::withRange(s.nb[i].physical, s.nb[i].bytes);
+    if (m) {
+      s.nmap[i] = OSSharedPtr<IOMemoryMap>(m->map(kIOMapAnywhere | kIOMapWriteCombineCache), OSNoRetain);
+      m->release();
+    }
+    if (!s.nmap[i]) return GuampAdrenoBuffers;
+    s.ncpu[i] = reinterpret_cast<volatile uint8_t *>(s.nmap[i]->getVirtualAddress());
+  }
+  // The SQE microcode, already without the file's first dword (adreno_fw_create_bo; GpuService.inc loadSqe).
+  const uint32_t sqeBytes = in->sqeBytes;
+  if (sqeBytes < 4 || (sqeBytes & 3) || sqeBytes > s.nb[0].bytes) return GuampAdrenoSqe;
+  for (uint32_t i = 0; i < sqeBytes; i = i + 1) s.ncpu[0][i] = in->sqe[i];
+  __asm__ volatile("dsb sy" ::: "memory");
+  for (uint32_t i = 0; i < sqeBytes; i = i + 1)
+    if (s.ncpu[0][i] != in->sqe[i]) {
+      IOLog("GuampAdreno: sqe copy differs at byte %u\n", i);
+      return GuampAdrenoSqe;
+    }
+  IOLog("GuampAdreno: sqe %u bytes at iova %llx, hw_init\n", sqeBytes, static_cast<unsigned long long>(s.nb[0].iova));
+  naHwInit(s);
+  IOLog("GuampAdreno: hw_init done: rbbm clock cntl %08x cp protect cntl %08x\n", gr(s, 0x00AE), gr(s, 0x84F));
+  gw64(s, 0x830, s.nb[0].iova);                                        // CP_SQE_INSTR_BASE, before CP_SQE_CNTL
+  gRio = NativeAdrenoRingIo{&s, naWrite, naRead, naBarrier, nullptr, nullptr};   // no GMU, no AHB fence to check
+  gRing = new NativeAdrenoRing;
+  gCpInit = new NativeAdrenoCpInit;
+  if (!gRing || !gCpInit || gRing->setGeneration(6)) return GuampAdrenoRing;
+  const IOReturn att = gRing->attach(&gRio, &gCache, const_cast<uint8_t *>(s.ncpu[1]), s.nb[1].bytes, s.nb[1].iova,
+                                     const_cast<uint8_t *>(s.ncpu[2]), s.nb[2].bytes, s.nb[2].iova);
+  IOLog("GuampAdreno: ring attach %x (ring iova %llx, %llu bytes)\n", att, static_cast<unsigned long long>(s.nb[1].iova),
+        static_cast<unsigned long long>(s.nb[1].bytes));
+  if (att) return GuampAdrenoRing;
+  gw(s, 0x808, 1);                                                     // CP_SQE_CNTL: start the microcode
+  NativeAdrenoCpInitConfig config{s.nb[0].iova, 0, 1};
+  config.generation = 6;
+  uint32_t fence = 0, seen = 0;
+  const IOReturn init = gCpInit->run(&gRio, gRing, &config, &fence);
+  const unsigned waited = init ? 0 : unsigned(gRing->wait(fence, &gClock, 200000, &seen));
+  IOLog("GuampAdreno: CP_ME_INIT run %x fence %u wait %u (seen %u)\n", init, fence, waited, seen);
+  if (init || waited) {cpState(s, "cp init stopped"); return GuampAdrenoCpInit;}
+  volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(s.ncpu[4]);
+  scratch[0] = 0;
+  __asm__ volatile("dsb sy" ::: "memory");
+  uint32_t words[4] = {};
+  if (AdrenoPM4Type7(0x3d, 3, &words[0]) != AdrenoPM4Success) return GuampAdrenoMemWrite;   // CP_MEM_WRITE
+  words[1] = uint32_t(s.nb[4].iova); words[2] = uint32_t(s.nb[4].iova >> 32); words[3] = 0xA6100C0D;
+  if (gRing->submit(words, 4, &fence)) return GuampAdrenoMemWrite;
+  const unsigned memWait = unsigned(gRing->wait(fence, &gClock, 200000, &seen));
+  IOLog("GuampAdreno: CP_MEM_WRITE fence %u wait %u, scratch %08x (want a6100c0d)\n", fence, memWait, scratch[0]);
+  cpState(s, "after mem write");
+  return memWait || scratch[0] != 0xA6100C0D ? GuampAdrenoMemWrite : GuampAdrenoOk;
+}
+
+// Secure mode without the zap shader: mainline a6xx_hw_init writes RBBM_SECVID_TRUST_CNTL (0xF400) = 0 when no zap shader
+// exists. Whether the normal world may change it here is exactly what this line records; the stages go on either way, and a
+// GPU left in secure mode shows up as faults of the user submissions.
+void naSecureFallback(Session &s) {
+  const uint32_t before = gr(s, 0xF400);
+  gw(s, 0xF400, 0);
+  const uint32_t after = gr(s, 0xF400);
+  IOLog("GuampAdreno: secvid trust cntl %08x -> %08x%s (no zap shader)\n", before, after,
+        after == 0 ? " (unsecured)" : " (write ignored)");
+}
+
+// The GPU interrupt line, then one CP_NOP fence that must raise it.
+int naIrq(Session &s) {
+  if (!&armcpu_spi_attach) {
+    IOLog("GuampAdreno: irq: armcpu_spi_attach missing, waits keep polling\n");
+    return GuampAdrenoOk;
+  }
+  uint32_t readback = 0;
+  uint64_t router = ~0ull;
+  const int attached = armcpu_spi_attach(kGpuIntid, false, gpuIrq, &s, &readback, &router);
+  gIrqAttached = attached == 0;
+  IOSleep(20);
+  const uint32_t before = gIrqCount;
+  uint32_t nop = 0, fence = 0, seen = 0;
+  const bool ok = AdrenoPM4Type7(0x10, 0, &nop) == AdrenoPM4Success && !gRing->submit(&nop, 1, &fence) &&
+                  !gRing->wait(fence, &gClock, 200000, &seen);
+  IOSleep(20);
+  IOLog("GuampAdreno: irq intid %u attach %d readback %08x router %llx; nop fence %s, interrupts %u -> %u seen %08x\n", kGpuIntid,
+        attached, readback, static_cast<unsigned long long>(router), ok ? "ok" : "failed", before, gIrqCount, gIrqSeen);
+  return attached ? GuampAdrenoIrq : GuampAdrenoOk;
+}
+
+// The submission object, the CP always-on counter as the GPU clock, and the device published for user clients.
+int naPublish(Session &s) {
+  NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+  gSubmit = new NativeAdrenoSubmit;
+  gTimer = new NativeAdrenoTimer;
+  if (!vm || !gSubmit || !gTimer) return GuampAdrenoPublish;
+  const IOReturn sub = gSubmit->attach(vm, gRing);
+  gTimerIo = NativeAdrenoTimeIo{&s, naTimerRead};
+  const IOReturn tim = gTimer->attach(&gTimerIo, NativeAdrenoTimeCp);
+  const IOReturn pub = sub ? sub : native_adreno_publish(vm, gSubmit, gRing, &gClock, tim ? nullptr : gTimer, &kDeviceInfo, 31,
+                                                         s.report.output_bits);
+  IOLog("GuampAdreno: publish: submit attach %x timer %x publish %x\n", sub, tim, pub);
+  return sub || pub ? GuampAdrenoPublish : GuampAdrenoOk;
+}
+
+// The staged AGXAccelerator for the original Metal discovery (tb128fu naMetal). Its static initializer runs only after the
+// original IOGPUFamily kext has loaded, because the parent metaclass does not exist before that.
+int naAccelerator() {
+  if (!&native_adreno_accelerator_static_init || !&native_adreno_accelerator_allocate || !&native_adreno_accelerator_instance_size) {
+    IOLog("GuampAdreno: accelerator: staged class not linked (build-native-adreno-accelerator.py did not run)\n");
+    return GuampAdrenoAccelerator;
+  }
+  const kern_return_t kext = OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
+  const OSSymbol *name = OSSymbol::withCString("IOAcceleratorES");
+  const OSMetaClass *parent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+  OSSafeReleaseNULL(name);
+  IOLog("GuampAdreno: accelerator: IOGPUFamily load %x, IOAcceleratorES %s size %u\n", kext, parent ? "found" : "missing",
+        parent ? parent->getClassSize() : 0);
+  if (kext || !parent || parent->getClassSize() != 136) return GuampAdrenoAccelerator;
+  void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+  if (!handle) return GuampAdrenoAccelerator;
+  native_adreno_accelerator_static_init();
+  const IOReturn loaded = OSMetaClass::postModLoad(handle);
+  if (loaded || native_adreno_accelerator_instance_size() != 136) {
+    IOLog("GuampAdreno: accelerator: metaclass %x size %u\n", loaded, native_adreno_accelerator_instance_size());
+    return GuampAdrenoAccelerator;
+  }
+  IOService *accelerator = native_adreno_accelerator_allocate();
+  if (!accelerator) return GuampAdrenoAccelerator;
+  if (!accelerator->init()) {accelerator->release(); return GuampAdrenoAccelerator;}
+  // The keys the original _MTLRegisterDevices helper reads (the plugin name is ours, no Apple device identity is claimed), and the
+  // processes whose opens the kernel grants past the sandbox (patches/xnu/zzw-native-adreno-sandbox-grant.patch). The plugin
+  // itself is not installed yet (no GPU addon on guamp): Metal discovery will fail to load it and keep the CPU renderer.
+  accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
+  accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences");
+  accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+  accelerator->setProperty("NativeTurnipDebug", "nocb,noconform,sysmem");
+  accelerator->setProperty("NativeMetalWithhold", "apple-families");
+  if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return GuampAdrenoAccelerator;}
+  accelerator->registerService();
+  IOLog("GuampAdreno: accelerator AGXAccelerator registered (IOAcceleratorES)\n");
+  return GuampAdrenoOk;
+}
+}  // namespace
+
+extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
+  static bool started = false;
+  if (!in || !in->gpu || in->gpuBytes < 0x90000 || !in->sqe || !in->level || started) return GuampAdrenoBadArgs;
+  started = true;
+  Session &s = gSession;
+  s.gpu = in->gpu;
+  IOLog("GuampAdreno: start level %u: rbbm status %08x, sqe %u bytes\n", in->level, gr(s, 0x210), in->sqeBytes);
+  int result = GuampAdrenoOk;
+  do {
+    if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
+    if (!naContext(s)) {result = GuampAdrenoContext; break;}
+    if ((result = naCp(s, in))) break;
+    naSecureFallback(s);
+    if ((result = naIrq(s))) break;
+    if ((result = naPublish(s))) break;
+    // The user-client self test of tb128fu (naSelfTest: BO alloc/map, an IB of CP_MEM_WRITEs) is not ported yet.
+    IOLog("GuampAdreno: self test not ported yet\n");
+    if (in->level >= 2) result = naAccelerator();
+  } while (false);
+  IOLog("GuampAdreno: RESULT %d (level %u, context step %u, irqs %u, idle sleeps %llu spins %llu)\n", result, in->level,
+        gContextStep, gIrqCount, native_gpu_idle_sleeps, native_gpu_idle_spins);
+  return result;
+}

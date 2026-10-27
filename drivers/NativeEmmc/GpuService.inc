@@ -24,6 +24,8 @@
 #include "GuampGpuM1.h"
 #include "GuampGpuM2.h"
 #include "GuampGpuBlit.h"
+#include "../GuampAdreno/GuampAdreno.h"
+extern "C" int guamp_adreno_start(const GuampAdrenoStart *) __attribute__((weak_import));
 #include "GuampGpuG2.h"
 #include "GuampRpmCore.h"
 #include "GuampExt4.inc"
@@ -444,7 +446,22 @@ void thread(void *, wait_result_t) {
     IOSleep(1500);
     gm_do_reads(&io, &st);
   }
-  if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2, smmuMode, smmuCb);
+  // guamp-adreno=1|2: NativeAdreno (xVanTuring/Adreno610 A6XX backend, drivers/GuampAdreno) takes the GPU after M1
+  // instead of M2/M3: SMMU context, A610 init, ring, CP_ME_INIT, IRQ, publish (2: AGXAccelerator for the Metal plugin).
+  unsigned adreno = 0;
+  PE_parse_boot_argn("guamp-adreno", &adreno, sizeof(adreno));
+  if (adreno && st.gpuRead && st.aonOk) {
+    uint8_t *sqe = static_cast<uint8_t *>(IOMallocZero(gpum2::kSqeCap));
+    uint32_t h0 = 0, h1 = 0;
+    const uint32_t sqeBytes = sqe ? gpum2::loadSqe(sqe, gpum2::kSqeCap, &h0, &h1) : 0;
+    if (!&guamp_adreno_start) IOLog("GuampGpu: NativeAdreno not linked (guamp-adreno=%u)\n", adreno);
+    else if (!sqeBytes) IOLog("GuampGpu: NativeAdreno not started: no SQE microcode\n");
+    else {
+      GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno};
+      IOLog("GuampGpu: NativeAdreno start %d\n", guamp_adreno_start(&a));
+    }
+    if (sqe) IOFree(sqe, gpum2::kSqeCap);
+  } else if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2, smmuMode, smmuCb);
   unsigned g2 = 0;
   PE_parse_boot_argn("guamp-gpu-g2", &g2, sizeof(g2));
   if (g2 == 1 || g2 == 2) gpug2::run(gBase[GM_GPUCC], g2);
