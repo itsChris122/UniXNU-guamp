@@ -1,0 +1,13 @@
+--- drivers/NativeEmmc/README.md	2026-10-27 18:47:07.997746500 +0100
++++ drivers/NativeEmmc/README.md	2026-10-27 18:51:20.216629600 +0100
+@@ -13,3 +13,10 @@
+ PM6125 BT rails over SPMI (`guamp-bt-ldo=1` tries to enable the ones that are off), QUPv3 SE3 as a polled GENI UART
+ (GeniUart.h), the QCA power pulses, HCI_Reset, Read_Local_Version and the QCA EDL version, ending in one
+ `GuampBt: RESULT` line. Host tests: `tests/run-bt-tests.sh` (WSL).
++
++Boot argument `guamp-gpu-m1=1` (GpuService.inc, sequencing in GuampGpuM1.h): Adreno 610 milestone M1, power-up and
++register reads only (no SCM/TrustZone, zap shader, firmware or command submission): GCC GPU clocks, CX GDSC, GPUCC
++CX clocks, GX GDSC (BCR pulse, clamp off), core clock on XO, then, only when every GDSC and register-path clock
++reports on, VBIF_VERSION, RBBM_STATUS and CP_ALWAYS_ON_COUNTER_LO twice. Before/after register snapshots and one
++`GuampGpu: RESULT` line. `guamp-gpu-delay=<s>` starts later, `guamp-gpu-off=1` undoes the power-up at the end.
++Host tests: `tests/run-gpu-tests.sh` (WSL).

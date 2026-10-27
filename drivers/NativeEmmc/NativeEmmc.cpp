@@ -1022,6 +1022,7 @@ static void usbProbe()
 #include "PmicService.inc"
 #include "BtService.inc"
 #include "GuampWifiPrep.inc"
+#include "GpuService.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1148,6 +1149,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   pmic::start();
   touch::start();
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (SPMI rails, SE3 UART, HCI version), own thread
+  gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
