@@ -350,7 +350,12 @@ int naCp(Session &s, const GuampAdrenoStart *in) {
 // Secure mode without the zap shader: mainline a6xx_hw_init writes RBBM_SECVID_TRUST_CNTL (0xF400) = 0 when no zap shader
 // exists. Whether the normal world may change it here is exactly what this line records; the stages go on either way, and a
 // GPU left in secure mode shows up as faults of the user submissions.
+// guamp: reading 0xF400 stalled the core on the phone (TrustZone-protected here), so it is skipped unless guamp-adreno-secvid=1.
 void naSecureFallback(Session &s) {
+  if (bootArg("guamp-adreno-secvid", 0) != 1) {
+    IOLog("GuampAdreno: secvid trust cntl not touched (protected on guamp; guamp-adreno-secvid=1 to try)\n");
+    return;
+  }
   const uint32_t before = gr(s, 0xF400);
   gw(s, 0xF400, 0);
   const uint32_t after = gr(s, 0xF400);

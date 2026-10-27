@@ -12,6 +12,9 @@
 // guamp-cpufreq=0 (default): log the tables and current states only. =1: highest regular state on both domains.
 // =2: the state below the highest (cooler). guamp-cpufreq-silver=<index> / guamp-cpufreq-gold=<index> force an index.
 
+// One line per domain kept for GuampPerf, which prints it every minute (the boot-time lines precede the USB log mirror).
+char guamp_cpufreq_summary[2][160];
+
 namespace cpufreq {
 constexpr uint64_t kDomainPhys[2] = {0x0f521000ULL, 0x0f523000ULL};
 constexpr uint32_t kEnable = 0x0, kFreqLut = 0x110, kVoltLut = 0x114, kPerfState = 0x920, kRow = 32, kMaxRows = 12;
@@ -67,6 +70,8 @@ void start() {
     if (force[d] < rows) want = static_cast<int>(force[d]);
     else if (mode == 1) want = highest;
     else if (mode == 2) want = highest > 0 ? highest - 1 : highest;
+    snprintf(guamp_cpufreq_summary[d], sizeof(guamp_cpufreq_summary[d]), "%s state %u (%u MHz of max %u), enable %x, unchanged",
+             kNames[d], before, before < rows ? khz[before] / 1000 : 0, highest >= 0 ? khz[highest] / 1000 : 0, enable);
     if (want < 0 || !(enable & 1)) {
       if (want >= 0) IOLog("GuampCpufreq: %s hardware not enabled, state left\n", kNames[d]);
       continue;
@@ -77,6 +82,9 @@ void start() {
     IOLog("GuampCpufreq: %s perf state %u -> %u (%u -> %u MHz)%s\n", kNames[d], before, after,
           before < rows ? khz[before] / 1000 : 0, after < rows ? khz[after] / 1000 : 0,
           after == static_cast<uint32_t>(want) ? "" : " (not taken)");
+    snprintf(guamp_cpufreq_summary[d], sizeof(guamp_cpufreq_summary[d]), "%s state %u -> %u (%u -> %u MHz of max %u)%s",
+             kNames[d], before, after, before < rows ? khz[before] / 1000 : 0, after < rows ? khz[after] / 1000 : 0,
+             highest >= 0 ? khz[highest] / 1000 : 0, after == static_cast<uint32_t>(want) ? "" : " not taken");
   }
 }
 }  // namespace cpufreq

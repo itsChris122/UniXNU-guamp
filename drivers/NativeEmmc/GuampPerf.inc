@@ -127,6 +127,8 @@ static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
         top.cpuName[2], top.cpuPid[2], pm[2] / 10, pm[2] % 10, top.cpuName[3], top.cpuPid[3], pm[3] / 10, pm[3] % 10,
         top.cpuName[4], top.cpuPid[4], pm[4] / 10, pm[4] % 10, top.cpuName[5], top.cpuPid[5], pm[5] / 10, pm[5] % 10);
 }
+extern char guamp_cpufreq_summary[2][160];   // GuampCpufreq.inc
+
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
   static uint32_t previous[CPU_STATE_MAX] = {};
@@ -159,6 +161,11 @@ static void guampPerfSample() {
           basicResult == KERN_SUCCESS ? basic.avail_cpus : 0,
           basicResult == KERN_SUCCESS ? basic.max_cpus : 0, basicResult);
     guampMemSample();
+    static unsigned cpufreqRound = 0;
+    cpufreqRound = cpufreqRound + 1;
+    if (cpufreqRound % 6 == 1)
+      for (unsigned d = 0; d < 2; ++d)
+        if (guamp_cpufreq_summary[d][0]) IOLog("GuampCpufreq: %s\n", guamp_cpufreq_summary[d]);
     if (guamp_gpu_step[2]) IOLog("GuampGpu: progress step %u reg %x seq %u\n", guamp_gpu_step[0], guamp_gpu_step[1], guamp_gpu_step[2]);
     IOLog("GuampRamCache: managed IO RAM to Normal NC %u; MMIO/native WB policy retained\n", guamp_ram_nc_enabled);
     IOLog("GuampSmp: IPI pending-mode %u sent %llu received %llu; GIC group %x enabled %x ctl %x typer %x\n",
