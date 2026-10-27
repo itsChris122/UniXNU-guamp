@@ -160,10 +160,12 @@ int hx_interface_on(struct hx_chip *c)
     for (unsigned i = 0; i < 10; ++i) {
         if (burst(c, 0) || hx_bus_read(c, HX_BUS_CONTI, &a, 1) || hx_bus_read(c, HX_BUS_INCR4, &b, 1)) return HX_ERR_BUS;
         c->dbg_conti = a; c->dbg_incr4 = b;
+        // Linux (himax_mcu_interface_on in hx83102 sense_off path) never checks the read-back: on this HX83102D the burst
+        // registers read 0 and the chip still answers (bit-banged Linux sequence: status 0C, id 83 10 2D). Log only.
         if (a == 0x31 && b == 0x10) return HX_OK;
         sleep_ms(c, 1);
     }
-    return HX_ERR_CHIP;
+    return HX_OK;
 }
 
 int hx_sense_off(struct hx_chip *c)
