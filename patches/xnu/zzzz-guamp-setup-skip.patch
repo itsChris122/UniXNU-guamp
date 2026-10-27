@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,331 @@
+@@ -7858,6 +7858,352 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -324,6 +324,27 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			printf("guamp-mg-reset: %s status %d\n", mg[i], mg_error);
 +		}
 +	}
++	/* guamp-home-layout-reset=1 (owner request 27/10): SpringBoard rebuilds the default Home layout. */
++	unsigned int guamp_home_layout_reset = 0;
++	PE_parse_boot_argn("guamp-home-layout-reset", &guamp_home_layout_reset, sizeof(guamp_home_layout_reset));
++	if (guamp_home_layout_reset == 1) {
++		static const char *const home[] = {
++			"/private/var/mobile/Library/SpringBoard/IconState.plist",
++			"/private/var/mobile/Library/SpringBoard/DesiredIconState.plist",
++		};
++		for (size_t i = 0; i < sizeof(home) / sizeof(home[0]); i++) {
++			int32_t result = 0;
++			int home_error = copyout(home[i], scratch + 0xa00, strlen(home[i]) + 1);
++			if (!home_error) {
++				struct unlink_args ua = {.path = scratch + 0xa00};
++				home_error = unlink(p, &ua, &result);
++			}
++			if (!home_error) native_guamp_ui_cache_deleted++;
++			else if (home_error == ENOENT) native_guamp_ui_cache_absent++;
++			else native_guamp_ui_cache_error = home_error;
++			printf("guamp-home-layout-reset: %s status %d\n", home[i], home_error);
++		}
++	}
 +	/* Preserve MobileGestalt answers. Identity experiments must back up and invalidate
 +	 * the specific cache explicitly; never delete it as part of every boot. */
 +	printf("guamp: MobileGestalt cache preserved (automatic removal disabled)\n");
@@ -333,7 +354,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8308,7 @@
+@@ -7983,6 +8329,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
