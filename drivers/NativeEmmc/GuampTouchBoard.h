@@ -57,12 +57,40 @@
 #define GT_GPIO_SPI_D 80
 #define GT_FUNC_QUP2 1                        // PINGROUP(6/7/71/80, WEST, qup2, ...): function slot 1
 #define GT_DRIVE_6MA 2                        // drive-strength = <6>: (mA / 2) - 1
+#define GT_DRIVE_8MA 3                        // ts_int_active / ts_reset_active drive-strength = <8>
 #define GT_GPIO_RESET 66                      // himax,rst-gpio = <&tlmm 0x42 0>
 #define GT_GPIO_IRQ 67                        // himax,irq-gpio = <&tlmm 0x43 0x2008>, interrupts <0x43 2> (falling edge)
 #define GT_SPI_MODE 1                         // spi-cpha, no spi-cpol
 #define GT_SPI_MAX_HZ 10000000u               // spi-max-frequency = <0x989680>
 #define GT_PANEL_X 720                        // himax,panel-coords = <0 0x2d0 0 0x640>
 #define GT_PANEL_Y 1600
+
+// Panel side (TDDI: the touch block is part of the display driver IC and lives on its supplies; read-only probes).
+// TWRP (analisi/prove/twrp-driver-reference-20261025-182433.txt) only reads 83 10 2D after Linux powered the panel
+// itself: dsi_panel_post_unprepare 2.57 s, dsi_panel_power_on 2.59 s, dsi_panel_enable 2.72 s, hx83102_pin_reset 4.69 s.
+#define GT_TLMM_WEST_SIZE 0x53000ULL          // gpio 0..82 (all WEST: pinctrl-bengal.c PINGROUP(6/7/66/67/71/80/81/82, WEST))
+#define GT_GPIO_LCD_TE 81                     // dtbo qcom,platform-te-gpio = <&tlmm 0x51 0>
+#define GT_GPIO_LCD_RESET 82                  // bengal-guam-display.dtsi qcom,platform-reset-gpio = <&tlmm 82 0>
+#define GT_SID_PM6125 0
+#define GT_SID_PMI632_LCDB 3                  // pmi632.dtsi qpnp-lcdb@ec00 sits under qcom,pmi632@3
+#define GT_L9A_BASE 0x4800                    // vddio-supply = <&L9A> (bengal-sde-display.dtsi:104); "l9" 0x4800 (qcom_spmi-regulator.c)
+#define GT_VREG_TYPE 0x04                     // 0x04 = LDO (SPMI_REGULATOR_TYPE_LDO)
+#define GT_VREG_STATUS1 0x08                  // bit 7 VREG_OK/READY
+#define GT_VREG_VSET_LB 0x40
+#define GT_VREG_VSET_UB 0x41
+#define GT_VREG_ENABLE 0x46                   // SPMI_COMMON_REG_ENABLE, bit 7
+#define GT_LCDB_BASE 0xec00                   // qpnp-lcdb-regulator.c: STS1 0x08, STS3 0x0a bit7 LDO_VREG_OK, STS4 0x0b bit7
+#define GT_LCDB_STS1 0x08                     //   NCP_VREG_OK, ENABLE_CTL1 0x46 bit7 MODULE_EN (lab = ldo, ibb = ncp)
+#define GT_LCDB_STS3 0x0a
+#define GT_LCDB_STS4 0x0b
+#define GT_LCDB_ENABLE 0x46
+#define GT_GCC_DISP_AHB_CBCR 0x1700c          // gcc-bengal.c gcc_disp_ahb_clk halt_reg (hwcg bit 1)
+#define GT_DISPCC_BASE 0x05f00000ULL          // bengal.dtsi qcom,dispcc@5f00000
+#define GT_DISPCC_MDSS_PCLK0_CBCR 0x2004      // dispcc-bengal.c disp_cc_mdss_pclk0_clk
+#define GT_DISPCC_MDSS_AHB_CBCR 0x2044        // dispcc-bengal.c disp_cc_mdss_ahb_clk
+#define GT_MDSS_INTF1 0x05e6b800ULL           // bengal-sde.dtsi mdp_phys 0x5e00000 + qcom,sde-intf-off <0x0 0x6b800> (dsi)
+#define GT_INTF_TIMING_ENGINE_EN 0x000        // sde_hw_intf.c
+#define GT_INTF_FRAME_COUNT 0x0ac
 
 static inline uint32_t gt_pin(unsigned gpio) {return (uint32_t)gpio * GT_GPIO_STRIDE;}
 static inline uint32_t gt_pin_cfg(unsigned func, unsigned drive_code, unsigned pull) {

@@ -36,6 +36,7 @@ void ioWr(void *, unsigned region, uint32_t off, uint32_t v) {
 void ioDelay(void *, unsigned us) { IODelay(us); }
 
 struct spmi_arb gArb;
+volatile int gArbReady = 0;   // set once init() filled the APID table (TouchService reads the panel rails through read8)
 
 int init() {
   struct spmi_io io = {nullptr, ioRd, ioWr, ioDelay};
@@ -169,6 +170,8 @@ void thread(void *, wait_result_t) {
   int r = init();
   IOLog("GuampPmic: SPMI arbiter version %08x, %u APIDs, init %d\n", gArb.version, gArb.apids, r);
   if (r) return;
+  __asm__ volatile("dmb ish" ::: "memory");
+  gArbReady = 1;
   unsigned battery = 0;
   PE_parse_boot_argn("guamp-battery", &battery, sizeof(battery));
   gBatteryEnabled = battery == 1;

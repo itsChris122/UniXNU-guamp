@@ -34,6 +34,7 @@
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
 #include "GuampBatteryCore.h"
 #include "GuampPerf.inc"
+#include "GuampDisplayExt.inc"
 #include <sys/param.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -712,6 +713,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   const uint64_t busy = __atomic_load_n(&native_emmc_busy, __ATOMIC_RELAXED);
   const uint64_t requests = __atomic_load_n(&native_emmc_requests, __ATOMIC_RELAXED);
   if (report) {
+    dispext::log();
     guampPerfSample();
     uint64_t busyNs = 0;
     absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
@@ -1137,6 +1139,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   publishWindows();
   usbProbe();
   usbMirrorStart();
+  dispext::start();
   pmic::start();
   touch::start();
 }
