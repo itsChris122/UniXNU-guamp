@@ -11,6 +11,8 @@ extern "C" uint32_t guamp_smp_signal_flags(unsigned int);
 extern "C" volatile uint64_t guamp_timer_snapshot[8][27];
 extern "C" volatile uint32_t guamp_timer_sequence[8];
 extern "C" unsigned int guamp_ram_nc_enabled;
+extern "C" volatile uint64_t guamp_irq_trace[8][3][14];
+extern "C" volatile uint32_t guamp_irq_trace_sequence[8];
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
   static uint32_t previous[CPU_STATE_MAX] = {};
@@ -62,6 +64,18 @@ static void guampPerfSample() {
             cpu,r[15],r[16]&0xffffff,r[1],r[0],r[2],r[3],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[4],r[5],r[6],r[14]);
       IOLog("GuampGic: core %u ICC_CTLR %llx HPPIR1 %llx group %llx enabled %llx pending %llx groupmod %llx waker %llx distctl %llx priority %llx found %llu\n",
             cpu,r[17],r[18],r[19],r[20],r[21],r[22],r[23],r[24],r[25],r[26]);
+      uint32_t irqSeq = __atomic_load_n(&guamp_irq_trace_sequence[cpu], __ATOMIC_ACQUIRE);
+      if (!irqSeq || (irqSeq & 1)) continue;
+      uint64_t trace[3][14];
+      for (unsigned phase = 0; phase < 3; ++phase)
+        for (unsigned j = 0; j < 14; ++j) trace[phase][j] = guamp_irq_trace[cpu][phase][j];
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (irqSeq != __atomic_load_n(&guamp_irq_trace_sequence[cpu], __ATOMIC_ACQUIRE)) continue;
+      for (unsigned phase = 0; phase < 3; ++phase) {
+        const uint64_t *q = trace[phase];
+        IOLog("GuampIrq: core %u seq %u phase %u ct %llu vcval %llu vctl %llx pcval %llu pctl %llx pending %llx active %llx config %llx ctlr %llx rpr %llx hppir %llx iar %llx mpidr %llx freq %llu\n",
+          cpu,irqSeq,phase,q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12]&0xffffff,q[13]);
+      }
     }
   }
   previousValid = true;

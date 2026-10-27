@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1876,6 +1876,93 @@
+@@ -1876,6 +1876,100 @@
  	}
  }
  
@@ -17,6 +17,7 @@
 +
 +/* Read the current process's EL0 translation, not its contents. Preserve PAR
 + * and DAIF; IRQ/FIQ are masked only for this short, nonblocking sysreg sequence. */
++extern void guamp_ram_mapping_diag(uint64_t, uint64_t *);
 +static void
 +guamp_user_translation(const char *label, uint64_t address)
 +{
@@ -31,6 +32,12 @@
 +          "=&r"(mair), "=&r"(tcr), "=&r"(ttbr) : "r"(address) : "memory");
 +    printf("GuampMap: %s va %llx PAR %llx attr %02llx SCTLR %llx MAIR %llx TCR %llx TTBR0 %llx\n",
 +        label, address, par, (par >> 56) & 255, sctlr, mair, tcr, ttbr);
++    if (!(par & 1) && strcmp(label, "fault") == 0) {
++        uint64_t detail[7];
++        guamp_ram_mapping_diag(par, detail);
++        printf("GuampMapRange: pa %llx first %llx last %llx managed %llu native-wimg %llx native-PTE %llx dram %llu ram-nc %llu\n",
++            par & 0x000ffffffffff000ULL, detail[0], detail[1], detail[2], detail[3], detail[4], detail[5], detail[6]);
++    }
 +}
 +
 +static void
@@ -94,7 +101,7 @@
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -2027,6 +2114,11 @@
+@@ -2027,6 +2121,11 @@
  
  
  	/* stash the usage into corpse data if making_corpse == true */

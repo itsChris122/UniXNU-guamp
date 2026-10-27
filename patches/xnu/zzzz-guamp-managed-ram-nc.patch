@@ -1,11 +1,26 @@
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -2171,11 +2171,16 @@
+@@ -2171,11 +2171,31 @@
   *	avail_end	PA of last managed physical page
   */
  
 +/* guamp: immutable after bootstrap; read by native diagnostic logger. */
 +unsigned int guamp_ram_nc_enabled = 0;
++
++
++/* Read-only fault context; the caller has already checked PAR.F == 0.
++ * Native cache attributes are not necessarily the descriptor's requested WIMG. */
++void guamp_ram_mapping_diag(uint64_t par, uint64_t *out);
++void
++guamp_ram_mapping_diag(uint64_t par, uint64_t *out)
++{
++    pmap_paddr_t pa = par & 0x000ffffffffff000ULL;
++    unsigned int native = pmap_cache_attributes((ppnum_t)atop(pa));
++    out[0] = vm_first_phys; out[1] = vm_last_phys;
++    out[2] = pa_valid(pa); out[3] = native;
++    out[4] = wimg_to_pte(native, pa);
++    out[5] = is_dram_addr(pa); out[6] = guamp_ram_nc_enabled;
++}
 +
  void
  pmap_bootstrap(
@@ -17,7 +32,7 @@
  
  	lck_grp_init(&pmap_lck_grp, "pmap", LCK_GRP_ATTR_NULL);
  
-@@ -5813,6 +5818,15 @@
+@@ -5813,6 +5833,15 @@
  wimg_to_pte(unsigned int wimg, __unused pmap_paddr_t pa)
  {
  	pt_entry_t pte;
