@@ -4,3 +4,9 @@
 [submodule "drivers/ShengPreflight"]
 	path = drivers/ShengPreflight
 	url = https://github.com/UniXNU/ShengPreflight.git
+[submodule "drivers/NativeAdreno"]
+	path = drivers/NativeAdreno
+	url = https://github.com/xVanTuring/Adreno610.git
+[submodule "kits/ArmSmmu4K"]
+	path = kits/ArmSmmu4K
+	url = https://github.com/xVanTuring/ArmSmmu4K.git
