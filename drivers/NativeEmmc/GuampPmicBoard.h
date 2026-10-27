@@ -73,12 +73,14 @@
 #define GP_SMB5_MISC 0x1600
 // Fuel gauge: PMI632 qcom,qpnp-qg with qgauge@4800 and its SDAM at 0xb100. QG measures voltage and current; the state of
 // charge is computed by the Linux driver from the battery profile, and only its last result is kept in the SDAM. Our
-// first battery level will be an estimate from the measured voltage.
+// gauge (GuampBatteryCore.h) does the same with the JK50-SWD profile of the guamp overlay (GuampBatteryProfile.h).
 #define GP_QG_BASE 0x4800
 #define GP_QG_SDAM 0xb100
 // Battery node in the base DTB (qcom,max-voltage-uv 0x426030 = 4350000, qcom,fastchg-current-ma 0x1518 = 5400,
 // battery-type "Alium_860_89032_0000_3600mAh_Jun15th2018"): the bengal reference battery, not necessarily the Moto 5000
-// mAh pack; the overlay may override it. Use 4.35 V as the voltage ceiling until the Moto profile is found.
+// mAh pack; the overlay overrides it: bengal-guamp-common-overlay.dtsi mtp_batterydata -> JK50-SWD-4850MAH
+// (qcom,max-voltage-uv 4400000, qcom,fg-cc-cv-threshold-uv 4390000, FCC 5029 mAh @ 25 C). 4.35 V stays this port's
+// conservative charge ceiling.
 #define GP_BATT_MAX_UV 4350000u
 
 #endif

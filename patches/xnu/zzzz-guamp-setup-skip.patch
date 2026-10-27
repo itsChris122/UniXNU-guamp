@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,308 @@
+@@ -7858,6 +7858,331 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -301,6 +301,29 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			native_guamp_setup_written++;
 +		}
 +	}
++	/* guamp-mg-reset=1 (owner request 27/10): remove the MobileGestalt cache once so it is rebuilt with the
++	 * current ADT (e.g. the ringer switch). Counted in the periodic GuampUi line (deleted/absent). */
++	unsigned int guamp_mg_reset = 0;
++	PE_parse_boot_argn("guamp-mg-reset", &guamp_mg_reset, sizeof(guamp_mg_reset));
++	if (guamp_mg_reset == 1) {
++		static const char *const mg[] = {
++			"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++			"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
++			"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
++		};
++		for (size_t i = 0; i < sizeof(mg) / sizeof(mg[0]); i++) {
++			int32_t result = 0;
++			int mg_error = copyout(mg[i], scratch + 0xa00, strlen(mg[i]) + 1);
++			if (!mg_error) {
++				struct unlink_args ua = {.path = scratch + 0xa00};
++				mg_error = unlink(p, &ua, &result);
++			}
++			if (!mg_error) native_guamp_ui_cache_deleted++;
++			else if (mg_error == ENOENT) native_guamp_ui_cache_absent++;
++			else native_guamp_ui_cache_error = mg_error;
++			printf("guamp-mg-reset: %s status %d\n", mg[i], mg_error);
++		}
++	}
 +	/* Preserve MobileGestalt answers. Identity experiments must back up and invalidate
 +	 * the specific cache explicitly; never delete it as part of every boot. */
 +	printf("guamp: MobileGestalt cache preserved (automatic removal disabled)\n");
@@ -310,7 +333,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8285,7 @@
+@@ -7983,6 +8308,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);

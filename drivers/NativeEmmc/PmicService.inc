@@ -214,7 +214,13 @@ void thread(void *, wait_result_t) {
   unsigned battery = 0;
   PE_parse_boot_argn("guamp-battery", &battery, sizeof(battery));
   gBatteryEnabled = battery == 1;
-  IOLog("GuampBattery: read-only gauge and power-source publisher %s\n", gBatteryEnabled ? "enabled" : "disabled");
+  unsigned batteryTemp = 1, batterySdam = 0;
+  PE_parse_boot_argn("guamp-battery-temp", &batteryTemp, sizeof(batteryTemp));
+  PE_parse_boot_argn("guamp-battery-sdam", &batterySdam, sizeof(batterySdam));
+  gBatteryTempEnabled = batteryTemp != 0;
+  gBatterySdamStore = batterySdam == 1;
+  IOLog("GuampBattery: QG fuel gauge and power-source publisher %s, BAT_THERM ADC %s, SDAM store %s\n",
+        gBatteryEnabled ? "enabled" : "disabled", gBatteryTempEnabled ? "on" : "off", gBatterySdamStore ? "on" : "off");
   unsigned iclMa = 1500, fccMa = 2000;
   PE_parse_boot_argn("guamp-icl-ma", &iclMa, sizeof(iclMa));
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
