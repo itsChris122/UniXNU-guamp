@@ -20,7 +20,7 @@ namespace guamp_charge {
 namespace reg {   // smb5-reg.h offsets in the PMI632 0x1000 charger blocks
 constexpr uint16_t kStatus1 = 0x1006, kStatus2 = 0x1007, kStatus7 = 0x100d, kChgEnable = 0x1042, kChgPause = 0x1043,
                    kFcc = 0x1061, kFv = 0x1070, kJeitaEn = 0x1090, kJeitaThresholds = 0x1094,
-                   kIclStatus = 0x1107, kAiclStatus = 0x110a, kPowerPath = 0x110b,
+                   kIclStatus = 0x1107, kAiclStatus = 0x110a, kPowerPath = 0x110b, kOtgCmd = 0x1140, kOtgCfg = 0x1153,
                    kBatifPullUp = 0x1286,
                    kApsdStatus = 0x1307, kApsdResult = 0x1308, kUsbinRt = 0x1310, kUsbinCmdIl = 0x1340, kCmdApsd = 0x1341,
                    kCmdIclOverride = 0x1342, kTypeCCfg = 0x1358, kUsbinOptions1 = 0x1362, kUsbinLoadCfg = 0x1365,
@@ -172,6 +172,7 @@ struct Controller {
   uint32_t lastTypecKey = 0xffffffffu;
   unsigned apsdReruns = 0, aicl5vMv = kAicl5vDefaultMv, aiclContMv = kAiclContDefaultMv;
   unsigned plugins = 0, unplugs = 0, weakSteps = 0, redetects = 0, suspendRecoveries = 0, typecResets = 0, errors = 0;
+  unsigned otgOffs = 0;
   uint8_t iclCode = 0, fccCode = 0, lastIcl = 0xff, lastAicl = 0xff, lastResult = 0xff;
   unsigned appliedMa = 0;
   Snapshot snap = {};
@@ -362,6 +363,27 @@ struct Controller {
     }
   }
 
+  // OTG boost off (DCDC_CMD_OTG_REG OTG_EN_BIT 0) and OTG enabled by that command only (DCDC_OTG_CFG_REG
+  // OTG_EN_SRC_CFG_BIT 0, qpnp-smb5.c smb5_init_hw). Linux sets OTG_EN only as USB host (smblib_vbus_regulator_enable,
+  // smblib_notify_usb_host); this port is sink only. The XNU logs after a C-to-C replug showed 0x1140 = 01 (Linux 00,
+  // nothing in XNU writes it: left by the boot chain): the phone drove its own 5 V on VBUS (USBIN REVI + UV/VASHDN, USB_IN
+  // ADC ~5.0 V "present, not accepted", Type-C VBUS_ERROR), so the PC never turned its VBUS back on.
+  template <class Bus> int otgOff(Bus &b, const char *when) {
+    uint8_t cmd = 0, cfg = 0, usbin = 0;
+    int e = b.rd(reg::kOtgCmd, &cmd);
+    if (!e) e = masked(b, reg::kOtgCfg, 0x02, 0x00, &cfg);
+    if (!e && (cmd & 0x01)) e = b.wr(reg::kOtgCmd, static_cast<uint8_t>(cmd & ~0x01u));
+    if (e) { fail(b, "OTG off", e); return e; }
+    if ((cmd & 0x01) || (cfg & 0x02)) {
+      otgOffs = otgOffs + 1;
+      b.rd(reg::kUsbinRt, &usbin);
+      if (otgOffs <= 3 || otgOffs % 20 == 0)
+        b.log("GuampChg: OTG boost was on (%s: DCDC_CMD_OTG %02x, OTG_CFG %02x, USBIN %02x): off, sink only (%u)\n", when,
+              cmd, cfg, usbin, otgOffs);
+    }
+    return 0;
+  }
+
   // Type-C disable command (CC terminations off) now, the role back on at the first poll after ms + offMs
   template <class Bus> void typecOff(Bus &b, uint64_t ms, uint8_t role, unsigned offMs, const char *why) {
     lastTypecReset = ms;
@@ -413,6 +435,7 @@ struct Controller {
       linuxDiff(b, "boot, before");
       linuxConfig(b, "boot");
     }
+    otgOff(b, present ? "plugged" : "no VBUS");   // every poll: whatever turned it on, the next poll undoes it
 
     // --- transitions, one line each ---------------------------------------------------------------------------
     if (s.typecAttached() != attached) {
@@ -502,12 +525,16 @@ struct Controller {
         unsigned mv = 0;
         const int ve = b.vbusMv(&mv);
         lastVbusMv = ve ? 0 : mv;
+        uint8_t otg = 0, allow = 0;
+        b.rd(reg::kOtgCmd, &otg);
+        b.rd(reg::kUsbinAdapterAllow, &allow);
         if (ccRecoveries == 1) linuxDiff(b, "Rp without VBUS");
-        b.log("GuampChg: Rp without VBUS for %u s (state %02x misc %02x 0e %02x, USBIN %02x, VBUS ADC %u mV%s): Type-C "
-              "recovery %u, CC off %u s, then %s\n",
+        b.log("GuampChg: Rp without VBUS for %u s (state %02x misc %02x 0e %02x, USBIN %02x, VBUS ADC %u mV%s, OTG %02x "
+              "cmd-il %02x allow %02x): Type-C recovery %u, CC off %u s, then %s\n",
               static_cast<unsigned>((ms - noVbusSince) / 1000), s.sm, s.misc, s.cc, s.usbin, ve ? 0u : mv,
-              ve ? " (ADC error)" : mv >= 4000 ? " PRESENT, NOT ACCEPTED" : mv >= 800 ? " not discharged" : "",
-              ccRecoveries, offMs / 1000, (typecDrp || roleDrp) ? "DRP try.SNK" : "sink only");
+              ve ? " (ADC error)" : mv >= 4000 ? ((otg & 1) ? " OWN OTG BOOST" : " PRESENT, NOT ACCEPTED")
+                 : mv >= 800 ? " not discharged" : "",
+              otg, s.cmdIl, allow, ccRecoveries, offMs / 1000, (typecDrp || roleDrp) ? "DRP try.SNK" : "sink only");
         typecOff(b, ms, typecMode(wantMode, typecDrp || roleDrp), offMs, nullptr);
       }
       return;
