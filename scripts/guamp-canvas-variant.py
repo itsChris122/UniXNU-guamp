@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'f7fb3d130e691ab2079fc3485cc85cb61929351267be0e19c96102e9fbd141f2'
+PATCHED_SHA256 = '142f2fcd96cb821eea216d0e53b5ff52d81804a7bb461be879a432094f299595'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -250,44 +250,126 @@ EDITS.append((r'''            installBootDimensions((uint32_t)video.v_width,(uin
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,gopWidth,gopHeight);
 '''))
-# 9. guamp-fast-copy=1: the swapped surface is read through a cacheable kernel mapping (cleaned and invalidated by VA first, so
-#    lines the render server's CPU left dirty reach memory and no stale line is read), instead of the descriptor's default mode.
-#    guamp-copy-probe=N: the first N frames also time a read-only pass over the mapped surface, which splits the copy cost into
-#    reading the source and the rest (scaling and the scanout stores). guamp_copy_split: [0] frames mapped, [1] map + cache
-#    maintenance ticks, [2] probed frames, [3] probe ticks, [4] mapping cache mode (kIOMapCacheMask >> kIOMapCacheShift),
-#    [5] 1 when the cacheable mapping was used, [6] probe bytes, [7] fast mappings refused (default mapping used instead).
+# 9. Faster CPU copy of the swapped surface, each part behind its own boot-arg (all default off):
+#    guamp-fast-copy=1        the surface is read through a cacheable kernel mapping (kIOMapCopybackCache), cleaned and invalidated
+#                             by VA first so lines another CPU left dirty reach memory and no stale line is read;
+#    guamp-fast-copy-flush=0  skips that cache maintenance (only right if the render server's own mapping is cacheable too);
+#    guamp-map-cache=1        keeps the kernel mappings of the last 4 surfaces (per memory descriptor, oldest evicted) instead of
+#                             mapping every frame; the descriptor stays retained while cached;
+#    guamp-async-copy=1       the swap retires at once and a kernel thread call copies it, as the GPU offer path does (early retire,
+#                             transferred held until the copy ends, gpuComplete on the work loop); a failed copy falls back to the
+#                             synchronous copy for the next frame (gpuBypass);
+#    guamp-copy-probe=N       the first N synchronous frames also time a read-only pass over the surface.
+#    guamp_copy_split: [0] frames mapped, [1] map + cache maintenance ticks, [2] probed frames, [3] probe ticks, [4] mapping cache
+#    mode, [5] last mapping cacheable, [6] probe bytes, [7] cacheable mappings refused, [8] asynchronous copies, [9] cached mappings
+#    reused.
 EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}',
               'extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}\n'
-              'extern "C" {volatile uint64_t guamp_copy_split[8];volatile uint64_t guamp_copy_probe_sink;}\n'
+              '#include <kern/thread_call.h>\n'
+              'extern "C" {volatile uint64_t guamp_copy_split[10];volatile uint64_t guamp_copy_probe_sink;}\n'
               'extern "C" void flush_dcache64(addr64_t,unsigned,int);'))
-EDITS.append(('        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);\n',
-r'''        static int fastCopy=-1;static unsigned probeBudget=0;
-        if(fastCopy<0){unsigned v=0;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;
-            PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;}
+EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
+    // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
+    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false,asyncCopyOn=false;unsigned probeBudget=0;
+    void readCopyOptions() {
+        if(copyOptions>=0)return;
+        unsigned v=0;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;
+        v=1;PE_parse_boot_argn("guamp-fast-copy-flush",&v,sizeof v);fastFlush=v!=0;
+        v=0;PE_parse_boot_argn("guamp-map-cache",&v,sizeof v);mapCache=v==1;
+        v=0;PE_parse_boot_argn("guamp-async-copy",&v,sizeof v);asyncCopyOn=v==1;
+        PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;
+        copyOptions=1;
+    }
+    struct GuampMapSlot {IOMemoryDescriptor *memory;IOMemoryMap *map;uint64_t used;bool cacheable;};
+    GuampMapSlot mapSlots[4]={};uint64_t mapUse=0;
+    void freeMapSlots() {for(auto &s: mapSlots){OSSafeReleaseNULL(s.map);OSSafeReleaseNULL(s.memory);s.used=0;s.cacheable=false;}}
+    // A read-only kernel mapping of the surface that the caller releases (a cached one carries an extra reference).
+    IOMemoryMap *guampSourceMap(IOMemoryDescriptor *memory,uint64_t allocation) {
+        readCopyOptions();
         uint64_t mapStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapStart));
-        IOMemoryMap *source=nullptr;
-        if(fastCopy) {
-            source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
-            if(source && source->getVirtualAddress() && source->getLength()>=allocation && source->getLength()<=0xffffffffull)
-                flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
-            else {OSSafeReleaseNULL(source);guamp_copy_split[7]=guamp_copy_split[7]+1;}
+        IOMemoryMap *source=nullptr;bool cacheable=false;
+        if(mapCache)
+            for(auto &s: mapSlots)
+                if(s.memory==memory && s.map) {
+                    source=s.map;source->retain();s.used=++mapUse;cacheable=s.cacheable;guamp_copy_split[9]=guamp_copy_split[9]+1;break;
+                }
+        if(!source) {
+            if(fastCopy) {
+                source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
+                if(!source || !source->getVirtualAddress() || source->getLength()<allocation || source->getLength()>0xffffffffull)
+                    {OSSafeReleaseNULL(source);guamp_copy_split[7]=guamp_copy_split[7]+1;}
+                else cacheable=true;
+            }
+            if(!source)source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+            if(source && mapCache) {
+                GuampMapSlot *slot=&mapSlots[0];
+                for(auto &s: mapSlots) {if(!s.map){slot=&s;break;} if(s.used<slot->used)slot=&s;}
+                OSSafeReleaseNULL(slot->map);OSSafeReleaseNULL(slot->memory);
+                memory->retain();source->retain();slot->memory=memory;slot->map=source;slot->used=++mapUse;slot->cacheable=cacheable;
+            }
         }
-        guamp_copy_split[5]=source?1:0;
-        if(!source)source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        if(source && cacheable && fastFlush && source->getVirtualAddress() && source->getLength()<=0xffffffffull)
+            flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
         if(source) {
             uint64_t mapEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(mapEnd));
             guamp_copy_split[0]=guamp_copy_split[0]+1;guamp_copy_split[1]=guamp_copy_split[1]+(mapEnd-mapStart);
-            guamp_copy_split[4]=(source->getMapOptions()&kIOMapCacheMask)>>kIOMapCacheShift;
-            if(probeBudget && source->getVirtualAddress()) {
-                --probeBudget;
-                const uint64_t *word=reinterpret_cast<const uint64_t *>(source->getVirtualAddress());
-                const uint64_t words=((source->getLength()<allocation?source->getLength():allocation)/32)*4;
-                uint64_t sum=0,probeStart,probeEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeStart));
-                for(uint64_t i=0;i<words;i+=4)sum+=word[i]^word[i+1]^word[i+2]^word[i+3];
-                __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeEnd));
-                guamp_copy_probe_sink=sum;guamp_copy_split[2]=guamp_copy_split[2]+1;
-                guamp_copy_split[3]=guamp_copy_split[3]+(probeEnd-probeStart);guamp_copy_split[6]=words*8;
+            guamp_copy_split[4]=(source->getMapOptions()&kIOMapCacheMask)>>kIOMapCacheShift;guamp_copy_split[5]=cacheable?1:0;
+        }
+        return source;
+    }
+    // guamp-async-copy=1: one copy in flight; its parameters are taken under the work loop before the thread call runs.
+    thread_call_t asyncCall=nullptr;IOMemoryDescriptor *asyncMemory=nullptr;
+    uint64_t asyncStride=0,asyncAllocation=0,asyncLength=0,asyncRowBytes=0;uint32_t asyncWidth=0,asyncHeight=0;bool asyncScaled=false;
+    static void asyncCopyEntry(thread_call_param_t owner,thread_call_param_t) {static_cast<NativeLegacyDisplay *>(owner)->asyncCopy();}
+    void asyncCopy() {
+        IOMemoryDescriptor *memory=asyncMemory;asyncMemory=nullptr;
+        int status=-1;
+        IOMemoryMap *source=memory?guampSourceMap(memory,asyncAllocation):nullptr;
+        if(source && source->getVirtualAddress() && source->getLength()>=asyncAllocation && bootMapping) {
+            uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+            const int ok=asyncScaled
+                ?guampScalePixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),asyncRowBytes,
+                    reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),asyncStride,scaler)
+                :native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
+                    asyncRowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),asyncStride,asyncWidth,asyncHeight);
+            __asm__ volatile("dsb sy" ::: "memory");
+            uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+            if(ok){native_legacy_copy_timing_observed(copyEnd-copyStart,asyncLength);if(asyncScaled)guamp_canvas_frames=guamp_canvas_frames+1;status=0;}
+        }
+        OSSafeReleaseNULL(source);OSSafeReleaseNULL(memory);
+        gpuComplete(status);
+    }
+    void freeAsync() {
+        if(asyncCall){thread_call_cancel_wait(asyncCall);thread_call_free(asyncCall);asyncCall=nullptr;}
+        OSSafeReleaseNULL(asyncMemory);freeMapSlots();
+    }
+'''))
+EDITS.append(('    void free() override {freeScaler();stopVsync();', '    void free() override {freeAsync();freeScaler();stopVsync();'))
+EDITS.append(('        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);\n',
+r'''        readCopyOptions();
+        if(asyncCopyOn && !gpuBypass) {
+            if(!asyncCall)asyncCall=thread_call_allocate_with_options(asyncCopyEntry,this,THREAD_CALL_PRIORITY_KERNEL_HIGH,0);
+            if(asyncCall && !asyncMemory) {
+                memory->retain();asyncMemory=memory;asyncStride=sourceStride;asyncAllocation=allocation;asyncLength=length;
+                asyncRowBytes=video.v_rowBytes;asyncWidth=width;asyncHeight=height;asyncScaled=scaled;
+                native_legacy_swap_stage(1);
+                shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+                if(retireSwap(request,true)){gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;}
+                guamp_copy_split[8]=guamp_copy_split[8]+1;
+                thread_call_enter(asyncCall);
+                return;
             }
+        }
+        IOMemoryMap *source=guampSourceMap(memory,allocation);
+        if(source && probeBudget && source->getVirtualAddress()) {
+            --probeBudget;
+            const uint64_t *word=reinterpret_cast<const uint64_t *>(source->getVirtualAddress());
+            const uint64_t words=((source->getLength()<allocation?source->getLength():allocation)/32)*4;
+            uint64_t sum=0,probeStart,probeEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeStart));
+            for(uint64_t i=0;i<words;i+=4)sum+=word[i]^word[i+1]^word[i+2]^word[i+3];
+            __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(probeEnd));
+            guamp_copy_probe_sink=sum;guamp_copy_split[2]=guamp_copy_split[2]+1;
+            guamp_copy_split[3]=guamp_copy_split[3]+(probeEnd-probeStart);guamp_copy_split[6]=words*8;
         }
 '''))
 def apply(data):
