@@ -1,7 +1,9 @@
 // Host tests of the Adreno 610 M1 sequencing (GuampGpuM1.h) against a fake GCC / GPUCC / GPU register file that
 // models the GDSC PWR_ON and branch CLK_OFF behaviour, RCG updates and the bus rules the kernel must respect: no
 // GPUCC access while gcc cfg_ahb is off, no GPU access unless both GDSCs and the register-path clocks are on (a real
-// unclocked read aborts the bus), no GPU write at all, no write outside the M1 register list.
+// unclocked read aborts the bus), no GPU write at all, no write outside the M1 register list (nor to its read-only
+// entries). As on the phone (log 2026-10-27), the GCC GPU branches memnoc / snoc_dvm keep CLK_OFF set while the GPU CX
+// GDSC is off.
 #include <stdio.h>
 #include <string.h>
 #include <map>
@@ -15,6 +17,9 @@ struct Fake {
   // knobs
   bool cfgAhbStuck = false, cxNever = false, gxNever = false, gxGfx3dStuck = false, gfxRcgStuck = false, pll0 = true,
        aonStuck = false, dropGxClock = false;
+  bool gpuBranchNeedsCx = true;   // memnoc / snoc_dvm CLK_OFF until CX is on (phone)
+  bool memnocNever = false, memnocNeedsGx = false, axiStatusOff = false;
+  bool ahbStatusLies = false;     // gpu_cc_ahb (BRANCH_HALT_DELAY) runs but its CLK_OFF reads set
   // observations
   uint64_t us = 0;
   unsigned aresPulses = 0, gpuReads = 0, gpuUnclocked = 0, gpuWrites = 0, gpuccNoAhb = 0, gpuccAccesses = 0,
@@ -28,6 +33,9 @@ struct Fake {
     gcc[GM_GCC_GPU_SNOC_DVM_GFX] = 0x80000000;
     gcc[GM_GCC_GPU_IREF] = 0x80000000;
     gcc[GM_GCC_BIMC_GPU_AXI] = 0x80000000;
+    gcc[GM_GCC_GPU_THROTTLE_CORE] = 0x80000000;
+    gcc[GM_GCC_QMIP_GPU_CFG_AHB] = 0x80000000;
+    gcc[GM_GCC_BRANCH_VOTE2] = 0;
     cc[GM_CC_CX_GDSCR] = 0x00222001;
     cc[GM_CC_GX_GDSCR] = 0x00222001;
     cc[GM_CC_GX_CLAMP] = GM_CLAMP_IO;
@@ -45,6 +53,11 @@ struct Fake {
   bool gccOn(uint32_t off) const {
     const uint32_t v = gcc.at(off);
     if (off == GM_GCC_GPU_CFG_AHB && cfgAhbStuck) return false;
+    if (off == GM_GCC_GPU_MEMNOC_GFX || off == GM_GCC_GPU_SNOC_DVM_GFX) {
+      if (gpuBranchNeedsCx && !cxOn()) return false;
+      if (off == GM_GCC_GPU_MEMNOC_GFX && (memnocNever || (memnocNeedsGx && !gxOn()))) return false;
+    }
+    if (off == GM_GCC_BIMC_GPU_AXI && axiStatusOff) return false;
     return v & GM_CBCR_EN;
   }
   bool cxOn() const { return !cxNever && !(cc.at(GM_CC_CX_GDSCR) & GM_GDSC_SW_COLLAPSE); }
@@ -75,7 +88,7 @@ struct Fake {
       if (off == GM_GCC_GPLL0_MODE) return pll0 ? 0xC0000007u : 0u;
       if (!gcc.count(off)) { badWrites++; return 0; }
       const uint32_t v = gcc[off];
-      if (off == GM_GCC_BRANCH_VOTE) return v;
+      if (off == GM_GCC_BRANCH_VOTE || off == GM_GCC_BRANCH_VOTE2) return v;
       if (off == GM_GCC_GPU_CFG_AHB) return cfgAhbStuck ? (v & ~GM_CBCR_HWCG) | GM_CBCR_CLK_OFF : v;   // hwcg: CLK_OFF unreliable
       return withOff(v, gccOn(off));
     }
@@ -88,7 +101,8 @@ struct Fake {
       case GM_CC_CX_GDSCR: return cxOn() ? v | GM_GDSC_PWR_ON : v & ~GM_GDSC_PWR_ON;
       case GM_CC_CX_HW_CTRL: return cxOn() ? GM_GDSC_PWR_ON : 0;
       case GM_CC_GX_GDSCR: return gxOn() ? v | GM_GDSC_PWR_ON : v & ~GM_GDSC_PWR_ON;
-      case GM_CC_AHB: case GM_CC_CXO: case GM_CC_CX_GMU: case GM_CC_SMMU_VOTE: case GM_CC_CX_GFX3D: case GM_CC_GX_GFX3D:
+      case GM_CC_AHB: return withOff(v, ccOn(off) && !ahbStatusLies);
+      case GM_CC_CXO: case GM_CC_CX_GMU: case GM_CC_SMMU_VOTE: case GM_CC_CX_GFX3D: case GM_CC_GX_GFX3D:
         return withOff(v, ccOn(off));
       default: return v;
       }
@@ -105,7 +119,7 @@ struct Fake {
   void write(unsigned block, uint32_t off, uint32_t v) {
     if (block == GM_GPU) { gpuWrites++; return; }
     bool known = false;
-    for (const gm_reg_desc &d : kGmRegs) known = known || (d.block == block && d.off == off);
+    for (const gm_reg_desc &d : kGmRegs) known = known || (d.block == block && d.off == off && !d.ro);
     if (!known || (block == GM_GCC && off == GM_GCC_GPLL0_MODE) || (block == GM_GPUCC && off == GM_CC_CX_HW_CTRL)) { badWrites++; return; }
     // bit 31 is read-only status (CLK_OFF, PWR_ON, ROOT_OFF) except in the vote register and the RCG CFG
     const bool ro31 = !(block == GM_GCC && off == GM_GCC_BRANCH_VOTE) && off != GM_CC_GMU_RCG + 4 && off != GM_CC_GFX3D_RCG + 4;
@@ -133,9 +147,10 @@ static void fDelay(void *c, unsigned us) { static_cast<Fake *>(c)->us += us; }
 static bool fMap(void *c) { static_cast<Fake *>(c)->mapCalls++; return true; }
 
 struct Run { Fake f; gm_io io; gm_state st; bool up = false, read = false; };
-static void run(Run &r, bool dropAfterUp = false) {
+static void run(Run &r, bool dropAfterUp = false, bool relaxed = false) {
   r.io = gm_io{&r.f, fRd, fWr, fDelay, fMap};
   gm_init(&r.st);
+  r.st.relaxed = relaxed;
   r.up = gm_power_up(&r.io, &r.st);
   if (dropAfterUp) r.f.dropGxClock = true;
   r.read = gm_read_gpu(&r.io, &r.st);
@@ -184,9 +199,84 @@ int main() {
     const uint32_t ccRegs[] = {GM_CC_AHB, GM_CC_CXO, GM_CC_CX_GMU, GM_CC_SMMU_VOTE, GM_CC_CX_GFX3D, GM_CC_GX_GFX3D};
     for (uint32_t o : ccRegs) CHECK((r.f.cc[o] & GM_CBCR_EN) == (Fake().cc[o] & GM_CBCR_EN));
     const uint32_t gccRegs[] = {GM_GCC_BRANCH_VOTE, GM_GCC_GPU_CFG_AHB, GM_GCC_GPU_MEMNOC_GFX, GM_GCC_GPU_SNOC_DVM_GFX,
-                                GM_GCC_GPU_IREF, GM_GCC_BIMC_GPU_AXI};
+                                GM_GCC_GPU_IREF, GM_GCC_BIMC_GPU_AXI, GM_GCC_GPU_THROTTLE_CORE, GM_GCC_QMIP_GPU_CFG_AHB,
+                                GM_GCC_BRANCH_VOTE2};
     for (uint32_t o : gccRegs) CHECK(r.f.gcc[o] == Fake().gcc[o]);
     CHECK(r.st.haveOff && !(r.st.off[GMR_GX_GDSCR] & GM_GDSC_PWR_ON));
+    CHECK(r.st.stuck == 0 && r.st.late == 0);
+  }
+  {  // the phone, log 2026-10-27: cfg_ahb 00000009 (on, no HW_CTL), memnoc CLK_OFF until CX is on, iref already on.
+     // The old order (GCC branches before the CX GDSC) stopped at "memnoc"; the Linux order gets through.
+    Run r;
+    r.f.gcc[GM_GCC_BRANCH_VOTE] = 0x00c05d5b;
+    r.f.gcc[GM_GCC_GPU_CFG_AHB] = 0x00000009;
+    r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] = 0x80004220;
+    r.f.gcc[GM_GCC_GPU_IREF] = 0x00000001;
+    CHECK(r.f.read(GM_GCC, GM_GCC_GPU_CFG_AHB) == 0x9);
+    r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] |= GM_CBCR_EN;
+    CHECK(r.f.read(GM_GCC, GM_GCC_GPU_MEMNOC_GFX) == 0x80004221);   // as logged: enabled, CLK_OFF with CX off
+    r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] &= ~GM_CBCR_EN;
+    CHECK(gm_branch_state(0x9, kGmBranches[0]) == GM_BS_ON);
+    run(r);
+    common(r);
+    CHECK(r.up && r.read && !r.st.stop && r.st.gpuccOk && r.st.stuck == 0);
+    CHECK(!(r.st.after[GMR_MEMNOC] & GM_CBCR_CLK_OFF) && !(r.st.after[GMR_SNOC_DVM] & GM_CBCR_CLK_OFF));
+    CHECK((r.st.after[GMR_AXI] & GM_CBCR_EN) && (r.st.after[GMR_SNOC_DVM] & GM_CBCR_EN));
+    CHECK(r.st.enabled & (1u << GMR_MEMNOC));
+    CHECK(!(r.st.enabled & (1u << GMR_CFG_AHB)) && !(r.st.enabled & (1u << GMR_IREF)));
+    CHECK(gm_power_down(&r.io, &r.st));
+    common(r);
+    CHECK(r.f.gcc[GM_GCC_GPU_CFG_AHB] == 0x9 && r.f.gcc[GM_GCC_GPU_IREF] == 1 && r.f.gcc[GM_GCC_BRANCH_VOTE] == 0x00c05d5b);
+    CHECK(!(r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] & GM_CBCR_EN) && !(r.f.gcc[GM_GCC_GPU_SNOC_DVM_GFX] & GM_CBCR_EN));
+  }
+  {  // memnoc never reports on: the rest still runs (and is logged), the stop names it, the GPU is never touched
+    Run r; r.f.memnocNever = true;
+    run(r);
+    common(r); noGpu(r);
+    CHECK(!r.up && r.st.stop && !strcmp(r.st.stop, "memnoc") && r.st.gpuccOk);
+    CHECK(!strcmp(r.st.cx, "on") && !strcmp(r.st.gx, "on") && !strcmp(r.st.clocks, "off"));
+    CHECK(r.st.stuck == (1u << GMR_MEMNOC) && r.st.late == 0);
+    CHECK((r.st.after[GMR_SNOC_DVM] & GM_CBCR_EN) && !(r.st.after[GMR_SNOC_DVM] & GM_CBCR_CLK_OFF));
+    CHECK((r.st.after[GMR_MEMNOC] & GM_CBCR_EN) && (r.st.after[GMR_MEMNOC] & GM_CBCR_CLK_OFF));
+    CHECK(gm_branch_state(r.st.after[GMR_MEMNOC], kGmBranches[1]) == GM_BS_CLK_OFF);
+    CHECK(gm_power_down(&r.io, &r.st));
+    common(r);
+    CHECK(!r.f.gxOn() && !r.f.cxOn());
+    CHECK(r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] == 0x80000000 && r.f.gcc[GM_GCC_GPU_SNOC_DVM_GFX] == 0x80000000);
+    CHECK((r.f.cc[GM_CC_SMMU_VOTE] & GM_CBCR_EN) == 0 && (r.f.cc[GM_CC_GX_GFX3D] & GM_CBCR_EN) == 0);
+  }
+  {  // memnoc only reports on once GX is powered: stuck at enable, on at the re-poll, then everything passes
+    Run r; r.f.memnocNeedsGx = true;
+    run(r);
+    common(r);
+    CHECK(r.up && r.read && r.st.stuck == (1u << GMR_MEMNOC) && r.st.late == (1u << GMR_MEMNOC));
+  }
+  {  // bimc_gpu_axi (BRANCH_HALT_DELAY, report only) with CLK_OFF set: not checked, as in Linux
+    Run r; r.f.axiStatusOff = true;
+    run(r);
+    common(r);
+    CHECK(r.up && r.read && r.st.stuck == 0);
+    CHECK(gm_branch_state(r.st.after[GMR_AXI], kGmBranches[8]) == GM_BS_UNCHECKED);
+  }
+  {  // gpu_cc_ahb (BRANCH_HALT_DELAY) runs but reads CLK_OFF: the default gate refuses, guamp-gpu-relaxed=1 passes
+    Run r; r.f.ahbStatusLies = true;
+    run(r);
+    common(r); noGpu(r);
+    CHECK(r.up && !r.read && !strcmp(r.st.stop, "ahb") && !strcmp(r.st.clocks, "gate"));
+    Run q; q.f.ahbStatusLies = true;
+    run(q, false, true);
+    common(q);
+    CHECK(q.up && q.read && q.f.gpuReads == 4);
+  }
+  {  // relaxed never waives a checked branch (cxo, BRANCH_HALT) nor an enable bit
+    Run r;
+    run(r, false, true);
+    CHECK(r.read);
+    r.f.cc[GM_CC_CXO] &= ~GM_CBCR_EN;
+    CHECK(gm_gate(&r.io, true) && !strcmp(gm_gate(&r.io, true), "cxo"));
+    r.f.cc[GM_CC_CXO] |= GM_CBCR_EN;
+    r.f.cc[GM_CC_AHB] &= ~GM_CBCR_EN;
+    CHECK(gm_gate(&r.io, true) && !strcmp(gm_gate(&r.io, true), "ahb"));
   }
   {  // CX never powers: stop before GX, no GPU access
     Run r; r.f.cxNever = true;
@@ -204,17 +294,18 @@ int main() {
     common(r); noGpu(r);
     CHECK(!r.up && !strcmp(r.st.gx, "timeout") && !strcmp(r.st.cx, "on"));
   }
-  {  // gx_gfx3d CLK_OFF stuck
+  {  // gx_gfx3d CLK_OFF stuck: BRANCH_HALT_SKIP, so the power-up does not wait on it; the gate refuses
     Run r; r.f.gxGfx3dStuck = true;
     run(r);
     common(r); noGpu(r);
-    CHECK(!r.up && r.st.stop && !strcmp(r.st.stop, "gx_gfx3d"));
+    CHECK(r.up && r.st.stop && !strcmp(r.st.stop, "gx_gfx3d") && !strcmp(r.st.clocks, "gate"));
   }
   {  // gcc cfg_ahb does not come on: GPUCC never accessed
     Run r; r.f.cfgAhbStuck = true; r.f.gcc[GM_GCC_GPU_CFG_AHB] = 0x80000000;
     run(r);
     common(r); noGpu(r);
-    CHECK(!r.up && r.f.gpuccAccesses == 0 && !r.st.gpuccOk);
+    CHECK(!r.up && r.f.gpuccAccesses == 0 && !r.st.gpuccOk && !strcmp(r.st.stop, "gcc cfg_ahb off (GPUCC not touched)"));
+    CHECK(r.f.gcc[GM_GCC_GPU_MEMNOC_GFX] == 0x80000000);   // nothing past cfg_ahb
     gm_power_down(&r.io, &r.st);
     CHECK(r.f.gpuccAccesses == 0);
     CHECK(r.f.gcc[GM_GCC_GPU_CFG_AHB] == 0x80000000);
@@ -279,6 +370,15 @@ int main() {
     CHECK(!gm_branch_is_on(0x80000001, false));
     CHECK(gm_branch_is_on(0x20000001, false) && !gm_branch_is_on(0xA0000001, false));   // NOC FSM ON needs CLK_OFF clear
     CHECK(gm_branch_is_on(0x80000003, true) && !gm_branch_is_on(0x80000003, false));
+    const gm_branch hb = {GMR_CFG_AHB, GM_HALT, true, true, GM_PH_GCC}, db = {GMR_AHB, GM_HALT_DELAY, false, true, GM_PH_SMMU};
+    CHECK(gm_branch_state(0x00000009, hb) == GM_BS_ON);          // the phone's cfg_ahb: on
+    CHECK(gm_branch_state(0x80000003, hb) == GM_BS_HWCG);        // HW_CTL + EN: Linux skips the check
+    CHECK(gm_branch_state(0x80000002, hb) == GM_BS_DISABLED);    // HW_CTL without EN: off
+    CHECK(gm_branch_state(0x80004221, hb) == GM_BS_CLK_OFF);     // the phone's memnoc
+    CHECK(gm_branch_state(0x80000001, db) == GM_BS_UNCHECKED && gm_bstate_ok(GM_BS_UNCHECKED, true) &&
+          !gm_bstate_ok(GM_BS_UNCHECKED, false) && !gm_bstate_ok(GM_BS_CLK_OFF, true));
+    CHECK(!strcmp(gm_halt_name(kGmBranches[1].halt), "VOTED") && !strcmp(gm_halt_name(kGmBranches[9].halt), "SKIP"));
+    for (const gm_branch &b : kGmBranches) CHECK(!kGmRegs[b.reg].ro);
     CHECK(GM_GMU_200M_CFG == 0x505);
     CHECK(GM_A6XX_CP_ALWAYS_ON_COUNTER_LO * 4 == 0x2600 && GM_A6XX_VBIF_VERSION * 4 == 0xc000);
     CHECK(GM_A6XX_VBIF_VERSION * 4 < GM_GPU_SIZE);
