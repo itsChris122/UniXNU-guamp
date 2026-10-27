@@ -9,8 +9,9 @@
 //           must increase) are read. An unclocked GPU read aborts the bus, so any failure stops before the mapping.
 //           guamp-gpu-relaxed=1: the BRANCH_HALT_DELAY / SKIP clocks (Linux never reads their status: gpu_cc_ahb,
 //           gx_gfx3d, cx_gfx3d) pass the gate with their enable bit set even when CLK_OFF reads set.
-// Strict scope: no SCM/SMC, no zap shader, no firmware, no command submission, no GPU register write, no
-// RBBM_SW_RESET, no PLL programming. Writes stay limited to the GCC/GPUCC registers listed in kGmRegs.
+// Strict scope of M1: no SCM/SMC, no zap shader, no firmware, no command submission, no GPU register write, no
+// RBBM_SW_RESET, no PLL programming. Writes stay limited to the GCC/GPUCC registers listed in kGmRegs. M2 (below,
+// guamp-gpu-m2) adds the SQE firmware, GPU register writes and the CP start; still no SCM/SMC and no zap shader.
 // Other boot arguments: guamp-gpu-delay=<s> (start later, so the USB mirror sees the lines), guamp-gpu-off=1 (undo
 // the power-up at the end; default: the GPU stays powered). guamp-gpu-rpm=1: before the GCC GPU branches, the RPM
 // votes Linux holds for kgsl on bengal (GuampRpm.inc, kRpmGpuVotes): qdss Enab 1 (active + sleep), bimc / snoc / cnoc
@@ -21,7 +22,200 @@
 // "GuampGpu: RESULT ..." line. Host-tested by tests/gpu_host.cpp.
 
 #include "GuampGpuM1.h"
+#include "GuampGpuM2.h"
 #include "GuampRpmCore.h"
+#include "GuampExt4.inc"
+
+namespace wifiprep {   // GuampWifiPrep.inc: GPT lookup by name, active slot
+bool findPartition(const char *wanted, uint64_t *first, uint64_t *blocks, uint64_t *attributes);
+char activeSlot();
+}
+
+// M2 (guamp-gpu-m2=1|2|3, only after M1 read the GPU with a running always-on counter), GuampGpuM2.h:
+//   1  read only: GPU SMMU path of stream 0, and a630_sqe.fw from /firmware of the vendor_<slot> logical partition
+//      (super, liblp metadata of the slot, ext4), header dwords logged; no GPU write
+//   2  plus the CP start (soft reset, A610 a6xx_start subset, ring, SQE unhalt, CP_ME_INIT, CP_MEM_WRITE, SECVID
+//      trust write) when the SMMU leaves stream 0 untranslated; otherwise it stops there
+//   3  as 2 even with a translating / faulting SMMU path (forced: the CP fetches then fault inside the GPU)
+// 64 KiB physically contiguous, uncached, below 4 GiB: SQE at 0 (up to 56 KiB), ring 4 KiB at 0xe000, scratch at
+// 0xf000. Never freed once the CP was started (it keeps the ring and microcode addresses).
+namespace gpum2 {
+volatile uint8_t *gGpu, *gSmmu;
+
+uint32_t rd(void *, unsigned block, uint32_t off) {
+  return *reinterpret_cast<volatile uint32_t *>((block == GM2_GPU ? gGpu : gSmmu) + off);
+}
+void wr(void *, unsigned block, uint32_t off, uint32_t v) {
+  if (block != GM2_GPU) return;   // the SMMU is never written
+  *reinterpret_cast<volatile uint32_t *>(gGpu + off) = v;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+void udelay(void *, unsigned us) { IODelay(us); }
+void flush(void *, const void *p, size_t bytes) {
+  uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
+  for (; a < end; a += 64) __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+constexpr uint32_t kMemBytes = 0x10000, kSqeCap = 0xe000, kRingOff = 0xe000, kScratchOff = 0xf000;
+constexpr uint32_t kRingDwords = 1024;
+
+struct Vendor { uint64_t superFirst, superBlocks; gm2_extent ext[GM2_LP_MAX_EXTENTS]; unsigned n; uint64_t sectors; };
+
+// sectors of super (relative), at most kBounceBlocks per card read
+bool readSuper(const Vendor *v, uint64_t sector, uint32_t count, uint8_t *out) {
+  if (!count || sector >= v->superBlocks || count > v->superBlocks - sector) return false;
+  Card &card = gCard;
+  while (count) {
+    const uint32_t now = count > kBounceBlocks ? kBounceBlocks : count;
+    IOLockLock(card.gate);
+    const bool ok = card.online && card.readBlocks(v->superFirst + sector, now, out);
+    IOLockUnlock(card.gate);
+    if (!ok) return false;
+    sector += now;
+    count -= now;
+    out += now * kBlock;
+  }
+  return true;
+}
+// ext4::ReadFn over the logical partition: split at extent boundaries
+bool readVendor(void *ctx, uint64_t sector, uint32_t count, uint8_t *out) {
+  const Vendor *v = static_cast<const Vendor *>(ctx);
+  while (count) {
+    uint64_t phys, run;
+    if (!gm2_lp_map(v->ext, v->n, sector, &phys, &run)) return false;
+    const uint32_t now = run < count ? static_cast<uint32_t>(run) : count;
+    if (!readSuper(v, phys, now, out)) return false;
+    sector += now;
+    count -= now;
+    out += now * kBlock;
+  }
+  return true;
+}
+
+// a630_sqe.fw into dst (after its first dword, as kgsl _load_firmware). One log line. Returns the microcode bytes.
+uint32_t loadSqe(uint8_t *dst, uint32_t cap, uint32_t *hdr0, uint32_t *hdr1) {
+  char arg[4] = {};
+  const char slot = PE_parse_boot_argn("guamp-gpu-slot", arg, sizeof(arg)) && (arg[0] == 'a' || arg[0] == 'b')
+                        ? arg[0] : wifiprep::activeSlot();
+  char part[12] = {'v', 'e', 'n', 'd', 'o', 'r', '_', slot, 0};
+  Vendor *v = static_cast<Vendor *>(IOMallocZero(sizeof(Vendor)));
+  uint8_t *geo = static_cast<uint8_t *>(IOMallocZero(4096));
+  uint8_t *meta = nullptr, *scratch = nullptr, *file = nullptr;
+  ext4::Fs *fs = nullptr;
+  uint32_t maxSize = 0, slots = 0, size = 0, done = 0;
+  uint16_t major = 0, minor = 0;
+  uint64_t attr = 0;
+  const char *step = "out of memory";
+  int lp = GM2_LP_FORMAT, m = ext4::kErrIo, f = ext4::kErrIo;
+  ext4::Inode ino;
+  if (!v || !geo) goto out;
+  step = "super not found";
+  if (!gCard.online || !gCard.gate || !wifiprep::findPartition("super", &v->superFirst, &v->superBlocks, &attr)) goto out;
+  step = "geometry";
+  if (!readSuper(v, GM2_LP_GEOMETRY_OFFSET / kBlock, 4096 / kBlock, geo) || !gm2_lp_geometry(geo, &maxSize, &slots)) goto out;
+  step = "metadata";
+  meta = static_cast<uint8_t *>(IOMallocZero(maxSize));
+  if (!meta) goto out;
+  if (!readSuper(v, (GM2_LP_METADATA_OFFSET + (slot == 'b' && slots > 1 ? maxSize : 0)) / kBlock, maxSize / kBlock, meta)) goto out;
+  lp = gm2_lp_find(meta, maxSize, part, v->ext, &v->n, &major, &minor);
+  if (lp) goto out;
+  for (unsigned i = 0; i < v->n; i++) v->sectors += v->ext[i].sectors;
+  step = "ext4";
+  scratch = static_cast<uint8_t *>(IOMallocZero(ext4::kScratchBytes));
+  fs = static_cast<ext4::Fs *>(IOMallocZero(sizeof(ext4::Fs)));
+  if (!scratch || !fs) goto out;
+  m = fs->mount(readVendor, v, v->sectors, scratch);
+  if (m) goto out;
+  step = "file";
+  f = fs->lookupPath("/firmware/a630_sqe.fw", &ino);
+  if (!f && (!ino.isFile() || ino.size < 8 || ino.size > cap + 4u)) f = ext4::kErrRange;
+  if (f) goto out;
+  size = static_cast<uint32_t>(ino.size);
+  file = static_cast<uint8_t *>(IOMallocZero(size));
+  if (!file) { f = ext4::kErrIo; goto out; }
+  f = fs->readFile(ino, 0, file, size);
+  if (f) goto out;
+  *hdr0 = gm2_le32(file);
+  *hdr1 = gm2_le32(file + 4);
+  memcpy(dst, file + 4, size - 4);
+  done = size - 4;
+  step = "read";
+out:
+  IOLog("GuampGpu: M2 sqe %s: super LBA %llu (%llu sectors), lp geometry max %u slots %u, metadata v%u.%u %s, %u extents "
+        "%llu sectors, ext4 %s, /firmware/a630_sqe.fw %u bytes %s, header %08x %08x: %s\n", part,
+        static_cast<unsigned long long>(v ? v->superFirst : 0), static_cast<unsigned long long>(v ? v->superBlocks : 0),
+        maxSize, slots, major, minor, gm2_lp_err(lp), v ? v->n : 0, static_cast<unsigned long long>(v ? v->sectors : 0),
+        ext4::errorName(m), size, ext4::errorName(f), *hdr0, *hdr1, step);
+  if (file) IOFree(file, size);
+  if (fs) IOFree(fs, sizeof(ext4::Fs));
+  if (scratch) IOFree(scratch, ext4::kScratchBytes);
+  if (meta) IOFree(meta, maxSize);
+  if (geo) IOFree(geo, 4096);
+  if (v) IOFree(v, sizeof(Vendor));
+  return done;
+}
+
+void run(volatile uint8_t *gpu, unsigned level) {
+  gGpu = gpu;
+  gSmmu = mapPhysical(GM2_SMMU_PHYS, GM2_SMMU_SIZE);
+  if (!gGpu || !gSmmu) {
+    IOLog("GuampGpu: M2 RESULT smmu - sqe - cp - stop map failed\n");
+    return;
+  }
+  const gm2_io io = {nullptr, rd, wr, udelay, flush};
+  gm2_smmu s;
+  gm2_smmu_read(&io, 0, &s);
+  IOLog("GuampGpu: M2 smmu scr0 %08x idr0 %08x idr1 %08x gfsr %08x, %u SMRs, page %x cb base %x: sid 0 smr %d (%08x) "
+        "s2cr %08x cb %u cbar %08x sctlr %08x ttbr0 %llx fsr %08x far %llx: %s\n", s.scr0, s.idr0, s.idr1, s.gfsr,
+        s.smrs, s.pageSize, s.cbBase, s.smr, s.smrVal, s.s2cr, s.cb, s.cbar, s.sctlr,
+        static_cast<unsigned long long>(s.ttbr0), s.fsr, static_cast<unsigned long long>(s.far), gm2_path_name(s.path));
+  const bool identity = gm2_path_identity(s.path);
+
+  IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) |
+                       static_cast<IOOptionBits>(kIOMapInhibitCache), kMemBytes, 0xFFFFF000ULL);
+  uint8_t *virt = buf ? static_cast<uint8_t *>(buf->getBytesNoCopy()) : nullptr;
+  const uint64_t phys = buf ? buf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) : 0;
+  if (!virt || !phys || phys + kMemBytes > 0x100000000ULL) {
+    IOLog("GuampGpu: M2 RESULT smmu %s sqe - cp - stop dma buffer (phys %llx)\n", identity ? "identity" : "translated",
+          static_cast<unsigned long long>(phys));
+    if (buf) buf->release();
+    return;
+  }
+  memset(virt, 0, kMemBytes);
+  uint32_t hdr0 = 0, hdr1 = 0;
+  const uint32_t sqeBytes = loadSqe(virt, kSqeCap, &hdr0, &hdr1);
+  flush(nullptr, virt, kMemBytes);
+  const char *stop = !sqeBytes ? "sqe" : level < 2 ? nullptr : !identity && level != 3 ? "smmu" : nullptr;
+  if (level < 2 || stop) {
+    IOLog("GuampGpu: M2 RESULT smmu %s sqe %s (%u bytes, header %08x %08x) cp - %s%s\n", identity ? "identity" : "translated",
+          sqeBytes ? "ok" : "missing", sqeBytes, hdr0, hdr1, stop ? "stop " : "read only (guamp-gpu-m2=1)", stop ? stop : "");
+    buf->release();
+    return;
+  }
+  const gm2_mem mem = {reinterpret_cast<const uint32_t *>(virt), phys, reinterpret_cast<uint32_t *>(virt + kRingOff),
+                       phys + kRingOff, kRingDwords, reinterpret_cast<volatile uint32_t *>(virt + kScratchOff),
+                       phys + kScratchOff};
+  IOLog("GuampGpu: M2 cp start: sqe %llx (%u bytes) ring %llx (%u dwords) scratch %llx%s\n",
+        static_cast<unsigned long long>(phys), sqeBytes, static_cast<unsigned long long>(mem.ringPhys), kRingDwords,
+        static_cast<unsigned long long>(mem.scratchPhys), identity ? "" : " (forced, guamp-gpu-m2=3)");
+  gm2_cp c;
+  gm2_cp_start(&io, &mem, &c);
+  gm2_smmu_faults(&io, &s);
+  IOLog("GuampGpu: M2 cp reset read %08x, protect %08x, rb_cntl %08x, wptr %u rptr %u after %u us, rbbm status %08x->%08x "
+        "status3 %08x int %08x, cp hw_fault %08x int %08x status_1 %08x, scratch %08x->%08x, smmu gfsr %08x cb fsr %08x "
+        "far %llx\n", c.resetRead, c.protect, c.rbCntl, c.wptr, c.rptr, c.waitedUs, c.status0, c.status, c.status3,
+        c.rbbmInt, c.hwFault, c.cpInt, c.cpStatus1, c.scratchBefore, c.scratchAfter, s.gfsr, s.fsr,
+        static_cast<unsigned long long>(s.far));
+  IOLog("GuampGpu: M2 RESULT smmu %s sqe ok (%u bytes, header %08x %08x) cp %s me_init %s mem_write %s secvid %08x->%08x%s\n",
+        identity ? "identity" : "translated", sqeBytes, hdr0, hdr1, c.rptr == 0 ? "no fetch" : "fetching",
+        c.consumed ? "consumed" : "stuck", c.wrote ? "ok" : "none", c.secvidBefore, c.secvidAfter,
+        c.secvidAfter == 0 ? " (unsecured)" : " (write ignored)");
+  // buf stays allocated: the CP keeps the ring and microcode addresses
+}
+}  // namespace gpum2
 
 namespace rpm {   // GuampRpm.inc
 int set(uint32_t type, uint32_t id, uint32_t key, uint32_t value, unsigned which, unsigned timeoutMs);
@@ -99,7 +293,9 @@ const char *rpmVotes() {
 
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-gpu-m1");
-  unsigned delay = 0, off = 0, rpmOn = 0, relaxed = 0;
+  unsigned delay = 0, off = 0, rpmOn = 0, relaxed = 0, m2 = 0;
+  PE_parse_boot_argn("guamp-gpu-m2", &m2, sizeof(m2));
+  if (m2 > 3) m2 = 0;
   PE_parse_boot_argn("guamp-gpu-delay", &delay, sizeof(delay));
   PE_parse_boot_argn("guamp-gpu-relaxed", &relaxed, sizeof(relaxed));
   PE_parse_boot_argn("guamp-gpu-off", &off, sizeof(off));
@@ -127,6 +323,8 @@ void thread(void *, wait_result_t) {
     IOSleep(1500);
     gm_do_reads(&io, &st);
   }
+  if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2);
+  else if (m2) IOLog("GuampGpu: M2 RESULT smmu - sqe - cp - stop M1 (GPU %s)\n", st.gpuRead ? "counter stuck" : "not read");
   if (st.stop) IOLog("GuampGpu: stopped at %s, GPU block %s\n", st.stop, st.mapped ? "mapped, not read" : "not touched");
   if (off == 1) {
     const bool down = gm_power_down(&io, &st);

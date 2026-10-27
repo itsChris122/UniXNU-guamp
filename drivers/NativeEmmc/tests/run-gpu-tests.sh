@@ -11,11 +11,13 @@ echo "== kernel glue: arm64-apple-ios, -Werror, integer registers only"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 \
   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/gpu_glue_check.cpp" -o "$WORK/glue.o" && echo "glue: compiled" || rc=1
 echo "== no raw newline inside a string literal of the new kernel sources"
-(cd "$HERE/.." && python3 -I tests/check_literals.py GpuService.inc GuampGpuM1.h) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GpuService.inc GuampGpuM1.h GuampGpuM2.h) || rc=1
 echo "== host build (clang and gcc)"
 clang++ $FLAGS "$HERE/gpu_host.cpp" -o "$WORK/gpu_host" || exit 1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/gpu_host.cpp" -o "$WORK/gpu_host_gcc" || rc=1
 "$WORK/gpu_host" || rc=1
 [ -x "$WORK/gpu_host_gcc" ] && { "$WORK/gpu_host_gcc" >/dev/null || rc=1; }
+clang++ $FLAGS "$HERE/gpu_m2_host.cpp" -o "$WORK/gpu_m2_host" && "$WORK/gpu_m2_host" || rc=1
+g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/gpu_m2_host.cpp" -o "$WORK/gpu_m2_host_gcc" && "$WORK/gpu_m2_host_gcc" >/dev/null || rc=1
 echo "== result: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc
