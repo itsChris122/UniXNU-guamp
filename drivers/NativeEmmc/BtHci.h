@@ -175,4 +175,55 @@ static inline unsigned bt_hex(char *out, unsigned cap, const uint8_t *p, size_t 
     if (cap) out[o < cap ? o : cap - 1] = 0;
     return o;
 }
+// Transport mode (guamp-bt-shim=1): the raw controller stream goes to the shim unchanged; this scanner only follows the
+// H4 packet boundaries (ACL/SCO/event/ISO headers) so that the IBS bytes between packets (WAKE_IND 0xFD, WAKE_ACK 0xFC,
+// SLEEP_IND 0xFE) are counted and payload bytes with those values are not. Bytes that cannot start a packet count as
+// noise and are skipped one at a time (as the shim's reassembly does).
+struct bt_ibs_scan {
+    uint8_t type;
+    uint8_t hdr[4];
+    unsigned hdrHave, hdrNeed;
+    size_t remaining;
+    int inPkt;
+    uint32_t wake, ack, sleep, packets, noise;
+    uint8_t state;        // controller after the last IBS byte or packet start, in stream order: 0 unknown, 1 awake, 2 asleep
+};
+static inline unsigned bt_ibs_header(uint8_t type) {
+    return type == BT_H4_ACL ? 4u : type == BT_H4_SCO ? 3u : type == BT_H4_EVT ? 2u : type == 0x05 ? 4u : 0u;
+}
+static inline size_t bt_ibs_payload(uint8_t type, const uint8_t *h) {
+    if (type == BT_H4_ACL) return (size_t)(h[2] | h[3] << 8);
+    if (type == BT_H4_SCO) return h[2];
+    if (type == BT_H4_EVT) return h[1];
+    if (type == 0x05) return (size_t)((h[2] | h[3] << 8) & 0x3fff);
+    return 0;
+}
+// Feeds n bytes; returns the WAKE_IND count of these bytes (each needs a WAKE_ACK from the host).
+static inline unsigned bt_ibs_scan_feed(struct bt_ibs_scan *s, const uint8_t *p, size_t n) {
+    unsigned wakes = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t b = p[i];
+        if (!s->inPkt) {
+            const unsigned h = bt_ibs_header(b);
+            if (h) { s->type = b; s->hdrHave = 0; s->hdrNeed = h; s->inPkt = 1; s->state = 1; }
+            else if (b == BT_IBS_WAKE_IND) { s->wake += 1; wakes += 1; s->state = 1; }
+            else if (b == BT_IBS_WAKE_ACK) { s->ack += 1; s->state = 1; }
+            else if (b == BT_IBS_SLEEP_IND) { s->sleep += 1; s->state = 2; }
+            else s->noise += 1;
+            continue;
+        }
+        if (s->hdrHave < s->hdrNeed) {
+            s->hdr[s->hdrHave] = b;
+            s->hdrHave += 1;
+            if (s->hdrHave == s->hdrNeed) {
+                s->remaining = bt_ibs_payload(s->type, s->hdr);
+                if (!s->remaining) { s->inPkt = 0; s->packets += 1; }
+            }
+            continue;
+        }
+        s->remaining -= 1;
+        if (!s->remaining) { s->inPkt = 0; s->packets += 1; }
+    }
+    return wakes;
+}
 #endif

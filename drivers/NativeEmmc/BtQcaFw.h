@@ -206,4 +206,30 @@ static inline int bt_bd_addr_eq(const uint8_t a[6], const uint8_t b[6]) {
     for (unsigned k = 0; k < 6; ++k) if (a[k] != b[k]) return 0;
     return 1;
 }
+// guamp-bt-addr=aa:bb:cc:dd:ee:ff (text order, most significant first) into the little-endian HCI order of a[6].
+static inline int bt_bd_addr_parse(const char *s, uint8_t a[6]) {
+    for (unsigned k = 0; k < 6; ++k) {
+        unsigned v = 0;
+        for (unsigned d = 0; d < 2; ++d) {
+            const char c = s[3 * k + d];
+            const int x = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (x < 0) return -1;
+            v = v * 16 + (unsigned)x;
+        }
+        if (k < 5 && s[3 * k + 2] != ':' && s[3 * k + 2] != '-') return -1;
+        a[5 - k] = (uint8_t)v;
+    }
+    return s[17] ? -1 : 0;
+}
+// For logs: only the last two bytes ("xx:xx:xx:xx:ee:ff").
+static inline void bt_bd_addr_masked(const uint8_t a[6], char out[18]) {
+    bt_bd_addr_text(a, out);
+    for (unsigned k = 0; k < 12; ++k) if (out[k] != ':') out[k] = 'x';
+}
+// btqca.c qca_set_bdaddr (WCN399x/WCN3950): EDL_WRITE_BD_ADDR 0xFC14 with the baswap()ed address, i.e. the six bytes in
+// text order; answered by a Command Complete.
+#define BT_OP_QCA_WRITE_BD_ADDR 0xfc14
+static inline void bt_qca_bdaddr_params(const uint8_t a[6], uint8_t out[6]) {
+    for (unsigned k = 0; k < 6; ++k) out[k] = a[5 - k];
+}
 #endif

@@ -6,5 +6,27 @@ void IODelay(unsigned);
 void IOSleep(unsigned);
 }
 volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
+// The transport (step 5) uses the shim interface of GuampBtSerial.inc (checked by run-bt-shim-tests.sh) and a few IOKit
+// calls: stand-ins with the kernel signatures.
+#define GUAMP_BT_HOST_CHECK 1
+#include "../GuampBtShim.h"
+namespace btshim {
+extern bool gEnabled;
+void start();
+void attach(const bts_link *link);
+void controllerBytes(const uint8_t *data, size_t len);
+void controllerReset();
+}
+IOLock *IOLockAlloc(void);
+class OSObject { public: void release() const; };
+class OSData : public OSObject { public: static OSData *withBytes(const void *bytes, unsigned numBytes); };
+class IORegistryPlane;
+extern const IORegistryPlane *gIODTPlane;
+class IORegistryEntry : public OSObject {
+public:
+  static IORegistryEntry *fromPath(const char *path, const IORegistryPlane *plane = nullptr, char *residualPath = nullptr,
+                                   int *residualLength = nullptr, IORegistryEntry *fromEntry = nullptr);
+  bool setProperty(const char *aKey, OSObject *anObject);
+};
 #include "../BtService.inc"
 void use() { bt::start(); }

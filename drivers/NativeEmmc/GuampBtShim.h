@@ -287,9 +287,9 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
         if (plen >= 6) {
             bts_copy(s->bdaddr, p, 6); s->bdaddrSet = true;
             if (s->link.set_bdaddr) s->link.set_bdaddr(s->link.ctx, s->bdaddr);
-            if (s->id.translateBdaddr && s->link.tx) {   // same little-endian bdaddr_t, Linux qca_set_bdaddr
+            if (s->id.translateBdaddr && s->link.tx) {   // Linux qca_set_bdaddr: baswap of the little-endian bdaddr_t
                 uint8_t q[10] = {BTS_H4_CMD, (uint8_t)BTS_QCA_EDL_WRITE_BD_ADDR, (uint8_t)(BTS_QCA_EDL_WRITE_BD_ADDR >> 8), 6};
-                bts_copy(q + 4, s->bdaddr, 6);
+                for (size_t i = 0; i < 6; i = i + 1) q[4 + i] = s->bdaddr[5 - i];
                 if (!s->link.tx(s->link.ctx, q, sizeof q)) s->internalOpcode = BTS_QCA_EDL_WRITE_BD_ADDR;
                 else s->st.txErrors = s->st.txErrors + 1;
             }

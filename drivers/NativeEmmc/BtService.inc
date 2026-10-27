@@ -44,6 +44,9 @@
 #include "BtQcaFw.h"
 #include "GuampExt4.inc"
 
+#ifndef GUAMP_BT_HOST_CHECK
+#include <IOKit/IODeviceTreeSupport.h>   // gIODTPlane (guamp-bt-addr)
+#endif
 namespace pmic {
 extern volatile int gArbReady;
 extern struct spmi_arb gArb;
@@ -85,6 +88,9 @@ unsigned gIbsSleeps, gIbsAcksRx, gIbsWakeSent;
 uint8_t gCap[96];
 size_t gCapLen;
 volatile uint32_t gStep;
+// guamp-bt-addr=aa:bb:cc:dd:ee:ff: the BD address written after the NVM (EDL_WRITE_BD_ADDR) and into the ADT nodes.
+uint8_t gAddr[6];
+bool gHaveAddr;
 
 // --- step 1: supplies ---------------------------------------------------------------------------------------------
 struct Rail { int err, apid; unsigned owner; uint8_t type, sub, st, lb, ub, mode, en; };
@@ -772,11 +778,20 @@ bool m1() {
 
   // qca_check_bdaddr: an address equal to the NVM's tag 2 is a placeholder (Linux then needs local-bd-address from the
   // device tree, HCI_QUIRK_USE_BDADDR_PROPERTY). Nothing is written here.
+  if (gHaveAddr) {
+    uint8_t params[6];
+    bt_qca_bdaddr_params(gAddr, params);
+    const int wres = command("EDL_WRITE_BD_ADDR", BT_OP_QCA_WRITE_BD_ADDR, params, 6, 0, 1000, &ev, false, true);
+    const uint8_t ws = !wres && ev.len > 3 ? ev.p[3] : 0xff;
+    char masked[18];
+    bt_bd_addr_masked(gAddr, masked);
+    IOLog("GuampBt: EDL_WRITE_BD_ADDR %s: %s (status %02x)\n", masked, wres ? "no reply" : ws ? "error" : "ok", ws);
+  }
   uint8_t addr[6] = {}, status = 0xff;
   const int br = command("Read_BD_ADDR", BT_OP_READ_BD_ADDR, nullptr, 0, 0, 1000, &ev, false, true);
   const int bd = br ? -1 : bt_decode_bd_addr(&ev, addr, &status);
   char text[18];
-  bt_bd_addr_text(addr, text);
+  bt_bd_addr_masked(addr, text);   // never the whole address in the log
   if (bd) {
     gBdaddr = br == GENI_ERR_TIMEOUT ? "timeout" : "error";
     IOLog("GuampBt: Read_BD_ADDR %s (status %02x)\n", gBdaddr, status);
@@ -787,15 +802,146 @@ bool m1() {
     gBdaddr = "nvm-default";
     IOLog("GuampBt: BD address %s = NVM default: placeholder, BD address set needed (Linux: local-bd-address from DT; none "
           "invented)\n", text);
+  } else if (gHaveAddr && bt_bd_addr_eq(addr, gAddr)) {
+    gBdaddr = "guamp-bt-addr";
+    IOLog("GuampBt: BD address %s = guamp-bt-addr\n", text);
   } else {
     gBdaddr = "set";
-    IOLog("GuampBt: BD address %s (not the NVM default)\n", text);
+    IOLog("GuampBt: BD address %s (not the NVM default)%s\n", text, gHaveAddr ? ", NOT guamp-bt-addr" : "");
   }
   return true;
 }
 
+// --- step 5: transport (guamp-bt=2 guamp-bt-shim=1, after M1) ---------------------------------------------------
+// The controller becomes the H4 transport of the Bluetooth M2 shim (GuampBtSerial.inc / GuampBtShim.h): this thread
+// moves every UART byte to btshim::controllerBytes, link.tx (bluetoothd's write, through the shim) sends whole H4
+// packets. gUartLock serializes the UART between the two; bytes read while link.tx waits for an IBS WAKE_ACK go to
+// gPend and reach the shim from this thread (the shim lock is held around link.tx). The IBS bytes between packets are
+// tracked with bt_ibs_scan: each controller WAKE_IND gets a WAKE_ACK, a SLEEP_IND marks it asleep until it speaks.
+// BlueTool's /dev/btreset (release after assert) and /dev/btpoweroff (on again) re-run M0+M1 here, since a real reset
+// drops the rampatch (guamp-bt-shim-reset=0: ignored); /dev/btpoweroff sends the power-off pulse.
+IOLock *gUartLock;
+uint8_t gPend[2048];
+size_t gPendLen;
+bt_ibs_scan gScan;
+volatile bool gReinit, gPowerOff, gResetHeld, gOff;
+uint32_t gTxPkts, gTxErr, gRxBytes, gReinits;
+
+// Under gUartLock: new UART bytes into dst (cap), IBS bookkeeping (WAKE_ACK answers). Returns the bytes read.
+size_t transportRead(uint8_t *dst, size_t cap) {
+  const size_t n = geni_uart_read(&gUart, dst, cap);
+  if (!n) return 0;
+  unsigned wakes = bt_ibs_scan_feed(&gScan, dst, n);
+  for (; wakes; --wakes) {
+    const uint8_t a = BT_IBS_WAKE_ACK;
+    if (!geni_uart_write(&gUart, &a, 1, 20000)) gIbsAcks = gIbsAcks + 1;
+  }
+  // In stream order: an event followed by SLEEP_IND in the same read leaves the controller asleep (not awake).
+  if (gScan.state) gAsleep = gScan.state == 2;
+  gRxBytes += static_cast<uint32_t>(n);
+  return n;
+}
+
+int linkTx(void *, const uint8_t *pkt, size_t len) {
+  if (gOff) return -1;
+  IOLockLock(gUartLock);
+  if (gIbs && gAsleep) {
+    const uint8_t ind = BT_IBS_WAKE_IND;
+    geni_uart_write(&gUart, &ind, 1, 20000);
+    gIbsWakeSent = gIbsWakeSent + 1;
+    for (unsigned ms = 0; ms < 30 && gAsleep; ++ms) {
+      const uint32_t acks = gScan.ack;
+      if (gPendLen < sizeof gPend) gPendLen += transportRead(gPend + gPendLen, sizeof gPend - gPendLen);
+      if (gScan.ack != acks) gAsleep = false;
+      if (gAsleep) IOSleep(1);
+    }
+  }
+  const int r = geni_uart_write(&gUart, pkt, len, 200000);
+  IOLockUnlock(gUartLock);
+  gTxPkts = gTxPkts + 1;
+  if (r) gTxErr = gTxErr + 1;
+  return r ? -1 : 0;
+}
+bool gResetEnabled = true;
+void linkReset(void *, bool asserted) {
+  if (asserted) { gResetHeld = true; return; }
+  if (gResetHeld && gResetEnabled) gReinit = true;
+  gResetHeld = false;
+}
+void linkPower(void *, bool off) {
+  if (off) gPowerOff = true;
+  else if (gOff && gResetEnabled) gReinit = true;
+}
+
+void transport() {
+  gUartLock = IOLockAlloc();
+  if (!gUartLock) { IOLog("GuampBt: transport: no lock\n"); return; }
+  unsigned rs = 1;
+  if (PE_parse_boot_argn("guamp-bt-shim-reset", &rs, sizeof(rs))) gResetEnabled = rs != 0;
+  bts_link link = {};
+  link.tx = linkTx;
+  link.reset = linkReset;
+  link.power = linkPower;
+  btshim::attach(&link);
+  IOLog("GuampBt: transport on at %u baud (IBS %u), reset re-download %u\n", gBaudRate, gIbs ? 1u : 0u,
+        gResetEnabled ? 1u : 0u);
+  static uint8_t buf[2048];
+  uint64_t lastLog = 0;
+  for (;;) {
+    if (gPowerOff) {
+      IOLockLock(gUartLock);
+      gPowerOff = false;
+      geni_uart_rx_stop(&gUart, 2000);
+      const int r = pulse(BT_QCA_POWEROFF_PULSE, 2400);
+      gOff = true;
+      IOLockUnlock(gUartLock);
+      btshim::controllerReset();   // a packet cut by the power-off must not prefix the next one
+      IOLog("GuampBt: transport: power off (btpoweroff) pulse rc %d\n", r);
+    }
+    if (gReinit) {
+      IOLockLock(gUartLock);
+      gReinit = false;
+      gRxLen = gRxPos = 0;
+      gPendLen = 0;
+      gIbs = false;
+      gAsleep = false;
+      gScan = bt_ibs_scan{};
+      gReinits = gReinits + 1;
+      hci();
+      const bool ok = m1();
+      gOff = !ok;
+      IOLockUnlock(gUartLock);
+      btshim::controllerReset();   // bytes M1 consumed never reached the shim: drop its half packet
+      IOLog("GuampBt: transport: controller re-initialised (%u): M1 %s, BD address %s\n", gReinits, ok ? "ok" : "FAILED",
+            gBdaddr);
+    }
+    size_t n = 0;
+    if (!gOff) {
+      IOLockLock(gUartLock);
+      if (gPendLen) {
+        for (size_t i = 0; i < gPendLen; ++i) buf[i] = gPend[i];
+        n = gPendLen;
+        gPendLen = 0;
+      }
+      n += transportRead(buf + n, sizeof buf - n);
+      IOLockUnlock(gUartLock);
+    }
+    if (n) btshim::controllerBytes(buf, n);
+    else IOSleep(2);
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    if (now - lastLog > 60000000000ULL) {
+      lastLog = now;
+      IOLog("GuampBt: transport: tx %u packets (%u errors), rx %u bytes (%u packets, %u noise), IBS wake rx %u ack tx %u "
+            "sleep rx %u wake tx %u, %s, re-inits %u\n", gTxPkts, gTxErr, gRxBytes, gScan.packets, gScan.noise, gScan.wake,
+            gIbsAcks, gScan.sleep, gIbsWakeSent, gOff ? "off" : gAsleep ? "asleep" : "awake", gReinits);
+    }
+  }
+}
+
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-bt");
+  btshim::start();                                     // guamp-bt-shim=1: /dev/cu.bluetooth & co. (devfs is up by now)
   unsigned mode = 1, delay = 0;
   PE_parse_boot_argn("guamp-bt", &mode, sizeof(mode));
   PE_parse_boot_argn("guamp-bt-delay", &delay, sizeof(delay));
@@ -813,6 +959,13 @@ void thread(void *, wait_result_t) {
       uartState = "up";
       hci();
       const bool m1ok = mode == 2 && m1();
+      if (m1ok && btshim::gEnabled) {
+        IOLog("GuampBt: RESULT rails %s uart %s reset %s version %s qca %s download %s baud %u %s version after %s bdaddr %s "
+              "controller on (transport)\n", railState, uartState, gReset, gVersion, gQca, gDownload, gBaudRate, gBaud, gAfter,
+              gBdaddr);
+        transport();                                     // does not return while the transport runs
+        return;
+      }
       if (!keepSet) keep = m1ok ? 1u : 0u;               // =2: a patched controller stays on; =1 and failures: off
       geni_uart_rx_stop(&gUart, 2000);
       unsigned pulses = 1;
@@ -832,7 +985,36 @@ void thread(void *, wait_result_t) {
         on ? "on" : "off");
 }
 
+// guamp-bt-addr: parsed at start, and published in the ADT nodes iOS reads (ADT-CAPACITA-BT.md: libMobileGestalt takes
+// /chosen/mac-address-bluetooth0, the bluetooth node carries local-mac-address) before bluetoothd and MobileGestalt run.
+// Only the nodes that exist are changed; six bytes in text order, as the Apple ADTs hold them.
+void publishAddress() {
+  char text[24] = {};
+  if (!PE_parse_boot_argn("guamp-bt-addr", text, sizeof(text))) return;
+  if (bt_bd_addr_parse(text, gAddr)) { IOLog("GuampBt: guamp-bt-addr not aa:bb:cc:dd:ee:ff, ignored\n"); return; }
+  gHaveAddr = true;
+  uint8_t be[6];
+  bt_qca_bdaddr_params(gAddr, be);
+  static const char *const kNodes[2][2] = {{"/arm-io/uart1/bluetooth", "local-mac-address"},
+                                           {"/chosen", "mac-address-bluetooth0"}};
+  unsigned done = 0;
+  for (unsigned i = 0; i < 2; ++i) {
+    IORegistryEntry *e = IORegistryEntry::fromPath(kNodes[i][0], gIODTPlane);
+    if (!e) continue;
+    OSData *d = OSData::withBytes(be, sizeof be);
+    if (d) {
+      if (e->setProperty(kNodes[i][1], d)) done = done + 1;
+      d->release();
+    }
+    e->release();
+  }
+  char masked[18];
+  bt_bd_addr_masked(gAddr, masked);
+  IOLog("GuampBt: guamp-bt-addr %s: %u/2 ADT properties set\n", masked, done);
+}
+
 void start() {
+  publishAddress();
   unsigned on = 0;
   if (!PE_parse_boot_argn("guamp-bt", &on, sizeof(on)) || (on != 1 && on != 2)) return;
   thread_t t = nullptr;

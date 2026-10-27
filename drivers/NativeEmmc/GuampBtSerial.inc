@@ -226,6 +226,14 @@ void controllerBytes(const uint8_t *data, size_t len) {
   if (more) selwakeup(&gSel);
 }
 
+// The controller was reset or powered off (BtService.inc transport): forget a half-reassembled controller packet.
+void controllerReset() {
+  if (!gEnabled) return;
+  IOLockLock(gLock);
+  bts_h4_reset(&gShim->ctrl);
+  IOLockUnlock(gLock);
+}
+
 void start() {
   unsigned on = 0;
   PE_parse_boot_argn("guamp-bt-shim", &on, sizeof(on));

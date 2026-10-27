@@ -73,6 +73,17 @@ struct Mounted {
 static bt_event ev(const uint8_t *pkt) { bt_event e; e.code = pkt[1]; e.len = pkt[2]; e.p = pkt + 3; return e; }
 
 static void testUnit() {
+  {  // guamp-bt-addr: parse (text -> HCI little-endian), masked log text, EDL_WRITE_BD_ADDR parameters (baswap)
+    uint8_t a[6] = {}, p6[6] = {};
+    char m[18];
+    CHECK(bt_bd_addr_parse("00:11:22:Aa:bB:cc", a) == 0 && a[0] == 0xcc && a[1] == 0xbb && a[5] == 0x00, "");
+    bt_bd_addr_masked(a, m);
+    CHECK(!strcmp(m, "xx:xx:xx:xx:bb:cc"), "%s", m);
+    bt_qca_bdaddr_params(a, p6);
+    CHECK(p6[0] == 0x00 && p6[3] == 0xaa && p6[5] == 0xcc, "");
+    CHECK(bt_bd_addr_parse("00:11:22:33:44", a) == -1 && bt_bd_addr_parse("00:11:22:33:44:5g", a) == -1, "");
+    CHECK(bt_bd_addr_parse("00:11:22:33:44:55:", a) == -1 && bt_bd_addr_parse("00-11-22-33-44-55", a) == 0, "");
+  }
   // enum qca_baudrate (btqca.h): 3000000 = 14, 3200000 = 17 (highest qca_set_baudrate accepts), 3500000 refused
   CHECK(bt_qca_baud_code(115200) == 0 && bt_qca_baud_code(230400) == 5 && bt_qca_baud_code(921600) == 10, "");
   CHECK(bt_qca_baud_code(3000000) == 0x0e && bt_qca_baud_code(3200000) == 0x11 && bt_qca_baud_code(2000000) == 13, "");

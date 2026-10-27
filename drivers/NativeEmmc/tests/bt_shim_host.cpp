@@ -6,6 +6,7 @@
 #include <string.h>
 #include <vector>
 #include "../GuampBtShim.h"
+#include "../BtHci.h"      // bt_ibs_scan: the transport side of BtService.inc
 
 static unsigned gFail = 0, gChecks = 0;
 #define CHECK(c) do { gChecks = gChecks + 1; if (!(c)) { gFail = gFail + 1; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -148,7 +149,7 @@ static void testShim() {
     s.id.translateBdaddr = true;
     l.sent.clear();
     bts_shim_host_write(&s, bd.data(), bd.size());
-    CHECK(l.sent.size() == 1 && l.sent[0] == pktCmd(0xfc14, {1, 2, 3, 4, 5, 6}));
+    CHECK(l.sent.size() == 1 && l.sent[0] == pktCmd(0xfc14, {6, 5, 4, 3, 2, 1}));   // qca_set_bdaddr baswap
     CHECK(drain(&s) == cc(0xfc01, {0}));
     Bytes qv = pktEvt(0xff, {0x00, 0x14}), qcc = cc(0xfc14, {0}), other = cc(0x0c03, {0});
     for (auto *q : {&qv, &qcc, &qcc, &other}) bts_shim_ctrl_input(&s, q->data(), q->size());
@@ -275,6 +276,101 @@ static void testRandom() {
            s.st.hostPkts, s.st.ctrlPkts, s.host.skipped, s.ctrl.skipped, s.host.oversize, s.ctrl.oversize);
 }
 
+// End to end as on the phone: a fake bluetoothd writes to the shim, the shim's link goes to a fake WCN3950 (Qualcomm
+// identity), the controller's byte stream passes the transport scanner of BtService.inc (IBS bytes between packets,
+// payload bytes with IBS values) into bts_shim_ctrl_input, and bluetoothd reads a BCM4355C0.
+struct FakeQca { std::vector<Bytes> got; Bytes out; };
+static int qcaTx(void *ctx, const uint8_t *p, size_t n) {
+    FakeQca *q = (FakeQca *)ctx;
+    q->got.push_back(Bytes(p, p + n));
+    if (n < 4 || p[0] != BTS_H4_CMD) return 0;
+    const uint16_t op = (uint16_t)(p[1] | p[2] << 8);
+    Bytes reply;
+    if (op == BTS_OP_READ_LOCAL_VERSION) reply = cc(op, {0x00, 0x09, 0x00, 0x00, 0x09, 0x1d, 0x00, 0x08, 0x01});   // Qualcomm 0x1d
+    else if (op == BTS_OP_READ_LOCAL_NAME) {
+        Bytes r(1 + BTS_NAME_LEN, 0);
+        memcpy(r.data() + 1, "WCN3950", 7);
+        reply = cc(op, r);
+    } else reply = cc(op, {0x00});
+    q->out.push_back(BT_IBS_SLEEP_IND);                 // IBS bytes before the answer
+    q->out.push_back(BT_IBS_WAKE_IND);
+    q->out.insert(q->out.end(), reply.begin(), reply.end());
+    return 0;
+}
+static void testEndToEnd() {
+    FakeQca q;
+    bts_link l = {};
+    l.ctx = &q;
+    l.tx = qcaTx;
+    bts_shim *s = (bts_shim *)calloc(1, sizeof(bts_shim));
+    bts_shim_init(s, &l, nullptr);
+    bt_ibs_scan scan = {};
+    unsigned wakeAcks = 0;
+    auto pump = [&](size_t chunk) {                      // the transport loop: UART reads of chunk bytes
+        for (size_t i = 0; i < q.out.size(); i += chunk) {
+            const size_t n = q.out.size() - i < chunk ? q.out.size() - i : chunk;
+            wakeAcks += bt_ibs_scan_feed(&scan, q.out.data() + i, n);
+            bts_shim_ctrl_input(s, q.out.data() + i, n);
+        }
+        q.out.clear();
+    };
+    Bytes cmd = pktCmd(BTS_OP_READ_LOCAL_VERSION, {});
+    bts_shim_host_write(s, cmd.data(), cmd.size());
+    CHECK(q.got.size() == 1 && q.got[0] == cmd);
+    pump(3);
+    Bytes ev = drain(s);
+    CHECK(ev.size() == 3 + 3 + 9 && ev[0] == BTS_H4_EVT && ev[1] == BTS_EVT_CMD_COMPLETE);
+    if (ev.size() == 15) {
+        CHECK(bts_le16(&ev[4]) == BTS_OP_READ_LOCAL_VERSION && ev[6] == 0);
+        CHECK(bts_le16(&ev[11]) == 15 && bts_le16(&ev[13]) == 0x6103);
+    }
+    CHECK(wakeAcks == 1 && scan.sleep == 1 && scan.packets == 1 && scan.noise == 0);
+    cmd = pktCmd(BTS_OP_READ_LOCAL_NAME, {});
+    bts_shim_host_write(s, cmd.data(), cmd.size());
+    pump(64);
+    ev = drain(s);
+    CHECK(ev.size() == 3 + 3 + 1 + BTS_NAME_LEN && !memcmp(ev.data() + 7, "BCM4355C0", 10));
+    CHECK(wakeAcks == 2 && scan.packets == 2);
+    // An ACL packet whose payload holds IBS byte values: not counted, delivered unchanged.
+    Bytes acl = {BTS_H4_ACL, 0x01, 0x20, 0x04, 0x00, BT_IBS_WAKE_IND, BT_IBS_SLEEP_IND, BT_IBS_WAKE_ACK, 0x00};
+    q.out = acl;
+    q.out.push_back(BT_IBS_WAKE_ACK);
+    pump(2);
+    ev = drain(s);
+    CHECK(ev == acl);
+    CHECK(wakeAcks == 2 && scan.sleep == 2 && scan.ack == 1 && scan.packets == 3 && scan.noise == 0);
+    free(s);
+}
+
+
+// Review fixes: IBS state in stream order, and a controller reset dropping a half packet.
+static void testReview() {
+    bt_ibs_scan sc = {};
+    Bytes ev = cc(0x0c03, {0});
+    Bytes a = ev; a.push_back(BT_IBS_SLEEP_IND);            // event then SLEEP_IND in one read: asleep
+    bt_ibs_scan_feed(&sc, a.data(), a.size());
+    CHECK(sc.state == 2 && sc.packets == 1 && sc.sleep == 1);
+    Bytes b = {BT_IBS_SLEEP_IND}; b.insert(b.end(), ev.begin(), ev.end());   // SLEEP_IND then event: awake
+    bt_ibs_scan_feed(&sc, b.data(), b.size());
+    CHECK(sc.state == 1);
+    Bytes noise = {0x00, 0x77};                              // noise leaves the state as it was
+    bt_ibs_scan_feed(&sc, noise.data(), noise.size());
+    CHECK(sc.state == 1);
+    bt_ibs_scan fresh = {};
+    bt_ibs_scan_feed(&fresh, noise.data(), noise.size());
+    CHECK(fresh.state == 0);                                 // unknown: the transport keeps M1's view
+    // Half a Read Local Version reply, then the controller is re-initialised (M1 consumes its bytes): without the
+    // reset the next event would be appended to the stale header and bluetoothd would read garbage.
+    static bts_shim s; bts_shim_init(&s, nullptr, nullptr);
+    Bytes half = {BTS_H4_EVT, BTS_EVT_CMD_COMPLETE, 12, 1, 0x01};
+    bts_shim_ctrl_input(&s, half.data(), half.size());
+    bts_h4_reset(&s.ctrl);                                   // btshim::controllerReset()
+    Bytes r = cc(0x0c03, {0});
+    bts_shim_ctrl_input(&s, r.data(), r.size());
+    uint8_t out[64]; const size_t n = bts_shim_read(&s, out, sizeof out);
+    CHECK(n == r.size() && !memcmp(out, r.data(), n));
+}
+
 int main() {
     testReassembly();
     testEncoders();
@@ -283,6 +379,8 @@ int main() {
     testRewrite();
     testTty();
     testRandom();
+    testEndToEnd();
+    testReview();
     printf("bt_shim_host: %u checks, %u failed\n", gChecks, gFail);
     return gFail ? 1 : 0;
 }
