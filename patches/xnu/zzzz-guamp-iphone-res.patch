@@ -1,0 +1,232 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2962759..a482dc3 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7485,14 +7485,218 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		at += (packed + 7) & ~7ULL;
+ 	}
+ }
++/* guamp: iPhone-only resource files (XS 17.7 21H16) shown to the iPadOS 17.7.11 processes through the same read-only union bindfs
++ * views as the GPU addon (boot-arg guamp-iphone-res=1). The files come from the boot payload's addon (scripts/make-guamp-iphone-res.py,
++ * names iphone-res/<Framework>.framework/<file>) and are written into Data's /private/var/ngpu by native_gpu_addon_install; once
++ * written they stay in Data, so later boots need no addon. Each Data directory holds only names its sealed directory lacks, directly
++ * in its root: the union falls through to the covered directory only for a name the upper directory does not have, so Info.plist,
++ * _CodeSignature and the .lproj directories always come from the sealed volume. Both frameworks live on the root system volume
++ * (not in the SystemOS cryptex). Never panics: a missing directory or a refused mount only records its status (stage 5 = mounted,
++ * a sealed name and the new name both visible). */
++volatile int native_guamp_iphone_res_stage[2] = {0, 0};
++volatile int native_guamp_iphone_res_status[2] = {-1, -1};
++static const struct {
++	const char *source;
++	const char *point;
++	const char *visible;
++	const char *own;
++} native_guamp_iphone_res[] = {
++	{"/private/var/ngpu/iphone-res/TextInputUI.framework", "/System/Library/PrivateFrameworks/TextInputUI.framework",
++	 "/System/Library/PrivateFrameworks/TextInputUI.framework/KBLayouts_iPad.dat",
++	 "/System/Library/PrivateFrameworks/TextInputUI.framework/KBLayouts_iPhone.dat"},
++	{"/private/var/ngpu/iphone-res/ControlCenterUI.framework", "/System/Library/PrivateFrameworks/ControlCenterUI.framework",
++	 "/System/Library/PrivateFrameworks/ControlCenterUI.framework/DefaultModuleSettings~ipad.plist",
++	 "/System/Library/PrivateFrameworks/ControlCenterUI.framework/DefaultModuleSettings~iphone.plist"},
++};
++static int
++native_guamp_iphone_res_enabled(void)
++{
++	uint32_t enabled = 0;
++	return PE_parse_boot_argn("guamp-iphone-res", &enabled, sizeof(enabled)) && enabled == 1;
++}
++/* The addon install creates directories only below /private/var/ngpu; a guamp Data volume does not have that one. */
++static void
++native_guamp_iphone_res_ngpu(proc_t p, user_addr_t scratch)
++{
++	static const char ngpu[] = "/private/var/ngpu";
++	struct mkdir_args request = {.path = scratch + 0xc00, .mode = 0755};
++	int32_t result = 0;
++	int error = copyout(ngpu, request.path, sizeof(ngpu));
++	if (!error) {
++		error = mkdir(p, &request, &result);
++	}
++	if (error && error != EEXIST) {
++		printf("guamp-iphone-res: mkdir %s: error %d\n", ngpu, error);
++	}
++}
++static void
++native_guamp_iphone_res_mount(proc_t p, user_addr_t scratch)
++{
++	printf("guamp-iphone-res: addon files %d, written %d, same %d, failed %d (last error %d)\n", native_gpu_addon_files,
++	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error);
++	for (size_t i = 0; i < sizeof(native_guamp_iphone_res) / sizeof(native_guamp_iphone_res[0]); i++) {
++		native_gpu_addon_mount(p, scratch, 0x400, native_guamp_iphone_res[i].source, strlen(native_guamp_iphone_res[i].source) + 1,
++		    native_guamp_iphone_res[i].point, strlen(native_guamp_iphone_res[i].point) + 1, native_guamp_iphone_res[i].visible,
++		    native_guamp_iphone_res[i].own, &native_guamp_iphone_res_stage[i], &native_guamp_iphone_res_status[i]);
++		printf("guamp-iphone-res: %s stage %d status %d\n", native_guamp_iphone_res[i].point, native_guamp_iphone_res_stage[i],
++		    native_guamp_iphone_res_status[i]);
++	}
++}
++/* guamp-cc-reset=N (N > 0, owner request): one-shot removal of Control Center's saved module layout, Data's
++ * /private/var/mobile/Library/ControlCenter/ModuleConfiguration*.plist, so Control Center rebuilds it from its defaults (with
++ * guamp-iphone-res=1 the iPhone ones). /private/var/db/guamp-cc-reset-N.done marks cycle N as done: the argument can stay set
++ * without wiping a layout the user changes later; a new N runs it once more. Regular files with that name pattern only. */
++#include <sys/dirent.h>
++#define NATIVE_GUAMP_CC_RESET_MAX 8
++uint32_t native_guamp_cc_reset_cycle, native_guamp_cc_reset_deleted, native_guamp_cc_reset_done;
++int native_guamp_cc_reset_error;
++static int
++native_guamp_cc_reset_match(const char *name)
++{
++	static const char prefix[] = "ModuleConfiguration", suffix[] = ".plist";
++	size_t length = strlen(name), p_length = sizeof(prefix) - 1, s_length = sizeof(suffix) - 1;
++	return length >= p_length + s_length && length < 64 && !strncmp(name, prefix, p_length) &&
++	       !strcmp(name + length - s_length, suffix);
++}
++static void
++native_guamp_cc_reset(proc_t p, user_addr_t scratch)
++{
++	uint32_t cycle = 0;
++	if (!PE_parse_boot_argn("guamp-cc-reset", &cycle, sizeof(cycle)) || !cycle) {
++		return;
++	}
++	native_guamp_cc_reset_cycle = cycle;
++	vfs_context_t ctx = vfs_context_current();
++	char marker[96];
++	snprintf(marker, sizeof(marker), "/private/var/db/guamp-cc-reset-%u.done", cycle);
++	vnode_t vp = NULLVP;
++	if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		native_guamp_cc_reset_done = 1;
++		printf("guamp-cc-reset: cycle %u already done\n", cycle);
++		return;
++	}
++	static const char directory[] = "/private/var/mobile/Library/ControlCenter";
++	char (*names)[64] = kalloc_data(NATIVE_GUAMP_CC_RESET_MAX * 64, Z_WAITOK | Z_ZERO);
++	const uint32_t entries_size = 16384;
++	uint8_t *entries = kalloc_data(entries_size, Z_WAITOK);
++	uint32_t found = 0;
++	int error = names && entries ? 0 : ENOMEM;
++	vnode_t dir = NULLVP;
++	if (!error) {
++		error = vnode_lookup(directory, VNODE_LOOKUP_NOFOLLOW, &dir, ctx);
++	}
++	if (!error && vnode_vtype(dir) != VDIR) {
++		error = ENOTDIR;
++	}
++	int opened = 0;
++	if (!error) {
++		error = VNOP_OPEN(dir, FREAD, ctx);
++		opened = !error;
++	}
++	/* Collect first, unlink after the enumeration (no removal while the directory is being read). */
++	off_t offset = 0;
++	for (int eof = 0; !error && !eof;) {
++		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
++		if (!uio) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(entries), entries_size);
++		int count = 0;
++		error = vnode_readdir64(dir, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx);
++		uint32_t filled = entries_size - (uint32_t)uio_resid(uio);
++		offset = uio_offset(uio);
++		uio_free(uio);
++		if (error || !filled) {
++			break;
++		}
++		for (uint32_t at = 0; at + offsetof(struct direntry, d_name) < filled;) {
++			struct direntry *entry = (struct direntry *)(entries + at);
++			if (!entry->d_reclen || at + entry->d_reclen > filled) {
++				error = EINVAL;
++				break;
++			}
++			at += entry->d_reclen;
++			if (!entry->d_ino || entry->d_type != DT_REG || !native_guamp_cc_reset_match(entry->d_name)) {
++				continue;
++			}
++			if (found < NATIVE_GUAMP_CC_RESET_MAX) {
++				strlcpy(names[found], entry->d_name, sizeof(names[found]));
++				found = found + 1;
++			}
++		}
++	}
++	if (opened) {
++		VNOP_CLOSE(dir, FREAD, ctx);
++	}
++	if (dir != NULLVP) {
++		vnode_put(dir);
++	}
++	if (error == ENOENT) {
++		error = 0;   /* no Control Center directory yet: nothing to reset */
++	}
++	char path[128];
++	for (uint32_t i = 0; !error && i < found; i++) {
++		snprintf(path, sizeof(path), "%s/%s", directory, names[i]);
++		int32_t result = 0;
++		struct unlink_args request = {.path = scratch + 0xa00};
++		int unlink_error = copyout(path, request.path, strlen(path) + 1);
++		if (!unlink_error) {
++			unlink_error = unlink(p, &request, &result);
++		}
++		if (!unlink_error) {
++			native_guamp_cc_reset_deleted = native_guamp_cc_reset_deleted + 1;
++		} else if (unlink_error != ENOENT) {
++			error = unlink_error;
++		}
++		printf("guamp-cc-reset: %s status %d\n", path, unlink_error);
++	}
++	if (!error) {
++		/* The marker's directory may not exist yet on a fresh Data volume (the skeleton runs later). */
++		struct mkdir_args request = {.path = scratch + 0xa00, .mode = 0755};
++		int32_t result = 0;
++		if (!copyout("/private/var/db", request.path, sizeof("/private/var/db"))) {
++			(void)mkdir(p, &request, &result);
++		}
++		vp = NULLVP;
++		error = vnode_open(marker, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx);
++		if (!error) {
++			error = vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	if (names) {
++		kfree_data(names, NATIVE_GUAMP_CC_RESET_MAX * 64);
++	}
++	if (entries) {
++		kfree_data(entries, entries_size);
++	}
++	native_guamp_cc_reset_error = error;
++	native_guamp_cc_reset_done = !error;
++	printf("guamp-cc-reset: cycle %u: %u found, %u deleted, status %d\n", cycle, found, native_guamp_cc_reset_deleted, error);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+ 	uint32_t enabled = 0;
+-	if (!PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled)) || enabled != 1) {
++	if (!PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled))) {
++		enabled = 0;
++	}
++	/* guamp-iphone-res=1 installs the payload addon too (it carries the iPhone resources) and mounts their views right after it. */
++	int iphone_res = native_guamp_iphone_res_enabled();
++	if (enabled != 1 && !iphone_res) {
+ 		return;
+ 	}
++	if (iphone_res) {
++		native_guamp_iphone_res_ngpu(p, scratch);
++	}
+ 	native_gpu_addon_install(p, scratch);
++	if (iphone_res) {
++		native_guamp_iphone_res_mount(p, scratch);
++	}
++	if (enabled != 1) {
++		return;
++	}
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
+ 	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
+@@ -7986,6 +8190,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ 	if (actual != device || (vfs_flags(data_mount) & MNT_RDONLY) ||
+ 	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
+ 	if (!error) native_owner_data_stage = 4;
++	if (!error) native_guamp_cc_reset(p, scratch);
+ 	if (!error) native_gpu_addon_prepare(p, scratch);
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
+ 	if (!error) native_guamp_data_skeleton(p, scratch);

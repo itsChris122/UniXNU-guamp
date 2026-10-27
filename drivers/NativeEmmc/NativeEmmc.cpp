@@ -1206,13 +1206,37 @@ static IOService *mediaForDevice(dev_t device)
 
 extern "C" void native_verified_root_probe(void) {}
 
-// The boot-time GPU addon of the owner Data mount (zzy-native-gpu-addon-mount) comes from NativeRamBlock on the
-// reference boards; guamp has no GPU addon
+// The boot-time addon of the owner Data mount (zzy-native-gpu-addon-mount; on guamp the iPhone resources of
+// zzzz-guamp-iphone-res, scripts/make-guamp-iphone-res.py), as NativeRamBlock answers it on the reference boards:
+// DarwinBoot loads Payloads/kernel.macho.gpuaddon after the trust caches into the boot window and fills
+// /chosen/memory-map/GpuAddon (physical address, size). Boot memory below TopOfKernelData, never freed. The kernel
+// validates every entry; only the header is checked here. Returns 0 without an addon.
+extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
 extern "C" int native_ram_block_gpu_addon(const uint8_t **data, uint64_t *bytes)
 {
-  if (data) *data = nullptr;
-  if (bytes) *bytes = 0;
-  return 0;
+  if (!data || !bytes) return 0;
+  *data = nullptr;
+  *bytes = 0;
+  IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+  if (!map) return 0;
+  OSData *range = OSDynamicCast(OSData, map->getProperty("GpuAddon"));
+  uint64_t physical = 0, size = 0;
+  if (range && range->getLength() == 16) {
+    memcpy(&physical, range->getBytesNoCopy(), 8);
+    memcpy(&size, static_cast<const uint8_t *>(range->getBytesNoCopy()) + 8, 8);
+  }
+  map->release();
+  if (size < 24 || size > (UINT64_C(64) << 20) || (physical & 4095) || physical < guamp_phys_base ||
+      size > guamp_phys_size || physical - guamp_phys_base > guamp_phys_size - size) {
+    if (range) IOLog("NativeEmmc: GpuAddon range rejected (size %llu)\n", static_cast<unsigned long long>(size));
+    return 0;
+  }
+  const uint8_t *addon = reinterpret_cast<const uint8_t *>(ml_static_ptovirt(static_cast<vm_offset_t>(physical)));
+  if (!addon || memcmp(addon, "NGPUADD2", 8)) return 0;
+  *data = addon;
+  *bytes = size;
+  IOLog("NativeEmmc: GpuAddon %llu bytes\n", static_cast<unsigned long long>(size));
+  return 1;
 }
 
 extern "C" int native_verified_block_root_authorized(dev_t device)
