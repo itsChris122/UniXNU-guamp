@@ -365,6 +365,9 @@ int waitEvent(const char *what, uint16_t op, unsigned kind, unsigned timeoutMs, 
     bt_hex(text, sizeof text, gCap, gCapLen, 32);
     IOLog("GuampBt: %s: received after the command %u bytes: %s\n", what, static_cast<unsigned>(gCapLen),
           gCapLen ? text : "none");
+    if (bt_seven_bit_event(gCap, gCapLen))
+      IOLog("GuampBt: %s: the answer has bit 7 set on every byte: the controller sends 7-bit characters (NVM HCI tag "
+            "line-format byte changed?)\n", what);
   }
   return found;
 }
@@ -694,11 +697,15 @@ bool m1() {
   const int pr = bt_tlv_patch_parse(patch.data, patch.size, &ph);
   const bool match = !pr && ph.product == (gQv.product_id & 0xffff) && ph.rom_build == gQv.rom_ver;
   bt_tlv_nvm nv = {};
-  // guamp-bt-nvm-baud: HCI tag bytes that get the baud code, 1 data[1], 2 data[2] (btqca.c for WCN3950, default), 3 both
-  unsigned fields = newLayout ? 1u : 2u;
-  PE_parse_boot_argn("guamp-bt-nvm-baud", &fields, sizeof(fields));
-  if (fields < 1 || fields > 3) fields = newLayout ? 1u : 2u;
+  // guamp-bt-nvm-baud: HCI tag bytes that get the baud code, 0 none, 1 data[1], 2 data[2] (btqca.c for WCN3950), 3
+  // both; absent: bt_tlv_nvm_baud_fields_auto (the Linux byte only if it holds a rate code: none on the guamp NVM).
+  bt_tlv_nvm probe = {};
+  bt_tlv_nvm_fix_fields(cfg.data, cfg.size, code, 0u, &probe);   // only the idempotent edits (IBS, deep sleep)
+  unsigned fields = bt_tlv_nvm_baud_fields_auto(probe.hci_before, newLayout);
+  if (PE_parse_boot_argn("guamp-bt-nvm-baud", &fields, sizeof(fields)) && fields > 3) fields = 0;
   const int nr = bt_tlv_nvm_fix_fields(cfg.data, cfg.size, code, fields, &nv);
+  for (unsigned k = 0; k < 3; ++k) nv.hci_before[k] = probe.hci_before[k];   // as shipped (the probe already set bit 7)
+  nv.sleep_before = probe.sleep_before;
   IOLog("GuampBt: fw: WCN%u %s patch %04x product %04x rom %04x mode %u (%u segments)%s; %s type %u, %u tags, hci %02x %02x %02x -> "
         "%02x %02x %02x, deep sleep %02x -> %02x, BD tag %s%s\n", family, tlv, ph.patch_ver, ph.product, ph.rom_build, ph.mode,
         bt_tlv_segments(patch.size), pr ? " NOT A TLV PATCH" : match ? "" : " NOT FOR THIS CONTROLLER", nvm, nv.type, nv.tags,

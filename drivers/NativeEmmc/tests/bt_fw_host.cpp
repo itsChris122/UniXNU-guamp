@@ -135,6 +135,19 @@ static void testUnit() {
     CHECK(bt_tlv_nvm_fix_fields(n4.data(), n4.size(), 0x11, 2u, &o4) == 0 && o4.hci_after[2] == 0x11 &&
           o4.hci_after[1] == o4.hci_before[1], "");
   }
+  {  // auto byte choice: the guamp NVM (15 11 22) gets no baud byte, a file with a rate code at data[2] keeps Linux's
+    const uint8_t g[3] = {0x15, 0x11, 0x22}, r[3] = {0x15, 0x00, 0x0e}, u[3] = {0x15, 0x0e, 0x22};
+    CHECK(bt_tlv_nvm_baud_fields_auto(g, 0) == 0u && bt_tlv_nvm_baud_fields_auto(r, 0) == 2u &&
+          bt_tlv_nvm_baud_fields_auto(u, 1) == 1u && bt_tlv_nvm_baud_fields_auto(g, 1) == 1u, "");
+    std::vector<uint8_t> n5 = n2;
+    bt_tlv_nvm o5 = {};
+    CHECK(bt_tlv_nvm_fix_fields(n5.data(), n5.size(), 0x0e, 0u, &o5) == 0 && o5.hci_after[1] == o5.hci_before[1] &&
+          o5.hci_after[2] == o5.hci_before[2] && (o5.hci_after[0] & 0x80), "");
+  }
+  {  // the answer seen on the phone after writing 0x0e into data[2]: HCI_Reset Command Complete with bit 7 set, SLEEP_IND
+    const uint8_t seen[] = {0x84, 0x8e, 0x84, 0x81, 0x83, 0x8c, 0x80, 0xfe}, fine[] = {0x04, 0x0e, 0x04, 0x01, 0x03, 0x0c, 0x00};
+    CHECK(bt_seven_bit_event(seen, sizeof seen) && !bt_seven_bit_event(fine, sizeof fine) && !bt_seven_bit_event(seen, 5), "");
+  }
   CHECK(bt_qca_baud_of_code(0x0e) == 3000000 && bt_qca_baud_of_code(0x11) == 3200000 && bt_qca_baud_of_code(0x00) == 115200 &&
         bt_qca_baud_of_code(0x22) == 0 && bt_qca_baud_of_code(bt_qca_baud_code(921600)) == 921600, "");
   std::vector<uint8_t> bad = orig;

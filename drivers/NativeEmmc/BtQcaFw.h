@@ -139,6 +139,23 @@ static inline int bt_tlv_nvm_fix_fields(uint8_t *f, size_t n, uint8_t baud_code,
     }
     return 0;
 }
+// Which HCI tag bytes may take the baud code (guamp-bt-nvm-baud absent): the Linux byte, but only when the file
+// holds a rate code there. On the guamp WCN3950 NVM (15 11 22) data[2] = 0x22 is no rate: writing 0x0e there made
+// the patched controller answer with 7-bit characters (reset Command Complete read as 84 8e 84 81 83 8c 80), so the
+// byte is a line-format field on this ROM and is left alone (0 = no byte written; the rate set by VSC 0xFC48 stays).
+static inline unsigned bt_tlv_nvm_baud_fields_auto(const uint8_t hci_before[3], int new_layout) {
+    const unsigned k = new_layout ? 1u : 2u;
+    return bt_qca_baud_of_code(hci_before[k]) ? (new_layout ? 1u : 2u) : 0u;
+}
+// Bytes with bit 7 set where an H4 event would start (0x84 = 0x04 | 0x80): the controller sends 7 data bits and
+// the host reads the stop bit as bit 7. 1 when buf, with bit 7 cleared, starts with a complete H4 event.
+static inline int bt_seven_bit_event(const uint8_t *buf, size_t n) {
+    if (n < 3 || buf[0] != (0x04 | 0x80)) return 0;
+    const size_t plen = buf[2] & 0x7f;
+    if (n < 3 + plen) return 0;
+    for (size_t i = 0; i < 3 + plen; ++i) if (!(buf[i] & 0x80)) return 0;
+    return 1;
+}
 // The Linux layout: new_layout = WCN3991 and later (baud code in data[1]), else data[2].
 static inline int bt_tlv_nvm_fix(uint8_t *f, size_t n, uint8_t baud_code, int new_layout, struct bt_tlv_nvm *o) {
     return bt_tlv_nvm_fix_fields(f, n, baud_code, new_layout ? 1u : 2u, o);
