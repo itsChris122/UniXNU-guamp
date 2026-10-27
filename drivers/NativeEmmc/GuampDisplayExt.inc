@@ -13,7 +13,8 @@ extern "C" volatile uint64_t native_legacy_copy_max __attribute__((weak_import))
 extern "C" volatile uint64_t native_legacy_copy_bytes_sum __attribute__((weak_import));
 extern "C" volatile uint32_t native_legacy_swap_accepted_count __attribute__((weak_import));
 extern "C" volatile uint32_t native_legacy_swap_rejected_count __attribute__((weak_import));
-extern "C" unsigned int guamp_fb_wc_enabled __attribute__((weak_import));
+// zzzz-guamp-ram-fb-wc.patch defines it (pmap); 0 here while that patch is out of the series (static link).
+extern "C" __attribute__((weak)) unsigned int guamp_fb_wc_enabled = 0;
 namespace dispext {
 static volatile uint32_t gSeen = 0, gExternalBefore = 0, gBuiltIn = 0, gForced = 0;
 static bool gForce = true;
@@ -66,7 +67,7 @@ static void copyLog()
   IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
         "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
         max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
-        &guamp_fb_wc_enabled && guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+        guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
   lastN = n; lastSum = sum; lastBytes = bytes; lastMax = max;
   lastAccepted = accepted; lastRejected = rejected;
 }

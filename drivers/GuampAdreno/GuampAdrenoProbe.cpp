@@ -50,10 +50,14 @@ extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_pool_mi
 // ArmCpu's SPI attach (also used by the touch service).
 int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
-void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp")
-    __attribute__((weak_import));
-IOService *native_adreno_accelerator_allocate(void) __attribute__((weak_import));
-unsigned native_adreno_accelerator_instance_size(void) __attribute__((weak_import));
+// The kernel is linked statically, where an undefined weak_import still fails: weak definitions stand in (instance size 0
+// makes level 2 log "accelerator: ... size 0" and stop) and the staged objects override them.
+void native_adreno_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp");
+__attribute__((weak)) void native_adreno_accelerator_static_init(void) {}
+__attribute__((weak)) IOService *native_adreno_accelerator_allocate(void) { return nullptr; }
+__attribute__((weak)) unsigned native_adreno_accelerator_instance_size(void) { return 0; }
+// NativeAdrenoPublish.cpp exports its boot log through sheng's UFS driver; guamp has none (-1 = not stored).
+__attribute__((weak)) int boot_log_export_put(uint32_t, uint32_t, uint32_t, const void *, uint32_t) { return -1; }
 kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern kmod_info_t g_kernel_kmod_info;
 
@@ -393,7 +397,7 @@ int naPublish(Session &s) {
 // The staged AGXAccelerator for the original Metal discovery (tb128fu naMetal). Its static initializer runs only after the
 // original IOGPUFamily kext has loaded, because the parent metaclass does not exist before that.
 int naAccelerator() {
-  if (!&native_adreno_accelerator_static_init || !&native_adreno_accelerator_allocate || !&native_adreno_accelerator_instance_size) {
+  if (!native_adreno_accelerator_instance_size()) {   // the weak stand-in answers 0
     IOLog("GuampAdreno: accelerator: staged class not linked (build-native-adreno-accelerator.py did not run)\n");
     return GuampAdrenoAccelerator;
   }
