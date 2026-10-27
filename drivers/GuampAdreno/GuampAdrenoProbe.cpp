@@ -30,6 +30,7 @@
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoABI.h"
+#include "NativeAdrenoUserClient.h"
 #include "GuampAdreno.h"
 
 extern "C" {
@@ -45,6 +46,7 @@ IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
 NativeAdrenoVm *NativeAdrenoGpuContextVm();
 IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
                                const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
+IOService *native_adreno_published_service(void);
 extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_pool_mib, native_adreno_wc_enabled,
     native_adreno_written_imports_owned;
 // ArmCpu's SPI attach (also used by the touch service).
@@ -409,6 +411,129 @@ int naPublish(Session &s) {
   return sub || pub ? GuampAdrenoPublish : GuampAdrenoOk;
 }
 
+// The user-client self test, ported from UniXNU-tb128fu package/GpuProbe.cpp (naSelfTest / ucRound, BSD-2-Clause-Patent): a kernel
+// connection of the plugin's open type, Query and GetDeviceInfo, two 4 KiB BOs mapped in the client window and in the kernel, an IB
+// of three CP_MEM_WRITEs submitted and waited for, the target read back, then clientClose. Two rounds: the second proves the client
+// slot and the IOVAs recycle. No import test (kernel_task imports are refused; tb128fu-033). guamp-adreno-selftest=0 skips it.
+struct UcStats { uint32_t passed, steps, firstError, firstStep, memStatus; };
+
+IOReturn ucCall(IOUserClient *uc, uint32_t method, const void *in, void *out) {
+  IOExternalMethodArguments a{};
+  a.version = kIOExternalMethodArgumentsCurrentVersion;
+  a.selector = method;
+  const size_t is = NativeAdrenoUserClient::inputSize(method), os = NativeAdrenoUserClient::outputSize(method);
+  a.structureInput = is ? in : nullptr;
+  a.structureInputSize = uint32_t(is);
+  a.structureOutput = os ? out : nullptr;
+  a.structureOutputSize = uint32_t(os);
+  return uc->externalMethod(method, &a, nullptr, nullptr, nullptr);
+}
+
+// Returns the matching dwords of the target (4 = the three writes landed and the fourth word is untouched) or -1.
+int ucRound(IOService *svc, UcStats &st) {
+  auto step = [&](IOReturn status) {
+    const uint32_t at = st.steps;
+    st.steps = st.steps + 1;
+    if (!status) st.passed = st.passed + 1;
+    else if (!st.firstError) {st.firstError = uint32_t(status); st.firstStep = at;}
+    return !status;
+  };
+  constexpr UInt32 kPluginOpenType = 0x4147;   // NativeAdrenoPublish.cpp NativeAdrenoPluginOpenType; type 0 is refused
+  IOUserClient *uc = nullptr;
+  if (!step(svc->newUserClient(kernel_task, nullptr, kPluginOpenType, nullptr, &uc)) || !uc) return -1;
+  IOUserClient *second = nullptr;
+  step(svc->newUserClient(kernel_task, nullptr, kPluginOpenType, nullptr, &second) == kIOReturnBusy ? kIOReturnSuccess
+                                                                                                    : kIOReturnError);
+  if (second) second->release();
+  NativeAdrenoAbiParams params{};
+  step(ucCall(uc, NativeAdrenoMethodQuery, nullptr, &params));
+  NativeAdrenoAbiDeviceInfo info{};
+  step(ucCall(uc, NativeAdrenoMethodGetDeviceInfo, nullptr, &info));
+  step(info.chip_id == kDeviceInfo.chip_id && info.gmem_bytes == kDeviceInfo.gmem_bytes ? kIOReturnSuccess : kIOReturnError);
+  NativeAdrenoAbiBoAlloc alloc{4096, 12, 0};
+  NativeAdrenoAbiBoAllocReply ib{}, tgt{};
+  int matched = -1;
+  IOMemoryDescriptor *desc[2] = {};
+  IOMemoryMap *maps[2] = {};
+  if (step(ucCall(uc, NativeAdrenoMethodBoAlloc, &alloc, &ib)) && step(ucCall(uc, NativeAdrenoMethodBoAlloc, &alloc, &tgt))) {
+    const uint64_t ibIova = 0x20004000, tgtIova = 0x20005000;   // inside the client window of kDeviceInfo
+    NativeAdrenoAbiBoMap mapIb{ib.handle, ibIova, 1, 0, 2, 0}, mapTgt{tgt.handle, tgtIova, 3, 0, 2, 0};
+    NativeAdrenoAbiBoMapReply r{};
+    NativeAdrenoAbiBoCpuMap cmIb{ib.handle}, cmTgt{tgt.handle};
+    NativeAdrenoAbiBoCpuMapReply crIb{}, crTgt{};
+    if (step(ucCall(uc, NativeAdrenoMethodBoMap, &mapIb, &r)) && step(ucCall(uc, NativeAdrenoMethodBoMap, &mapTgt, &r)) &&
+        step(ucCall(uc, NativeAdrenoMethodBoCpuMap, &cmIb, &crIb)) && step(ucCall(uc, NativeAdrenoMethodBoCpuMap, &cmTgt, &crTgt))) {
+      IOOptionBits opt[2] = {};
+      const uint32_t tokens[2] = {crIb.token, crTgt.token};
+      bool mapped = true;
+      for (int i = 0; i < 2; i = i + 1) {
+        const IOReturn status = uc->clientMemoryForType(tokens[i], &opt[i], &desc[i]);
+        if (!st.memStatus) st.memStatus = uint32_t(status);
+        if (status || !desc[i]) {mapped = false; continue;}
+        maps[i] = desc[i]->createMappingInTask(kernel_task, 0, opt[i]);
+        if (!maps[i]) {mapped = false; if (!st.memStatus) st.memStatus = 0xbad;}
+      }
+      IOMemoryDescriptor *none = nullptr;   // type 0 and a stale token must be refused
+      IOOptionBits o = 0;
+      step(uc->clientMemoryForType(0, &o, &none) != kIOReturnSuccess && !none ? kIOReturnSuccess : kIOReturnError);
+      step(mapped ? kIOReturnSuccess : kIOReturnNoMemory);
+      if (mapped) {
+        volatile uint32_t *iw = reinterpret_cast<volatile uint32_t *>(maps[0]->getVirtualAddress());
+        volatile uint32_t *tw = reinterpret_cast<volatile uint32_t *>(maps[1]->getVirtualAddress());
+        for (unsigned i = 0; i < 1024; i = i + 1) tw[i] = 0xdeadbeef;
+        const uint32_t values[3] = {0x0badc0deu, 0xfeed0001u, 0x600d0003u};
+        uint32_t words[12];
+        bool built = true;
+        for (unsigned i = 0; i < 3; i = i + 1) {
+          built = built && AdrenoPM4Type7(0x3d, 3, &words[i * 4]) == AdrenoPM4Success;   // CP_MEM_WRITE
+          words[i * 4 + 1] = uint32_t(tgtIova + i * 4);
+          words[i * 4 + 2] = uint32_t(tgtIova >> 32);
+          words[i * 4 + 3] = values[i];
+        }
+        for (unsigned i = 0; i < 12; i = i + 1) iw[i] = words[i];
+        __asm__ volatile("dsb sy" ::: "memory");
+        NativeAdrenoAbiSubmit submit{};
+        submit.buffer_count = 1;
+        submit.buffers[0] = {ib.handle, ibIova, sizeof words};
+        NativeAdrenoAbiSubmitReply sr{};
+        if (step(built ? kIOReturnSuccess : kIOReturnInternalError) && step(ucCall(uc, NativeAdrenoMethodSubmit, &submit, &sr))) {
+          NativeAdrenoAbiWaitFence wait{sr.fence, 200000000ull};
+          if (step(ucCall(uc, NativeAdrenoMethodWaitFence, &wait, nullptr))) {
+            __asm__ volatile("dsb sy" ::: "memory");
+            matched = (tw[0] == values[0]) + (tw[1] == values[1]) + (tw[2] == values[2]) + (tw[3] == 0xdeadbeef);
+          }
+        }
+        NativeAdrenoAbiTimestamp ts{};
+        step(ucCall(uc, NativeAdrenoMethodGetTimestamp, nullptr, &ts));
+      }
+    }
+  }
+  for (auto *m : maps) if (m) m->release();
+  for (auto *d : desc) if (d) d->release();
+  step(uc->clientClose());
+  uc->release();
+  return matched;
+}
+
+// One line per round; false when a round did not see its three writes. Not fatal for the stages.
+bool naSelfTest() {
+  if (bootArg("guamp-adreno-selftest", 1) == 0) return true;
+  IOService *svc = native_adreno_published_service();
+  if (!svc) {
+    IOLog("GuampAdreno: self test: no published service\n");
+    return false;
+  }
+  bool ok = true;
+  for (unsigned round = 0; round < 2; round = round + 1) {
+    UcStats st{};
+    const int matched = ucRound(svc, st);
+    IOLog("GuampAdreno: self test round %u: user IB writes matched %d/4, steps %u/%u, first error %x at step %u, "
+          "client memory %x\n", round, matched, st.passed, st.steps, st.firstError, st.firstStep, st.memStatus);
+    ok = ok && matched == 4;
+  }
+  return ok;
+}
+
 // The staged AGXAccelerator for the original Metal discovery (tb128fu naMetal). Its static initializer runs only after the
 // original IOGPUFamily kext has loaded, because the parent metaclass does not exist before that.
 int naAccelerator() {
@@ -464,8 +589,8 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     naSecureFallback(s);
     if ((result = naIrq(s))) break;
     if ((result = naPublish(s))) break;
-    // The user-client self test of tb128fu (naSelfTest: BO alloc/map, an IB of CP_MEM_WRITEs) is not ported yet.
-    IOLog("GuampAdreno: self test not ported yet\n");
+    const bool tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
+    IOLog("GuampAdreno: self test %s\n", tested ? "ok" : "FAILED (the stages go on)");
     if (in->level >= 2) result = naAccelerator();
   } while (false);
   IOLog("GuampAdreno: RESULT %d (level %u, context step %u, irqs %u, idle sleeps %llu spins %llu)\n", result, in->level,

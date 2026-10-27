@@ -42,6 +42,7 @@ archives = [
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py NativeEmmc",
   "build-guamp-adreno.py",          # NativeAdreno A6XX (xVanTuring/Adreno610) + GuampAdreno probe, guamp-adreno=1|2
+  "build-native-adreno-accelerator.py",   # staged AGXAccelerator for guamp-adreno=2 (IOAcceleratorES ABI audited on f18b4df, slide -0x1000000)
   "build-arm-driver.py ArmDTPlatform",
   "guamp-smp-variant.py",           # exact pinned opt-in GICR SGI delivery
   "build-arm-driver.py ArmCpu",

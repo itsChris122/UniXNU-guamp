@@ -24,11 +24,13 @@ typedef unsigned ppnum_t;
 typedef int boolean_t;
 typedef void *event_t;
 typedef struct task *task_t;
+typedef uint32_t UInt32;
 typedef int wait_result_t;
 typedef int (*thread_continue_t)(void);
 enum : IOReturn {kIOReturnSuccess = 0, kIOReturnError = 0x2bc, kIOReturnNoMemory, kIOReturnNoResources, kIOReturnBadArgument = 0x2c2,
                  kIOReturnUnsupported = 0x2c7, kIOReturnNotReady = 0x2d8, kIOReturnNotFound = 0x2f0, kIOReturnBusy = 0x2d5,
-                 kIOReturnTimeout = 0x2d6, kIOReturnIOError = 0x2ca, kIOReturnInvalid = 0x2c1, kIOReturnNotAttached = 0x2c4};
+                 kIOReturnTimeout = 0x2d6, kIOReturnIOError = 0x2ca, kIOReturnInvalid = 0x2c1, kIOReturnNotAttached = 0x2c4,
+                 kIOReturnInternalError = 0x2c9};
 enum : IOOptionBits {kIOMapAnywhere = 1, kIOMapInhibitCache = 0x100, kIOMapWriteCombineCache = 0x400,
                      kIODirectionInOut = 3, kIOMemoryPhysicallyContiguous = 0x10};
 enum {THREAD_UNINT = 0};
@@ -83,6 +85,7 @@ public:
 class IOMemoryDescriptor : public OSObject {
 public:
   IOMemoryMap *map(IOOptionBits);
+  IOMemoryMap *createMappingInTask(task_t, uint64_t, IOOptionBits);
 };
 class IOBufferMemoryDescriptor : public IOMemoryDescriptor {};
 class IODeviceMemory : public IOMemoryDescriptor {
@@ -96,7 +99,21 @@ public:
   bool attach(IOService *);
   void registerService();
   static IOService *getPlatform();
+  virtual IOReturn newUserClient(task_t, void *, UInt32, void *, class IOUserClient **);
 };
-class IOUserClient : public IOService {};
+struct IOExternalMethodArguments {
+  uint32_t version, selector;
+  const void *structureInput;
+  uint32_t structureInputSize;
+  void *structureOutput;
+  uint32_t structureOutputSize;
+};
+enum {kIOExternalMethodArgumentsCurrentVersion = 2};
+class IOUserClient : public IOService {
+public:
+  virtual IOReturn externalMethod(uint32_t, IOExternalMethodArguments *, void *, OSObject *, void *);
+  virtual IOReturn clientMemoryForType(UInt32, IOOptionBits *, IOMemoryDescriptor **);
+  virtual IOReturn clientClose();
+};
 struct kmod_info_t {char name[64];};
 #endif
