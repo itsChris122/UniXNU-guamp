@@ -21,7 +21,8 @@
 //   asks for the power-up register list (needs a kgsl buffer), left out. After it, one CP_MEM_WRITE of a magic word
 //   to the scratch page proves CP memory writes through the GPU SMMU.
 // GPU SMMU (msm-arm-smmu-bengal.dtsi kgsl_smmu 0x59a0000, qsmmu-v500, qcom,skip-init: the boot chain owns the global
-// setup; kgsl-3d0 context bank "gfx3d_user" iommus <&kgsl_smmu 0 1>): read only. The physical addresses handed to
+// setup; kgsl-3d0 context bank "gfx3d_user" iommus <&kgsl_smmu 0 1>): read by gm2_smmu_read; M3 (gm2_smmu_setup,
+// below) writes one stream-mapping entry and, if needed, one context bank, never the global configuration. The physical addresses handed to
 // the CP are usable only when stream 0 is not translated: SMMU client port disabled, unmatched stream with bypass,
 // S2CR bypass, or a context bank with SCTLR.M clear. Anything else stops before the CP start (level 2) or is only
 // reported (level 3, forced).
@@ -102,7 +103,7 @@ enum gm2_block : unsigned { GM2_GPU = 0, GM2_SMMU = 1 };
 struct gm2_io {
   void *ctx;
   uint32_t (*rd)(void *ctx, unsigned block, uint32_t byteOff);
-  void (*wr)(void *ctx, unsigned block, uint32_t byteOff, uint32_t v);   // GPU only (the SMMU is never written)
+  void (*wr)(void *ctx, unsigned block, uint32_t byteOff, uint32_t v);   // GPU; SMMU only from gm2_smmu_setup (M3)
   void (*udelay)(void *ctx, unsigned us);
   void (*flush)(void *ctx, const void *p, size_t bytes);                // clean + invalidate to the point of coherency
 };
@@ -384,5 +385,266 @@ static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) {
   c->secvidBefore = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
   gm2_w(io, GM2_RBBM_SECVID_TRUST_CNTL, 0);
   c->secvidAfter = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
+}
+
+// === M3: GPU SMMU stream 0, ring submission with a fence, interrupt diagnostics ====================================
+// The phone's SMMU (M2 log): sCR0 00200406 (client port on, USFCFG: unmatched streams fault), 4 SMRs none valid,
+// 5 context banks at 0x8000, 4 KiB pages. Linux drivers/iommu/arm-smmu (arm-smmu.h offsets, arm_smmu_write_sme: S2CR
+// before SMR; arm_smmu_write_context_bank: CBA2R, CBAR, TCR2, TCR, TTBR0, MAIR0, SCTLR last; arm-smmu-qcom.c
+// qcom_smmu_cfg_probe: firmware that turns an S2CR BYPASS write into FAULT gets bypass emulated by a context bank of
+// type S1_TRANS_S2_BYPASS with SCTLR.M clear). Modes (guamp-gpu-smmu):
+//   1 S2CR BYPASS for SMR sid 0 mask 1; if the read-back is not BYPASS it falls back to 2
+//   2 S2CR -> context bank (default the last one) with SCTLR.M clear: identity, the qcom bypass quirk
+//   3 the same context bank with stage 1 on: AArch64 4 KiB granule, T0SZ 32, four 1 GiB identity blocks (first GiB
+//     Device, the rest Normal non-cacheable), the table in the caller's uncached memory
+#define GM2_SMMU_IDR2 0x28
+#define GM2_SMMU_TLBGSYNC 0x70
+#define GM2_SMMU_TLBGSTATUS 0x74
+#define GM2_SMMU_CBA2R(n) (0x800u + 4u * (n))     // in GR1
+#define GM2_CB_TCR2 0x10
+#define GM2_CB_TCR 0x30
+#define GM2_CB_CONTEXTIDR 0x34
+#define GM2_CB_MAIR0 0x38
+#define GM2_CB_MAIR1 0x3c
+#define GM2_CB_TLBIALL 0x618
+#define GM2_CB_TLBSYNC 0x7f0
+#define GM2_CB_TLBSTATUS 0x7f4
+#define GM2_GPU_SID 0u
+#define GM2_GPU_SID_MASK 1u
+#define GM2_SMR_VALID (1u << 31)
+#define GM2_S2CR_BYPASS (1u << 16)
+#define GM2_S2CR_FAULT (2u << 16)
+#define GM2_CBAR_S1_BYPASS_S2 ((1u << 16) | (3u << 8) | (0xfu << 12))   // TYPE 1, BPSHCFG NSH, MEMATTR WB (Linux)
+#define GM2_SCTLR_IDENTITY_ON 0x27u                // M, TRE, AFE, CFRE (no CFIE: no SMMU context interrupt handler)
+#define GM2_TCR_IDENTITY ((32u) | (1u << 23) | (2u << 30))   // T0SZ 32, walks non-cacheable, EPD1, TG1 4K
+#define GM2_TCR2_IDENTITY ((7u << 15) | 1u)        // SEP upstream, PASize 36 bit
+#define GM2_MAIR0_IDENTITY 0x00000044u             // attr0 Normal NC, attr1 Device-nGnRnE
+#define GM2_SMMU_SYNC_STEPS 1000                   // 1 us each
+
+enum gm2_smmu_mode : unsigned { GM2_SM_NONE = 0, GM2_SM_BYPASS = 1, GM2_SM_CB_BYPASS = 2, GM2_SM_CB_IDENTITY = 3 };
+static inline const char *gm2_sm_name(unsigned m) {
+  return m == GM2_SM_BYPASS ? "s2cr-bypass" : m == GM2_SM_CB_BYPASS ? "cb-bypass" : m == GM2_SM_CB_IDENTITY ? "cb-identity" : "none";
+}
+
+struct gm2_smmu_cfg {
+  unsigned want, used;         // requested mode, mode in force at the end (NONE when nothing took effect)
+  int smr;                     // stream-mapping group written, -1 none
+  unsigned cb;                 // context bank (modes 2 and 3)
+  uint32_t idr2, gfsrBefore, gfsrAfter, bypassRead;
+  uint32_t s2crWant, s2crRead, smrWant, smrRead, cbarWant, cbarRead, sctlrWant, sctlrRead, tcrRead, mairRead;
+  uint64_t ttbrRead;
+  bool sync, ok;
+  const char *why;             // first failure, null when ok
+};
+
+// Block descriptor of one 1 GiB identity block: AF, AP[2:1] 01 (read/write), AttrIndx (GiB 0 Device), block.
+static inline uint64_t gm2_block_1g(uint64_t i) {
+  return (i << 30) | (1u << 10) | (1u << 6) | ((i == 0 ? 1u : 0u) << 2) | 1u;
+}
+
+static inline void gm2_sw(const gm2_io *io, uint32_t off, uint32_t v) { io->wr(io->ctx, GM2_SMMU, off, v); }
+static inline uint32_t gm2_sr(const gm2_io *io, uint32_t off) { return io->rd(io->ctx, GM2_SMMU, off); }
+static inline bool gm2_smmu_wait_clear(const gm2_io *io, uint32_t off) {
+  for (uint32_t i = 0; i < GM2_SMMU_SYNC_STEPS; i++) {
+    if (!(gm2_sr(io, off) & 1u)) return true;
+    io->udelay(io->ctx, 1);
+  }
+  return false;
+}
+
+// One context bank for stream 0 (modes 2, 3). table/tablePhys: four uint64_t, 32-byte aligned, uncached (mode 3).
+static inline bool gm2_smmu_cb(const gm2_io *io, const gm2_smmu *s, gm2_smmu_cfg *c, bool translate, uint64_t *table,
+                               uint64_t tablePhys) {
+  const uint32_t numCb = s->idr1 & 0xffu;
+  if (c->cb >= numCb) c->cb = numCb ? numCb - 1 : 0;
+  const uint32_t cbOff = s->cbBase + c->cb * s->pageSize;
+  if (!numCb || cbOff + s->pageSize > GM2_SMMU_SIZE) { c->why = "no context bank"; return false; }
+  if (translate) {
+    if (!((c->idr2 >> 12) & 1u)) { c->why = "no AArch64 4K tables (IDR2)"; return false; }
+    if (!table || (tablePhys & 31u) || tablePhys + 32 > 0x100000000ULL) { c->why = "table"; return false; }
+    for (uint64_t i = 0; i < 4; i++) table[i] = gm2_block_1g(i);
+    io->flush(io->ctx, table, 32);
+  }
+  gm2_sw(io, cbOff + GM2_CB_SCTLR, 0);                                 // off while it is rewritten
+  gm2_sw(io, cbOff + GM2_CB_FSR, gm2_sr(io, cbOff + GM2_CB_FSR));      // write one to clear
+  gm2_sw(io, s->pageSize + GM2_SMMU_CBA2R(c->cb), 1u);                 // VA64
+  c->cbarWant = GM2_CBAR_S1_BYPASS_S2;
+  gm2_sw(io, s->pageSize + GM2_SMMU_CBAR(c->cb), c->cbarWant);
+  c->sctlrWant = 0;
+  if (translate) {
+    gm2_sw(io, cbOff + GM2_CB_TCR2, GM2_TCR2_IDENTITY);
+    gm2_sw(io, cbOff + GM2_CB_TCR, GM2_TCR_IDENTITY);
+    gm2_sw(io, cbOff + GM2_CB_TTBR0_LO, static_cast<uint32_t>(tablePhys));
+    gm2_sw(io, cbOff + GM2_CB_TTBR0_HI, static_cast<uint32_t>(tablePhys >> 32));   // ASID 0
+    gm2_sw(io, cbOff + GM2_CB_MAIR0, GM2_MAIR0_IDENTITY);
+    gm2_sw(io, cbOff + GM2_CB_MAIR1, 0);
+    gm2_sw(io, cbOff + GM2_CB_CONTEXTIDR, 0);
+    gm2_sw(io, cbOff + GM2_CB_TLBIALL, 0);
+    gm2_sw(io, cbOff + GM2_CB_TLBSYNC, 0);
+    if (!gm2_smmu_wait_clear(io, cbOff + GM2_CB_TLBSTATUS)) { c->why = "cb tlb sync"; return false; }
+    c->sctlrWant = GM2_SCTLR_IDENTITY_ON;
+    gm2_sw(io, cbOff + GM2_CB_SCTLR, c->sctlrWant);
+  }
+  c->cbarRead = gm2_sr(io, s->pageSize + GM2_SMMU_CBAR(c->cb));
+  c->sctlrRead = gm2_sr(io, cbOff + GM2_CB_SCTLR);
+  c->tcrRead = gm2_sr(io, cbOff + GM2_CB_TCR);
+  c->mairRead = gm2_sr(io, cbOff + GM2_CB_MAIR0);
+  c->ttbrRead = gm2_sr(io, cbOff + GM2_CB_TTBR0_LO) | static_cast<uint64_t>(gm2_sr(io, cbOff + GM2_CB_TTBR0_HI)) << 32;
+  if ((c->cbarRead & 0x3ffffu) != (c->cbarWant & 0x3ffffu) || (c->sctlrRead & 1u) != (c->sctlrWant & 1u)) {
+    c->why = "cb writes ignored";
+    return false;
+  }
+  if (translate && (c->ttbrRead & 0xffffffffffffull) != tablePhys) { c->why = "ttbr0 write ignored"; return false; }
+  return true;
+}
+
+// Writes S2CR then SMR of one group (arm_smmu_write_sme order) and reads both back.
+static inline bool gm2_smmu_sme(const gm2_io *io, gm2_smmu_cfg *c, uint32_t s2cr) {
+  const uint32_t idx = static_cast<uint32_t>(c->smr);
+  c->s2crWant = s2cr;
+  c->smrWant = GM2_SMR_VALID | (GM2_GPU_SID_MASK << 16) | GM2_GPU_SID;
+  gm2_sw(io, GM2_SMMU_S2CR(idx), s2cr);
+  gm2_sw(io, GM2_SMMU_SMR(idx), c->smrWant);
+  c->s2crRead = gm2_sr(io, GM2_SMMU_S2CR(idx));
+  c->smrRead = gm2_sr(io, GM2_SMMU_SMR(idx));
+  return (c->smrRead & 0xffff7fffu) == (c->smrWant & 0xffff7fffu) && (c->s2crRead & 0x300ffu) == (s2cr & 0x300ffu);
+}
+
+// Makes stream 0 reach memory untranslated (or identity-translated). s: a fresh gm2_smmu_read. cb: wanted context bank
+// (out of range: the last one). Never touches sCR0 or the other groups; stops at the first write that does not stick
+// and then leaves the group FAULT, as the boot chain had it (unmatched + USFCFG).
+static inline void gm2_smmu_setup(const gm2_io *io, const gm2_smmu *s, unsigned mode, unsigned cb, uint64_t *table,
+                                  uint64_t tablePhys, gm2_smmu_cfg *c) {
+  *c = {};
+  c->want = mode;
+  c->smr = -1;
+  c->cb = cb;
+  c->gfsrBefore = s->gfsr;
+  if (mode == GM2_SM_NONE || mode > GM2_SM_CB_IDENTITY) { c->why = "disabled"; return; }
+  if (gm2_path_identity(s->path)) { c->ok = true; return; }   // already untranslated: nothing written
+  c->idr2 = gm2_sr(io, GM2_SMMU_IDR2);
+  if (s->smr >= 0) c->smr = s->smr;
+  for (uint32_t i = 0; c->smr < 0 && i < s->smrs && i < 128; i++)
+    if (!(gm2_sr(io, GM2_SMMU_SMR(i)) & GM2_SMR_VALID)) c->smr = static_cast<int>(i);
+  if (c->smr < 0) { c->why = "no free SMR"; return; }
+  if (c->gfsrBefore) gm2_sw(io, GM2_SMMU_GFSR, c->gfsrBefore);   // write one to clear
+  if (mode == GM2_SM_BYPASS) {
+    const bool stuck = gm2_smmu_sme(io, c, GM2_S2CR_BYPASS);
+    c->bypassRead = c->s2crRead;
+    if (stuck) { c->used = GM2_SM_BYPASS; c->ok = true; }
+    else mode = GM2_SM_CB_BYPASS;   // qcom firmware turning BYPASS into FAULT: emulate it with a context bank
+  }
+  if (!c->ok) {
+    if (!gm2_smmu_cb(io, s, c, mode == GM2_SM_CB_IDENTITY, table, tablePhys)) {
+      gm2_smmu_sme(io, c, GM2_S2CR_FAULT);
+    } else if (!gm2_smmu_sme(io, c, c->cb & 0xffu)) {
+      c->why = "s2cr/smr writes ignored";
+      gm2_smmu_sme(io, c, GM2_S2CR_FAULT);
+    } else {
+      c->used = mode;
+      c->ok = true;
+    }
+  }
+  gm2_sw(io, GM2_SMMU_TLBGSYNC, 0);
+  c->sync = gm2_smmu_wait_clear(io, GM2_SMMU_TLBGSTATUS);
+  c->gfsrAfter = gm2_sr(io, GM2_SMMU_GFSR);
+}
+
+// Physical addresses are valid GPU addresses after the set-up: the path itself is identity, or the context bank
+// translates through the identity table written by mode 3.
+static inline bool gm2_identity_after(const gm2_smmu *s, const gm2_smmu_cfg *c) {
+  return gm2_path_identity(s->path) || (s->path == GM2_PATH_CB_TRANSLATE && c->ok && c->used == GM2_SM_CB_IDENTITY);
+}
+
+// --- ring submission with a CACHE_FLUSH_TS fence (adreno_ringbuffer.c addcmds: CP_EVENT_WRITE, 3 + 64-bit address) -
+#define GM2_CP_NOP 0x10
+#define GM2_CP_EVENT_WRITE 0x46
+#define GM2_CACHE_FLUSH_TS 4u
+#define GM2_FENCE_IRQ (1u << 31)          // kgsl sets it on internal commands: raises RBBM INT CP_CACHE_FLUSH_TS
+#define GM2_FENCE_OFF 32u                 // byte offset of the fence word in the scratch page
+#define GM2_SUBMIT_TAIL 5u                // dwords of the fence packet
+#define GM2_RBBM_INT_CLEAR_CMD 0x37
+#define GM2_RBBM_INT_0_MASK 0x38
+
+// The ring as the CP left it after gm2_cp_start (wptr = gm2_cp.wptr, ts 0).
+struct gm2_ring {
+  uint32_t *ring;
+  uint64_t ringPhys;
+  uint32_t dwords, wptr, ts;
+  volatile uint32_t *scratch;
+  uint64_t scratchPhys;
+};
+enum : int { GM2_SUBMIT_OK = 0, GM2_SUBMIT_TOO_BIG = -1, GM2_SUBMIT_FULL = -2, GM2_SUBMIT_TIMEOUT = -3 };
+static inline const char *gm2_submit_err(int e) {
+  return e == GM2_SUBMIT_OK ? "ok" : e == GM2_SUBMIT_TOO_BIG ? "too big" : e == GM2_SUBMIT_FULL ? "ring full" : "fence timeout";
+}
+
+static inline uint32_t gm2_fence(const gm2_io *io, const gm2_ring *rb) {
+  io->flush(io->ctx, const_cast<const uint32_t *>(rb->scratch), 64);
+  return rb->scratch[GM2_FENCE_OFF / 4];
+}
+
+// Copies n dwords of PM4 packets into the ring (a CP_NOP pads to the end when they would wrap), appends the fence
+// write of the next timestamp, moves WPTR and waits up to timeoutUs for the fence. *waitedUs: time spent waiting.
+// Not reentrant: one caller at a time (the owner serializes).
+static inline int gm2_submit(const gm2_io *io, gm2_ring *rb, const uint32_t *pkts, uint32_t n, uint32_t timeoutUs,
+                             uint32_t *waitedUs) {
+  *waitedUs = 0;
+  const uint32_t need = n + GM2_SUBMIT_TAIL;
+  if (need + 8 > rb->dwords) return GM2_SUBMIT_TOO_BIG;
+  const uint32_t pad = rb->wptr + need > rb->dwords ? rb->dwords - rb->wptr : 0;
+  for (;;) {
+    const uint32_t rptr = gm2_r(io, GM2_CP_RB_RPTR) % rb->dwords;
+    const uint32_t used = (rb->wptr + rb->dwords - rptr) % rb->dwords;
+    if (rb->dwords - used - 1 >= pad + need) break;
+    if (*waitedUs >= timeoutUs) return GM2_SUBMIT_FULL;
+    io->udelay(io->ctx, GM2_POLL_STEP_US);
+    *waitedUs = *waitedUs + GM2_POLL_STEP_US;
+  }
+  if (pad) {
+    rb->ring[rb->wptr] = gm2_pkt7(GM2_CP_NOP, pad - 1);
+    rb->wptr = 0;
+  }
+  uint32_t *r = rb->ring + rb->wptr;
+  for (uint32_t i = 0; i < n; i++) r[i] = pkts[i];
+  const uint32_t ts = rb->ts + 1;
+  const uint64_t fence = rb->scratchPhys + GM2_FENCE_OFF;
+  r[n + 0] = gm2_pkt7(GM2_CP_EVENT_WRITE, 4);
+  r[n + 1] = GM2_CACHE_FLUSH_TS | GM2_FENCE_IRQ;
+  r[n + 2] = static_cast<uint32_t>(fence);
+  r[n + 3] = static_cast<uint32_t>(fence >> 32);
+  r[n + 4] = ts;
+  io->flush(io->ctx, rb->ring, rb->dwords * 4u);
+  rb->ts = ts;
+  rb->wptr = (rb->wptr + need) % rb->dwords;
+  gm2_w(io, GM2_CP_RB_WPTR, rb->wptr);
+  for (;;) {
+    if (static_cast<int32_t>(gm2_fence(io, rb) - ts) >= 0) return GM2_SUBMIT_OK;
+    if (*waitedUs >= timeoutUs) return GM2_SUBMIT_TIMEOUT;
+    io->udelay(io->ctx, GM2_POLL_STEP_US);
+    *waitedUs = *waitedUs + GM2_POLL_STEP_US;
+  }
+}
+
+// RBBM_INT_0 bit names (a6xx_reg.h A6XX_INT_*), for the log; no interrupt handler is registered.
+static inline void gm2_int_names(uint32_t v, char *out, size_t size) {
+  static const struct { unsigned bit; const char *name; } kBits[] = {
+      {0, "idle"}, {1, "cp_ahb_error"}, {6, "atb_fifo_overflow"}, {7, "gpc_error"}, {8, "cp_sw"}, {9, "cp_hw_error"},
+      {13, "ib2"}, {14, "ib1"}, {15, "cp_rb"}, {17, "rb_done_ts"}, {18, "wt_done_ts"}, {20, "cache_flush_ts"},
+      {22, "atb_bus_overflow"}, {23, "hang_detect"}, {24, "uche_oob"}, {25, "uche_trap"}, {28, "tsb_write_error"}};
+  if (!size) return;
+  size_t o = 0;
+  out[0] = 0;
+  for (const auto &b : kBits) {
+    if (!((v >> b.bit) & 1u)) continue;
+    for (const char *p = o ? "," : ""; *p && o + 1 < size; p++) out[o++] = *p;
+    for (const char *p = b.name; *p && o + 1 < size; p++) out[o++] = *p;
+    out[o] = 0;
+  }
+  if (!o) {
+    const char *none = "none";
+    for (const char *p = none; *p && o + 1 < size; p++) out[o++] = *p;
+    out[o] = 0;
+  }
 }
 #endif

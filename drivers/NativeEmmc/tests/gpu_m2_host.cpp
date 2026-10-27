@@ -72,8 +72,10 @@ struct Fake {
   std::vector<uint32_t> gpu = std::vector<uint32_t>(0x90000 / 4), smmu = std::vector<uint32_t>(0x10000 / 4);
   uint32_t *ring = nullptr, *scratch = nullptr;
   uint64_t ringPhys = 0, scratchPhys = 0;
+  uint32_t ringDwords = 1024;
   bool execute = true, secvidLocked = false;
-  unsigned writes = 0, flushes = 0;
+  bool smmuIgnore = false, bypassBecomesFault = false;   // firmware behaviours seen on qcom SMMUs
+  unsigned writes = 0, flushes = 0, smmuWrites = 0;
 };
 static uint32_t frd(void *c, unsigned b, uint32_t off) {
   Fake *f = static_cast<Fake *>(c);
@@ -81,21 +83,31 @@ static uint32_t frd(void *c, unsigned b, uint32_t off) {
 }
 static void fwr(void *c, unsigned b, uint32_t off, uint32_t v) {
   Fake *f = static_cast<Fake *>(c);
-  if (b != GM2_GPU) { f->writes += 1000; return; }
+  if (b != GM2_GPU) {
+    f->smmuWrites++;
+    if (f->smmuIgnore) return;
+    if (off == GM2_SMMU_GFSR) { f->smmu.at(off / 4) &= ~v; return; }   // write one to clear
+    if (f->bypassBecomesFault && off >= GM2_SMMU_S2CR(0) && off < GM2_SMMU_S2CR(128) && ((v >> 16) & 3u) == 1)
+      v = (v & ~(3u << 16)) | (2u << 16);
+    f->smmu.at(off / 4) = v;
+    return;
+  }
   f->writes++;
   const uint32_t reg = off / 4;
   if (reg == GM2_RBBM_SECVID_TRUST_CNTL && f->secvidLocked) return;
   f->gpu.at(reg) = v;
   if (reg == GM2_CP_RB_WPTR && f->execute && f->gpu[GM2_CP_SQE_CNTL] == 1) {
-    // walk the ring: ME_INIT then MEM_WRITE at the given address (the scratch page)
-    uint32_t i = 0;
-    while (i < v) {
+    // walk the ring from RPTR to the new WPTR: NOP, ME_INIT, MEM_WRITE / EVENT_WRITE into the scratch page
+    uint32_t i = f->gpu[GM2_CP_RB_RPTR];
+    while (i != v) {
       const uint32_t h = f->ring[i], cnt = h & 0x3fff, op = (h >> 16) & 0x7f;
-      if (op == GM2_CP_MEM_WRITE) {
-        const uint64_t a = f->ring[i + 1] | static_cast<uint64_t>(f->ring[i + 2]) << 32;
-        f->scratch[(a - f->scratchPhys) / 4] = f->ring[i + 3];
+      if (op == GM2_CP_MEM_WRITE || op == GM2_CP_EVENT_WRITE) {
+        const uint32_t k = op == GM2_CP_EVENT_WRITE ? 1 : 0;
+        const uint64_t a = f->ring[i + 1 + k] | static_cast<uint64_t>(f->ring[i + 2 + k]) << 32;
+        f->scratch[(a - f->scratchPhys) / 4] = f->ring[i + 3 + k];
+        if (k) f->gpu[GM2_RBBM_INT_0_STATUS] |= 1u << 20;
       }
-      i += 1 + cnt;
+      i = (i + 1 + cnt) % f->ringDwords;
     }
     f->gpu[GM2_CP_RB_RPTR] = v;
   }
@@ -129,7 +141,155 @@ static void testSmmu() {
   CHECK(s.path == GM2_PATH_BYPASS);
   gm2_smmu_read(&io, 2, &s);   // sid 2 does not match sid 0 / mask 1
   CHECK(s.smr == -1 && s.path == GM2_PATH_UNMATCHED_FAULT);
-  CHECK(f.writes == 0);   // read only
+  CHECK(f.writes == 0 && f.smmuWrites == 0);   // read only
+}
+
+// The phone's SMMU as M2 read it: client port on, USFCFG, 4 SMRs none valid, 5 context banks at 0x8000, 4 KiB pages.
+static void phoneSmmu(Fake &f, bool aarch64) {
+  f.smmu[0] = 0x00200406;
+  f.smmu[GM2_SMMU_IDR0 / 4] = 0x4c017e04;
+  f.smmu[GM2_SMMU_IDR1 / 4] = 0x20000005;
+  f.smmu[GM2_SMMU_IDR2 / 4] = aarch64 ? 0x00001055u : 0x00000055u;
+}
+
+static void testSmmuSetup() {
+  std::vector<uint64_t> table(4, 0);
+  const uint64_t tablePhys = 0x80000000ull + 0xf800;
+  {   // mode 1, bypass kept
+    Fake f;
+    phoneSmmu(f, true);
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(s.path == GM2_PATH_UNMATCHED_FAULT && s.cbBase == 0x8000 && s.smrs == 4);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_BYPASS, 0xff, table.data(), tablePhys, &c);
+    CHECK(c.ok && c.used == GM2_SM_BYPASS && c.smr == 0 && !c.why && c.sync);
+    CHECK(f.smmu[GM2_SMMU_SMR(0) / 4] == 0x80010000u && f.smmu[GM2_SMMU_S2CR(0) / 4] == 0x10000u);
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(s.path == GM2_PATH_BYPASS && gm2_identity_after(&s, &c));
+    gm2_smmu_read(&io, 1, &s);   // mask 1: sid 1 is the same group
+    CHECK(s.path == GM2_PATH_BYPASS);
+    CHECK(f.smmu[0] == 0x00200406u && f.writes == 0);   // sCR0 untouched, no GPU write
+  }
+  {   // mode 1 on firmware that writes BYPASS as FAULT: falls back to the context-bank bypass
+    Fake f;
+    phoneSmmu(f, true);
+    f.bypassBecomesFault = true;
+    f.smmu[GM2_SMMU_GFSR / 4] = 0x2;
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_BYPASS, 0xff, table.data(), tablePhys, &c);
+    CHECK(c.ok && c.used == GM2_SM_CB_BYPASS && c.cb == 4 && ((c.bypassRead >> 16) & 3u) == 2);
+    CHECK(c.gfsrBefore == 2 && c.gfsrAfter == 0);
+    CHECK(f.smmu[(0x1000 + GM2_SMMU_CBAR(4)) / 4] == GM2_CBAR_S1_BYPASS_S2);
+    CHECK(f.smmu[(0x1000 + GM2_SMMU_CBA2R(4)) / 4] == 1u && f.smmu[(0x8000 + 4 * 0x1000) / 4] == 0);
+    CHECK(f.smmu[GM2_SMMU_S2CR(0) / 4] == 4u && f.smmu[GM2_SMMU_SMR(0) / 4] == 0x80010000u);
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(s.path == GM2_PATH_CB_OFF && s.cb == 4 && gm2_identity_after(&s, &c));
+  }
+  {   // mode 3: stage-1 identity table on context bank 1
+    Fake f;
+    phoneSmmu(f, true);
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_CB_IDENTITY, 1, table.data(), tablePhys, &c);
+    CHECK(c.ok && c.used == GM2_SM_CB_IDENTITY && c.cb == 1 && c.ttbrRead == tablePhys);
+    CHECK(table[0] == 0x445u && table[1] == 0x40000441ull && table[3] == 0xc0000441ull);
+    const uint32_t cb1 = 0x8000 + 0x1000;
+    CHECK(f.smmu[(cb1 + GM2_CB_TCR) / 4] == GM2_TCR_IDENTITY && f.smmu[(cb1 + GM2_CB_MAIR0) / 4] == 0x44u);
+    CHECK(f.smmu[(cb1 + GM2_CB_SCTLR) / 4] == GM2_SCTLR_IDENTITY_ON && f.smmu[GM2_SMMU_S2CR(0) / 4] == 1u);
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(s.path == GM2_PATH_CB_TRANSLATE && gm2_identity_after(&s, &c));
+  }
+  {   // mode 3 without AArch64 tables: stops, the group stays FAULT
+    Fake f;
+    phoneSmmu(f, false);
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_CB_IDENTITY, 0xff, table.data(), tablePhys, &c);
+    CHECK(!c.ok && c.used == GM2_SM_NONE && c.why && ((f.smmu[GM2_SMMU_S2CR(0) / 4] >> 16) & 3u) == 2);
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(!gm2_identity_after(&s, &c));
+  }
+  {   // the hypervisor drops every SMMU write
+    Fake f;
+    phoneSmmu(f, true);
+    f.smmuIgnore = true;
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_BYPASS, 0xff, table.data(), tablePhys, &c);
+    CHECK(!c.ok && c.used == GM2_SM_NONE && c.why && f.smmuWrites > 0);
+    gm2_smmu_read(&io, 0, &s);
+    CHECK(s.path == GM2_PATH_UNMATCHED_FAULT && !gm2_identity_after(&s, &c));
+  }
+  {   // mode 0 and an already untranslated path: nothing written
+    Fake f;
+    phoneSmmu(f, true);
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    gm2_smmu s;
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_cfg c;
+    gm2_smmu_setup(&io, &s, GM2_SM_NONE, 0xff, table.data(), tablePhys, &c);
+    CHECK(!c.ok && f.smmuWrites == 0);
+    f.smmu[0] |= 1u;   // CLIENTPD
+    gm2_smmu_read(&io, 0, &s);
+    gm2_smmu_setup(&io, &s, GM2_SM_BYPASS, 0xff, table.data(), tablePhys, &c);
+    CHECK(c.ok && c.used == GM2_SM_NONE && f.smmuWrites == 0);
+  }
+}
+
+static void testSubmit(bool execute) {
+  Fake f;
+  f.execute = execute;
+  std::vector<uint32_t> mem(0x10000 / 4, 0);
+  f.ring = &mem[0xe000 / 4];
+  f.scratch = &mem[0xf000 / 4];
+  f.ringPhys = 0x80000000ull + 0xe000;
+  f.scratchPhys = 0x80000000ull + 0xf000;
+  const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+  const gm2_mem m = {&mem[0], 0x80000000ull, f.ring, f.ringPhys, 1024, f.scratch, f.scratchPhys};
+  gm2_cp c;
+  gm2_cp_start(&io, &m, &c);
+  gm2_ring rb = {f.ring, f.ringPhys, 1024, c.wptr, 0, f.scratch, f.scratchPhys};
+  uint32_t waited = 0;
+  int e = gm2_submit(&io, &rb, nullptr, 0, 200000, &waited);   // fence only
+  if (!execute) {
+    CHECK(e == GM2_SUBMIT_TIMEOUT && waited >= 200000 && rb.ts == 1);
+    return;
+  }
+  CHECK(e == GM2_SUBMIT_OK && waited == 0 && rb.ts == 1 && gm2_fence(&io, &rb) == 1 && rb.wptr == 18);
+  CHECK(f.ring[13] == 0x70460004u && f.ring[14] == 0x80000004u && f.ring[15] == static_cast<uint32_t>(f.scratchPhys + 32));
+  CHECK((f.gpu[GM2_RBBM_INT_0_STATUS] >> 20) & 1u);
+  const uint64_t t = f.scratchPhys + 48;
+  const uint32_t pk[4] = {gm2_pkt7(GM2_CP_MEM_WRITE, 3), static_cast<uint32_t>(t), static_cast<uint32_t>(t >> 32), 0x1234};
+  e = gm2_submit(&io, &rb, pk, 4, 200000, &waited);
+  CHECK(e == GM2_SUBMIT_OK && rb.ts == 2 && f.scratch[12] == 0x1234 && gm2_fence(&io, &rb) == 2);
+  // 300-dword packets: the fourth one pads with a NOP and wraps to the start of the ring
+  std::vector<uint32_t> big(300, 0);
+  big[0] = gm2_pkt7(GM2_CP_NOP, 299);
+  for (unsigned i = 0; i < 6; i++) {
+    e = gm2_submit(&io, &rb, big.data(), 300, 200000, &waited);
+    CHECK(e == GM2_SUBMIT_OK && gm2_fence(&io, &rb) == rb.ts && f.gpu[GM2_CP_RB_RPTR] == rb.wptr);
+  }
+  CHECK(rb.ts == 8 && rb.wptr < 1024);
+  std::vector<uint32_t> huge(1020, 0);
+  CHECK(gm2_submit(&io, &rb, huge.data(), 1020, 1000, &waited) == GM2_SUBMIT_TOO_BIG);
+  char names[64];
+  gm2_int_names((1u << 20) | (1u << 9), names, sizeof(names));
+  CHECK(!strcmp(names, "cp_hw_error,cache_flush_ts"));
+  gm2_int_names(0, names, sizeof(names));
+  CHECK(!strcmp(names, "none"));
+  gm2_int_names(0xffffffffu, names, 8);   // truncated, still terminated
+  CHECK(strlen(names) == 7);
 }
 
 static void testCp(bool execute, bool locked) {
@@ -164,6 +324,9 @@ int main() {
   testSmmu();
   testCp(true, false);
   testCp(false, true);
+  testSmmuSetup();
+  testSubmit(true);
+  testSubmit(false);
   printf("gpu_m2_host: %d checks, %d failures\n", checks, fails);
   return fails ? 1 : 0;
 }

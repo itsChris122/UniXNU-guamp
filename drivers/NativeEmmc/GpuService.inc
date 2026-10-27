@@ -23,6 +23,7 @@
 
 #include "GuampGpuM1.h"
 #include "GuampGpuM2.h"
+#include "GuampGpuBlit.h"
 #include "GuampRpmCore.h"
 #include "GuampExt4.inc"
 
@@ -37,6 +38,13 @@ char activeSlot();
 //   2  plus the CP start (soft reset, A610 a6xx_start subset, ring, SQE unhalt, CP_ME_INIT, CP_MEM_WRITE, SECVID
 //      trust write) when the SMMU leaves stream 0 untranslated; otherwise it stops there
 //   3  as 2 even with a translating / faulting SMMU path (forced: the CP fetches then fault inside the GPU)
+// M3, levels 2 and 3, before the CP start when stream 0 is translated or faults (GuampGpuM2.h gm2_smmu_setup):
+//   guamp-gpu-smmu=0 no SMMU write; 1 (default) S2CR bypass for SMR sid 0 mask 1, falling back to 2 when the
+//   firmware does not keep it; 2 context bank with SCTLR.M clear (qcom bypass quirk); 3 context bank with a stage-1
+//   identity table (four 1 GiB blocks, at 0xf800 of the buffer). guamp-gpu-smmu-cb=<n> context bank (default the last).
+//   After a CP start that consumed the ring and wrote the magic word: one fence-only submission (CP_EVENT_WRITE
+//   CACHE_FLUSH_TS, timestamp at scratch + 32) and the RBBM interrupt status, read only (no handler registered).
+//   gpum2::submit() then accepts PM4 packets from this thread (one caller at a time).
 // 64 KiB physically contiguous, uncached, below 4 GiB: SQE at 0 (up to 56 KiB), ring 4 KiB at 0xe000, scratch at
 // 0xf000. Never freed once the CP was started (it keeps the ring and microcode addresses).
 namespace gpum2 {
@@ -45,9 +53,8 @@ volatile uint8_t *gGpu, *gSmmu;
 uint32_t rd(void *, unsigned block, uint32_t off) {
   return *reinterpret_cast<volatile uint32_t *>((block == GM2_GPU ? gGpu : gSmmu) + off);
 }
-void wr(void *, unsigned block, uint32_t off, uint32_t v) {
-  if (block != GM2_GPU) return;   // the SMMU is never written
-  *reinterpret_cast<volatile uint32_t *>(gGpu + off) = v;
+void wr(void *, unsigned block, uint32_t off, uint32_t v) {   // the SMMU only from gm2_smmu_setup (levels 2, 3)
+  *reinterpret_cast<volatile uint32_t *>((block == GM2_GPU ? gGpu : gSmmu) + off) = v;
   __asm__ volatile("dsb sy" ::: "memory");
 }
 void udelay(void *, unsigned us) { IODelay(us); }
@@ -58,7 +65,7 @@ void flush(void *, const void *p, size_t bytes) {
   __asm__ volatile("dsb sy" ::: "memory");
 }
 
-constexpr uint32_t kMemBytes = 0x10000, kSqeCap = 0xe000, kRingOff = 0xe000, kScratchOff = 0xf000;
+constexpr uint32_t kMemBytes = 0x10000, kSqeCap = 0xe000, kRingOff = 0xe000, kScratchOff = 0xf000, kTableOff = 0xf800;
 constexpr uint32_t kRingDwords = 1024;
 
 struct Vendor { uint64_t superFirst, superBlocks; gm2_extent ext[GM2_LP_MAX_EXTENTS]; unsigned n; uint64_t sectors; };
@@ -157,7 +164,18 @@ out:
   return done;
 }
 
-void run(volatile uint8_t *gpu, unsigned level) {
+gm2_ring gRing;
+bool gReady;   // the CP took the fence-only submission: submit() may be used
+
+// PM4 packets from the guamp-gpu-m1 thread after run(); returns the gm2_submit result codes.
+int submit(const uint32_t *pkts, uint32_t n, uint32_t timeoutUs, uint32_t *waitedUs) {
+  *waitedUs = 0;
+  if (!gReady) return GM2_SUBMIT_FULL;
+  const gm2_io io = {nullptr, rd, wr, udelay, flush};
+  return gm2_submit(&io, &gRing, pkts, n, timeoutUs, waitedUs);
+}
+
+void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmuCb) {
   gGpu = gpu;
   gSmmu = mapPhysical(GM2_SMMU_PHYS, GM2_SMMU_SIZE);
   if (!gGpu || !gSmmu) {
@@ -171,7 +189,7 @@ void run(volatile uint8_t *gpu, unsigned level) {
         "s2cr %08x cb %u cbar %08x sctlr %08x ttbr0 %llx fsr %08x far %llx: %s\n", s.scr0, s.idr0, s.idr1, s.gfsr,
         s.smrs, s.pageSize, s.cbBase, s.smr, s.smrVal, s.s2cr, s.cb, s.cbar, s.sctlr,
         static_cast<unsigned long long>(s.ttbr0), s.fsr, static_cast<unsigned long long>(s.far), gm2_path_name(s.path));
-  const bool identity = gm2_path_identity(s.path);
+  bool identity = gm2_path_identity(s.path);
 
   IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
       kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) |
@@ -188,6 +206,18 @@ void run(volatile uint8_t *gpu, unsigned level) {
   uint32_t hdr0 = 0, hdr1 = 0;
   const uint32_t sqeBytes = loadSqe(virt, kSqeCap, &hdr0, &hdr1);
   flush(nullptr, virt, kMemBytes);
+  gm2_smmu_cfg sc = {};
+  if (sqeBytes && level >= 2 && !identity) {
+    gm2_smmu_setup(&io, &s, smmuMode, smmuCb, reinterpret_cast<uint64_t *>(virt + kTableOff), phys + kTableOff, &sc);
+    gm2_smmu_read(&io, 0, &s);
+    identity = gm2_identity_after(&s, &sc);
+    IOLog("GuampGpu: M3 smmu %s -> %s%s%s: smr %d %08x/%08x s2cr %08x/%08x (bypass try %08x) cb %u cbar %08x/%08x "
+          "sctlr %08x/%08x tcr %08x mair %08x ttbr0 %llx, idr2 %08x gfsr %08x->%08x sync %s: path %s\n",
+          gm2_sm_name(sc.want), gm2_sm_name(sc.used), sc.why ? ", stop: " : "", sc.why ? sc.why : "", sc.smr, sc.smrWant,
+          sc.smrRead, sc.s2crWant, sc.s2crRead, sc.bypassRead, sc.cb, sc.cbarWant, sc.cbarRead, sc.sctlrWant, sc.sctlrRead,
+          sc.tcrRead, sc.mairRead, static_cast<unsigned long long>(sc.ttbrRead), sc.idr2, sc.gfsrBefore, sc.gfsrAfter,
+          sc.sync ? "ok" : "TIMEOUT", gm2_path_name(s.path));
+  }
   const char *stop = !sqeBytes ? "sqe" : level < 2 ? nullptr : !identity && level != 3 ? "smmu" : nullptr;
   if (level < 2 || stop) {
     IOLog("GuampGpu: M2 RESULT smmu %s sqe %s (%u bytes, header %08x %08x) cp - %s%s\n", identity ? "identity" : "translated",
@@ -214,6 +244,63 @@ void run(volatile uint8_t *gpu, unsigned level) {
         c.consumed ? "consumed" : "stuck", c.wrote ? "ok" : "none", c.secvidBefore, c.secvidAfter,
         c.secvidAfter == 0 ? " (unsecured)" : " (write ignored)");
   // buf stays allocated: the CP keeps the ring and microcode addresses
+  if (!c.consumed || !c.wrote) return;
+  gRing = {mem.ring, mem.ringPhys, kRingDwords, c.wptr, 0, mem.scratch, mem.scratchPhys};
+  uint32_t waited = 0;
+  const int e = gm2_submit(&io, &gRing, nullptr, 0, 200000, &waited);
+  gReady = e == GM2_SUBMIT_OK;
+  gm2_smmu_faults(&io, &s);
+  const uint32_t intStatus = gm2_r(&io, GM2_RBBM_INT_0_STATUS), intMask = gm2_r(&io, GM2_RBBM_INT_0_MASK);
+  char names[192];
+  gm2_int_names(intStatus, names, sizeof(names));
+  IOLog("GuampGpu: M3 fence ts %u %s after %u us (fence word %08x), rptr %u wptr %u, rbbm int %08x (%s) mask %08x, "
+        "cp hw_fault %08x int %08x, smmu gfsr %08x cb fsr %08x far %llx\n", gRing.ts, gm2_submit_err(e), waited,
+        gm2_fence(&io, &gRing), gm2_r(&io, GM2_CP_RB_RPTR), gRing.wptr, intStatus, names, intMask,
+        gm2_r(&io, GM2_CP_HW_FAULT), gm2_r(&io, GM2_CP_INTERRUPT_STATUS), s.gfsr, s.fsr,
+        static_cast<unsigned long long>(s.far));
+  IOLog("GuampGpu: M3 RESULT smmu %s fence %s submit %s\n", gm2_sm_name(sc.used), gm2_submit_err(e),
+        gReady ? "ready" : "off");
+  // guamp-gpu-blit=N: N 2D solid fills (GuampGpuBlit.h) of a band of the GOP surface, 500 ms apart with changing
+  // colours, so the GPU's writes stay visible over a still screen (iOS redraws the surface on its next frame).
+  unsigned blits = 0;
+  PE_parse_boot_argn("guamp-gpu-blit", &blits, sizeof(blits));
+  if (!gReady || !blits) return;
+  if (blits > 40) blits = 40;
+  static const uint32_t kColors[4] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffff00ffu};
+  uint32_t pkts[GMB_CLEAR_MAX_DWORDS];
+  for (unsigned i = 0; i < blits; ++i) {
+    gmb_clear c = {};
+    c.dst = 0x5C000000ULL;   // kFbPhys, the GOP surface (NativeEmmc.cpp)
+    c.pitch = 2880;
+    c.surfW = 720;
+    c.surfH = 1600;
+    c.x = 60;
+    c.y = 600;
+    c.w = 600;
+    c.h = 240;
+    c.argb = kColors[i & 3];
+    c.bgra = true;
+    c.smmuIdentity = true;   // gReady implies the identity path at guamp-gpu-m2=2
+    c.ts = gRing.scratchPhys + 0x100;
+    c.fence = gRing.scratchPhys + 0x120;
+    c.fenceValue = 0xb1170000u | i;
+    const uint32_t n = gmb_build_clear(pkts, GMB_CLEAR_MAX_DWORDS, &c);
+    if (!n) {
+      IOLog("GuampGpu: blit %u not built: %s\n", i, gmb_check(&c));
+      return;
+    }
+    uint32_t w = 0;
+    const int r = gm2_submit(&io, &gRing, pkts, n, 200000, &w);
+    const uint32_t fenceWord = gRing.scratch[0x120 / 4];
+    gm2_smmu_faults(&io, &s);
+    if (i < 3 || r != GM2_SUBMIT_OK)
+      IOLog("GuampGpu: blit %u colour %08x %u dwords: %s after %u us, fence %08x (want %08x), rbbm status %08x "
+            "cp hw_fault %08x, smmu gfsr %08x cb fsr %08x\n", i, c.argb, n, gm2_submit_err(r), w, fenceWord,
+            c.fenceValue, gm2_r(&io, GM2_RBBM_STATUS), gm2_r(&io, GM2_CP_HW_FAULT), s.gfsr, s.fsr);
+    if (r != GM2_SUBMIT_OK) return;
+    IOSleep(500);
+  }
+  IOLog("GuampGpu: blit RESULT %u fills done\n", blits);
 }
 }  // namespace gpum2
 
@@ -293,9 +380,11 @@ const char *rpmVotes() {
 
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-gpu-m1");
-  unsigned delay = 0, off = 0, rpmOn = 0, relaxed = 0, m2 = 0;
+  unsigned delay = 0, off = 0, rpmOn = 0, relaxed = 0, m2 = 0, smmuMode = GM2_SM_BYPASS, smmuCb = 0xff;
   PE_parse_boot_argn("guamp-gpu-m2", &m2, sizeof(m2));
   if (m2 > 3) m2 = 0;
+  PE_parse_boot_argn("guamp-gpu-smmu", &smmuMode, sizeof(smmuMode));
+  PE_parse_boot_argn("guamp-gpu-smmu-cb", &smmuCb, sizeof(smmuCb));
   PE_parse_boot_argn("guamp-gpu-delay", &delay, sizeof(delay));
   PE_parse_boot_argn("guamp-gpu-relaxed", &relaxed, sizeof(relaxed));
   PE_parse_boot_argn("guamp-gpu-off", &off, sizeof(off));
@@ -323,7 +412,7 @@ void thread(void *, wait_result_t) {
     IOSleep(1500);
     gm_do_reads(&io, &st);
   }
-  if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2);
+  if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2, smmuMode, smmuCb);
   else if (m2) IOLog("GuampGpu: M2 RESULT smmu - sqe - cp - stop M1 (GPU %s)\n", st.gpuRead ? "counter stuck" : "not read");
   if (st.stop) IOLog("GuampGpu: stopped at %s, GPU block %s\n", st.stop, st.mapped ? "mapped, not read" : "not touched");
   if (off == 1) {
