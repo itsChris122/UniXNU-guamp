@@ -249,6 +249,63 @@ const Variant kVariants[] = {
 };
 const unsigned kVariantCount = sizeof kVariants / sizeof kVariants[0];
 
+// guamp-touch-scan=1: bit-banged pin-role scan. Under Linux (TWRP) the chip answers, and in XNU it drives its IRQ low
+// (powered), so the failure is in our transaction. Every assignment of gpio6/7/71/80 to MISO/MOSI/CLK/CS (24) is tried
+// in the four SPI modes at ~100 kHz with the Himax bus read F3 00 + 4 bytes; any non-zero MISO byte is logged.
+// The four pads are restored to their saved configuration afterwards.
+uint8_t bbByte(unsigned miso, unsigned mosi, unsigned clk, unsigned mode, uint8_t out) {
+  const unsigned cpol = (mode >> 1) & 1u, cpha = mode & 1u;
+  uint8_t in = 0;
+  for (int bit = 7; bit >= 0; --bit) {
+    const unsigned b = (out >> bit) & 1u;
+    if (!cpha) {
+      pinWrite(mosi, 4, b ? 2u : 0u); IODelay(5);
+      pinWrite(clk, 4, cpol ? 0u : 2u); IODelay(2);
+      in = static_cast<uint8_t>((in << 1) | (pinRead(miso, 4) & 1u)); IODelay(3);
+      pinWrite(clk, 4, cpol ? 2u : 0u);
+    } else {
+      pinWrite(clk, 4, cpol ? 0u : 2u);
+      pinWrite(mosi, 4, b ? 2u : 0u); IODelay(5);
+      pinWrite(clk, 4, cpol ? 2u : 0u); IODelay(2);
+      in = static_cast<uint8_t>((in << 1) | (pinRead(miso, 4) & 1u)); IODelay(3);
+    }
+  }
+  return in;
+}
+void pinScan() {
+  unsigned scan = 0;
+  PE_parse_boot_argn("guamp-touch-scan", &scan, sizeof(scan));
+  if (scan != 1) return;
+  static const unsigned pins[4] = {GT_GPIO_SPI_A, GT_GPIO_SPI_B, GT_GPIO_SPI_C, GT_GPIO_SPI_D};
+  uint32_t saved[4];
+  for (unsigned i = 0; i < 4; ++i) saved[i] = pinRead(pins[i], 0);
+  unsigned hits = 0;
+  for (unsigned a = 0; a < 4; ++a) for (unsigned b = 0; b < 4; ++b) for (unsigned c = 0; c < 4; ++c) {
+    if (a == b || a == c || b == c) continue;
+    const unsigned d = 6 - a - b - c;
+    const unsigned miso = pins[a], mosi = pins[b], clk = pins[c], cs = pins[d];
+    for (unsigned mode = 0; mode < 4; ++mode) {
+      pinWrite(miso, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 3));
+      pinWrite(cs, 4, 2u); pinWrite(cs, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 0) | GT_PIN_OE);
+      pinWrite(clk, 4, (mode & 2u) ? 2u : 0u); pinWrite(clk, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 0) | GT_PIN_OE);
+      pinWrite(mosi, 4, 0u); pinWrite(mosi, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 0) | GT_PIN_OE);
+      IODelay(50);
+      pinWrite(cs, 4, 0u); IODelay(10);
+      bbByte(miso, mosi, clk, mode, 0xf3); bbByte(miso, mosi, clk, mode, 0x00);
+      uint8_t rx[4], any = 0;
+      for (unsigned i = 0; i < 4; ++i) { rx[i] = bbByte(miso, mosi, clk, mode, 0x00); any = static_cast<uint8_t>(any | rx[i]); }
+      pinWrite(cs, 4, 2u); IODelay(20);
+      if (any) {
+        hits = hits + 1;
+        IOLog("GuampTouch: scan miso %u mosi %u clk %u cs %u mode %u rx %02x %02x %02x %02x\n", miso, mosi, clk, cs, mode,
+              rx[0], rx[1], rx[2], rx[3]);
+      }
+    }
+  }
+  for (unsigned i = 0; i < 4; ++i) pinWrite(pins[i], 0, saved[i]);
+  IOLog("GuampTouch: scan done, %u of 96 combinations got MISO activity\n", hits);
+}
+
 bool openBus() {
   gStep = 3;
   unsigned verbose = 0;
@@ -327,6 +384,7 @@ bool openBus() {
         "irq pu/pd %u%u | panel %s | %s\n",
         stageMax, r, ok, ok >= 0 ? kVariants[ok].mode : 0u, gChip.id[3], gChip.id[2], gChip.id[1], failMask, gRxOr,
         miso0.pu, miso0.pd, miso1.pu, miso1.pd, irq0.pu, irq0.pd, off ? "OFF" : "on/unknown", verdict);
+  if (r) pinScan();
   if (r) { fail(32, r); return false; }
   return true;
 }
