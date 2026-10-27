@@ -278,6 +278,20 @@ bool openBus() {
   gBus.ctx = nullptr; gBus.xfer = busXfer; gBus.sleep_ms = busSleep; gBus.reset = busReset;
   memset(&gChip, 0, sizeof gChip);
   gChip.bus = &gBus; gChip.frame = gFrame; gChip.rx = gRx;
+  // guamp-touch-lcdreset=1: redo the panel-side reset Linux performs before the touch probe (bengal-guam-display.dtsi
+  // reset sequence 1/5, 0/2, 1/60 ms on gpio82), with the touch reset held low across it, then release the touch reset.
+  // gpio82 is already a GPIO output (cfg 0x2c3); only its level is written. The display stays dark until re-initialised.
+  unsigned lcdReset = 0;
+  PE_parse_boot_argn("guamp-touch-lcdreset", &lcdReset, sizeof(lcdReset));
+  if (lcdReset == 1) {
+    pinWrite(GT_GPIO_RESET, 4, 0u);
+    pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(5);
+    pinWrite(GT_GPIO_LCD_RESET, 4, 0u); IOSleep(2);
+    pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(60);
+    pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(50);
+    IOLog("GuampTouch: lcd reset cycle done, lcd-rst %u tp-rst %u irq %u\n", pinRead(GT_GPIO_LCD_RESET, 4) & 1u,
+          pinRead(GT_GPIO_RESET, 4) & 1u, pinRead(GT_GPIO_IRQ, 4) & 1u);
+  }
   // Electrical check before any chip access: engine idle, CS high, reset released.
   const PadFloat miso0 = padFloat(GT_GPIO_SPI_A), irq0 = padFloat(GT_GPIO_IRQ);
   r = HX_ERR_CHIP;
