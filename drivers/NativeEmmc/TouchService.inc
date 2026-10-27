@@ -48,7 +48,7 @@ struct hx_chip gChip;
 uint8_t *gFrame, *gRx, *gCfg;
 uint64_t gLevelHz[GT_DFS_LEVELS];
 bool gDfs;
-volatile uint32_t gStep, gEvents, gBad, gIrqs;
+volatile uint32_t gStep, gEvents, gBad, gIrqs, gReleases;
 volatile int gError;
 
 void fail(unsigned step, int code) { if (!gError) { gStep = step; gError = code ? code : -1; } IOLog("GuampTouch: step %u failed (%d)\n", step, code); }
@@ -652,6 +652,8 @@ void thread(void *param, wait_result_t) {
   uint32_t seen = gIrqEvents;
   bool down = false;
   uint32_t polls = 0;
+  uint64_t lastGood = 0, releaseTicks = 0;
+  nanoseconds_to_absolutetime(100 * 1000 * 1000ULL, &releaseTicks);
   for (;;) {
     if (useIrq) {
       // Woken by the IRQ, or after 20 ms at the latest: works even if the IRQ line never fires.
@@ -664,13 +666,21 @@ void thread(void *param, wait_result_t) {
     }
     polls = polls + 1;
     if (polls == 50 || (polls & 2047) == 0)
-      IOLog("GuampTouch: polls %u irqs %u events %u bad %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad,
+      IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad, gReleases,
             gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback);
     struct hx_report rep;
     if (hx_read_event(&gChip, ev) || hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep)) {
       gBad = gBad + 1;
+      // A lost "finger up" report left iOS with a stuck contact: release after 100 ms without a valid report.
+      if (down && mach_absolute_time() - lastGood > releaseTicks) {
+        struct hx_report up = {};
+        down = false;
+        gReleases = gReleases + 1;
+        publish(up);
+      }
       continue;
     }
+    lastGood = mach_absolute_time();
     if (!rep.count && !down) continue;
     down = rep.count != 0;
     gEvents = gEvents + 1;

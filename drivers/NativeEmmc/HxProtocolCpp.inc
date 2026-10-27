@@ -337,7 +337,8 @@ int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *o
     for (unsigned i = 0; i < HX_EVENT_LEN; ++i) {sum += buf[i]; zero += buf[i] == 0;}
     out->count = 0;
     out->point_cnt = buf[HX_EVENT_POINT_CNT];
-    if ((sum & 0xFF) || zero == HX_EVENT_LEN) return HX_ERR_CHECKSUM;
+    if (zero == HX_EVENT_LEN) return HX_OK;                                          // empty stack: no fingers (release)
+    if (sum & 0xFF) return HX_ERR_CHECKSUM;
     if (out->point_cnt == 0xFF || !(out->point_cnt & 0x0F)) return HX_OK;           // all fingers up
     for (unsigned i = 0; i < HX_MAX_PT; ++i) {
         const uint8_t *p = buf + 4 * i;
