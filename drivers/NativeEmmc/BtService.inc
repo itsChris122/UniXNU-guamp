@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// guamp Bluetooth milestone M0, included by NativeEmmc.cpp after PmicService.inc (mapPhysical, the boot log, the SPMI
-// helpers). A one-shot diagnostic on its own kernel thread, opt-in with boot argument guamp-bt=1:
+// guamp Bluetooth milestones M0 and M1, included by NativeEmmc.cpp after PmicService.inc (mapPhysical, the boot log,
+// the SPMI helpers, gCard). A one-shot diagnostic on its own kernel thread, opt-in with boot argument guamp-bt=1 (M0)
+// or guamp-bt=2 (M0, then M1):
 //   1 rails   PM6125 L9A (io), L16A (xo), L17A (core), L23A (pa) read over SPMI (type, subtype, status, enable,
 //             voltage); guamp-bt-ldo=1 enables the rails that are off (enable bit only), =2 also writes Linux's
 //             voltage when the read-back is outside bt_wcn3990's range. Any rail the apps EE may not write stops this
@@ -14,11 +15,24 @@
 //             version request (VSC 0xFC00, 0x19), raw bytes (at most 10 lines) and the decoded versions, plus the
 //             firmware files of the bluetooth_a partition that fit the controller. At the end RX is stopped and the
 //             power-off pulse is sent again (guamp-bt-keep=1 leaves the controller on).
+//   4 M1      (guamp-bt=2 only, after a decoded QCA version) btqca.c qca_uart_setup for the controller family of the
+//             version reply (product 0x0f = WCN3950: cmbtfw<rom>.tlv + cmnv<rom>.bin): both files read from /image of
+//             the bluetooth_<slot> partition (GPT name; slot as the Wi-Fi preparation finds it, guamp-bt-slot=a|b
+//             overrides) with the read-only GuampExt4.inc reader; the TLV patch header must name the controller's
+//             product and ROM build. hci_qca.c qca_set_speed: flow control off (RFR not ready), VSC 0xFC48 with the
+//             baud code, 1-10 ms, host to the new rate (without DFS the RCG moves to 48 MHz for 3 Mbit/s at 16x),
+//             flow control on, the controller's vendor event awaited 100 ms, Read_Local_Version at the new rate.
+//             Then patch, 10 ms, NVM (with Linux's NVM edits: in-band sleep, baud code, deep sleep) in 243-byte VSC
+//             0xFC00/0x1E segments acked as the TLV download mode says, HCI_Reset, Read_Local_Version, the EDL
+//             version (patch version after the download) and HCI_Read_BD_ADDR, compared with the NVM default as
+//             qca_check_bdaddr does (no address is written). guamp-bt-baud=<rate> (default 3000000; 115200 = no
+//             switch). After a successful M1 the controller stays powered (guamp-bt-keep=0 sends the power-off pulse).
 // Other boot arguments: guamp-bt-delay=<s> (start later, so the USB mirror sees the lines), guamp-bt-uart=0 (rails
 // only), guamp-bt-pulse=0 (no power pulses), guamp-bt-os=16|32 (UART oversampling; default from the QUP version).
 // Outcome of a boot: the single "GuampBt: RESULT ..." line. Writes stay limited to SE3, gpio8-11, the SE3 GCC votes /
 // RCG and (only with guamp-bt-ldo=1/2) the four LDO enable/voltage registers. Every wait has a timeout.
-// Board facts: GuampBtBoard.h; UART engine: GeniUart.h; HCI framing and decoders: BtHci.h (host-tested).
+// Board facts: GuampBtBoard.h; UART engine: GeniUart.h; HCI framing and decoders: BtHci.h; rampatch/NVM handling:
+// BtQcaFw.h (all host-tested).
 
 #include "GuampSpmi.h"
 #include "GuampPmicBoard.h"
@@ -27,6 +41,8 @@
 #include "BtHci.h"
 #include "GeniUartCpp.inc"
 #include "GuampRpmCore.h"
+#include "BtQcaFw.h"
+#include "GuampExt4.inc"
 
 namespace pmic {
 extern volatile int gArbReady;
@@ -37,6 +53,10 @@ int apidOf(unsigned sid, uint16_t addr);
 }
 namespace rpm {   // GuampRpm.inc
 int request(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *kv, unsigned n, unsigned timeoutMs);
+}
+namespace wifiprep {   // GuampWifiPrep.inc (included later): GPT lookup by name, active slot
+bool findPartition(const char *wanted, uint64_t *first, uint64_t *blocks, uint64_t *attributes);
+char activeSlot();
 }
 
 namespace bt {
@@ -54,7 +74,9 @@ uint64_t gLevelHz[GT_DFS_LEVELS];
 bool gDfs;
 unsigned gOs = 16, gHexLines;
 uint8_t gRx[640];
-size_t gRxLen;
+size_t gRxLen, gRxPos;
+unsigned gIbsAcks;
+bool gIbs;                                           // set once the M1 NVM (in-band sleep enabled) is in the controller
 volatile uint32_t gStep;
 
 // --- step 1: supplies ---------------------------------------------------------------------------------------------
@@ -187,14 +209,34 @@ void hexLine(const char *tag, const uint8_t *p, size_t n) {
   bt_hex(text, sizeof text, p, n, 48);
   IOLog("GuampBt: %s %u bytes: %s%s\n", tag, static_cast<unsigned>(n), text, gHexLines == 10 ? " (raw log limit)" : "");
 }
+// Non-DFS: the SE3 RCG on an ftbl entry (GPLL0_OUT_AUX2, M/N) as clk_rcg2 would; gLevelHz[0] = the rate read back.
+void rcgProgram(const bt_rcg_entry &e) {
+  wr(gGcc, BT_S3_RCG + BT_RCG_M, e.m);
+  wr(gGcc, BT_S3_RCG + BT_RCG_N, bt_rcg_n_reg(e.m, e.n));
+  wr(gGcc, BT_S3_RCG + BT_RCG_D, bt_rcg_d_reg(e.m, e.n));
+  wr(gGcc, BT_S3_RCG + GT_RCG_CFG, BT_RCG_7M37_CFG);
+  wr(gGcc, BT_S3_RCG + GT_RCG_CMD, rd(gGcc, BT_S3_RCG + GT_RCG_CMD) | 1u);
+  for (unsigned i = 0; i < 1000 && (rd(gGcc, BT_S3_RCG + GT_RCG_CMD) & 1u); ++i) IODelay(1);
+  gLevelHz[0] = gt_level_hz(rd(gGcc, BT_S3_RCG + GT_RCG_CFG), rd(gGcc, BT_S3_RCG + BT_RCG_M), rd(gGcc, BT_S3_RCG + BT_RCG_N));
+}
+// With DFS a level of the boot chain's table; without, the lowest ftbl entry with an exact divider (kBtRcgTable),
+// reprogrammed only when the rate changes (7.3728 MHz serves 2400 and 115200, 48 MHz 3000000 at 16x).
 bool setBaud(unsigned baud) {
   struct bt_uart_clock c;
-  if (bt_choose_uart_clock(gLevelHz, GT_DFS_LEVELS, baud, gOs, &c)) { IOLog("GuampBt: no clock level for %u baud\n", baud); return false; }
+  if (gDfs ? bt_choose_uart_clock(gLevelHz, GT_DFS_LEVELS, baud, gOs, &c) : bt_choose_rcg(baud, gOs, &c)) {
+    IOLog("GuampBt: no clock level for %u baud\n", baud);
+    return false;
+  }
   const int err = bt_baud_error_permille(baud, c.baud_actual);
   const unsigned aerr = static_cast<unsigned>(err < 0 ? -err : err);
-  IOLog("GuampBt: %u baud: level %u (%llu Hz) div %u -> %u baud (%s%u.%u%%), os %u\n", baud, c.level,
-        static_cast<unsigned long long>(c.src_hz), c.div, c.baud_actual, err < 0 ? "+" : "-", aerr / 10, aerr % 10, gOs);
+  const bool reprogram = !gDfs && aerr <= 25 && gLevelHz[0] != c.src_hz;
+  if (reprogram) rcgProgram(kBtRcgTable[c.level]);
+  const bool rcgOk = gDfs || gLevelHz[0] == c.src_hz;
+  IOLog("GuampBt: %u baud: level %u (%llu Hz) div %u -> %u baud (%s%u.%u%%), os %u%s\n", baud, c.level,
+        static_cast<unsigned long long>(c.src_hz), c.div, c.baud_actual, err < 0 ? "+" : "-", aerr / 10, aerr % 10, gOs,
+        !reprogram ? "" : rcgOk ? ", RCG reprogrammed" : ", RCG read-back mismatch");
   if (aerr > 25) { IOLog("GuampBt: %u baud error above 2.5%%, not used\n", baud); return false; }
+  if (!rcgOk) return false;
   return geni_uart_set_clock(&gUart, c.div, gDfs ? c.level : 0) == 0;
 }
 bool cbcrOn(uint32_t v) { return !(v & GT_CBCR_CLK_OFF) || (v & 2u); }
@@ -228,14 +270,7 @@ bool uartUp() {
   if (!ok) { IOLog("GuampBt: SE3 clocks did not start (s3 cbcr %08x)\n", rd(gGcc, BT_HALT_S3)); return false; }
   if (!gDfs) {
     // No DFS table: program the ftbl's 7.3728 MHz entry (GPLL0_OUT_AUX2 * 384 / 15625), as clk_rcg2 would.
-    const uint32_t m = BT_RCG_7M37_M, n = BT_RCG_7M37_N;
-    wr(gGcc, BT_S3_RCG + BT_RCG_M, m);
-    wr(gGcc, BT_S3_RCG + BT_RCG_N, bt_rcg_n_reg(m, n));
-    wr(gGcc, BT_S3_RCG + BT_RCG_D, bt_rcg_d_reg(m, n));
-    wr(gGcc, BT_S3_RCG + GT_RCG_CFG, BT_RCG_7M37_CFG);
-    wr(gGcc, BT_S3_RCG + GT_RCG_CMD, rd(gGcc, BT_S3_RCG + GT_RCG_CMD) | 1u);
-    for (unsigned i = 0; i < 1000 && (rd(gGcc, BT_S3_RCG + GT_RCG_CMD) & 1u); ++i) IODelay(1);
-    gLevelHz[0] = gt_level_hz(rd(gGcc, BT_S3_RCG + GT_RCG_CFG), rd(gGcc, BT_S3_RCG + BT_RCG_M), rd(gGcc, BT_S3_RCG + BT_RCG_N));
+    rcgProgram(kBtRcgTable[0]);
     IOLog("GuampBt: SE3 RCG without DFS: programmed cfg %08x cmd %08x -> %llu Hz\n", rd(gGcc, BT_S3_RCG + GT_RCG_CFG),
           rd(gGcc, BT_S3_RCG + GT_RCG_CMD), static_cast<unsigned long long>(gLevelHz[0]));
   }
@@ -260,42 +295,73 @@ bool uartUp() {
 }
 
 // --- step 3: power pulses and HCI ---------------------------------------------------------------------------------
-// One command, then events until the expected one or timeoutMs. kind 0: Command Complete of op; 1: QCA version reply.
-// The returned event points into gRx (valid until the next command).
-int command(const char *what, uint16_t op, const uint8_t *params, uint8_t plen, unsigned kind, unsigned timeoutMs, bt_event *out) {
-  uint8_t pkt[16];
-  const size_t n = bt_h4_cmd(pkt, sizeof pkt, op, params, plen);
-  gRxLen = 0;
-  int r = geni_uart_write(&gUart, pkt, n, 200000);
-  if (r) {
-    IOLog("GuampBt: %s: TX failed %d (m_irq %08x, CTS gpio8 level %u)\n", what, r, gUart.last_m_irq, pinRead(8, 4) & 1u);
-    return r;
+// Receive side: gRx holds the bytes read so far, gRxPos the parse position. rxPump moves the RX FIFO in (compacting
+// only once the buffer is half full, so the raw dump of a short exchange still shows every byte); nextEvent parses and
+// once the M1 NVM has switched in-band sleep on, answers each IBS WAKE_IND of the controller with a WAKE_ACK (before,
+// a 0xFD is just noise and 0xFC, the power-on pulse byte, is never sent).
+struct RxStats { unsigned events, skipped; };
+void rxPump() {
+  if (gRxPos && gRxLen > sizeof gRx / 2) {
+    size_t k = 0;
+    for (size_t i = gRxPos; i < gRxLen; ++i) gRx[k++] = gRx[i];
+    gRxLen = k;
+    gRxPos = 0;
   }
-  size_t pos = 0;
-  unsigned skipped = 0, events = 0;
+  if (gRxLen == sizeof gRx) gRxLen = gRxPos = 0;     // stuck on a packet larger than the buffer: drop, resynchronise
+  gRxLen += geni_uart_read(&gUart, gRx + gRxLen, sizeof gRx - gRxLen);
+}
+bool nextEvent(bt_event *ev, RxStats *st) {
+  unsigned wake = 0;
+  const bool got = bt_h4_next_ibs(gRx, gRxLen, &gRxPos, ev, &st->skipped, gIbs ? &wake : nullptr) != 0;
+  for (; wake; --wake) {
+    const uint8_t ack = BT_IBS_WAKE_ACK;
+    if (!geni_uart_write(&gUart, &ack, 1, 20000)) gIbsAcks = gIbsAcks + 1;
+  }
+  if (got) st->events = st->events + 1;
+  return got;
+}
+// Events until the expected one or timeoutMs. kind 0: Command Complete of op; 1: QCA version reply; 2: any vendor
+// event (TLV segment ack, baud change). A Command Status with an error for op ends the wait (1). The returned event
+// points into gRx (valid until the next pump). quiet: raw dump only when the wait fails.
+int waitEvent(const char *what, uint16_t op, unsigned kind, unsigned timeoutMs, bt_event *out, bool quiet) {
+  RxStats st = {0, 0};
   int found = GENI_ERR_TIMEOUT;
   for (unsigned t = 0; t <= timeoutMs && found == GENI_ERR_TIMEOUT; ++t) {
-    gRxLen += geni_uart_read(&gUart, gRx + gRxLen, sizeof gRx - gRxLen);
+    rxPump();
     bt_event ev;
-    while (found == GENI_ERR_TIMEOUT && bt_h4_next(gRx, gRxLen, &pos, &ev, &skipped)) {
-      events = events + 1;
-      uint16_t eop = 0; const uint8_t *ret = nullptr; uint8_t rlen = 0, st = 0;
+    while (found == GENI_ERR_TIMEOUT && nextEvent(&ev, &st)) {
+      uint16_t eop = 0; const uint8_t *ret = nullptr; uint8_t rlen = 0, status = 0;
       bt_qca_version qv;
       if (kind == 0 && !bt_cmd_complete(&ev, &eop, &ret, &rlen) && eop == op) { *out = ev; found = 0; }
       else if (kind == 1 && !bt_decode_qca_version(&ev, &qv)) { *out = ev; found = 0; }
-      else if (!bt_cmd_status(&ev, &eop, &st) && eop == op && st) {
-        IOLog("GuampBt: %s: Command Status %02x\n", what, st);
+      else if (kind == 2 && ev.code == BT_EVT_VENDOR) { *out = ev; found = 0; }
+      else if (!bt_cmd_status(&ev, &eop, &status) && eop == op && status) {
+        IOLog("GuampBt: %s: Command Status %02x\n", what, status);
         *out = ev; found = 1;
       }
     }
-    if (gRxLen == sizeof gRx) break;
     if (found == GENI_ERR_TIMEOUT) IOSleep(1);
   }
-  hexLine(what, gRx, gRxLen);
+  if (!quiet || found) hexLine(what, gRx, gRxLen);
   if (found == GENI_ERR_TIMEOUT)
     IOLog("GuampBt: %s: no reply in %u ms (%u bytes, %u events, %u bytes skipped, dropped %u, CTS gpio8 level %u)\n", what,
-          timeoutMs, static_cast<unsigned>(gRxLen), events, skipped, gUart.rx_dropped, pinRead(8, 4) & 1u);
+          timeoutMs, static_cast<unsigned>(gRxLen), st.events, st.skipped, gUart.rx_dropped, pinRead(8, 4) & 1u);
   return found;
+}
+int sendPacket(const char *what, const uint8_t *pkt, size_t n) {
+  const int r = geni_uart_write(&gUart, pkt, n, 200000);
+  if (r) IOLog("GuampBt: %s: TX failed %d (m_irq %08x, CTS gpio8 level %u)\n", what, r, gUart.last_m_irq, pinRead(8, 4) & 1u);
+  return r;
+}
+// One command, then waitEvent. fresh: forget the bytes received before (M0); M1 keeps them (an event or a WAKE_IND
+// may straddle two exchanges).
+int command(const char *what, uint16_t op, const uint8_t *params, uint8_t plen, unsigned kind, unsigned timeoutMs, bt_event *out,
+            bool fresh = true, bool quiet = false) {
+  uint8_t pkt[16];
+  const size_t n = bt_h4_cmd(pkt, sizeof pkt, op, params, plen);
+  if (fresh) gRxLen = gRxPos = 0;
+  const int r = sendPacket(what, pkt, n);
+  return r ? r : waitEvent(what, op, kind, timeoutMs, out, quiet);
 }
 
 int pulse(uint8_t byte, unsigned baud) {
@@ -307,6 +373,8 @@ int pulse(uint8_t byte, unsigned baud) {
 }
 
 const char *gReset = "-", *gVersion = "-", *gQca = "-";
+bt_qca_version gQv;
+bool gQvOk;
 void hci() {
   gStep = 3;
   unsigned pulses = 1;
@@ -349,6 +417,8 @@ void hci() {
   if (r || bt_decode_qca_version(&ev, &qv)) { gQca = r == GENI_ERR_TIMEOUT ? "timeout" : "error"; return; }
   IOLog("GuampBt: QCA product %08x patch %04x rom %04x soc %08x -> soc_ver %08x rom %02x (reply form %u)\n", qv.product_id,
         qv.patch_ver, qv.rom_ver, qv.soc_id, qv.soc_ver, qv.rom, qv.form);
+  gQv = qv;
+  gQvOk = true;
   char tlv[16], nvm[16], match[160];
   bt_qca_names(qv.rom, tlv, nvm);
   const unsigned m = bt_fw_matches(&qv);
@@ -365,36 +435,308 @@ void hci() {
   gQca = at ? "ok" : "no-fw";
 }
 
+// --- step 4 (guamp-bt=2): rampatch + NVM download at the operating speed ----------------------------------------
+constexpr uint32_t kFwMax = 512 * 1024;                  // largest file of bluetooth_a: 229868 bytes
+struct FwWindow { uint64_t first, blocks; };
+struct FwFile { uint8_t *data; uint32_t size; };
+bool fwRead(void *ctx, uint64_t sector, uint32_t count, uint8_t *out) {
+  const FwWindow *w = static_cast<const FwWindow *>(ctx);
+  if (!count || count > kBounceBlocks || sector >= w->blocks || count > w->blocks - sector) return false;
+  Card &card = gCard;
+  IOLockLock(card.gate);
+  const bool ok = card.online && card.readBlocks(w->first + sector, count, out);
+  IOLockUnlock(card.gate);
+  return ok;
+}
+void fwFree(FwFile *f) {
+  if (f->data) IOFree(f->data, f->size);
+  f->data = nullptr;
+  f->size = 0;
+}
+// /image/<name> into a buffer of its size. 0 or an ext4 error (kErrRange: empty, not a file or above kFwMax).
+int fwLoad(ext4::Fs *fs, const char *name, FwFile *out) {
+  char path[48] = {'/', 'i', 'm', 'a', 'g', 'e', '/'};
+  unsigned at = 7;
+  for (const char *s = name; *s && at + 1 < sizeof path; ++s) path[at++] = *s;
+  path[at] = 0;
+  ext4::Inode ino;
+  int r = fs->lookupPath(path, &ino);
+  if (r) return r;
+  if (!ino.isFile() || !ino.size || ino.size > kFwMax) return ext4::kErrRange;
+  const uint32_t size = static_cast<uint32_t>(ino.size);
+  uint8_t *p = static_cast<uint8_t *>(IOMallocZero(size));
+  if (!p) return ext4::kErrIo;
+  r = fs->readFile(ino, 0, p, size);
+  if (r) { IOFree(p, size); return r; }
+  out->data = p;
+  out->size = size;
+  return 0;
+}
+// Both files from the bluetooth_<slot> partition, read only; one log line.
+bool fwLoadBoth(const char *tlv, const char *nvm, FwFile *patch, FwFile *cfg) {
+  char arg[4] = {};
+  const char slot = PE_parse_boot_argn("guamp-bt-slot", arg, sizeof(arg)) && (arg[0] == 'a' || arg[0] == 'b') ? arg[0]
+                                                                                                             : wifiprep::activeSlot();
+  char part[12] = {'b', 'l', 'u', 'e', 't', 'o', 'o', 't', 'h', '_', slot, 0};
+  FwWindow w = {0, 0};
+  uint64_t attr = 0;
+  if (!gCard.online || !gCard.gate || !wifiprep::findPartition(part, &w.first, &w.blocks, &attr)) {
+    IOLog("GuampBt: fw: partition %s not found (eMMC %s)\n", part, gCard.online ? "online" : "offline");
+    return false;
+  }
+  uint8_t *scratch = static_cast<uint8_t *>(IOMallocZero(ext4::kScratchBytes));
+  ext4::Fs *fs = static_cast<ext4::Fs *>(IOMallocZero(sizeof(ext4::Fs)));
+  int m = ext4::kErrIo, a = ext4::kErrIo, b = ext4::kErrIo;
+  if (scratch && fs) {
+    m = fs->mount(fwRead, &w, w.blocks, scratch);
+    if (!m) a = fwLoad(fs, tlv, patch);
+    if (!m) b = fwLoad(fs, nvm, cfg);
+  }
+  IOLog("GuampBt: fw: %s at LBA %llu (%llu sectors): ext4 %s, /image/%s %u bytes %s, /image/%s %u bytes %s\n", part,
+        static_cast<unsigned long long>(w.first), static_cast<unsigned long long>(w.blocks),
+        scratch && fs ? ext4::errorName(m) : "out of memory", tlv, patch->size, m ? "-" : a ? ext4::errorName(a) : "read",
+        nvm, cfg->size, m ? "-" : b ? ext4::errorName(b) : "read");
+  if (scratch) IOFree(scratch, ext4::kScratchBytes);
+  if (fs) IOFree(fs, sizeof(ext4::Fs));
+  return !m && !a && !b;
+}
+
+// hci_qca.c qca_set_speed(QCA_OPER_SPEED), WCN399x branch: flow control off (RTS deasserted, the controller holds its
+// reply), VSC 0xFC48 {code}, 1-10 ms for the controller, host to the new rate, flow control on. Then the controller's
+// vendor event at the new rate (100 ms, logged only: Linux drops it) and Read_Local_Version as the proof.
+bool switchBaud(unsigned baud, uint8_t code) {
+  uint8_t pkt[8];
+  const size_t n = bt_h4_cmd(pkt, sizeof pkt, BT_OP_QCA_SET_BAUD, &code, 1);
+  rxPump();
+  geni_uart_flow(&gUart, 0);
+  const int tx = sendPacket("QCA_set_baud", pkt, n);
+  IOSleep(5);
+  rxPump();
+  const int stop = geni_uart_rx_stop(&gUart, 2000);
+  const bool host = !tx && setBaud(baud);
+  const int start = geni_uart_rx_start(&gUart);
+  geni_uart_flow(&gUart, 1);
+  RxStats st = {0, 0};
+  uint8_t vlen = 0, v0 = 0, v1 = 0;
+  bool vendor = false;
+  for (unsigned t = 0; host && t < 100 && !vendor; ++t) {
+    rxPump();
+    bt_event ev;
+    while (!vendor && nextEvent(&ev, &st))
+      if (ev.code == BT_EVT_VENDOR) { vendor = true; vlen = ev.len; v0 = ev.len > 0 ? ev.p[0] : 0; v1 = ev.len > 1 ? ev.p[1] : 0; }
+    if (!vendor) IOSleep(1);
+  }
+  bt_event ev;
+  bt_local_version lv;
+  const int r = host ? command("Read_Local_Version@baud", BT_OP_READ_LOCAL_VERSION, nullptr, 0, 0, 500, &ev, false, true) : -1;
+  const bool ok = !r && !bt_decode_local_version(&ev, &lv);
+  IOLog("GuampBt: baud %u: VSC fc48 %02x tx %d, rx stop %d start %d, host %s, vendor event %s (len %u: %02x %02x), "
+        "Read_Local_Version %s at the new rate\n", baud, code, tx, stop, start, host ? "switched" : "NOT switched",
+        vendor ? "seen" : "none in 100 ms", vlen, v0, v1, ok ? "ok" : r == GENI_ERR_TIMEOUT ? "timeout" : "error");
+  return ok;
+}
+
+// qca_download_firmware: the whole file in 243-byte VSC 0xFC00/0x1E segments, sent back to back (UART flow control
+// only) except where the TLV download mode wants an ack: then the vendor event must be {00 04 result} within 5 s
+// (Linux: wrong size/type fails, a non-zero result is only logged). Events arriving between segments are consumed.
+uint8_t gSeg[BT_QCA_SEG_PKT_MAX];
+int download(const char *what, const char *name, const FwFile &f, unsigned mode) {
+  const unsigned segs = bt_tlv_segments(f.size);
+  unsigned sent = 0, acked = 0, nonzero = 0;
+  uint8_t lastNonzero = 0;
+  RxStats st = {0, 0};
+  int err = 0;
+  const uint64_t began = mach_absolute_time();
+  for (unsigned i = 0; i < segs && !err; ++i) {
+    int ack = 0;
+    const size_t n = bt_tlv_segment(f.data, f.size, i, mode, gSeg, sizeof gSeg, &ack);
+    if (!n) { err = -1; break; }
+    if (sendPacket(what, gSeg, n)) { err = -2; break; }
+    sent = sent + 1;
+    bt_event ev;
+    if (!ack) {
+      rxPump();
+      while (nextEvent(&ev, &st)) {}
+      continue;
+    }
+    const int w = waitEvent(what, BT_OP_QCA_EDL, 2, 5000, &ev, true);
+    uint8_t res = 0;
+    if (w) {
+      err = -3;
+    } else if (bt_tlv_ack(&ev, &res)) {
+      hexLine("bad TLV ack", ev.p, ev.len);
+      err = -4;
+    } else {
+      acked = acked + 1;
+      if (res) { nonzero = nonzero + 1; lastNonzero = res; }
+    }
+  }
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+  IOLog("GuampBt: %s %s: %u bytes, %u/%u segments sent, %u acked (%u with result != 0, last %02x), mode %u, %u other events, "
+        "%llu ms -> %s\n", what, name, f.size, sent, segs, acked, nonzero, lastNonzero, mode, st.events,
+        static_cast<unsigned long long>(ns / 1000000), err == 0 ? "ok" : err == -2 ? "TX failed" : err == -3 ? "no ack" :
+        err == -4 ? "bad ack" : "error");
+  return err;
+}
+
+const char *gDownload = "-", *gBaud = "-", *gAfter = "-", *gBdaddr = "-";
+unsigned gBaudRate = 115200;
+char gAfterText[48] = "-";
+// The M1 sequence (btqca.c qca_uart_setup after qca_set_speed). True when the patched controller answered HCI_Reset.
+bool m1() {
+  gStep = 4;
+  if (!gQvOk) { gDownload = "skipped"; IOLog("GuampBt: M1 skipped: no QCA version\n"); return false; }
+  char tlv[20], nvm[20];
+  const unsigned family = bt_qca_fw_names(&gQv, tlv, nvm);
+  const bool newLayout = family == 3990 && gQv.soc_id == BT_QCA_SOC_WCN3991;   // soc_type >= QCA_WCN3991
+  unsigned baud = 3000000;
+  PE_parse_boot_argn("guamp-bt-baud", &baud, sizeof(baud));
+  uint8_t code = bt_qca_baud_code(baud);
+  if (code == 0xff) {
+    IOLog("GuampBt: guamp-bt-baud=%u is not a QCA rate, 115200 kept\n", baud);
+    baud = 115200;
+    code = 0;
+  }
+  gBaudRate = baud;
+  FwFile patch = {nullptr, 0}, cfg = {nullptr, 0};
+  if (!fwLoadBoth(tlv, nvm, &patch, &cfg)) {
+    fwFree(&patch); fwFree(&cfg);
+    gDownload = "no-file";
+    return false;
+  }
+  bt_tlv_patch ph = {};
+  const int pr = bt_tlv_patch_parse(patch.data, patch.size, &ph);
+  const bool match = !pr && ph.product == (gQv.product_id & 0xffff) && ph.rom_build == gQv.rom_ver;
+  bt_tlv_nvm nv = {};
+  const int nr = bt_tlv_nvm_fix(cfg.data, cfg.size, code, newLayout, &nv);
+  IOLog("GuampBt: fw: WCN%u %s patch %04x product %04x rom %04x mode %u (%u segments)%s; %s type %u, %u tags, hci %02x %02x %02x -> "
+        "%02x %02x %02x, deep sleep %02x -> %02x, BD tag %s%s\n", family, tlv, ph.patch_ver, ph.product, ph.rom_build, ph.mode,
+        bt_tlv_segments(patch.size), pr ? " NOT A TLV PATCH" : match ? "" : " NOT FOR THIS CONTROLLER", nvm, nv.type, nv.tags,
+        nv.hci_before[0], nv.hci_before[1], nv.hci_before[2], nv.hci_after[0], nv.hci_after[1], nv.hci_after[2], nv.sleep_before,
+        nv.sleep_after, nv.has_bdaddr ? (bt_bd_addr_zero(nv.bdaddr) ? "zero" : "set") : "absent", nr ? ", NVM MALFORMED" : "");
+  if (!match || nr || newLayout) {
+    if (newLayout) IOLog("GuampBt: WCN3991 command-complete acks not implemented: no download\n");
+    fwFree(&patch); fwFree(&cfg);
+    gDownload = newLayout ? "unsupported" : "bad-file";
+    return false;
+  }
+  if (baud != 115200) {
+    const bool ok = switchBaud(baud, code);
+    gBaud = ok ? "ok" : "fail";
+    if (!ok) { fwFree(&patch); fwFree(&cfg); gDownload = "skipped"; return false; }
+  } else {
+    gBaud = "unchanged";
+  }
+  int e = download("patch", tlv, patch, ph.mode);
+  if (!e) {
+    IOSleep(10);                                           // "Give the controller some time to get ready to receive the NVM"
+    e = download("nvm", nvm, cfg, BT_QCA_SKIP_NONE);
+    gDownload = e ? "fail-nvm" : "ok";
+    gIbs = !e;
+  } else {
+    gDownload = "fail-patch";
+  }
+  fwFree(&patch); fwFree(&cfg);
+  if (e) return false;
+
+  bt_event ev;
+  int r = command("HCI_Reset after", BT_OP_RESET, nullptr, 0, 0, 2000, &ev, false, true);
+  const uint8_t rst = !r && ev.len > 3 ? ev.p[3] : 0xff;
+  bt_local_version lv = {};
+  const int lr = r ? -1 : command("Read_Local_Version after", BT_OP_READ_LOCAL_VERSION, nullptr, 0, 0, 1000, &ev, false, true);
+  const bool lvOk = !lr && !bt_decode_local_version(&ev, &lv);
+  IOLog("GuampBt: after download: HCI_Reset %s (status %02x), local version %s HCI %s (%u) rev %04x LMP %u subver %04x "
+        "manufacturer %04x\n", r ? "no reply" : rst ? "error" : "ok", rst, lvOk ? "ok" : "FAILED", bt_hci_version_name(lv.hci_ver),
+        lv.hci_ver, lv.hci_rev, lv.lmp_ver, lv.lmp_subver, lv.manufacturer);
+  if (r || rst) return false;
+
+  const uint8_t sub = BT_QCA_EDL_VER_REQ;
+  bt_qca_version qa;
+  const int qr = command("QCA_EDL_version after", BT_OP_QCA_EDL, &sub, 1, 1, 2000, &ev, false, true);
+  if (!qr && !bt_decode_qca_version(&ev, &qa)) {
+    static const char hx[] = "0123456789abcdef";
+    const uint16_t v[2] = {qa.patch_ver, qa.rom_ver};
+    const char *label[2] = {"patch ", " rom "};
+    unsigned at = 0;
+    for (unsigned k = 0; k < 2; ++k) {
+      for (const char *s = label[k]; *s; ++s) gAfterText[at++] = *s;
+      for (int sh = 12; sh >= 0; sh -= 4) gAfterText[at++] = hx[(v[k] >> sh) & 15];
+    }
+    gAfterText[at] = 0;
+    gAfter = gAfterText;
+    IOLog("GuampBt: after download: QCA product %08x patch %04x rom %04x soc %08x (TLV patch %04x: %s), IBS wake acks %u\n",
+          qa.product_id, qa.patch_ver, qa.rom_ver, qa.soc_id, ph.patch_ver, qa.patch_ver == ph.patch_ver ? "running" : "differs",
+          gIbsAcks);
+  } else {
+    gAfter = qr == GENI_ERR_TIMEOUT ? "timeout" : "error";
+  }
+
+  // qca_check_bdaddr: an address equal to the NVM's tag 2 is a placeholder (Linux then needs local-bd-address from the
+  // device tree, HCI_QUIRK_USE_BDADDR_PROPERTY). Nothing is written here.
+  uint8_t addr[6] = {}, status = 0xff;
+  const int br = command("Read_BD_ADDR", BT_OP_READ_BD_ADDR, nullptr, 0, 0, 1000, &ev, false, true);
+  const int bd = br ? -1 : bt_decode_bd_addr(&ev, addr, &status);
+  char text[18];
+  bt_bd_addr_text(addr, text);
+  if (bd) {
+    gBdaddr = br == GENI_ERR_TIMEOUT ? "timeout" : "error";
+    IOLog("GuampBt: Read_BD_ADDR %s (status %02x)\n", gBdaddr, status);
+  } else if (bt_bd_addr_zero(addr)) {
+    gBdaddr = "zero";
+    IOLog("GuampBt: BD address %s: not set, NVM/BD address set needed (Linux: local-bd-address from DT; none invented)\n", text);
+  } else if (nv.has_bdaddr && bt_bd_addr_eq(addr, nv.bdaddr)) {
+    gBdaddr = "nvm-default";
+    IOLog("GuampBt: BD address %s = NVM default: placeholder, BD address set needed (Linux: local-bd-address from DT; none "
+          "invented)\n", text);
+  } else {
+    gBdaddr = "set";
+    IOLog("GuampBt: BD address %s (not the NVM default)\n", text);
+  }
+  return true;
+}
+
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-bt");
-  unsigned delay = 0;
+  unsigned mode = 1, delay = 0;
+  PE_parse_boot_argn("guamp-bt", &mode, sizeof(mode));
   PE_parse_boot_argn("guamp-bt-delay", &delay, sizeof(delay));
   if (delay && delay <= 600) IOSleep(delay * 1000);
   const char *railState = rails();
   unsigned uart = 1, keep = 0;
   PE_parse_boot_argn("guamp-bt-uart", &uart, sizeof(uart));
-  PE_parse_boot_argn("guamp-bt-keep", &keep, sizeof(keep));
+  const bool keepSet = PE_parse_boot_argn("guamp-bt-keep", &keep, sizeof(keep));
   const char *uartState = "skipped";
+  bool on = false;
   if (uart) {
     if (!uartUp()) {
       uartState = "fail";
     } else {
       uartState = "up";
       hci();
+      const bool m1ok = mode == 2 && m1();
+      if (!keepSet) keep = m1ok ? 1u : 0u;               // =2: a patched controller stays on; =1 and failures: off
       geni_uart_rx_stop(&gUart, 2000);
       unsigned pulses = 1;
       PE_parse_boot_argn("guamp-bt-pulse", &pulses, sizeof(pulses));
       if (pulses && !keep) IOLog("GuampBt: power-off pulse at the end rc %d\n", pulse(BT_QCA_POWEROFF_PULSE, 2400));
+      on = !pulses || keep;
       geni_uart_flow(&gUart, 0);
     }
   }
   gStep = 9;
-  IOLog("GuampBt: RESULT rails %s uart %s reset %s version %s qca %s\n", railState, uartState, gReset, gVersion, gQca);
+  if (mode != 2) {
+    IOLog("GuampBt: RESULT rails %s uart %s reset %s version %s qca %s\n", railState, uartState, gReset, gVersion, gQca);
+    return;
+  }
+  IOLog("GuampBt: RESULT rails %s uart %s reset %s version %s qca %s download %s baud %u %s version after %s bdaddr %s "
+        "controller %s\n", railState, uartState, gReset, gVersion, gQca, gDownload, gBaudRate, gBaud, gAfter, gBdaddr,
+        on ? "on" : "off");
 }
 
 void start() {
   unsigned on = 0;
-  if (!PE_parse_boot_argn("guamp-bt", &on, sizeof(on)) || on != 1) return;
+  if (!PE_parse_boot_argn("guamp-bt", &on, sizeof(on)) || (on != 1 && on != 2)) return;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

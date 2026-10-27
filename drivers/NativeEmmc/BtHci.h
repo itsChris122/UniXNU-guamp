@@ -23,6 +23,11 @@
 #define BT_QCA_EDL_VER_REQ 0x19
 #define BT_QCA_POWERON_PULSE 0xfc               // btqca.h QCA_WCN3990_POWERON_PULSE (sent at 115200)
 #define BT_QCA_POWEROFF_PULSE 0xc0              // QCA_WCN3990_POWEROFF_PULSE (sent at 2400)
+// In-band sleep bytes (hci_qca.c HCI_IBS_*), outside packets; the NVM edit of the M1 download enables IBS on the
+// controller: a WAKE_IND from it is answered with a WAKE_ACK before it sends the pending event.
+#define BT_IBS_WAKE_IND 0xfd
+#define BT_IBS_WAKE_ACK 0xfc
+#define BT_IBS_SLEEP_IND 0xfe
 
 // H4 command packet: 01, opcode (LE), parameter length, parameters. Returns the packet length, 0 if cap is too small.
 static inline size_t bt_h4_cmd(uint8_t *out, size_t cap, uint16_t opcode, const uint8_t *params, uint8_t plen) {
@@ -35,8 +40,9 @@ static inline size_t bt_h4_cmd(uint8_t *out, size_t cap, uint16_t opcode, const 
 struct bt_event {uint8_t code, len; const uint8_t *p;};
 // Next complete H4 event in buf[*pos..len). Bytes that cannot start a packet are skipped (counted in *skipped); ACL
 // and SCO packets are stepped over whole. 1 = event in *ev and *pos past it, 0 = need more bytes (*pos at the start of
-// the incomplete packet).
-static inline int bt_h4_next(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped) {
+// the incomplete packet). wake (optional) counts the skipped bytes that are IBS WAKE_INDs.
+static inline int bt_h4_next_ibs(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped,
+                                 unsigned *wake) {
     size_t at = *pos;
     while (at < len) {
         const uint8_t t = buf[at];
@@ -63,10 +69,14 @@ static inline int bt_h4_next(const uint8_t *buf, size_t len, size_t *pos, struct
             continue;
         }
         if (skipped) *skipped += 1;
+        if (wake && t == BT_IBS_WAKE_IND) *wake += 1;
         at += 1;
     }
     *pos = at;
     return 0;
+}
+static inline int bt_h4_next(const uint8_t *buf, size_t len, size_t *pos, struct bt_event *ev, unsigned *skipped) {
+    return bt_h4_next_ibs(buf, len, pos, ev, skipped, NULL);
 }
 
 static inline uint16_t bt_le16(const uint8_t *p) {return (uint16_t)(p[0] | p[1] << 8);}

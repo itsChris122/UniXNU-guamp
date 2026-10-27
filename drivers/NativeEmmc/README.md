@@ -12,7 +12,12 @@ modem.mdt (GuampFirmware.inc). Host tests: `tests/run-tests.sh <modem_a.img> <ex
 Boot argument `guamp-bt=1` (BtService.inc): Bluetooth milestone M0, a one-shot probe of the WCN39xx controller: the
 PM6125 BT rails over SPMI (`guamp-bt-ldo=1` tries to enable the ones that are off), QUPv3 SE3 as a polled GENI UART
 (GeniUart.h), the QCA power pulses, HCI_Reset, Read_Local_Version and the QCA EDL version, ending in one
-`GuampBt: RESULT` line. Host tests: `tests/run-bt-tests.sh` (WSL).
+`GuampBt: RESULT` line. `guamp-bt=2` adds milestone M1 (btqca.c `qca_uart_setup` for the WCN3950-family controller):
+`cmbtfw<rom>.tlv` and `cmnv<rom>.bin` read from `/image` of the `bluetooth_<slot>` partition (GuampExt4.inc, which
+now also reads ext2 block maps), UART to 3 Mbit/s with the QCA vendor command (`guamp-bt-baud=`; RCG at 48 MHz),
+rampatch and NVM in 243-byte segments, HCI_Reset, versions after the download and HCI_Read_BD_ADDR (never written);
+the patched controller stays on (`guamp-bt-keep=0` powers it off). Host tests: `tests/run-bt-tests.sh
+[bluetooth_a.img]` (WSL; the image is only read).
 
 RPM client (GuampRpm.inc, protocol in GuampRpmCore.h): GLINK over the RPM message RAM (0x45f0000, TOC "grt0",
 FIFOs ap2r/r2ap, APCS doorbell 0xf111008 bit 0, polled) and rpm-smd v0 requests, `rpm::set(type, id, key, value)` /

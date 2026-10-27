@@ -27,6 +27,16 @@
 #define BT_RCG_7M37_CFG (1u | (2u << 8) | (2u << 12))
 #define BT_RCG_7M37_M 384u
 #define BT_RCG_7M37_N 15625u
+// Without DFS every rate comes from one of the ftbl entries on GPLL0_OUT_AUX2 (300 MHz) with pre_div 1 and the M/N
+// counter (same CFG as above): the lowest one giving an exact divider is programmed (7.3728 MHz for 2400 and 115200,
+// 48 MHz for 3000000 at 16x, 96 MHz at 32x).
+struct bt_rcg_entry {uint32_t hz, m, n;};
+static const struct bt_rcg_entry kBtRcgTable[11] = {
+    {7372800, 384, 15625}, {14745600, 768, 15625}, {29491200, 1536, 15625}, {32000000, 8, 75}, {48000000, 4, 25},
+    {64000000, 16, 75}, {80000000, 4, 15}, {96000000, 8, 25}, {102400000, 128, 375}, {112000000, 28, 75},
+    {117964800, 6144, 15625},
+};
+#define BT_RCG_AUX2_HZ 300000000ull
 static inline uint32_t bt_rcg_n_reg(uint32_t m, uint32_t n) {return ~(n - m) & 0xffffu;}
 static inline uint32_t bt_rcg_d_reg(uint32_t m, uint32_t n) {         // clk-rcg2.c 50 % duty: d = clamp(n, m, 2(n-m))
     uint32_t d = n, hi = 2u * (n - m);
@@ -103,6 +113,13 @@ static inline int bt_choose_uart_clock(const uint64_t *level_hz, unsigned n, uns
         }
     }
     return found ? 0 : -1;
+}
+// Non-DFS: entry of kBtRcgTable for baud (out->level = table index). 0 ok, -1 none.
+static inline int bt_choose_rcg(unsigned baud, unsigned os, struct bt_uart_clock *out) {
+    uint64_t hz[sizeof kBtRcgTable / sizeof kBtRcgTable[0]];
+    const unsigned n = sizeof kBtRcgTable / sizeof kBtRcgTable[0];
+    for (unsigned i = 0; i < n; ++i) hz[i] = kBtRcgTable[i].hz;
+    return bt_choose_uart_clock(hz, n, baud, os, out);
 }
 // Error of the chosen rate in tenths of a percent (positive = slow); UART tolerates roughly +-2 %.
 static inline int bt_baud_error_permille(unsigned want, unsigned actual) {

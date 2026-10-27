@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Minimal read-only ext4 reader for the guamp Wi-Fi preparation (GuampWifiPrep.inc), host-tested by
-// tests/wifi_host.cpp against the backup modem_a.img. Pure code: no kernel or libc calls besides memcpy/memset/memcmp,
+// Minimal read-only ext4 reader for the guamp Wi-Fi preparation (GuampWifiPrep.inc) and the Bluetooth firmware
+// (BtService.inc), host-tested by tests/wifi_host.cpp against the backup modem_a.img and by tests/bt_fw_host.cpp against
+// the backup bluetooth_a.img and mke2fs -t ext2 images. Pure code: no kernel or libc calls besides memcpy/memset/memcmp,
 // integer math only; the owner supplies a sector reader (512-byte sectors relative to the file system start, at most
 // kMaxSectors per call) and kScratchBytes of scratch memory.
 //   superblock  byte 1024; block size 1, 2 or 4 KiB; revision 0 or 1
@@ -8,11 +9,14 @@
 //               needs_recovery, meta_bg, inline_data, encrypt, casefold, compression, is refused at mount);
 //               ro_compat: everything except bigalloc (checksums are not checked)
 //   inodes      group descriptors right after the superblock block (32 bytes, or s_desc_size with 64bit)
-//   files       extent trees of any depth (<= 5), holes and uninitialized extents read as zeros; block-mapped,
-//               inline-data and encrypted inodes are refused per file
+//   files       extent trees of any depth (<= 5), holes and uninitialized extents read as zeros; ext2/ext3 block
+//               maps (12 direct, single and double indirect: 64 MiB at 1 KiB blocks, 4 GiB at 4 KiB; holes read as
+//               zeros, a triple-indirect block is refused); inline-data and encrypted inodes are refused per file
 //   directories linear scan of the data blocks (htree directories read the same way: their index blocks look like
 //               one empty entry); path lookup from the root inode, no symlinks
 // Never writes.
+#ifndef GUAMP_EXT4_INC
+#define GUAMP_EXT4_INC
 
 namespace ext4 {
 
@@ -63,7 +67,7 @@ struct Inode {
   uint16_t mode;
   uint32_t flags;
   uint64_t size;
-  uint8_t block[60];   // i_block: extent tree root
+  uint8_t block[60];   // i_block: extent tree root, or 15 block pointers (12 direct, single/double/triple indirect)
   bool isDir() const { return (mode & kModeType) == kModeDir; }
   bool isFile() const { return (mode & kModeType) == kModeFile; }
 };
@@ -79,7 +83,7 @@ struct Fs {   // plain data: zero it (IOMallocZero or = {}), then mount()
   uint32_t compat, incompat, roCompat;
   uint32_t refused;                           // unsupported feature bits seen by mount
   uint64_t sectorsRead;
-  uint64_t levelBlock[kMaxDepth];             // block held by each tree level buffer (0 = none)
+  uint64_t levelBlock[kMaxDepth];             // block held by each tree level / indirect buffer (0 = none)
 
   uint8_t *levelBuf(uint32_t level) { return scratch + level * kMaxBlock; }
   uint8_t *dirBuf() { return scratch + kMaxDepth * kMaxBlock; }
@@ -170,7 +174,7 @@ struct Fs {   // plain data: zero it (IOMallocZero or = {}), then mount()
   // uninitialized: zeros for *run blocks)
   int mapBlock(const Inode &ino, uint32_t lblk, uint64_t *pblk, uint32_t *run) {
     if (ino.flags & (kFlagInlineData | kFlagEncrypt)) return kErrUnsupported;
-    if (!(ino.flags & kFlagExtents)) return kErrUnsupported;   // block-mapped files: not needed for the firmware
+    if (!(ino.flags & kFlagExtents)) return mapIndirect(ino, lblk, pblk, run);
     const uint8_t *node = ino.block;
     uint32_t nodeBytes = 60, rootDepth = 0;
     uint64_t limit = 0x100000000ull;                           // first logical block past this node's range
@@ -222,6 +226,57 @@ struct Fs {   // plain data: zero it (IOMallocZero or = {}), then mount()
       node = levelBuf(level);
       nodeBytes = blockSize;
     }
+  }
+
+  // Block at level buffer `level` (cached by block number: same bytes whatever the block is used for)
+  const uint8_t *cachedBlock(uint32_t level, uint64_t block) {
+    if (levelBlock[level] != block) {
+      levelBlock[level] = 0;
+      if (!readBlocks(block, 1, levelBuf(level))) return nullptr;
+      levelBlock[level] = block;
+    }
+    return levelBuf(level);
+  }
+
+  // Run of an ext2 pointer array from entry i on: consecutive physical blocks, or consecutive holes (pblk 0)
+  int pointerRun(const uint8_t *ptrs, uint32_t count, uint32_t i, uint64_t *pblk, uint32_t *run) {
+    uint32_t first = le32(ptrs + 4 * i), n = 1;
+    if (first >= blocksCount) return kErrFormat;
+    while (i + n < count) {
+      uint32_t next = le32(ptrs + 4 * (i + n));
+      if (first ? next != first + n : next != 0) break;
+      n++;
+    }
+    if (first && n > blocksCount - first) return kErrFormat;
+    *pblk = first;
+    *run = n;
+    return kOk;
+  }
+
+  // ext2/ext3 block map (inode without the extents flag): i_block[0..11] direct, [12] single, [13] double indirect
+  int mapIndirect(const Inode &ino, uint32_t lblk, uint64_t *pblk, uint32_t *run) {
+    const uint32_t per = blockSize / 4;
+    if (lblk < 12) return pointerRun(ino.block, 12, lblk, pblk, run);
+    uint64_t rel = lblk - 12;
+    uint32_t top = le32(ino.block + 4 * 12);
+    if (rel >= per) {
+      rel -= per;
+      if (rel >= static_cast<uint64_t>(per) * per) return kErrUnsupported;   // triple indirect
+      top = le32(ino.block + 4 * 13);
+    }
+    if (top >= blocksCount) return kErrFormat;
+    bool dbl = lblk >= 12 + per;
+    uint32_t span = dbl ? per * per - static_cast<uint32_t>(rel) : per - static_cast<uint32_t>(rel);
+    if (!top) { *pblk = 0; *run = span; return kOk; }                 // whole indirect tree absent: hole
+    const uint8_t *ind = cachedBlock(0, top);
+    if (!ind) return kErrIo;
+    if (!dbl) return pointerRun(ind, per, static_cast<uint32_t>(rel), pblk, run);
+    uint32_t leaf = le32(ind + 4 * (rel / per)), at = static_cast<uint32_t>(rel % per);
+    if (leaf >= blocksCount) return kErrFormat;
+    if (!leaf) { *pblk = 0; *run = per - at; return kOk; }
+    const uint8_t *ptrs = cachedBlock(1, leaf);
+    if (!ptrs) return kErrIo;
+    return pointerRun(ptrs, per, at, pblk, run);
   }
 
   int readFile(const Inode &ino, uint64_t offset, uint8_t *out, uint32_t bytes) {
@@ -323,3 +378,4 @@ struct Fs {   // plain data: zero it (IOMallocZero or = {}), then mount()
 };
 
 }  // namespace ext4
+#endif  // GUAMP_EXT4_INC
