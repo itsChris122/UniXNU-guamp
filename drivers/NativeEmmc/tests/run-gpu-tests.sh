@@ -24,5 +24,6 @@ printf '#include "GuampGpuBlit.h"
 ' | clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti   -mgeneral-regs-only -Wall -Wextra -Werror -Wdeprecated-volatile -fsyntax-only -I "$HERE/.." -x c++ - && echo "blit: compiled" || rc=1
 clang++ $FLAGS "$HERE/gpu_blit_host.cpp" -o "$WORK/gpu_blit_host" && "$WORK/gpu_blit_host" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/gpu_blit_host.cpp" -o "$WORK/gpu_blit_host_gcc" && "$WORK/gpu_blit_host_gcc" >/dev/null || rc=1
+echo '#include "GuampGpu3D.h"' | clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -fsyntax-only -I "$HERE/.." -x c++ - && clang++ $FLAGS "$HERE/gpu_3d_host.cpp" -o "$WORK/gpu_3d_host" && "$WORK/gpu_3d_host" && python3 -I "$HERE/check_gpu3d_regs.py" "$HERE/../GuampGpu3D.h" || rc=1
 echo "== result: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc
