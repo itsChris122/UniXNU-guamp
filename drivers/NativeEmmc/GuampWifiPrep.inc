@@ -14,6 +14,9 @@
 #include "GuampExt4.inc"
 #include "GuampFirmware.inc"
 #include "GuampSmem.inc"
+#include "GuampScm.inc"
+#include "GuampScmArm64.inc"
+#include "GuampModemCore.inc"
 
 extern "C" {
 extern unsigned long guamp_phys_base __asm__("_gPhysBase");   // XNU-managed RAM (osfmk/arm64/arm_vm_init.c),
@@ -92,9 +95,61 @@ char activeSlot() {
   return 'a';
 }
 
+static bool modemStopped();
+static bool modemAwaitReady();
+#include "GuampModem.inc"
+
 // --- SMEM -----------------------------------------------------------------------------------------------------------
 uint32_t smemRead(void *ctx, uint32_t offset) {
   return *reinterpret_cast<const volatile uint32_t *>(static_cast<const volatile uint8_t *>(ctx) + offset);
+}
+
+static bool modemStopped() {
+  if(modem::overlap(kSmemPhys,kSmemBytes,guamp_phys_base,guamp_phys_size))return false;
+  IOMemoryDescriptor *d=IOMemoryDescriptor::withPhysicalAddress(kSmemPhys,kSmemBytes,kIODirectionIn);
+  IOMemoryMap *map=d?d->map(kIOMapInhibitCache|kIOMapReadOnly):nullptr;if(d)d->release();
+  if(!map)return false;
+  smem::Info *info=static_cast<smem::Info *>(IOMallocZero(sizeof(smem::Info)));
+  bool stopped=false;
+  if(info) {
+    smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
+    smem::parse(reader,info);uint32_t at=0,bytes=0;
+    const smem::Partition *peer=smem::partitionFor(*info,smem::kHostModem);
+    stopped=!info->error && info->initialized && (!peer || !peer->status) &&
+      !smem::find(reader,*info,smem::kHostModem,428,&at,&bytes);
+    IOFree(info,sizeof(*info));
+  }
+  map->release();return stopped;
+}
+
+static bool modemAwaitReady() {
+  if(modem::overlap(kSmemPhys,kSmemBytes,guamp_phys_base,guamp_phys_size))return false;
+  IOMemoryDescriptor *d=IOMemoryDescriptor::withPhysicalAddress(kSmemPhys,kSmemBytes,kIODirectionIn);
+  IOMemoryMap *map=d?d->map(kIOMapInhibitCache|kIOMapReadOnly):nullptr;if(d)d->release();
+  if(!map)return false;
+  smem::Info *info=static_cast<smem::Info *>(IOMallocZero(sizeof(smem::Info)));
+  smem::Smp2p *state=static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
+  bool ready=false;
+  if(info && state) {
+    smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
+    uint32_t last=~0u;
+    for(unsigned attempt=0;attempt<100;++attempt) {
+      __asm__ volatile("dmb sy" ::: "memory");
+      smem::parse(reader,info);uint32_t at=0,bytes=0;
+      if(!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes)) {
+        smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
+        if(state->valid && state->hasEntry && state->localPid==1 && state->remotePid==0) {
+          uint32_t flags=state->value;
+          if(flags!=last) {IOLog("GuampModem: SMP2P slave-kernel %x (ready %u fatal %u)\n",flags,flags>>1&1,flags&1);last=flags;}
+          if(flags&1)break;
+          if(flags&2) {ready=true;break;}
+        }
+      }
+      IOSleep(100);
+    }
+    if(!ready)IOLog("GuampModem: ready handshake not complete after bounded observation; apps SMP2P/GLINK prerequisites remain\n");
+  }
+  if(info)IOFree(info,sizeof(*info));if(state)IOFree(state,sizeof(*state));map->release();return ready;
 }
 
 void smemReport() {
@@ -199,6 +254,7 @@ void firmwareReport() {
         });
       IOLog("GuampWifi: wlanmdsp.mbn %s %llu bytes, %u bdwlan.* board files\n", w ? "absent" : "present",
             w ? 0ull : file.size, bdwlan);
+      modemBoot(*fs,mdt,chunk,!res->error && !res->failed && res->verified>0);
     }
   } else {
     IOLog("GuampWifi: out of memory\n");
@@ -214,6 +270,8 @@ void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-wifi-prep");
   smemReport();
   firmwareReport();
+  unsigned modemMode=0;
+  if(PE_parse_boot_argn("guamp-modem-start",&modemMode,sizeof(modemMode)) && modemMode==1)smemReport();
 }
 
 // Once, after publish(): boot argument guamp-wifi-prep=1

@@ -15,6 +15,7 @@ void IOLockLock(IOLock *);
 void IOLockUnlock(IOLock *);
 void *IOMallocZero(size_t);
 void IOFree(void *, size_t);
+void IOSleep(unsigned int);
 typedef int wait_result_t;
 typedef struct thread *thread_t;
 typedef int kern_return_t;
