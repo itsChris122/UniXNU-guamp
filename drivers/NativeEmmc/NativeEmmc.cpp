@@ -1027,6 +1027,7 @@ static void usbProbe()
 #include "GuampWifiPrep.inc"
 #include "GpuService.inc"
 #include "GuampBacklight.inc"
+#include "GuampCpufreq.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1150,6 +1151,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   usbProbe();
   usbMirrorStart();
   dispext::start();
+  cpufreq::start();   // guamp-cpufreq=1|2: cpufreq-hw performance state (tables logged always)
   backlight::start(); // guamp-backlight=1: panel DCS 0x51 brightness as AppleARMBacklight for CoreBrightness
   rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
   pmic::start();
