@@ -595,19 +595,93 @@ bool armIrq() {
   return true;
 }
 
+// Raw coordinates are panel pixels, the same ones Linux reports (himax_common.c passes x = buf[0]<<8|buf[1],
+// y = buf[2]<<8|buf[3] unchanged, abs range 0..719 x 0..1599 from himax,panel-coords <0 720 0 1600>, no swap or flip;
+// the panel node is a plain 720x1600 scanout): x left to right, y top to bottom, as the framebuffer. Only 0..max-1 is
+// on the glass: the chin under the panel reports y = 1600 (Linux drops it, here it is clamped to the bottom row).
+// Edge starts: NativeHidInput marks a contact as coming from an edge (kIOHIDDigitizerEventFromEdgeTip, which every
+// SpringBoard screen-edge gesture needs) only when its first position lies within 48/2032 of the HID y axis (38 px of
+// 1600) or 48/3048 of x (11 px of 720). The USB mirror's mouse starts at row 0, a finger on the top edge of this panel
+// does not: the pull then reaches the Home screen (Spotlight) instead of Notification / Control Center. A contact that
+// begins inside an edge band is moved onto that edge and the shift fades out over the next kEdgeFade pixels of travel
+// (continuous and monotonic; the finger and the point agree again once it has left the band). Bands in panel pixels:
+// guamp-touch-edge-top (default 88, the 44 pt status bar), guamp-touch-edge-side (24), guamp-touch-edge-bottom (40; the
+// chin itself reports the bottom row). guamp-touch-flip bit 0 mirrors x, bit 1 mirrors y. guamp-touch-maplog=<n>:
+// one line per contact (start and end, raw -> mapped) for the first n contacts (default 48), then every 32nd.
+const int kEdgeFade = 160;
+int gEdgeTop = 88, gEdgeSide = 24, gEdgeBottom = 40, gFlip = 0;
+unsigned gMapLog = 48, gContacts = 0;
+struct contact { bool down; unsigned n, reports; int sx, sy, smx, smy, offX, offY, rx, ry, mx, my; };
+contact gContact[HX_MAX_PT];
+
+void mapInit() {
+  unsigned v;
+  if (PE_parse_boot_argn("guamp-touch-edge-top", &v, sizeof(v)) && v < 128) gEdgeTop = static_cast<int>(v);
+  if (PE_parse_boot_argn("guamp-touch-edge-side", &v, sizeof(v)) && v < 128) gEdgeSide = static_cast<int>(v);
+  if (PE_parse_boot_argn("guamp-touch-edge-bottom", &v, sizeof(v)) && v < 128) gEdgeBottom = static_cast<int>(v);
+  if (PE_parse_boot_argn("guamp-touch-flip", &v, sizeof(v))) gFlip = static_cast<int>(v & 3);
+  if (PE_parse_boot_argn("guamp-touch-maplog", &v, sizeof(v))) gMapLog = v;
+}
+
+int clampTo(int v, int max) { return v < 0 ? 0 : v > max - 1 ? max - 1 : v; }
+int fade(int v, int start, int off) {
+  const int d = v > start ? v - start : start - v;
+  return d >= kEdgeFade ? v : v - off * (kEdgeFade - d) / kEdgeFade;
+}
+
+void logContact(int slot, const contact &c, const char *what) {
+  if (c.n > gMapLog && (c.n & 31)) return;
+  // pt = px / 2 (360x800 pt); HID = px * 32767 / (max - 1)
+  IOLog("GuampTouch: map #%u slot %d %s: start %d,%d -> %d,%d px = %d,%d pt (edge shift %d,%d), last raw %d,%d -> %d,%d px "
+        "= %d,%d pt, %u reports\n", c.n, slot, what, c.sx, c.sy, c.smx, c.smy, c.smx / 2, c.smy / 2, c.offX, c.offY,
+        c.rx, c.ry, c.mx, c.my, c.mx / 2, c.my / 2, c.reports);
+}
+
 void publish(const struct hx_report &r) {
   const int xmax = gChip.x_res ? gChip.x_res : GT_PANEL_X, ymax = gChip.y_res ? gChip.y_res : GT_PANEL_Y;
+  int xs[HX_MAX_PT], ys[HX_MAX_PT];
+  bool seen[HX_MAX_PT] = {};
+  const unsigned count = r.count < HX_MAX_PT ? r.count : HX_MAX_PT;
+  for (unsigned i = 0; i < count; ++i) {
+    const int s = r.slot[i];
+    int x = clampTo(r.point[i].x, xmax), y = clampTo(r.point[i].y, ymax);
+    if (gFlip & 1) x = xmax - 1 - x;
+    if (gFlip & 2) y = ymax - 1 - y;
+    if (s < 0 || s >= HX_MAX_PT) { xs[i] = x; ys[i] = y; continue; }
+    contact &c = gContact[s];
+    seen[s] = true;
+    if (!c.down) {   // the contact begins: its start decides the edge shift for its whole life
+      c.down = true; c.reports = 0; c.sx = x; c.sy = y;
+      gContacts = gContacts + 1; c.n = gContacts;
+      c.offX = gEdgeSide && x < gEdgeSide ? x : gEdgeSide && x > xmax - 1 - gEdgeSide ? x - (xmax - 1) : 0;
+      c.offY = gEdgeTop && y < gEdgeTop ? y : gEdgeBottom && y > ymax - 1 - gEdgeBottom ? y - (ymax - 1) : 0;
+    }
+    c.reports = c.reports + 1;
+    c.rx = r.point[i].x; c.ry = r.point[i].y;
+    c.mx = clampTo(c.offX ? fade(x, c.sx, c.offX) : x, xmax);
+    c.my = clampTo(c.offY ? fade(y, c.sy, c.offY) : y, ymax);
+    if (c.reports == 1) { c.smx = c.mx; c.smy = c.my; }
+    xs[i] = c.mx; ys[i] = c.my;
+  }
   native_touch_seq = native_touch_seq + 1;
   __asm__ volatile("dmb ish" ::: "memory");
-  native_touch_count = r.count;
-  for (unsigned i = 0; i < r.count && i < 12; ++i) {
-    native_touch_xs[i] = r.point[i].x * 30479 / (xmax - 1);
-    native_touch_ys[i] = r.point[i].y * 20319 / (ymax - 1);
+  native_touch_count = count;
+  for (unsigned i = 0; i < count; ++i) {
+    // Same scale as the USB mirror (UsbMirror.inc touch()): pixel 0..max-1 -> 0..30479 / 0..20319, which
+    // NativeHidInput turns into 0..32767 on both axes, i.e. the full 360x800 pt screen.
+    native_touch_xs[i] = xs[i] * 30479 / (xmax - 1);
+    native_touch_ys[i] = ys[i] * 20319 / (ymax - 1);
     native_touch_ids[i] = r.slot[i];
   }
   __asm__ volatile("dmb ish" ::: "memory");
   native_touch_seq = native_touch_seq + 1;
   native_touch_published();
+  for (int s = 0; s < HX_MAX_PT; ++s) {
+    if (gContact[s].down && !seen[s]) {
+      gContact[s].down = false;
+      logContact(s, gContact[s], "up");
+    }
+  }
 }
 
 void thread(void *param, wait_result_t) {
@@ -648,6 +722,10 @@ void thread(void *param, wait_result_t) {
   gStep = 5;
   const bool useIrq = armIrq();
   IOLog("GuampTouch: running, %s\n", useIrq ? "interrupt driven" : "polled every 10 ms");
+  mapInit();
+  IOLog("GuampTouch: map %dx%d px -> HID 0..32767 (360x800 pt), edge bands top %d side %d bottom %d px, fade %d, flip %d, "
+        "log %u contacts\n", gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, gEdgeTop, gEdgeSide,
+        gEdgeBottom, kEdgeFade, gFlip, gMapLog);
   uint8_t ev[HX_EVENT_LEN];
   uint32_t seen = gIrqEvents;
   bool down = false;
