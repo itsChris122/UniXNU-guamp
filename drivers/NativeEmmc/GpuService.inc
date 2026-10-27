@@ -27,6 +27,7 @@
 #include "../GuampAdreno/GuampAdreno.h"
 extern "C" int guamp_adreno_start(const GuampAdrenoStart *) __attribute__((weak_import));
 #include "GuampGpuG2.h"
+#include "GuampGpuPower.h"
 #include "GuampRpmCore.h"
 #include "GuampExt4.inc"
 
@@ -340,6 +341,7 @@ int set(uint32_t type, uint32_t id, uint32_t key, uint32_t value, unsigned which
 
 namespace gpug2 {   // below gpum1
 void run(volatile uint8_t *gpucc, unsigned level);
+uint64_t setFreq(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz);
 }
 
 namespace gpum1 {
@@ -457,6 +459,11 @@ void thread(void *, wait_result_t) {
     if (!&guamp_adreno_start) IOLog("GuampGpu: NativeAdreno not linked (guamp-adreno=%u)\n", adreno);
     else if (!sqeBytes) IOLog("GuampGpu: NativeAdreno not started: no SQE microcode\n");
     else {
+      // guamp-gpu-freq=320|465: the core clock leaves XO before NativeAdreno starts the CP (no ring in flight while the
+      // RCG switches; hw_init and the ME_INIT / MEM_WRITE fences then run at the new rate and check it).
+      unsigned freq = 0;
+      PE_parse_boot_argn("guamp-gpu-freq", &freq, sizeof(freq));
+      if (freq) gpug2::setFreq(gBase[GM_GPUCC], gBase[GM_GPU], freq);
       GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno};
       IOLog("GuampGpu: NativeAdreno start %d\n", guamp_adreno_start(&a));
     }
@@ -536,6 +543,58 @@ bool recover(const char *why) {
         "%08x cp hw_fault %08x\n", why, c.resetRead, c.wptr, c.rptr, c.waitedUs, c.consumed ? "consumed" : "stuck",
         c.wrote ? "ok" : "none", c.status, c.hwFault);
   return gpum2::gReady;
+}
+
+// GPU core clock off XO for the NativeAdreno path (no M2 ring, no fences here): VDD_CX vote acked first, then PLL1 and
+// the gfx3d RCG (GuampGpuG2.h sequence; GuampGpuPower.h kGpLevels for the corner and the PLL rate). Only 320 (CX
+// LOW_SVS, PLL1 640) and 465 (CX SVS, PLL1 930) MHz: both PLL1 rates stay under 1 GHz, so the MX vote kgsl adds for
+// PLL0 is not needed. Any failure leaves (or puts back) the GPU on XO. Returns the measured rate (0: counter still).
+uint64_t setFreq(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
+  gCc = gpucc;
+  gpum2::gGpu = gpu;
+  if (!gCc || !gpum2::gGpu) return 0;
+  const gp_level *lv = nullptr;
+  for (size_t i = 0; i < GP_NLEVELS; ++i)
+    if (kGpLevels[i].mhz == mhz && kGpLevels[i].pll == GP_PLL1) lv = &kGpLevels[i];
+  uint32_t cyc = 0, aon = 0;
+  const uint64_t xoHz = gg2_measure_hz(&kIo, 1000, &cyc, &aon);
+  if (!lv) {
+    IOLog("GuampGpu: freq %u MHz not allowed (320 or 465), GPU stays on XO (%llu Hz measured)\n", mhz,
+          static_cast<unsigned long long>(xoHz));
+    return xoHz;
+  }
+  const int vote = rpm::set(RPM_RES_SMPA, 3, 0x6c766c76u /* "vlvl" */, lv->cx, RPM_SET_ACTIVE, 500);
+  if (vote) {
+    IOLog("GuampGpu: freq %u MHz: VDD_CX level %u vote failed (%s), GPU stays on XO (%llu Hz)\n", mhz, lv->cx,
+          rpm_err_name(vote), static_cast<unsigned long long>(xoHz));
+    return xoHz;
+  }
+  const gg2_pll_cfg cfg = mhz == 320 ? kGg2Pll1 : gp_pll_cfg(GP_PLL1, static_cast<uint64_t>(lv->pllMhz) * 1000000ull);
+  gg2_pll p;
+  const bool pll = gg2_pll1_up(&kIo, &cfg, &p);
+  if (!pll) {
+    gg2_pll1_down(&kIo);
+    IOLog("GuampGpu: freq %u MHz: pll1 l %02x alpha %08x lock %s after %u us (%llu Hz)%s%s, GPU stays on XO\n", mhz,
+          cfg.l, cfg.alpha, p.locked ? "ok" : "NO", p.waitedUs, static_cast<unsigned long long>(p.hz),
+          p.why ? ": " : "", p.why ? p.why : "");
+    return xoHz;
+  }
+  gg2_rcg r;
+  const bool rcg = gg2_gfx_set(&kIo, GG2_SRC_PLL1_AUX, 4, &r);
+  const uint64_t hz = gg2_measure_hz(&kIo, 1000, &cyc, &aon);
+  const uint64_t want = static_cast<uint64_t>(mhz) * 1000000ull;
+  // The counter may not run before the CP: only a measured rate far from the target counts as wrong.
+  const bool off = hz && (hz < want / 2 || hz > want + want / 2);
+  if (!rcg || off) {
+    gg2_rcg back;
+    gg2_gfx_set(&kIo, GG2_SRC_XO, 0, &back);
+    gg2_pll1_down(&kIo);
+  }
+  IOLog("GuampGpu: freq XO %llu Hz -> %u MHz: cx vote %u ok, pll1 %llu Hz lock after %u us, gfx rcg %08x/%08x -> %08x/%08x "
+        "(%s), measured %llu Hz (%u cycles / %u aon)%s\n", static_cast<unsigned long long>(xoHz), mhz, lv->cx,
+        static_cast<unsigned long long>(p.hz), p.waitedUs, r.cmd0, r.cfg0, r.cmd, r.cfg, rcg ? "ok" : "FAILED",
+        static_cast<unsigned long long>(hz), cyc, aon, !rcg || off ? ", back on XO" : "");
+  return !rcg || off ? xoHz : hz;
 }
 
 void run(volatile uint8_t *gpucc, unsigned level) {
