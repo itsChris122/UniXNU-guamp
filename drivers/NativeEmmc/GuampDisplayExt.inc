@@ -18,9 +18,9 @@ static bool published(void *, void *, IOService *service, IONotifier *)
   gBuiltIn = service->getProperty("BuiltIn") == kOSBooleanTrue;
   if (gForce && (before == 1 || before == 3)) {
     service->setProperty("external", kOSBooleanFalse);
-    gForced++;
+    gForced = gForced + 1;
   }
-  gSeen++;
+  gSeen = gSeen + 1;
   return true;
 }
 
