@@ -1,0 +1,50 @@
+{
+  "purpose": "guamp Adreno 610 facts for the NativeAdreno user client (NativeAdrenoAbiDeviceInfo / NativeAdrenoAbiParams) and the userspace GPU stack (Turnip Darwin KMD + NativeMetal). Disabled by default: nothing reads this file unless the GPU userspace build is run by hand (analisi/gpu-ios/TURNIP-A610.md).",
+  "sources": {
+    "chip_id": "bengal-gpu.dtsi qcom,chipid = <0x06010000>; kgsl adreno-gpulist.h:1401 ADRENO_REV_A610 6,1,0",
+    "gmem_bytes": "adreno-gpulist.h:1405 gmem_size = SZ_128K + SZ_4K",
+    "gmem_base": "adreno.c:891 uche_gmem_base = ALIGN(gmem_size, SZ_1M) (not a650 family); adreno_a6xx.c:481 UCHE_GMEM_RANGE_MIN/MAX",
+    "uche_trap_base": "adreno_a6xx.c:471 UCHE_TRAP_BASE = 0x0001ffff_fffff000",
+    "highest_bank_bit": "bengal-gpu.dtsi qcom,highest-bank-bit = <14> (Mesa 25.0 freedreno_devices.py GPUId(610) says 13: only UBWC depends on it, UBWC stays off at first)",
+    "ubwc": "bengal-gpu.dtsi qcom,ubwc-mode = <1>; freedreno_devices.py GPUId(610) ubwc_swizzle 0x7, macrotile_mode 0",
+    "turnip": "freedreno_devices.py: GPUId(610) without TODO, [a6xx_base, a6xx_gen1_low], num_ccu 1, no GMU"
+  },
+  "device_info": {
+    "chip_id": "0x06010000",
+    "gpu_id_decoded": 610,
+    "gmem_bytes": "0x21000",
+    "gmem_base": "0x100000",
+    "uche_trap_base": "0x1fffffffff000",
+    "va_start": "0x20000000",
+    "va_size": "0x40000000",
+    "highest_bank_bit": 14,
+    "ubwc_swizzle": 7,
+    "macrotile_mode": 0,
+    "ubwc_version": 1,
+    "flags": "NativeAdrenoDeviceClientIova (1)"
+  },
+  "params": {
+    "abi_version": 1,
+    "input_bits": "from the GPU SMMU context bank (IDR2.IAS) the A610 backend programs; 32 like sheng is enough for va_start + va_size",
+    "output_bits": "from IDR2.OAS (sheng: 40); guamp DRAM ends below 0x140000000",
+    "flags": "NativeAdrenoParamsHostImport (1) only once BoImport works on guamp",
+    "max_bo_bytes": "1 << 28"
+  },
+  "client_windows": {
+    "note": "replaces NativeAdrenoPublish.cpp kClientWindows (sheng: render server 1 GiB + three 170 MiB windows in a 2 GiB aperture)",
+    "render_server": ["0x20000000", "0x20000000"],
+    "client_1": ["0x40000000", "0x08000000"],
+    "client_2": ["0x48000000", "0x08000000"],
+    "client_3": ["0x50000000", "0x08000000"]
+  },
+  "boot_args_when_enabled": [
+    "guamp-adreno=1",
+    "sheng-gpu-addon=1",
+    "sheng-gpu-pool=384"
+  ],
+  "plugin_environment": {
+    "TU_DEBUG": "sysmem,noubwc (the plugin sets sysmem,nocb; nocb is an a7xx concurrent-binning switch and harmless on A610, noubwc is the addition for the first tests)",
+    "CA_DISABLE_FRAMEBUFFER_COMPRESSION": "1 (already set by the plugin)",
+    "MESA_SHADER_CACHE_DISABLE": "only for the smoke test"
+  }
+}
