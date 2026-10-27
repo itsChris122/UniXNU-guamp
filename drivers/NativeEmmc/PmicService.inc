@@ -133,6 +133,42 @@ struct ChargeBus {
   int rd(uint16_t addr, uint8_t *v) { return read8(kPmi632, addr, v); }
   int wr(uint16_t addr, uint8_t v) { return write8(kPmi632, addr, v); }
   void sleepMs(unsigned ms) { IOSleep(ms); }
+  // One ADC5 conversion of USB_IN_V_16 (channel 0x08, 1/16 prescaler, absolute calibration, qcom-spmi-adc5.c
+  // adc_configure/adc_poll_wait_eoc and pmi632.dtsi), on the same user registers as batteryTherm (same thread).
+  int vbusMv(unsigned *mv) {
+    uint8_t p[5];
+    int error = 0;
+    for (unsigned k = 0; k < 5 && !error; ++k) error = read8(kPmi632, static_cast<uint16_t>(0x3142 + k), &p[k]);
+    if (error) return error;
+    p[0] = static_cast<uint8_t>((p[0] & ~0x7cu) | 0x28u);   // absolute calibration, decimation 2
+    p[1] = static_cast<uint8_t>(p[1] & ~0x07u);              // 1 sample
+    p[2] = 0x08;                                            // ADC_USB_IN_V_16
+    p[3] = static_cast<uint8_t>((p[3] & ~0x0fu) | 0x02u);   // 200 us settle
+    p[4] = static_cast<uint8_t>(p[4] | 0x80u);              // enable
+    for (unsigned k = 0; k < 5 && !error; ++k) error = write8(kPmi632, static_cast<uint16_t>(0x3142 + k), p[k]);
+    uint8_t channel = 0;
+    if (!error) error = read8(kPmi632, 0x3144, &channel);
+    if (!error && channel != 0x08) error = SPMI_ERR_IO;
+    if (!error) error = write8(kPmi632, 0x3147, 0x80);
+    if (error) return error;
+    uint8_t status = 0;
+    unsigned n = 0;
+    for (; n < 40; ++n) {
+      IOSleep(1);
+      error = read8(kPmi632, 0x3108, &status);
+      if (error) return error;
+      if ((status & 3u) == 1u) break;
+    }
+    if (n == 40) return SPMI_ERR_TIMEOUT;
+    uint8_t lo = 0, hi = 0;
+    error = read8(kPmi632, 0x3150, &lo);
+    if (!error) error = read8(kPmi632, 0x3151, &hi);
+    if (error) return error;
+    const unsigned code = lo | (static_cast<unsigned>(hi) << 8);
+    if (code == 0x8000) return SPMI_ERR_PARAM;               // no valid data
+    *mv = code > 0x7fff ? 0 : static_cast<unsigned>((static_cast<uint64_t>(code) * 1875u * 16u) / 0x70e4u);
+    return 0;
+  }
   __attribute__((format(printf, 2, 3))) void log(const char *format, ...) {
     va_list ap;
     va_start(ap, format);
@@ -163,7 +199,7 @@ void chargerGatingLog(bool force) {
   last = key;
   lastTypec = typecKey;
   IOLog("GuampChg: %s st1 %02x st2 %02x%s st7 %02x%s%s%s%s%s%s pp %02x%s%s%s icl %u mA aicl %02x%s usbin %02x%s%s%s%s%s "
-        "typec sm %02x%s%s misc %02x%s%s%s rp %02x src %02x 0a %02x 0e %02x legacy %02x rt %02x mode %02x "
+        "typec sm %02x%s%s misc %02x%s%s%s rp %02x src %02x 0a %02x 0e %02x legacy %02x rt %02x mode %02x vbus-adc %u mV "
         "cfg aicl-opt %02x%s jeita %02x pull %02x pause %02x en %02x weak %u redetect %u suspend-toggle %u cc-recover %u\n",
         kState[s1 & 7], s1, s2, (s2 & 0x02) ? " BAT_OV" : "", s7, (s7 & 0x20) ? " HOT_SOFT" : "",
         (s7 & 0x10) ? " COLD_SOFT" : "", (s7 & 0x08) ? " TOO_HOT" : "", (s7 & 0x04) ? " TOO_COLD" : "",
@@ -173,7 +209,7 @@ void chargerGatingLog(bool force) {
         (usbin & 0x04) ? " UV" : "", (usbin & 0x02) ? " VASHDN" : "", (usbin & 0x01) ? " COLLAPSE" : "", t.sm,
         (t.sm & 0x20) ? " ATTACHED" : "", (t.sm & 0x0f) == 2 ? " WAIT_VBUS" : "", t.misc,
         (t.misc & 0x01) ? " CC_ATTACHED" : "", (t.misc & 0x08) ? " DEBOUNCED" : "", (t.misc & 0x10) ? " VBUS_ERROR" : "",
-        t.snk, t.src, t.sm2, t.cc, t.legacy, t.typecRt, gTypecMode, aicl, (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "",
+        t.snk, t.src, t.sm2, t.cc, t.legacy, t.typecRt, gTypecMode, gCharge.lastVbusMv, aicl, (aicl & 0x80) ? " SUSPEND_ON_COLLAPSE" : "",
         jeita, pull, pause, en, gCharge.weakSteps, gCharge.redetects, gCharge.suspendRecoveries, gCharge.ccRecoveries);
 }
 
