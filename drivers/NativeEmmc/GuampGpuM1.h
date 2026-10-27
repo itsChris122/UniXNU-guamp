@@ -171,10 +171,11 @@ static const gm_branch kGmBranches[] = {
     {GMR_MEMNOC, GM_HALT_VOTED, true, true, GM_PH_SMMU}, {GMR_SNOC_DVM, GM_HALT, false, true, GM_PH_SMMU},
     {GMR_AHB, GM_HALT_DELAY, false, true, GM_PH_SMMU}, {GMR_SMMU, GM_HALT_VOTED, false, true, GM_PH_SMMU},
     // kgsl_pwrctrl_clk: clocks[] from the end (gmu_clk, iref_clk, rbbmtimer_clk, mem_clk = memnoc (already on),
-    // iface_clk = bimc_gpu_axi, core_clk), then gpu_cc_cx_gfx3d (child of the core RCG, not in the kgsl list)
+    // iface_clk = bimc_gpu_axi, core_clk), then gpu_cc_cx_gfx3d: child of the core RCG, not in the kgsl list of
+    // bengal-gpu.dtsi, so report only (its enable bit reads back 0 here, CLK_OFF clear)
     {GMR_CX_GMU, GM_HALT, false, true, GM_PH_KGSL}, {GMR_IREF, GM_HALT_DELAY, false, false, GM_PH_KGSL},
     {GMR_CXO, GM_HALT, false, true, GM_PH_KGSL}, {GMR_AXI, GM_HALT_DELAY, true, false, GM_PH_KGSL},
-    {GMR_GX_GFX3D, GM_HALT_SKIP, false, true, GM_PH_KGSL}, {GMR_CX_GFX3D, GM_HALT_DELAY, false, true, GM_PH_KGSL},
+    {GMR_GX_GFX3D, GM_HALT_SKIP, false, true, GM_PH_KGSL}, {GMR_CX_GFX3D, GM_HALT_DELAY, false, false, GM_PH_KGSL},
 };
 #define GM_NBRANCH (sizeof kGmBranches / sizeof kGmBranches[0])
 
