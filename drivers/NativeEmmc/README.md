@@ -14,6 +14,15 @@ PM6125 BT rails over SPMI (`guamp-bt-ldo=1` tries to enable the ones that are of
 (GeniUart.h), the QCA power pulses, HCI_Reset, Read_Local_Version and the QCA EDL version, ending in one
 `GuampBt: RESULT` line. Host tests: `tests/run-bt-tests.sh` (WSL).
 
+RPM client (GuampRpm.inc, protocol in GuampRpmCore.h): GLINK over the RPM message RAM (0x45f0000, TOC "grt0",
+FIFOs ap2r/r2ap, APCS doorbell 0xf111008 bit 0, polled) and rpm-smd v0 requests, `rpm::set(type, id, key, value)` /
+`rpm::request(...)` with timeouts, one request at a time. `guamp-rpm-test=1`: TOC/indices dump, handshake and one XO
+enable vote (active set), ending in `GuampRpm: RESULT`; `=2` read-only dump. Users: `guamp-bt-ldo=3` votes L9A/L16A/
+L17A/L23A on (swen + Linux's voltage, active and sleep set) before the UART step; `guamp-gpu-rpm=1` votes qdss and the
+bimc/snoc/cnoc clocks (`guamp-gpu-rpm-khz`, default the RPM maximum) before the GCC GPU branches. Other arguments:
+`guamp-rpm-ring=1` (keep the FIFO indices instead of Linux's reset), `guamp-rpm-fmt=1`, `guamp-rpm-log=0`,
+`guamp-rpm-delay`. Host tests: `tests/run-rpm-tests.sh` (WSL).
+
 
 Boot argument `guamp-torch=1` (GuampTorch.inc, default off): the PMI632 camera flash LED (SPMI slave 3, 0xd300) as a
 torch at a conservative current (`guamp-torch-ma`, default 100, max 200 mA; Linux DT allows 500), auto-off after

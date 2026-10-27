@@ -9,10 +9,19 @@
 // Strict scope: no SCM/SMC, no zap shader, no firmware, no command submission, no GPU register write, no
 // RBBM_SW_RESET, no PLL programming. Writes stay limited to the GCC/GPUCC registers listed in kGmRegs.
 // Other boot arguments: guamp-gpu-delay=<s> (start later, so the USB mirror sees the lines), guamp-gpu-off=1 (undo
-// the power-up at the end; default: the GPU stays powered). Log: before/after snapshots (3 lines each), an optional
+// the power-up at the end; default: the GPU stays powered). guamp-gpu-rpm=1: before the GCC GPU branches, the RPM
+// votes Linux holds for kgsl on bengal (GuampRpm.inc, kRpmGpuVotes): qdss Enab 1 (active + sleep), bimc / snoc / cnoc
+// KHz (active) at guamp-gpu-rpm-khz (default RPM_KHZ_MAX: the RPM clamps to its top level, as rpmcc's probe vote for
+// bimc; a low value would slow the DDR / eMMC path of the whole system), " rpm <state>" appended to RESULT.
+// Log: before/after snapshots (3 lines each), an optional
 // stop and off line, and the single "GuampGpu: RESULT ..." line. Host-tested by tests/gpu_host.cpp.
 
 #include "GuampGpuM1.h"
+#include "GuampRpmCore.h"
+
+namespace rpm {   // GuampRpm.inc
+int set(uint32_t type, uint32_t id, uint32_t key, uint32_t value, unsigned which, unsigned timeoutMs);
+}
 
 namespace gpum1 {
 volatile uint8_t *gBase[3];
@@ -46,11 +55,36 @@ void logSnap(const char *when, const uint32_t *v, bool gpucc) {
 
 gm_state gSt;
 
+// guamp-gpu-rpm=1, before any GCC GPU branch is touched. Returns a short word for the RESULT line.
+const char *rpmVotes() {
+  unsigned khz = RPM_KHZ_MAX;
+  PE_parse_boot_argn("guamp-gpu-rpm-khz", &khz, sizeof(khz));
+  if (!khz) khz = RPM_KHZ_MAX;
+  const uint32_t m0 = rd(nullptr, GM_GCC, GM_GCC_GPU_MEMNOC_GFX), s0 = rd(nullptr, GM_GCC, GM_GCC_GPU_SNOC_DVM_GFX),
+                 a0 = rd(nullptr, GM_GCC, GM_GCC_BIMC_GPU_AXI);
+  unsigned ok = 0;
+  int first = RPM_OK;
+  for (const rpm_vote &v : kRpmGpuVotes) {
+    const uint32_t value = v.key == RPM_KEY_KHZ ? khz : 1u;
+    int rc = rpm::set(v.type, v.id, v.key, value, RPM_SET_ACTIVE, 500);
+    if (!rc && v.sleep) rc = rpm::set(v.type, v.id, v.key, value, RPM_SET_SLEEP, 500);
+    if (!rc) ok = ok + 1;
+    else if (first == RPM_OK) first = rc;
+    if (rc == RPM_ERR_NOMAP || rc == RPM_ERR_TOC || rc == RPM_ERR_FIFO || rc == RPM_ERR_VERSION || rc == RPM_ERR_OPEN) break;
+  }
+  IODelay(100);
+  IOLog("GuampGpu: rpm votes %u/4 (first error %s), KHz %u: gcc memnoc %08x->%08x snoc_dvm %08x->%08x axi %08x->%08x\n", ok,
+        rpm_err_name(first), khz, m0, rd(nullptr, GM_GCC, GM_GCC_GPU_MEMNOC_GFX), s0, rd(nullptr, GM_GCC, GM_GCC_GPU_SNOC_DVM_GFX),
+        a0, rd(nullptr, GM_GCC, GM_GCC_BIMC_GPU_AXI));
+  return ok == 4 ? "ok" : ok ? "partial" : rpm_err_name(first);
+}
+
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-gpu-m1");
-  unsigned delay = 0, off = 0;
+  unsigned delay = 0, off = 0, rpmOn = 0;
   PE_parse_boot_argn("guamp-gpu-delay", &delay, sizeof(delay));
   PE_parse_boot_argn("guamp-gpu-off", &off, sizeof(off));
+  PE_parse_boot_argn("guamp-gpu-rpm", &rpmOn, sizeof(rpmOn));
   if (delay && delay <= 600) IOSleep(delay * 1000);
   gm_state &st = gSt;
   gm_init(&st);
@@ -61,6 +95,7 @@ void thread(void *, wait_result_t) {
     return;
   }
   const gm_io io = {nullptr, rd, wr, udelay, mapGpu};
+  const char *rpmState = rpmOn == 1 ? rpmVotes() : nullptr;
   gm_power_up(&io, &st);
   const bool ready = gm_prepare_read(&io, &st);
   // Logged before the first GPU read: if that read still aborts the bus, the kpan mirror (every second) and the panic
@@ -79,12 +114,12 @@ void thread(void *, wait_result_t) {
           st.off[GMR_CX_HWCTRL], st.off[GMR_VOTE]);
   }
   if (st.gpuRead)
-    IOLog("GuampGpu: RESULT cx %s gx %s clocks %s gmu %s gfx %s vbif %08x status %08x aon %08x->%08x %s%s\n", st.cx, st.gx,
+    IOLog("GuampGpu: RESULT cx %s gx %s clocks %s gmu %s gfx %s vbif %08x status %08x aon %08x->%08x %s%s%s%s\n", st.cx, st.gx,
           st.clocks, st.gmu, st.gfx, st.vbif, st.status, st.aon0, st.aon1, st.aonOk ? "ok" : "stuck",
-          off == 1 ? " (powered off)" : " (left powered)");
+          off == 1 ? " (powered off)" : " (left powered)", rpmState ? " rpm " : "", rpmState ? rpmState : "");
   else
-    IOLog("GuampGpu: RESULT cx %s gx %s clocks %s gmu %s gfx %s vbif - status - aon - stop %s\n", st.cx, st.gx, st.clocks,
-          st.gmu, st.gfx, st.stop ? st.stop : "?");
+    IOLog("GuampGpu: RESULT cx %s gx %s clocks %s gmu %s gfx %s vbif - status - aon - stop %s%s%s\n", st.cx, st.gx, st.clocks,
+          st.gmu, st.gfx, st.stop ? st.stop : "?", rpmState ? " rpm " : "", rpmState ? rpmState : "");
 }
 
 void start() {

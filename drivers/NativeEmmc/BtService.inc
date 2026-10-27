@@ -4,7 +4,9 @@
 //   1 rails   PM6125 L9A (io), L16A (xo), L17A (core), L23A (pa) read over SPMI (type, subtype, status, enable,
 //             voltage); guamp-bt-ldo=1 enables the rails that are off (enable bit only), =2 also writes Linux's
 //             voltage when the read-back is outside bt_wcn3990's range. Any rail the apps EE may not write stops this
-//             step before the first write (RPM-owned: the RPM SMD client is a later milestone).
+//             step before the first write (RPM-owned). guamp-bt-ldo=3 instead votes the four rails on through the RPM
+//             (GuampRpm.inc, ldoa 9/16/17/23, swen 1 + Linux's voltage, active and sleep set), then checks VREG_OK
+//             over SPMI (read only).
 //   2 uart    QUPv3 wrap0 SE3 (GCC votes like the touch SE2, DFS level or 7.3728 MHz RCG), gpio8-11 to qup3, GENI
 //             UART FIFO mode polled, 8N1
 //   3 hci     hci_qca.c qca_wcn3990_init: power-off pulse 0xC0 at 2400 baud, power-on pulse 0xFC at 115200 (flow
@@ -15,7 +17,7 @@
 // Other boot arguments: guamp-bt-delay=<s> (start later, so the USB mirror sees the lines), guamp-bt-uart=0 (rails
 // only), guamp-bt-pulse=0 (no power pulses), guamp-bt-os=16|32 (UART oversampling; default from the QUP version).
 // Outcome of a boot: the single "GuampBt: RESULT ..." line. Writes stay limited to SE3, gpio8-11, the SE3 GCC votes /
-// RCG and (only with guamp-bt-ldo) the four LDO enable/voltage registers. Every wait has a timeout.
+// RCG and (only with guamp-bt-ldo=1/2) the four LDO enable/voltage registers. Every wait has a timeout.
 // Board facts: GuampBtBoard.h; UART engine: GeniUart.h; HCI framing and decoders: BtHci.h (host-tested).
 
 #include "GuampSpmi.h"
@@ -24,6 +26,7 @@
 #include "GeniUart.h"
 #include "BtHci.h"
 #include "GeniUartCpp.inc"
+#include "GuampRpmCore.h"
 
 namespace pmic {
 extern volatile int gArbReady;
@@ -31,6 +34,9 @@ extern struct spmi_arb gArb;
 int read8(unsigned sid, uint16_t addr, uint8_t *v);
 int write8(unsigned sid, uint16_t addr, uint8_t v);
 int apidOf(unsigned sid, uint16_t addr);
+}
+namespace rpm {   // GuampRpm.inc
+int request(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *kv, unsigned n, unsigned timeoutMs);
 }
 
 namespace bt {
@@ -89,11 +95,43 @@ bool waitRailOk(unsigned i) {
   }
   return false;
 }
+// guamp-bt-ldo=3: the rails voted on through the RPM, as Linux's rpm-smd-regulator does for bluetooth-power.c
+// (qcom,set = <3>): per rail one request in the active set and one in the sleep set, each with swen = 1 and uv = the
+// voltage Linux ends up with (kRpmBtLdo, GuampRpmCore.h). With SPMI up, VREG_OK is then polled and the rail re-read
+// (read only). Stops at the first rail when the RPM link itself is down.
+const char *railsRpm(bool spmi) {
+  unsigned ok = 0;
+  for (unsigned i = 0; i < 4; ++i) {
+    const rpm_bt_ldo &l = kRpmBtLdo[i];
+    const rpm_kvp kv[2] = {{RPM_KEY_SWEN, 4, 1}, {RPM_KEY_UV, 4, l.uv}};
+    const int a = rpm::request(RPM_SET_ACTIVE, RPM_RES_LDOA, l.id, kv, 2, 500);
+    const int s = a ? a : rpm::request(RPM_SET_SLEEP, RPM_RES_LDOA, l.id, kv, 2, 500);
+    const char *chk = "";
+    if (spmi && !a) {
+      const bool readable = !gRail[i].err;   // from the read before the votes
+      const bool vreg = readable && waitRailOk(i);
+      railRead(i);
+      railLog(i, "rpm");
+      chk = !readable ? ", VREG_OK not readable over SPMI" : vreg ? ", VREG_OK" : ", no VREG_OK in 20 ms";
+    }
+    IOLog("GuampBt: rails: rpm %s(%s) ldoa %u %u uV swen 1: active %s, sleep %s%s\n", l.name, kBtRails[i].role, l.id, l.uv,
+          rpm_err_name(a), a ? "not sent" : rpm_err_name(s), chk);
+    if (!a && !s) ok = ok + 1;
+    if (a == RPM_ERR_NOMAP || a == RPM_ERR_TOC || a == RPM_ERR_FIFO || a == RPM_ERR_VERSION || a == RPM_ERR_OPEN) return "rpm-down";
+  }
+  return ok == 4 ? "rpm-on" : ok ? "rpm-partial" : "rpm-refused";
+}
+
 // Returns a short word for the RESULT line.
 const char *rails() {
   gStep = 1;
+  unsigned ldo = 0;
+  PE_parse_boot_argn("guamp-bt-ldo", &ldo, sizeof(ldo));
   for (unsigned i = 0; i < 300 && !pmic::gArbReady; ++i) IOSleep(10);
-  if (!pmic::gArbReady) { IOLog("GuampBt: rails: PMIC service not ready (guamp-pmic=0?), SPMI not read\n"); return "no-spmi"; }
+  if (!pmic::gArbReady) {
+    IOLog("GuampBt: rails: PMIC service not ready (guamp-pmic=0?), SPMI not read%s\n", ldo == 3 ? ", RPM votes only" : "");
+    return ldo == 3 ? railsRpm(false) : "no-spmi";
+  }
   unsigned off = 0, unknown = 0;
   for (unsigned i = 0; i < 4; ++i) {
     railRead(i);
@@ -101,18 +139,17 @@ const char *rails() {
     if (gRail[i].err) unknown = unknown + 1;
     else if (!railOn(i)) off = off + 1;
   }
+  if (ldo == 3) return railsRpm(true);   // voted even when on: keeps them on for the apps master
   if (!off) return unknown ? "unknown" : "on";
-  unsigned ldo = 0;
-  PE_parse_boot_argn("guamp-bt-ldo", &ldo, sizeof(ldo));
   if (ldo != 1 && ldo != 2) {
-    IOLog("GuampBt: rails: %u off, not enabled (guamp-bt-ldo=1 tries SPMI)\n", off);
+    IOLog("GuampBt: rails: %u off, not enabled (guamp-bt-ldo=1 tries SPMI, =3 the RPM)\n", off);
     return "off";
   }
   // No write at all unless every rail to switch is ours to write (spmi-pmic-arb write owner = apps EE 0).
   for (unsigned i = 0; i < 4; ++i) {
     if (railOn(i) || gRail[i].err) continue;
     if (gRail[i].apid < 0 || gRail[i].owner != GP_SPMI_EE) {
-      IOLog("GuampBt: rails: %s write owner ee%u, not ours: refused before any write (RPM-owned, needs the RPM SMD client: later milestone)\n",
+      IOLog("GuampBt: rails: %s write owner ee%u, not ours: refused before any write (RPM-owned: guamp-bt-ldo=3 votes through the RPM)\n",
             kBtRails[i].name, gRail[i].owner);
       return "rpm-owned";
     }
@@ -132,7 +169,7 @@ const char *rails() {
     railRead(i);
     railLog(i, "after");
     if (r) {
-      IOLog("GuampBt: rails: %s write refused by the arbiter (%d, status %08x): stop (RPM client = later milestone)\n", d.name, r,
+      IOLog("GuampBt: rails: %s write refused by the arbiter (%d, status %08x): stop (guamp-bt-ldo=3 votes through the RPM)\n", d.name, r,
             pmic::gArb.last_status);
       return "refused";
     }

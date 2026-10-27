@@ -1017,6 +1017,7 @@ static void usbProbe()
   }
 }
 
+#include "GuampRpm.inc"
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
@@ -1146,6 +1147,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   usbProbe();
   usbMirrorStart();
   dispext::start();
+  rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
   pmic::start();
   touch::start();
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (SPMI rails, SE3 UART, HCI version), own thread
