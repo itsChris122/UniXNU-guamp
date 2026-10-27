@@ -15,6 +15,7 @@ extern "C" volatile uint32_t guamp_timer_sequence[8];
 extern "C" unsigned int guamp_ram_nc_enabled;
 extern "C" volatile uint64_t guamp_irq_trace[8][3][14];
 extern "C" volatile uint32_t guamp_irq_trace_sequence[8];
+extern "C" volatile uint32_t guamp_gpu_step[3];   // GpuService.inc: last GPU access step, register, sequence
 extern "C" kern_return_t host_statistics64(host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *);
 extern "C" void proc_iterate(unsigned int, int (*)(struct proc *, void *), void *, int (*)(struct proc *, void *), void *);
 extern "C" task_t proc_task(struct proc *);
@@ -158,6 +159,7 @@ static void guampPerfSample() {
           basicResult == KERN_SUCCESS ? basic.avail_cpus : 0,
           basicResult == KERN_SUCCESS ? basic.max_cpus : 0, basicResult);
     guampMemSample();
+    if (guamp_gpu_step[2]) IOLog("GuampGpu: progress step %u reg %x seq %u\n", guamp_gpu_step[0], guamp_gpu_step[1], guamp_gpu_step[2]);
     IOLog("GuampRamCache: managed IO RAM to Normal NC %u; MMIO/native WB policy retained\n", guamp_ram_nc_enabled);
     IOLog("GuampSmp: IPI pending-mode %u sent %llu received %llu; GIC group %x enabled %x ctl %x typer %x\n",
           armcpu_ipi_pending_mode, armcpu_ipi_sent, armcpu_ipi_interrupts,

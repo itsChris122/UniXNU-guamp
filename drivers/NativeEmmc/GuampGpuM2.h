@@ -293,41 +293,102 @@ struct gm2_cp {
   uint32_t status0, status, status3, hwFault, cpInt, rbbmInt, cpStatus1, protect;
   uint32_t scratchBefore, scratchAfter;
   uint32_t secvidBefore, secvidAfter;
-  bool consumed, wrote;
+  uint32_t stoppedAt;   // GM2_STEP_* the guamp-gpu-m2-stop request halted at, 0 = ran to the end
+  bool consumed, wrote, softReset;
 };
+
+// --- step trace: a GPU register access that never completes stalls the CPU, so its own log line may never come.
+// Every access below first stores its step and register in the owner's progress words (printed every 10 s by an
+// other thread) and calls the owner's log hook; a step at or after stopAt is not performed (guamp-gpu-m2-stop).
+enum : uint32_t {
+  GM2_STEP_STATUS = 1, GM2_STEP_RESET_ON = 2, GM2_STEP_RESET_READ = 3, GM2_STEP_RESET_OFF = 4, GM2_STEP_GBIF_HALT = 5,
+  GM2_STEP_RBBM_GBIF_HALT = 6, GM2_STEP_GBIF_QOS = 7, GM2_STEP_UCHE = 8, GM2_STEP_CP_CFG = 9, GM2_STEP_PROTECT = 10,
+  GM2_STEP_RB = 11, GM2_STEP_SQE_BASE = 12, GM2_STEP_UNHALT = 13, GM2_STEP_WPTR = 14, GM2_STEP_RPTR_POLL = 15,
+  GM2_STEP_STATUS_READS = 16, GM2_STEP_SECVID = 17,
+  // the owner's steps after the CP start (GpuService.inc), and gm2_submit's own marks
+  GM2_STEP_SMMU_FAULTS = 20, GM2_STEP_FENCE = 21, GM2_STEP_INT_READS = 22, GM2_STEP_BLIT = 30,
+  GM2_STEP_SUBMIT_RPTR = 40, GM2_STEP_SUBMIT_WPTR = 41, GM2_STEP_SUBMIT_WAIT = 42,
+};
+struct gm2_hooks {
+  volatile uint32_t *progress;                  // [0] step, [1] register (dword offset), [2] sequence
+  void (*log)(uint32_t step, uint32_t reg);
+  uint32_t stopAt;                              // 0 = none
+};
+static inline gm2_hooks &gm2_hook() {
+  static gm2_hooks h = {nullptr, nullptr, 0};
+  return h;
+}
+// Marks the access (never stops): used inside loops and by gm2_submit.
+static inline void gm2_mark(uint32_t step, uint32_t reg) {
+  gm2_hooks &h = gm2_hook();
+  if (h.progress) {
+    h.progress[0] = step;
+    h.progress[1] = reg;
+    h.progress[2] = h.progress[2] + 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+}
+// Marks and logs a step; false when the step must not run (guamp-gpu-m2-stop).
+static inline bool gm2_step(uint32_t step, uint32_t reg) {
+  gm2_hooks &h = gm2_hook();
+  if (h.stopAt && step >= h.stopAt) return false;
+  gm2_mark(step, reg);
+  if (h.log) h.log(step, reg);
+  return true;
+}
+#define GM2_STEP(n, reg) do { if (!gm2_step((n), (reg))) { c->stoppedAt = (n); return; } } while (0)
 
 static inline void gm2_w(const gm2_io *io, uint32_t reg, uint32_t v) { io->wr(io->ctx, GM2_GPU, reg * 4u, v); }
 static inline uint32_t gm2_r(const gm2_io *io, uint32_t reg) { return io->rd(io->ctx, GM2_GPU, reg * 4u); }
+static inline void gm2_wm(const gm2_io *io, uint32_t step, uint32_t reg, uint32_t v) {
+  gm2_mark(step, reg);
+  gm2_w(io, reg, v);
+}
 
-// a6xx_soft_reset + the A610 subset of a6xx_start + a6xx_rb_start + a6xx_send_cp_init, then one CP_MEM_WRITE and the
-// unsecure-mode register write. Bounded: one 200 ms poll; never loops on hardware state otherwise.
-static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) {
+// [a6xx_soft_reset, only with softReset: kgsl _adreno_start (adreno.c 2117) soft-resets at power-up only when a
+// regulator was left on; after the GDSC power-up of M1 the core is already in its reset state] + the A610 subset of
+// a6xx_start + a6xx_rb_start + a6xx_send_cp_init, then one CP_MEM_WRITE and the unsecure-mode register write. Bounded:
+// one 200 ms poll; never loops on hardware state otherwise. Every access is a step (see above).
+static inline void gm2_cp_start_ex(const gm2_io *io, const gm2_mem *m, gm2_cp *c, bool softReset) {
   *c = {};
+  c->softReset = softReset;
+  GM2_STEP(GM2_STEP_STATUS, GM2_RBBM_STATUS);
   c->status0 = gm2_r(io, GM2_RBBM_STATUS);
-  gm2_w(io, GM2_RBBM_SW_RESET_CMD, 1);
-  c->resetRead = gm2_r(io, GM2_RBBM_SW_RESET_CMD);   // dummy read: the reset takes effect
-  gm2_w(io, GM2_RBBM_SW_RESET_CMD, 0);
-  io->udelay(io->ctx, GM2_RESET_US);
+  if (softReset) {
+    GM2_STEP(GM2_STEP_RESET_ON, GM2_RBBM_SW_RESET_CMD);
+    gm2_w(io, GM2_RBBM_SW_RESET_CMD, 1);
+    GM2_STEP(GM2_STEP_RESET_READ, GM2_RBBM_SW_RESET_CMD);
+    c->resetRead = gm2_r(io, GM2_RBBM_SW_RESET_CMD);   // dummy read: the reset takes effect
+    GM2_STEP(GM2_STEP_RESET_OFF, GM2_RBBM_SW_RESET_CMD);
+    gm2_w(io, GM2_RBBM_SW_RESET_CMD, 0);
+    io->udelay(io->ctx, GM2_RESET_US);
+  }
+  GM2_STEP(GM2_STEP_GBIF_HALT, GM2_GBIF_HALT);
   gm2_w(io, GM2_GBIF_HALT, 0);
+  GM2_STEP(GM2_STEP_RBBM_GBIF_HALT, GM2_RBBM_GBIF_HALT);
   gm2_w(io, GM2_RBBM_GBIF_HALT, 0);
-  for (uint32_t i = 0; i < 4; i++) gm2_w(io, GM2_GBIF_QSB_SIDE0 + i, 0x00071620);
-  gm2_w(io, GM2_RBBM_GBIF_CLIENT_QOS_CNTL, 0x3);
-  gm2_w(io, GM2_UCHE_WRITE_RANGE_MAX_LO, 0xffffffc0);
-  gm2_w(io, GM2_UCHE_WRITE_RANGE_MAX_HI, 0x0001ffff);
-  gm2_w(io, GM2_UCHE_TRAP_BASE_LO, 0xfffff000);
-  gm2_w(io, GM2_UCHE_TRAP_BASE_HI, 0x0001ffff);
-  gm2_w(io, GM2_UCHE_WRITE_THRU_BASE_LO, 0xfffff000);
-  gm2_w(io, GM2_UCHE_WRITE_THRU_BASE_HI, 0x0001ffff);
-  gm2_w(io, GM2_UCHE_FILTER_CNTL, 0x804);
-  gm2_w(io, GM2_UCHE_CACHE_WAYS, 0x4);
-  gm2_w(io, GM2_CP_ROQ_THRESHOLDS_2, 0x00800060);
-  gm2_w(io, GM2_CP_ROQ_THRESHOLDS_1, 0x40201b16);
-  gm2_w(io, GM2_CP_MEM_POOL_SIZE, 48);
-  gm2_w(io, GM2_CP_MEM_POOL_DBG_ADDR, 47);
-  gm2_w(io, GM2_PC_DBG_ECO_CNTL, 0x00080000);
-  gm2_w(io, GM2_CP_AHB_CNTL, 0x1);
-  gm2_w(io, GM2_UCHE_CLIENT_PF, 1);
-  gm2_w(io, GM2_CP_ADDR_MODE_CNTL, 0x1);
+  GM2_STEP(GM2_STEP_GBIF_QOS, GM2_GBIF_QSB_SIDE0);
+  for (uint32_t i = 0; i < 4; i++) gm2_wm(io, GM2_STEP_GBIF_QOS, GM2_GBIF_QSB_SIDE0 + i, 0x00071620);
+  gm2_wm(io, GM2_STEP_GBIF_QOS, GM2_RBBM_GBIF_CLIENT_QOS_CNTL, 0x3);
+  GM2_STEP(GM2_STEP_UCHE, GM2_UCHE_WRITE_RANGE_MAX_LO);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_WRITE_RANGE_MAX_LO, 0xffffffc0);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_WRITE_RANGE_MAX_HI, 0x0001ffff);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_TRAP_BASE_LO, 0xfffff000);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_TRAP_BASE_HI, 0x0001ffff);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_WRITE_THRU_BASE_LO, 0xfffff000);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_WRITE_THRU_BASE_HI, 0x0001ffff);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_FILTER_CNTL, 0x804);
+  gm2_wm(io, GM2_STEP_UCHE, GM2_UCHE_CACHE_WAYS, 0x4);
+  GM2_STEP(GM2_STEP_CP_CFG, GM2_CP_ROQ_THRESHOLDS_2);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_ROQ_THRESHOLDS_2, 0x00800060);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_ROQ_THRESHOLDS_1, 0x40201b16);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_MEM_POOL_SIZE, 48);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_MEM_POOL_DBG_ADDR, 47);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_PC_DBG_ECO_CNTL, 0x00080000);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_AHB_CNTL, 0x1);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_UCHE_CLIENT_PF, 1);
+  gm2_wm(io, GM2_STEP_CP_CFG, GM2_CP_ADDR_MODE_CNTL, 0x1);
+  GM2_STEP(GM2_STEP_PROTECT, GM2_CP_PROTECT_CNTL);
   c->protect = gm2_r(io, GM2_CP_PROTECT_CNTL);   // left as reset: no register protection in M2
 
   // the ring: CP_ME_INIT (8 ordinals) and CP_MEM_WRITE {addr lo, hi, magic}
@@ -353,17 +414,22 @@ static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) {
   io->flush(io->ctx, const_cast<const uint32_t *>(m->scratch), 32);
 
   c->rbCntl = (1u << 27) | ((gm2_log2(4) << 8) & 0x1f00u) | (gm2_log2(m->ringDwords >> 1) & 0x3fu);
-  gm2_w(io, GM2_CP_RB_RPTR_ADDR_LO, static_cast<uint32_t>(m->scratchPhys));
-  gm2_w(io, GM2_CP_RB_RPTR_ADDR_HI, static_cast<uint32_t>(m->scratchPhys >> 32));
-  gm2_w(io, GM2_CP_RB_CNTL, c->rbCntl);
-  gm2_w(io, GM2_CP_RB_BASE, static_cast<uint32_t>(m->ringPhys));
-  gm2_w(io, GM2_CP_RB_BASE_HI, static_cast<uint32_t>(m->ringPhys >> 32));
-  gm2_w(io, GM2_CP_SQE_INSTR_BASE_LO, static_cast<uint32_t>(m->sqePhys));
-  gm2_w(io, GM2_CP_SQE_INSTR_BASE_HI, static_cast<uint32_t>(m->sqePhys >> 32));
+  GM2_STEP(GM2_STEP_RB, GM2_CP_RB_RPTR_ADDR_LO);
+  gm2_wm(io, GM2_STEP_RB, GM2_CP_RB_RPTR_ADDR_LO, static_cast<uint32_t>(m->scratchPhys));
+  gm2_wm(io, GM2_STEP_RB, GM2_CP_RB_RPTR_ADDR_HI, static_cast<uint32_t>(m->scratchPhys >> 32));
+  gm2_wm(io, GM2_STEP_RB, GM2_CP_RB_CNTL, c->rbCntl);
+  gm2_wm(io, GM2_STEP_RB, GM2_CP_RB_BASE, static_cast<uint32_t>(m->ringPhys));
+  gm2_wm(io, GM2_STEP_RB, GM2_CP_RB_BASE_HI, static_cast<uint32_t>(m->ringPhys >> 32));
+  GM2_STEP(GM2_STEP_SQE_BASE, GM2_CP_SQE_INSTR_BASE_LO);
+  gm2_wm(io, GM2_STEP_SQE_BASE, GM2_CP_SQE_INSTR_BASE_LO, static_cast<uint32_t>(m->sqePhys));
+  gm2_wm(io, GM2_STEP_SQE_BASE, GM2_CP_SQE_INSTR_BASE_HI, static_cast<uint32_t>(m->sqePhys >> 32));
+  GM2_STEP(GM2_STEP_UNHALT, GM2_CP_SQE_CNTL);
   gm2_w(io, GM2_CP_SQE_CNTL, 1);   // clear SQE_HALT
   c->wptr = n;
+  GM2_STEP(GM2_STEP_WPTR, GM2_CP_RB_WPTR);
   gm2_w(io, GM2_CP_RB_WPTR, n);
 
+  GM2_STEP(GM2_STEP_RPTR_POLL, GM2_CP_RB_RPTR);
   for (uint32_t i = 0; i < GM2_POLL_STEPS; i++) {
     c->rptr = gm2_r(io, GM2_CP_RB_RPTR);
     if (c->rptr == n) { c->consumed = true; break; }
@@ -374,18 +440,27 @@ static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) {
   io->flush(io->ctx, const_cast<const uint32_t *>(m->scratch), 32);
   c->scratchAfter = m->scratch[4];
   c->wrote = c->scratchAfter == GM2_MAGIC;
+  GM2_STEP(GM2_STEP_STATUS_READS, GM2_RBBM_STATUS);
   c->status = gm2_r(io, GM2_RBBM_STATUS);
+  gm2_mark(GM2_STEP_STATUS_READS, GM2_RBBM_STATUS3);
   c->status3 = gm2_r(io, GM2_RBBM_STATUS3);
+  gm2_mark(GM2_STEP_STATUS_READS, GM2_CP_HW_FAULT);
   c->hwFault = gm2_r(io, GM2_CP_HW_FAULT);
+  gm2_mark(GM2_STEP_STATUS_READS, GM2_CP_INTERRUPT_STATUS);
   c->cpInt = gm2_r(io, GM2_CP_INTERRUPT_STATUS);
+  gm2_mark(GM2_STEP_STATUS_READS, GM2_RBBM_INT_0_STATUS);
   c->rbbmInt = gm2_r(io, GM2_RBBM_INT_0_STATUS);
+  gm2_mark(GM2_STEP_STATUS_READS, GM2_CP_STATUS_1);
   c->cpStatus1 = gm2_r(io, GM2_CP_STATUS_1);
 
   // adreno_set_unsecured_mode without a zap shader: the direct write (ignored if the secure world owns it)
+  GM2_STEP(GM2_STEP_SECVID, GM2_RBBM_SECVID_TRUST_CNTL);
   c->secvidBefore = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
   gm2_w(io, GM2_RBBM_SECVID_TRUST_CNTL, 0);
   c->secvidAfter = gm2_r(io, GM2_RBBM_SECVID_TRUST_CNTL);
 }
+// The recovery form (gpug2): with the soft reset, as a6xx_soft_reset before a restart.
+static inline void gm2_cp_start(const gm2_io *io, const gm2_mem *m, gm2_cp *c) { gm2_cp_start_ex(io, m, c, true); }
 
 // === M3: GPU SMMU stream 0, ring submission with a fence, interrupt diagnostics ====================================
 // The phone's SMMU (M2 log): sCR0 00200406 (client port on, USFCFG: unmatched streams fault), 4 SMRs none valid,
@@ -594,6 +669,7 @@ static inline int gm2_submit(const gm2_io *io, gm2_ring *rb, const uint32_t *pkt
   if (need + 8 > rb->dwords) return GM2_SUBMIT_TOO_BIG;
   const uint32_t pad = rb->wptr + need > rb->dwords ? rb->dwords - rb->wptr : 0;
   for (;;) {
+    gm2_mark(GM2_STEP_SUBMIT_RPTR, GM2_CP_RB_RPTR);
     const uint32_t rptr = gm2_r(io, GM2_CP_RB_RPTR) % rb->dwords;
     const uint32_t used = (rb->wptr + rb->dwords - rptr) % rb->dwords;
     if (rb->dwords - used - 1 >= pad + need) break;
@@ -617,7 +693,8 @@ static inline int gm2_submit(const gm2_io *io, gm2_ring *rb, const uint32_t *pkt
   io->flush(io->ctx, rb->ring, rb->dwords * 4u);
   rb->ts = ts;
   rb->wptr = (rb->wptr + need) % rb->dwords;
-  gm2_w(io, GM2_CP_RB_WPTR, rb->wptr);
+  gm2_wm(io, GM2_STEP_SUBMIT_WPTR, GM2_CP_RB_WPTR, rb->wptr);
+  gm2_mark(GM2_STEP_SUBMIT_WAIT, rb->ts);
   for (;;) {
     if (static_cast<int32_t>(gm2_fence(io, rb) - ts) >= 0) return GM2_SUBMIT_OK;
     if (*waitedUs >= timeoutUs) return GM2_SUBMIT_TIMEOUT;

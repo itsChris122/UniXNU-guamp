@@ -75,7 +75,7 @@ struct Fake {
   uint32_t ringDwords = 1024;
   bool execute = true, secvidLocked = false;
   bool smmuIgnore = false, bypassBecomesFault = false;   // firmware behaviours seen on qcom SMMUs
-  unsigned writes = 0, flushes = 0, smmuWrites = 0;
+  unsigned writes = 0, flushes = 0, smmuWrites = 0, resetWrites = 0;
 };
 static uint32_t frd(void *c, unsigned b, uint32_t off) {
   Fake *f = static_cast<Fake *>(c);
@@ -95,6 +95,7 @@ static void fwr(void *c, unsigned b, uint32_t off, uint32_t v) {
   f->writes++;
   const uint32_t reg = off / 4;
   if (reg == GM2_RBBM_SECVID_TRUST_CNTL && f->secvidLocked) return;
+  if (reg == GM2_RBBM_SW_RESET_CMD) f->resetWrites++;
   f->gpu.at(reg) = v;
   if (reg == GM2_CP_RB_WPTR && f->execute && f->gpu[GM2_CP_SQE_CNTL] == 1) {
     // walk the ring from RPTR to the new WPTR: NOP, ME_INIT, MEM_WRITE / EVENT_WRITE into the scratch page
@@ -318,6 +319,54 @@ static void testCp(bool execute, bool locked) {
   CHECK(f.writes < 1000 && f.flushes >= 3);
 }
 
+static uint32_t gLogged, gLastLogged;
+static void hookLog(uint32_t step, uint32_t) { gLogged++; gLastLogged = step; }
+
+// Step trace, guamp-gpu-m2-stop and the start without soft reset (the first start of GpuService.inc).
+static void testSteps() {
+  volatile uint32_t progress[3] = {0, 0, 0};
+  for (int pass = 0; pass < 2; pass++) {
+    Fake f;
+    std::vector<uint32_t> mem(0x10000 / 4, 0);
+    f.ring = &mem[0xe000 / 4];
+    f.scratch = &mem[0xf000 / 4];
+    f.ringPhys = 0x80000000ull + 0xe000;
+    f.scratchPhys = 0x80000000ull + 0xf000;
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    const gm2_mem m = {&mem[0], 0x80000000ull, f.ring, f.ringPhys, 1024, f.scratch, f.scratchPhys};
+    gLogged = 0;
+    gm2_hook() = {progress, hookLog, pass == 0 ? GM2_STEP_UNHALT : 0u};
+    gm2_cp c;
+    gm2_cp_start_ex(&io, &m, &c, false);
+    CHECK(f.resetWrites == 0 && !c.softReset);
+    if (pass == 0) {   // stopped before the unhalt: microcode base written, CP still halted, nothing fetched
+      CHECK(c.stoppedAt == GM2_STEP_UNHALT && f.gpu[GM2_CP_SQE_CNTL] == 0 && f.gpu[GM2_CP_RB_WPTR] == 0);
+      CHECK(progress[0] == GM2_STEP_SQE_BASE && progress[1] == GM2_CP_SQE_INSTR_BASE_HI && gLastLogged == GM2_STEP_SQE_BASE);
+      CHECK(f.gpu[GM2_CP_SQE_INSTR_BASE_LO] == 0x80000000u && !c.consumed);
+    } else {           // full run: last step SECVID, every step logged once (1, 5-17 without the reset steps)
+      CHECK(c.stoppedAt == 0 && c.consumed && c.wrote && progress[0] == GM2_STEP_SECVID && gLogged == 14);
+      gm2_ring rb = {f.ring, f.ringPhys, 1024, c.wptr, 0, f.scratch, f.scratchPhys};
+      uint32_t waited = 0;
+      CHECK(gm2_submit(&io, &rb, nullptr, 0, 1000, &waited) == GM2_SUBMIT_OK && progress[0] == GM2_STEP_SUBMIT_WAIT);
+    }
+    CHECK(progress[2] > 10);
+  }
+  gm2_cp c2;
+  {
+    Fake f;
+    std::vector<uint32_t> mem(0x10000 / 4, 0);
+    f.ring = &mem[0xe000 / 4];
+    f.scratch = &mem[0xf000 / 4];
+    f.scratchPhys = 0x80000000ull + 0xf000;
+    const gm2_io io = {&f, frd, fwr, fdelay, fflush};
+    const gm2_mem m = {&mem[0], 0x80000000ull, f.ring, 0x80000000ull + 0xe000, 1024, f.scratch, f.scratchPhys};
+    gm2_hook() = {progress, hookLog, GM2_STEP_RESET_ON};   // the recovery form resets: stop right there
+    gm2_cp_start(&io, &m, &c2);
+    CHECK(c2.stoppedAt == GM2_STEP_RESET_ON && f.resetWrites == 0 && c2.softReset);
+  }
+  gm2_hook() = {nullptr, nullptr, 0};
+}
+
 int main() {
   testPkt();
   testLp();
@@ -327,6 +376,7 @@ int main() {
   testSmmuSetup();
   testSubmit(true);
   testSubmit(false);
+  testSteps();
   printf("gpu_m2_host: %d checks, %d failures\n", checks, fails);
   return fails ? 1 : 0;
 }

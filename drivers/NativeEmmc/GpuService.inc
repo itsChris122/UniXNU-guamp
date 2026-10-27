@@ -46,10 +46,23 @@ char activeSlot();
 //   After a CP start that consumed the ring and wrote the magic word: one fence-only submission (CP_EVENT_WRITE
 //   CACHE_FLUSH_TS, timestamp at scratch + 32) and the RBBM interrupt status, read only (no handler registered).
 //   gpum2::submit() then accepts PM4 packets from this thread (one caller at a time).
+// Step trace (levels 2, 3): every GPU register access from the CP start on is announced first ("GuampGpu: step N reg
+// R") and stored in guamp_gpu_step[] (step, register, sequence), which GuampPerf prints every 10 s from another
+// thread: if an access stalls the CPU, the last step shows which one. guamp-gpu-m2-stop=N stops before step N
+// (GuampGpuM2.h GM2_STEP_*: 1 status, 2-4 soft reset, 5-6 GBIF halt, 7 QoS, 8 UCHE, 9 CP config, 10 protect, 11 ring
+// registers, 12 SQE base, 13 unhalt, 14 WPTR, 15 RPTR poll, 16 status reads, 17 SECVID, 20 SMMU faults, 21 fence,
+// 22 interrupt reads, 30 blits). guamp-gpu-m2-reset=1: RBBM soft reset before the start (default off: kgsl's first
+// start after the GDSC power-up has none).
 // 64 KiB physically contiguous, uncached, below 4 GiB: SQE at 0 (up to 56 KiB), ring 4 KiB at 0xe000, scratch at
 // 0xf000. Never freed once the CP was started (it keeps the ring and microcode addresses).
+extern "C" {
+volatile uint32_t guamp_gpu_step[3];   // step, register (dword offset), sequence: GuampPerf.inc prints it
+}
+
 namespace gpum2 {
 volatile uint8_t *gGpu, *gSmmu;
+
+void stepLog(uint32_t step, uint32_t reg) { IOLog("GuampGpu: step %u reg %x\n", step, reg); }
 
 uint32_t rd(void *, unsigned block, uint32_t off) {
   return *reinterpret_cast<volatile uint32_t *>((block == GM2_GPU ? gGpu : gSmmu) + off);
@@ -179,6 +192,10 @@ int submit(const uint32_t *pkts, uint32_t n, uint32_t timeoutUs, uint32_t *waite
 
 void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmuCb) {
   gGpu = gpu;
+  unsigned stopAt = 0, softReset = 0;
+  PE_parse_boot_argn("guamp-gpu-m2-stop", &stopAt, sizeof(stopAt));
+  PE_parse_boot_argn("guamp-gpu-m2-reset", &softReset, sizeof(softReset));
+  gm2_hook() = {guamp_gpu_step, level >= 2 ? stepLog : nullptr, stopAt};
   gSmmu = mapPhysical(GM2_SMMU_PHYS, GM2_SMMU_SIZE);
   if (!gGpu || !gSmmu) {
     IOLog("GuampGpu: M2 RESULT smmu - sqe - cp - stop map failed\n");
@@ -234,7 +251,13 @@ void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmu
         static_cast<unsigned long long>(phys), sqeBytes, static_cast<unsigned long long>(mem.ringPhys), kRingDwords,
         static_cast<unsigned long long>(mem.scratchPhys), identity ? "" : " (forced, guamp-gpu-m2=3)");
   gm2_cp c;
-  gm2_cp_start(&io, &mem, &c);
+  gm2_cp_start_ex(&io, &mem, &c, softReset == 1);
+  if (c.stoppedAt) {
+    IOLog("GuampGpu: M2 RESULT smmu %s sqe ok cp stopped before step %u (guamp-gpu-m2-stop=%u)%s\n",
+          identity ? "identity" : "translated", c.stoppedAt, stopAt, c.softReset ? " soft reset" : "");
+    return;
+  }
+  if (!gm2_step(GM2_STEP_SMMU_FAULTS, 0)) return;
   gm2_smmu_faults(&io, &s);
   IOLog("GuampGpu: M2 cp reset read %08x, protect %08x, rb_cntl %08x, wptr %u rptr %u after %u us, rbbm status %08x->%08x "
         "status3 %08x int %08x, cp hw_fault %08x int %08x status_1 %08x, scratch %08x->%08x, smmu gfsr %08x cb fsr %08x "
@@ -250,8 +273,10 @@ void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmu
   gRing = {mem.ring, mem.ringPhys, kRingDwords, c.wptr, 0, mem.scratch, mem.scratchPhys};
   gMem = mem;
   uint32_t waited = 0;
+  if (!gm2_step(GM2_STEP_FENCE, GM2_CP_RB_WPTR)) return;
   const int e = gm2_submit(&io, &gRing, nullptr, 0, 200000, &waited);
   gReady = e == GM2_SUBMIT_OK;
+  if (!gm2_step(GM2_STEP_INT_READS, GM2_RBBM_INT_0_STATUS)) return;
   gm2_smmu_faults(&io, &s);
   const uint32_t intStatus = gm2_r(&io, GM2_RBBM_INT_0_STATUS), intMask = gm2_r(&io, GM2_RBBM_INT_0_MASK);
   char names[192];
@@ -267,7 +292,7 @@ void run(volatile uint8_t *gpu, unsigned level, unsigned smmuMode, unsigned smmu
   // colours, so the GPU's writes stay visible over a still screen (iOS redraws the surface on its next frame).
   unsigned blits = 0;
   PE_parse_boot_argn("guamp-gpu-blit", &blits, sizeof(blits));
-  if (!gReady || !blits) return;
+  if (!gReady || !blits || !gm2_step(GM2_STEP_BLIT, 0)) return;
   if (blits > 40) blits = 40;
   static const uint32_t kColors[4] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffff00ffu};
   uint32_t pkts[GMB_CLEAR_MAX_DWORDS];
