@@ -175,19 +175,28 @@ void shutdown(bool panic) {
 }
 }  // namespace torch
 
-// IOKit endpoint (setProperties from user space, root only). The registry properties are refreshed by the PMIC thread.
+// IOKit endpoint (setProperties from user space). The registry properties are refreshed by the PMIC thread.
 class GuampTorchService : public IOService {
   OSDeclareDefaultStructors(GuampTorchService)
 public:
   void number(const char *key, uint64_t value) { setProperty(key, value, 32); }
   IOReturn setProperties(OSObject *properties) override {
-    OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
-    if (!dict) return kIOReturnBadArgument;
-    OSNumber *level = OSDynamicCast(OSNumber, dict->getObject("TorchLevel"));
-    OSBoolean *onOff = OSDynamicCast(OSBoolean, dict->getObject("TorchOn"));
+    // Accept a dictionary {TorchLevel|TorchOn} (IORegistryEntrySetCFProperty) or a bare OSNumber/OSBoolean
+    // (IORegistryEntrySetCFProperties with a CFNumber/CFBoolean), so a userland hook can drive the torch
+    // without building a dictionary or a key CFString.
+    OSNumber *level = OSDynamicCast(OSNumber, properties);
+    OSBoolean *onOff = OSDynamicCast(OSBoolean, properties);
+    if (OSDictionary *dict = OSDynamicCast(OSDictionary, properties)) {
+      level = OSDynamicCast(OSNumber, dict->getObject("TorchLevel"));
+      onOff = OSDynamicCast(OSBoolean, dict->getObject("TorchOn"));
+    }
     if (!level && !onOff) return kIOReturnUnsupported;
-    if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
-      return kIOReturnNotPrivileged;
+    // SpringBoard (the flashlight UI) and mediaserverd both run as user mobile, not root, so the former
+    // administrator check is dropped; the service is published only with guamp-torch=1. To keep a gate,
+    // allow just the console user, e.g.:
+    //   if (proc_getuid(current_proc()) != 501 &&
+    //       IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+    //     return kIOReturnNotPrivileged;
     torch::request(level ? level->unsigned32BitValue() : onOff->isTrue() ? 1000u : 0u);
     return kIOReturnSuccess;
   }
