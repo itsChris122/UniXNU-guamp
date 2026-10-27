@@ -1018,6 +1018,7 @@ static void usbProbe()
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
+#include "GuampWifiPrep.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1137,6 +1138,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
   publish(0, card.capacity, "user area");
   publishWindows();
+  wifiprep::start();   // guamp-wifi-prep=1: read-only SMEM and modem firmware checks, own thread
   usbProbe();
   usbMirrorStart();
   dispext::start();
