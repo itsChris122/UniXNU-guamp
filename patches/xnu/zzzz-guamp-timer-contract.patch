@@ -1,13 +1,14 @@
 --- a/osfmk/arm/rtclock.c
 +++ b/osfmk/arm/rtclock.c
-@@ -369,6 +369,58 @@
+@@ -369,6 +369,68 @@
  	timer_intr(user_mode, pc);
  }
  
 +
 +/* guamp: take at most about one register snapshot per second on the core
 + * actually handling this timer. No log, allocation, frequency or CVAL changes here. */
-+volatile uint64_t guamp_timer_snapshot[8][17];
++volatile uint64_t guamp_timer_snapshot[8][27];
++extern void armcpu_gic_diag(uint64_t, uint32_t *);
 +volatile uint32_t guamp_timer_sequence[8];
 +void guamp_native_timer_intr(unsigned int cpu, unsigned int mode);
 +void
@@ -40,6 +41,15 @@
 +        guamp_timer_snapshot[cpu][8] = data->cpu_decrementer;
 +        guamp_timer_snapshot[cpu][14] = data->cpu_number;
 +        guamp_timer_snapshot[cpu][16] = __builtin_arm_rsr64("MPIDR_EL1");
++        /* Read-only: do not read IAR (which would acknowledge an IRQ), or write
++         * EOIR, DIR, pending masks or timer controls. The existing helper finds
++         * this core's redistributor from its actual MPIDR affinity. */
++        guamp_timer_snapshot[cpu][17] = __builtin_arm_rsr64("ICC_CTLR_EL1");
++        guamp_timer_snapshot[cpu][18] = __builtin_arm_rsr64("ICC_HPPIR1_EL1");
++        uint32_t gic[8];
++        armcpu_gic_diag(guamp_timer_snapshot[cpu][16], gic);
++        for (unsigned i = 0; i < 8; ++i) { guamp_timer_snapshot[cpu][19 + i] = gic[i]; }
++
 +    }
 +    /* Match sleh_fiq(): a serviced timer must no longer advertise its old
 +     * positive decrementer. Keep rtcPop and all timer-queue deadline logic native. */

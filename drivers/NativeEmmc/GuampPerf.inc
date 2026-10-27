@@ -8,7 +8,7 @@ extern "C" volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8], armcpu_sm
 extern "C" volatile uint32_t armcpu_gic_boot[8], armcpu_ipi_pending_mode;
 extern "C" volatile uint64_t armcpu_ipi_sent, armcpu_ipi_interrupts;
 extern "C" uint32_t guamp_smp_signal_flags(unsigned int);
-extern "C" volatile uint64_t guamp_timer_snapshot[8][17];
+extern "C" volatile uint64_t guamp_timer_snapshot[8][27];
 extern "C" volatile uint32_t guamp_timer_sequence[8];
 extern "C" unsigned int guamp_ram_nc_enabled;
 static void guampPerfSample() {
@@ -54,12 +54,14 @@ static void guampPerfSample() {
     for (unsigned cpu = 0; cpu < cpuCount; ++cpu) {
       uint32_t sequence = __atomic_load_n(&guamp_timer_sequence[cpu], __ATOMIC_ACQUIRE);
       if (!sequence || (sequence & 1)) continue;
-      uint64_t r[17];
-      for (unsigned i = 0; i < 17; ++i) r[i] = guamp_timer_snapshot[cpu][i];
+      uint64_t r[27];
+      for (unsigned i = 0; i < 27; ++i) r[i] = guamp_timer_snapshot[cpu][i];
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
       if (sequence != __atomic_load_n(&guamp_timer_sequence[cpu], __ATOMIC_ACQUIRE)) continue;
       IOLog("GuampTimer: core %u mode %llu mpidr %llx CNTFRQ %llu before %llu ctl %llx cval %llu rtc %llu dec %llx after %llu ctl %llx cval %llu rtc %llu dec %llx SCTLR %llx MAIR %llx TCR %llx actual-core %llu\n",
             cpu,r[15],r[16]&0xffffff,r[1],r[0],r[2],r[3],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[4],r[5],r[6],r[14]);
+      IOLog("GuampGic: core %u ICC_CTLR %llx HPPIR1 %llx group %llx enabled %llx pending %llx groupmod %llx waker %llx distctl %llx priority %llx found %llu\n",
+            cpu,r[17],r[18],r[19],r[20],r[21],r[22],r[23],r[24],r[25],r[26]);
     }
   }
   previousValid = true;
