@@ -49,9 +49,18 @@
 #define GP_VOLUP_GPIO_BASE 0xc400
 #define GP_VOLUP_STATUS1 (GP_VOLUP_GPIO_BASE + 0x08)
 #define GP_VOLUP_LEVEL (1u << 0)
-// Google Assistant key: gpio-keys assist_key, gpios = <&tlmm 0x21 1> (TLMM GPIO 33, active low), linux,code 0xd9.
-// A TLMM pin, not a PMIC one: read like the touch interrupt pin (GuampTouchBoard.h, TLMM west tile).
+// Google Assistant key: gpio-keys assist_key, gpios = <&tlmm 0x21 1> (TLMM GPIO 33, active low), linux,code 0xd9,
+// debounce-interval 15 ms; pinctrl gpio_key_active (dtbo fragment@42): function "gpio", drive-strength 2, bias-pull-up.
+// A TLMM pin, not a PMIC one, and in the EAST tile: pinctrl-bengal.c PINGROUP(33, EAST, ...), EAST = 0x900000 inside
+// the TLMM window pinctrl@400000 (reg <0x400000 0xc00000>), so the pin's 0x1000 block is 0xd00000 + 33 * 0x1000:
+// cfg at +0 (pull 1:0, 3 = pull-up; function 5:2; drive 8:6; OE bit 9), IN_OUT at +4 (bit 0 = input level).
+// No gpio-reserved-ranges in the guamp DT. Used as the ring/silent switch (PmicService.inc).
 #define GP_ASSIST_TLMM_GPIO 33
+#define GP_ASSIST_TLMM_BLOCK 0x00d21000ULL
+#define GP_ASSIST_CFG 0x0
+#define GP_ASSIST_IN_OUT 0x4
+#define GP_ASSIST_CFG_MASK 0x23fu      // OE, function, pull: what must read "GPIO input with pull-up"
+#define GP_ASSIST_CFG_INPUT_PU 0x003u
 
 // Charger: PMI632 qcom,qpnp-smb5 (SID 2) with peripherals chgr@1000, dcdc@1100, batif@1200, usb@1300, typec@1500,
 // misc@1600 (misc has wdog-snarl/wdog-bark: the charger watchdog falls back to safe currents when nobody pets it, so the

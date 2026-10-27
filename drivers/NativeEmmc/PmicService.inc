@@ -7,7 +7,14 @@
 //   charger   PMI632 SMB5: pets the charger watchdog, enables charging and raises the USB input current limit and the
 //             fast charge current once a charger is detected; register offsets from Linux qcom_smbx.c (SMB2/SMB5 share
 //             them); the current codes assume 50 mA steps, so a 25 mA hardware step only halves them (never exceeds)
-// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 1500) and guamp-fcc-ma (default 2000).
+//   ringer    the Assistant key (TLMM GPIO 33, active low) is the ring/silent switch: every debounced press toggles a
+//             latched state that starts at "ring"; it is report 2 bit 4 (Telephony page 0x0B usage 0x2E, level: 1 ring,
+//             0 silent). backboardd BKButtonHIDEventProcessor -processEvent:sender:dispatcher: routes a keyboard event
+//             with page 0x0B usage 0x2E to -_processRingerSwitchEvent:down: (down != 0 -> "tone1", 0 -> "silent") and
+//             SpringBoard -__handleHIDEvent: 0xB002E -> -_handleRingerSwitchEvent: (gated by MobileGestalt ringer-switch
+//             = ADT /buttons property function-button_ringerab, see make-guamp-adt.py) -> _updateRingerState:.
+// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 1500) and guamp-fcc-ma (default 2000);
+// guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
 // Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, SPMI errors.
 
 #include "GuampSpmi.h"
@@ -151,7 +158,39 @@ void charger(bool configure, unsigned iclMa, unsigned fccMa, uint8_t *iclCode, u
   write8(kPmi632, kUsbinCmdIl, 0x00);      // input not suspended
 }
 
+// --- ringer switch (Assistant key, TLMM GPIO 33) -------------------------------------------------------------------
+constexpr uint32_t kRingerBit = 1u << 4;     // report 2 bit 4: Telephony 0x0B / 0x2E (guamp-hid-variant.py)
+volatile uint8_t *gAssist;                   // GPIO 33's own 0x1000 block, nothing else of the EAST tile
+volatile uint32_t gRingerState, gRingerPresses, gSinkGeneration;
+
+// Maps the pin and checks its configuration; only GPIO 33's cfg is ever written, and only when the boot chain left it
+// in another function, as an output or without the pull-up (the key would then read pressed or float).
+bool ringerInit() {
+  unsigned enabled = 1, start = 1;
+  PE_parse_boot_argn("guamp-ringer", &enabled, sizeof(enabled));
+  PE_parse_boot_argn("guamp-ringer-start", &start, sizeof(start));
+  gRingerState = start ? 1u : 0u;
+  if (!enabled) { IOLog("GuampPmic: ringer disabled (guamp-ringer=0)\n"); return false; }
+  gAssist = mapPhysical(GP_ASSIST_TLMM_BLOCK, 0x1000);
+  if (!gAssist) { IOLog("GuampPmic: ringer GPIO 33 mapping failed\n"); return false; }
+  volatile uint32_t *cfg = reinterpret_cast<volatile uint32_t *>(gAssist + GP_ASSIST_CFG);
+  const uint32_t before = *cfg;
+  if ((before & GP_ASSIST_CFG_MASK) != GP_ASSIST_CFG_INPUT_PU) {
+    *cfg = (before & ~GP_ASSIST_CFG_MASK) | GP_ASSIST_CFG_INPUT_PU;
+    __asm__ volatile("dsb sy" ::: "memory");
+    IODelay(100);                              // let the pull-up charge the line before the first sample
+  }
+  const uint32_t io = *reinterpret_cast<volatile uint32_t *>(gAssist + GP_ASSIST_IN_OUT);
+  IOLog("GuampPmic: ringer GPIO 33 cfg %08x -> %08x, level %u, start %s\n", before, *cfg, io & 1u,
+        gRingerState ? "ring" : "silent");
+  return true;
+}
+bool assistPressed() {   // active low
+  return gAssist && !(*reinterpret_cast<volatile uint32_t *>(gAssist + GP_ASSIST_IN_OUT) & 1u);
+}
+
 void sinkFromHid(void (*sink)(void *, uint32_t), void *context) {
+  gSinkGeneration = gSinkGeneration + 1;     // the PMIC thread sends the full state again to a new sink
   gSink = nullptr;
   __asm__ volatile("dmb ish" ::: "memory");
   gSinkContext = context;
@@ -185,8 +224,28 @@ void thread(void *, wait_result_t) {
   uint8_t iclCode = 0, fccCode = 0;
   bool configured = false, apsdRequested = false;
   unsigned absentTicks = 0, typecResets = 0;
+  const bool ringer = ringerInit();
+  bool keyLast = false, keyStable = false;
+  unsigned keyCount = 0;
+  uint32_t sinkSeen = gSinkGeneration;
   for (unsigned tick = 0;; ++tick) {
-    uint32_t now = readButtons();
+    if (ringer) {
+      // Momentary key, debounced like the PON keys (the same level on two polls 25 ms apart; Linux uses 15 ms); each
+      // press toggles the latched switch position, the release does nothing.
+      const bool key = assistPressed();
+      keyCount = key == keyLast ? keyCount + 1 : 0;
+      keyLast = key;
+      if (keyCount == 1 && key != keyStable) {
+        keyStable = key;
+        if (key) {
+          gRingerState = gRingerState ^ 1u;
+          gRingerPresses = gRingerPresses + 1;
+          IOLog("GuampPmic: ringer %s (assist key press %u, HID sink %s)\n", gRingerState ? "ring" : "silent",
+                gRingerPresses, gSink ? "attached" : "absent");
+        }
+      }
+    }
+    uint32_t now = readButtons() | (ringer && gRingerState ? kRingerBit : 0u);
     stable = now == last ? stable + 1 : 0;
     last = now;
     if (stable == 1 && now != sent) {             // the same set on two polls in a row
@@ -194,6 +253,12 @@ void thread(void *, wait_result_t) {
       gButtons = now;
       if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, now);
       IOLog("GuampPmic: buttons %x, HID sink %s\n", now, gSink ? "attached" : "absent");
+    } else if (tick % 40 == 0 || gSinkGeneration != sinkSeen) {
+      // The latched ringer level must reach the HID element even when the sink or its event driver came after the last
+      // change (NativeHidInput drops reports until its IOHIDEventDriver exists). The same report again is no event:
+      // IOHIDEventDriver only dispatches keyboard elements whose value changed.
+      sinkSeen = gSinkGeneration;
+      if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, sent);
     }
     if (tick % 200 == 0) {                        // every 5 s: watchdog pet, status; configure once a charger is seen
       // Input present = USBIN plug-in real-time status (0x1310 bit 4), not the APSD result: after a cable change the
@@ -254,6 +319,8 @@ void thread(void *, wait_result_t) {
               native_guamp_home_reset_id, native_guamp_home_reset_deleted, native_guamp_home_reset_absent,
               native_guamp_home_reset_error, native_guamp_home_reset_completed);
       }
+      if (tick % 1200 == 0)
+        IOLog("GuampPmic: ringer %s presses %u\n", gRingerState ? "ring" : "silent", gRingerPresses);
       if (tick % 1200 == 0)
         IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, iclCode, fccCode, gErrors,
