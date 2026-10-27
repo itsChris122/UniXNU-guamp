@@ -33,6 +33,8 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include "GuampBatteryCore.h"
 #include "GuampPerf.inc"
 #include "GuampDisplayExt.inc"
@@ -1024,6 +1026,7 @@ static void usbProbe()
 #include "BtService.inc"
 #include "GuampWifiPrep.inc"
 #include "GpuService.inc"
+#include "GuampBacklight.inc"
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1147,6 +1150,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   usbProbe();
   usbMirrorStart();
   dispext::start();
+  backlight::start(); // guamp-backlight=1: panel DCS 0x51 brightness as AppleARMBacklight for CoreBrightness
   rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
   pmic::start();
   touch::start();
