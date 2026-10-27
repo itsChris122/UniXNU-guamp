@@ -5,8 +5,9 @@
 // display archive (native_touch_* and native_touch_published, which NativeHidInput consumes).
 // Boot argument guamp-touch=<n>: 1 read only, 2 clocks and pins, 3 SPI and chip id, 4 firmware, start and events.
 // guamp-touch-panel=0 skips the read-only panel power probe (SPMI L9A/LCDB, MDSS INTF1); guamp-touch-verbose=1 logs
-// every identify variant. Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel"
-// line (every stage). Writes stay limited to the touch pins, SE2 and its GCC clock votes.
+// every identify variant; guamp-touch-scan=1 / guamp-touch-linuxseq=1 run bit-banged diagnostics when identify fails.
+// Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
+// Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
 
 #include <IOKit/IODeviceTreeSupport.h>   // gIODTPlane
@@ -306,6 +307,188 @@ void pinScan() {
   IOLog("GuampTouch: scan done, %u of 96 combinations got MISO activity\n", hits);
 }
 
+// guamp-touch-linuxseq=1: the Linux probe that works under TWRP, replayed byte for byte by a GPIO bit-banged SPI master
+// at ~60 kHz, first in SPI mode 3 (himax_platform.c:1035 sets spi->mode = SPI_MODE_3; spi-geni-qcom applies it per
+// message), then in mode 0. Sequence: himax_gpio_power_config (reset low, 2 ms, high), hx83102_chip_detect:
+// hx83102_pin_reset (low 20 ms, high 50 ms), bus read 0x13 (1 byte, ignored), hx83102_sense_off(false) (FW_ISR
+// 0x9000005C = A5 without burst enable, 20 ms, central state 0x900000A8 [0x9000005C too if it reads 05]; then up to 16
+// times: password 0x31 = 27, 0x32 = 95, read 0x900000A8; 0C -> TCON/ADC reset and done, else 10 ms and pin reset), then
+// the id at 0x900000D0, up to 5 reads (Linux reads it only after a successful sense_off: here once anyway).
+// hx83102_register_read (4 bytes): F2 13 31, F2 0D 10, F2 00 <addr le>, F2 0C 00, F3 08 00 + 4 bytes. Each
+// himax_bus_read/write is one spi_message: CS stays low across its command and rx transfers (no cs_change; spi-geni-qcom
+// marks every transfer but the last FRAGMENTATION), MOSI 0 during the rx transfer, CS high between messages.
+// Log: "L<mode>.<n> tx <bytes> rx <bytes clocked in> m <MISO right after CS low, then after each byte>", at most 26
+// lines a pass (safe-mode retries after the first only when MISO moves), a line per pass, one RESULT line. MISO has the
+// TLMM pull-up: a tri-stated MISO reads ff. Expected under Linux: A8 reads 0c, D0 reads xx 2d 10 83. The SPI pads and
+// the reset pad are restored afterwards.
+struct LsPass { unsigned mode, idle, smIter, ones, samples; uint8_t st, sm, rxOr, rxAnd, id[4]; bool safe; };
+struct LsBus { unsigned mode, half, seq, lines, budget; bool verbose; LsPass *p; };
+LsBus gLs;
+
+unsigned lsMiso() { return pinRead(GT_GPIO_SPI_A, 4) & 1u; }
+void lsClk(unsigned high) { pinWrite(GT_GPIO_SPI_C, 4, high ? 2u : 0u); }
+uint8_t lsByte(uint8_t out) {
+  const unsigned cpol = (gLs.mode >> 1) & 1u, cpha = gLs.mode & 1u, h = gLs.half;
+  unsigned in = 0;
+  for (unsigned i = 0; i < 8; ++i) {
+    const unsigned b = (out >> (7 - i)) & 1u;
+    if (!cpha) {                                                   // set up before the leading edge, sampled on it
+      pinWrite(GT_GPIO_SPI_B, 4, b ? 2u : 0u); IODelay(h);
+      lsClk(cpol ^ 1u);
+      in = (in << 1) | lsMiso(); IODelay(h);
+      lsClk(cpol);
+    } else {                                                       // shifted on the leading edge, sampled on the trailing
+      lsClk(cpol ^ 1u);
+      pinWrite(GT_GPIO_SPI_B, 4, b ? 2u : 0u); IODelay(h);
+      in = (in << 1) | lsMiso();
+      lsClk(cpol); IODelay(h);
+    }
+  }
+  return static_cast<uint8_t>(in);
+}
+void lsHex(char *o, const uint8_t *p, unsigned n) {
+  static const char k[] = "0123456789abcdef";
+  for (unsigned i = 0; i < n; ++i) { o[2 * i] = k[p[i] >> 4]; o[2 * i + 1] = k[p[i] & 15u]; }
+  o[2 * n] = 0;
+}
+// One spi_message: ncmd bytes (tx transfer), then ndata bytes clocked with MOSI 0 (rx transfer), CS low across both.
+void lsMsg(const uint8_t *cmd, unsigned ncmd, uint8_t *data, unsigned ndata) {
+  uint8_t tx[12] = {}, rx[12] = {};
+  char m[14], th[25], rh[25];
+  const unsigned n = ncmd + ndata;                                 // at most 10 (flash_write_burst)
+  for (unsigned i = 0; i < ncmd; ++i) tx[i] = cmd[i];
+  pinWrite(GT_GPIO_SPI_D, 4, 0u); IODelay(2 * gLs.half);           // CS low
+  m[0] = static_cast<char>('0' + lsMiso());
+  for (unsigned i = 0; i < n; ++i) {
+    rx[i] = lsByte(tx[i]);
+    m[i + 1] = static_cast<char>('0' + lsMiso());
+    IODelay(gLs.half);
+  }
+  m[n + 1] = 0;
+  IODelay(2 * gLs.half);
+  pinWrite(GT_GPIO_SPI_D, 4, 2u); IODelay(20);                    // CS high between messages
+  LsPass &p = *gLs.p;
+  bool moved = false;
+  for (unsigned i = 0; i < n; ++i) {
+    p.rxOr = static_cast<uint8_t>(p.rxOr | rx[i]);
+    p.rxAnd = static_cast<uint8_t>(p.rxAnd & rx[i]);
+    if (rx[i]) moved = true;
+  }
+  for (unsigned i = 0; i <= n; ++i) if (m[i] == '1') { p.ones = p.ones + 1; moved = true; }
+  p.samples = p.samples + n + 1;
+  for (unsigned i = 0; i < ndata; ++i) data[i] = rx[ncmd + i];
+  gLs.seq = gLs.seq + 1;
+  if (gLs.lines < gLs.budget && (gLs.verbose || moved)) {
+    lsHex(th, tx, n); lsHex(rh, rx, n);
+    IOLog("GuampTouch: L%u.%02u tx %s rx %s m %s\n", gLs.mode, gLs.seq, th, rh, m);
+    gLs.lines = gLs.lines + 1;
+  }
+}
+void lsWrite(uint8_t reg, const uint8_t *d, unsigned n) {         // himax_bus_write: F2 reg data
+  uint8_t b[10] = {0xF2, reg};
+  for (unsigned i = 0; i < n && i < 8; ++i) b[2 + i] = d[i];
+  lsMsg(b, n + 2, nullptr, 0);
+}
+void lsRead(uint8_t reg, uint8_t *d, unsigned n) {                // himax_bus_read: F3 reg 00, then n bytes
+  const uint8_t c[3] = {0xF3, reg, 0x00};
+  lsMsg(c, 3, d, n);
+}
+void lsLe(uint8_t *b, uint32_t v) {
+  b[0] = static_cast<uint8_t>(v); b[1] = static_cast<uint8_t>(v >> 8);
+  b[2] = static_cast<uint8_t>(v >> 16); b[3] = static_cast<uint8_t>(v >> 24);
+}
+void lsWriteBurst(uint32_t addr, uint32_t val) {                  // hx83102_flash_write_burst: F2 00 addr data
+  uint8_t b[8];
+  lsLe(b, addr); lsLe(b + 4, val);
+  lsWrite(0x00, b, 8);
+}
+void lsRegRead(uint32_t addr, uint8_t *d) {                       // hx83102_register_read(addr, 4)
+  uint8_t v = 0x31, a[4];
+  lsWrite(0x13, &v, 1);                                            // hx83102_burst_enable(0)
+  v = 0x10; lsWrite(0x0D, &v, 1);
+  lsLe(a, addr); lsWrite(0x00, a, 4);
+  v = 0x00; lsWrite(0x0C, &v, 1);
+  lsRead(0x08, d, 4);
+}
+void lsPinReset() { pinWrite(GT_GPIO_RESET, 4, 0u); IOSleep(20); pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(50); }
+bool lsIdOk(const uint8_t *id) {
+  return id[3] == 0x83 && id[2] == 0x10 && (id[1] == 0x2A || id[1] == 0x2B || id[1] == 0x2D || id[1] == 0x2E);
+}
+void lsRun(LsPass &p, unsigned mode) {
+  memset(&p, 0, sizeof p);
+  p.mode = mode; p.rxAnd = 0xff;
+  gLs.mode = mode; gLs.seq = 0; gLs.lines = 0; gLs.verbose = true; gLs.p = &p;
+  const uint32_t out = gt_pin_cfg(0, GT_DRIVE_6MA, 0) | GT_PIN_OE;
+  pinWrite(GT_GPIO_SPI_D, 4, 2u); pinWrite(GT_GPIO_SPI_D, 0, out);                 // CS idle high
+  pinWrite(GT_GPIO_SPI_C, 4, (mode & 2u) ? 2u : 0u); pinWrite(GT_GPIO_SPI_C, 0, out); // CLK idle at CPOL
+  pinWrite(GT_GPIO_SPI_B, 4, 0u); pinWrite(GT_GPIO_SPI_B, 0, out);
+  pinWrite(GT_GPIO_SPI_A, 0, gt_pin_cfg(0, GT_DRIVE_6MA, 3));                     // MISO input, pull-up
+  IODelay(200);
+  pinWrite(GT_GPIO_RESET, 4, 0u); IOSleep(2); pinWrite(GT_GPIO_RESET, 4, 2u);       // himax_gpio_power_config
+  lsPinReset();                                                                    // hx83102_chip_detect
+  p.idle = lsMiso();
+  IOLog("GuampTouch: L%u pass: SPI mode %u ~%u kHz, CS high MISO %u (pull-up) irq %u reset %u\n", mode, mode,
+        500 / gLs.half, p.idle, pinRead(GT_GPIO_IRQ, 4) & 1u, pinRead(GT_GPIO_RESET, 4) & 1u);
+  uint8_t d[4] = {};
+  lsRead(0x13, d, 1);
+  lsWriteBurst(0x9000005Cu, 0xA5u);                                // sense_off: first loop, once (check_en false)
+  IOSleep(20);
+  lsRegRead(0x900000A8u, d);
+  p.st = d[0];
+  if (d[0] == 0x05) lsRegRead(0x9000005Cu, d);
+  for (unsigned cnt = 0; cnt < 16 && !p.safe; ++cnt) {             // do { ... } while (cnt++ < 15)
+    gLs.verbose = cnt == 0;
+    uint8_t v = 0x27;
+    lsWrite(0x31, &v, 1);
+    v = 0x95; lsWrite(0x32, &v, 1);
+    lsRegRead(0x900000A8u, d);
+    p.sm = d[0]; p.smIter = cnt + 1;
+    if (d[0] == 0x0C) {
+      gLs.verbose = true;
+      lsWriteBurst(0x80020020u, 0); IODelay(1000); lsWriteBurst(0x80020020u, 1);   // TCON reset
+      lsWriteBurst(0x80020094u, 0); IODelay(1000); lsWriteBurst(0x80020094u, 1);   // ADC reset
+      p.safe = true;
+    } else {
+      IOSleep(10);
+      lsPinReset();
+    }
+  }
+  gLs.verbose = true;
+  for (unsigned i = 0; i < (p.safe ? 5u : 1u); ++i) {
+    lsRegRead(0x900000D0u, p.id);
+    if (lsIdOk(p.id)) break;
+  }
+  IOLog("GuampTouch: L%u done: status %02x safe-mode %02x after %u%s, id %02x %02x %02x, rx-or %02x rx-and %02x, MISO high %u/%u\n",
+        mode, p.st, p.sm, p.smIter, p.safe ? " (entered)" : "", p.id[3], p.id[2], p.id[1], p.rxOr, p.rxAnd, p.ones, p.samples);
+}
+void linuxSeq() {
+  unsigned on = 0;
+  PE_parse_boot_argn("guamp-touch-linuxseq", &on, sizeof(on));
+  if (on != 1) return;
+  static const unsigned pins[5] = {GT_GPIO_SPI_A, GT_GPIO_SPI_B, GT_GPIO_SPI_C, GT_GPIO_SPI_D, GT_GPIO_RESET};
+  uint32_t cfg[5], io[5];
+  for (unsigned i = 0; i < 5; ++i) { cfg[i] = pinRead(pins[i], 0); io[i] = pinRead(pins[i], 4); }
+  gLs.half = 8;                                                    // 8 us half period: ~60 kHz
+  gLs.budget = 26;
+  LsPass p3, p0;
+  lsRun(p3, 3);
+  lsRun(p0, 0);
+  for (unsigned i = 0; i < 5; ++i) { pinWrite(pins[i], 4, io[i] & 2u); pinWrite(pins[i], 0, cfg[i]); }
+  IODelay(20);
+  const LsPass *ok = lsIdOk(p3.id) ? &p3 : lsIdOk(p0.id) ? &p0 : nullptr;
+  const bool floats = p3.rxAnd == 0xff && p3.ones == p3.samples && p0.rxAnd == 0xff && p0.ones == p0.samples;
+  const bool moves = p3.rxOr || p0.rxOr || p3.ones || p0.ones;
+  const char *verdict =
+      ok ? (ok == &p3 ? "OK in mode 3: chip and pin roles fine, our GENI transfer differs from Linux (clock/CS/config)"
+                      : "OK only in mode 0: chip and pin roles fine, the phase is wrong")
+      : floats ? "MISO FLOATS: pulled up and never driven, the chip never sees CS (gpio80) or is not in SPI mode"
+      : moves ? "MISO MOVES, no valid id: compare the L lines with the expected replies (A8 0c, D0 xx 2d 10 83)"
+      : "SILENT: MISO low in every sample, also with CS high and the pull-up on: gpio6 is driven low, not a tri-stated MISO";
+  IOLog("GuampTouch: L RESULT m3 st %02x sm %02x id %02x%02x%02x or %02x hi %u/%u | m0 st %02x sm %02x id %02x%02x%02x or %02x "
+        "hi %u/%u | %s\n", p3.st, p3.sm, p3.id[3], p3.id[2], p3.id[1], p3.rxOr, p3.ones, p3.samples, p0.st, p0.sm, p0.id[3],
+        p0.id[2], p0.id[1], p0.rxOr, p0.ones, p0.samples, verdict);
+}
+
 bool openBus() {
   gStep = 3;
   unsigned verbose = 0;
@@ -385,6 +568,7 @@ bool openBus() {
         stageMax, r, ok, ok >= 0 ? kVariants[ok].mode : 0u, gChip.id[3], gChip.id[2], gChip.id[1], failMask, gRxOr,
         miso0.pu, miso0.pd, miso1.pu, miso1.pd, irq0.pu, irq0.pd, off ? "OFF" : "on/unknown", verdict);
   if (r) pinScan();
+  if (r) linuxSeq();
   if (r) { fail(32, r); return false; }
   return true;
 }
