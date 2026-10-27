@@ -651,15 +651,21 @@ void thread(void *param, wait_result_t) {
   uint8_t ev[HX_EVENT_LEN];
   uint32_t seen = gIrqEvents;
   bool down = false;
+  uint32_t polls = 0;
   for (;;) {
     if (useIrq) {
-      assert_wait((event_t)&gIrqEvents, THREAD_UNINT);
+      // Woken by the IRQ, or after 20 ms at the latest: works even if the IRQ line never fires.
+      assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, 20, 1000 * 1000);
       if (gIrqEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
       else thread_block(THREAD_CONTINUE_NULL);
       seen = gIrqEvents;
     } else {
       IOSleep(10);
     }
+    polls = polls + 1;
+    if (polls == 50 || (polls & 2047) == 0)
+      IOLog("GuampTouch: polls %u irqs %u events %u bad %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad,
+            gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback);
     struct hx_report rep;
     if (hx_read_event(&gChip, ev) || hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep)) {
       gBad = gBad + 1;

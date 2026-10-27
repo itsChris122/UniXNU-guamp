@@ -310,6 +310,13 @@ int hx_start(struct hx_chip *c)
     c->x_res = (uint16_t)(d[2] << 8 | d[3]);
     if (hx_reg_read(c, HX_ADDR_INT_IS_EDGE, d, 4)) return HX_ERR_BUS;
     c->int_is_edge = (d[1] & 1) != 0;
+    // Implausible information (seen: 9234x1027, 0 points) falls back to what Linux reads on guamp:
+    // HX_RX_NUM 32, HX_TX_NUM 18, HX_MAX_PT 10, 720x1600, HX_INT_IS_EDGE 1 (TWRP dmesg).
+    if (c->x_res < 100 || c->x_res > 4096 || c->y_res < 100 || c->y_res > 4096 || !c->max_pt || c->max_pt > HX_MAX_PT) {
+        c->info_fallback = 1;
+        c->rx_num = 32; c->tx_num = 18; c->max_pt = 10;
+        c->x_res = 720; c->y_res = 1600; c->int_is_edge = 1;
+    }
     c->stage = 23;
     return HX_OK;
 }
