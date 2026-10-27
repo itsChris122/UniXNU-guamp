@@ -32,17 +32,23 @@
  
  	lck_grp_init(&pmap_lck_grp, "pmap", LCK_GRP_ATTR_NULL);
  
-@@ -5813,6 +5833,15 @@
+@@ -5813,6 +5833,21 @@
  wimg_to_pte(unsigned int wimg, __unused pmap_paddr_t pa)
  {
  	pt_entry_t pte;
 +
 +    /* Observed EL0 pixel buffers had Device attr00 and alignment faults on
 +     * Kryo260 while SCTLR.A was clear. Keep this pure PTE constructor free
-+     * of logging/side effects. Only managed RAM with IO semantics changes;
++     * of logging/side effects. Only managed RAM with IO/RT/posted semantics
++     * changes (RT is Device here: no HAS_UCNORMAL_MEM);
 +     * preserve the native NC policy, NX/PNX, cache maintenance and TLB paths.
 +     * Reserved/unmanaged memory and MMIO retain the original policy. */
-+    if (guamp_ram_nc_enabled == 1 && (wimg & VM_WIMG_MASK) == VM_WIMG_IO && pa_valid(pa)) {
++    if (guamp_ram_nc_enabled == 1 && pa_valid(pa) &&
++        ((wimg & VM_WIMG_MASK) == VM_WIMG_IO ||
++        (wimg & VM_WIMG_MASK) == VM_WIMG_RT ||
++        (wimg & VM_WIMG_MASK) == VM_WIMG_POSTED ||
++        (wimg & VM_WIMG_MASK) == VM_WIMG_POSTED_REORDERED ||
++        (wimg & VM_WIMG_MASK) == VM_WIMG_POSTED_COMBINED_REORDERED)) {
 +        wimg = (wimg & ~VM_WIMG_MASK) | VM_WIMG_WCOMB;
 +    }
  
