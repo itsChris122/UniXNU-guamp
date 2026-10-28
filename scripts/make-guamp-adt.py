@@ -202,6 +202,11 @@ def main():
         # Codex/cpu-config-8-full2-power-nome-ram-ci2 replaces those 14 entries with 23 (368 bytes): without
         # disableColorFill the symbol goes through a transparency layer, SourceIn fill with
         # options.monochromeForegroundColor or white; analisi/gpu-ci/prepara-fixup-glifi-cg.py.
+        # MobileSafari (saf1) aborts in -[NSData initWithContentsOfURL:...] with a nil builtInListURL inside SafariCore's
+        # WBSRemotelyUpdatableDataController builtInDataProvider block (bundle resource not found). ADT
+        # Codex/cpu-config-8-cattura-safari adds dyld_shared_cache_arm64.15,6312488/6312498/63124a8 (11 instructions): a nil
+        # URL skips the NSData call and yields nil data, which _loadBuiltInSnapshotIfNeeded already handles
+        # (analisi/gpu-ci/prepara-fixup-safari-url.py).
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
