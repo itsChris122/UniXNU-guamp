@@ -40,7 +40,7 @@ defconfig = "guamp_defconfig"
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
-  "build-arm-driver.py NativeEmmc --wifi-runtime --wifi-redwood",   # GUAMP_WIFI_RUNTIME=1 + drivers/GuampWifi (R2); GUAMP_WIFI_REDWOOD=1: mode 2 (iOS station, en0). Inert without guamp-wifi-start=1|2
+  "build-arm-driver.py NativeEmmc --wifi-runtime",   # GUAMP_WIFI_RUNTIME=1 + drivers/GuampWifi (R2). Mode 2 (--wifi-redwood) off until its CI compile (TargetConditionals.h via kern/debug.h) is fixed. Inert without guamp-wifi-start=1
   "build-guamp-adreno.py",          # NativeAdreno A6XX (xVanTuring/Adreno610) + GuampAdreno probe, guamp-adreno=1|2
   "build-native-adreno-accelerator.py",   # staged AGXAccelerator for guamp-adreno=2 (IOAcceleratorES ABI audited on f18b4df, slide -0x1000000)
   "build-arm-driver.py ArmDTPlatform",
