@@ -1,0 +1,13 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -6104,7 +6104,8 @@ cs_validate_hash(
+  * the original bytes match, so a different file or build is left alone.
+  */
+ #include <pexpert/device_tree.h>
+-#define CS_TEXT_FIXUP_MAX 32
++/* 64 entries (28/10/2026): the board table holds 33 (29 GPU/UI, 3 Bluetooth, the UIKitCore emoji size) and grows. */
++#define CS_TEXT_FIXUP_MAX 64
+ #define CS_TEXT_FIXUP_BYTES 16
+ struct cs_text_fixup {
+ 	char            name[64];

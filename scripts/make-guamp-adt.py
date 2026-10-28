@@ -115,6 +115,10 @@ def main():
     parser.add_argument('--text-fixup', action='append', default=[])
     args = parser.parse_args()
 
+    # cs_text_fixup_init() (native-text-fixup + zzzzz-guamp-text-fixup-64 patches) keeps 64 entries under 160 bytes
+    if len(args.text_fixup) > 64 or any(len(f.encode()) >= 160 or '\0' in f for f in args.text_fixup):
+        parser.error('--text-fixup: at most 64 entries, each under 160 bytes')
+
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
     if args.owned_memory_size is not None and (not 0x10000000 <= args.owned_memory_size <= 0x200000000
@@ -182,7 +186,8 @@ def main():
         # bluetoothd's UART is the kernel control com.apple.uart.sk.bluetooth (0x1000ddaa8); for the sk name it moves the
         # data to a Skywalk os_channel, which this kernel lacks. cpu-config-8-bt6 adds bluetoothd,ddd20,a0050034,1f2003d5
         # (cbz w0 after the strcmp with the sk name -> nop): bluetoothd then uses the plain read()/write() path on the
-        # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc). 32 fixups, the max.
+        # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc).
+        # The kernel table holds 64 fixups (zzzzz-guamp-text-fixup-64.patch, 28/10); this ADT uses 32.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
