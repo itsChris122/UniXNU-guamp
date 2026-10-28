@@ -1,0 +1,125 @@
+diff --git a/NativeAdrenoGpuContext.cpp b/NativeAdrenoGpuContext.cpp
+index dfac46d..8db3c41 100644
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -39,14 +39,22 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
+         if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
+     }
+-    if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
++    /* The wide table pool (6 MiB contiguous) when the board asked for it; if it cannot be had, the 2 GiB pool as before. */
++    uint64_t aperture=GpuApertureBytes;
++    native_adreno_wide_active=0;
++    if(!status && native_adreno_wide_request) {
++        if(tables_.allocate(WideTablePages*0x1000,report->output_bits,true,WideTablePages*0x1000)==kIOReturnSuccess)aperture=GpuWideApertureBytes;
++        else (void)tables_.release();
++    }
++    if(!status && aperture==GpuApertureBytes)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
+     for(unsigned i=0;!status && i<GpuBufferCount;++i)
+         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
+     if(!status) {
+         step(Prepare);
+-        status=smmu_.prepare(&tables_,0,0,GpuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
++        status=smmu_.prepare(&tables_,0,0,aperture,NativeAdrenoSmmuContext::MaxLeaves,
+             bank,asid,1000,report->output_bits);
+         if(!status)smmu_.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
++        if(!status && aperture==GpuWideApertureBytes)native_adreno_wide_active=1;
+     }
+     if(!status) {
+         step(Program);
+@@ -86,6 +94,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     report->status=status;
+     return status;
+ }
++extern "C" {volatile uint32_t native_adreno_wide_request,native_adreno_wide_active;}
+ static NativeAdrenoGpuContext *board_gpu_context;
+ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,
+     unsigned slot0,unsigned sid0,unsigned slot1,unsigned sid1,void (*progress)(uint32_t),
+diff --git a/NativeAdrenoGpuContext.h b/NativeAdrenoGpuContext.h
+index dbe915a..4dcbbc5 100644
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -15,8 +15,15 @@
+  * a matching non-cacheable view. Bank, ASID, SMR slots and stream IDs are caller inputs. Nothing is torn down. */
+ enum : uint64_t {
+     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
+-    GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
++    GpuScratchIova=0x302000, GpuApertureBytes=0x80000000,
++    /* guamp (patches/native-adreno/0003-wide-aperture-extension-windows.patch): 0..3 GiB when the board asks for it, so that the
++     * client windows above 2 GiB (NativeAdrenoPublish.cpp) exist. Same input size (32 bits), same root level: one more level-2 table
++     * and 512 more leaf tables. */
++    GpuWideApertureBytes=0xC0000000
+ };
++/* Set by the board before NativeAdrenoGpuContextBringup: nonzero asks for the wide aperture. The bring-up sets
++ * native_adreno_wide_active to 1 when its table pool and SMMU region were made that size (the 2 GiB layout otherwise, as before). */
++extern "C" {extern volatile uint32_t native_adreno_wide_request,native_adreno_wide_active;}
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+ class NativeAdrenoGpuContext final {
+@@ -29,7 +36,7 @@ class NativeAdrenoGpuContext final {
+     bool ready_=false,used_=false;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+-    enum : size_t {TablePages=1027};
++    enum : size_t {TablePages=1027,WideTablePages=1540};   /* 1 + 2 + 1024, 1 + 3 + 1536 table pages */
+     NativeAdrenoGpuContext()=default;
+     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
+     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 9ccca98..38f53c0 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -109,9 +109,26 @@ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
+  * wallpaper, iconservicesagent for the icons, WidgetRenderer_Default for the widgets: int-196's screen pictures showed a black wallpaper and white widget
+  * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
+  * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
+-enum : unsigned {NativeAdrenoMaxClients=4};
++/* guamp (patches/native-adreno/0003-wide-aperture-extension-windows.patch): slots 4..7 are 256 MiB windows above 2 GiB, which exist only
++ * when the GPU context was built with the wide aperture (native_adreno_wide_active). Wallpaper and widget extensions (AegirPoster,
++ * KaleidoscopePoster: NanoUniverse and ClockKitUI abort or fault on a nil Metal device) take only these, so they never use up the three
++ * windows of the processes listed before them (iconservicesagent, Preferences, PosterBoard, adrenoprobed); every other process tries
++ * slots 1..3 first, then these. Without the wide aperture an extension is refused (kIOReturnBusy: the plugin returns nil), as before. */
++enum : unsigned {NativeAdrenoMaxClients=8,NativeAdrenoNarrowClients=4};
+ static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
+-    {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
++    {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull},
++    {0x80000000ull,0x10000000ull},{0x90000000ull,0x10000000ull},{0xA0000000ull,0x10000000ull},{0xB0000000ull,0x10000000ull}};
++/* Inside the 3 GiB of GpuWideApertureBytes (NativeAdrenoGpuContext.h); the bring-up sets native_adreno_wide_active only with that aperture. */
++extern "C" {extern volatile uint32_t native_adreno_wide_active;}
++/* A poster or widget extension: a name with "Poster" other than PosterBoard (the 16-character process names: AegirPoster,
++ * KaleidoscopePost, PhotosPosterProv, CollectionsPoste, GradientPosterEx...), or WidgetRenderer_*. */
++static bool extensionClient(const char *name)
++{
++    if(!strncmp(name,"WidgetRenderer",14))return true;
++    if(!strncmp(name,"PosterBoard",20))return false;
++    for(unsigned i=0;i<20 && name[i];++i)if(!strncmp(name+i,"Poster",6))return true;
++    return false;
++}
+ 
+ namespace {
+ void shiftName(char names[3][17]) {
+@@ -232,7 +249,8 @@ bool AGXDeviceUserClient::mount(bool kernel)
+     if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
+     else {
+         if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
+-        for(unsigned i=1;slot==NativeAdrenoMaxClients && i<NativeAdrenoMaxClients;++i)if(!g.slots[i])slot=i;
++        const unsigned last=native_adreno_wide_active?NativeAdrenoMaxClients:NativeAdrenoNarrowClients;
++        for(unsigned i=extensionClient(name_)?NativeAdrenoNarrowClients:1;slot==NativeAdrenoMaxClients && i<last;++i)if(!g.slots[i])slot=i;
+     }
+     const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
+     if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
+diff --git a/NativeAdrenoSmmuContext.h b/NativeAdrenoSmmuContext.h
+index 4ed1bcc..17cdc05 100644
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -30,8 +30,8 @@ public:
+     ~NativeAdrenoSmmuContext()=default;
+     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
+     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
+-    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves. */
+-    enum : size_t {MaxLeaves=size_t(1)<<19};
++    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves; the GPU's wide 3 GiB one (guamp, patches/native-adreno/0003) 786432. */
++    enum : size_t {MaxLeaves=size_t(1)<<20};
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
+     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,

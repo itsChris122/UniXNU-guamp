@@ -61,6 +61,8 @@ IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdr
 IOService *native_adreno_published_service(void);
 extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_pool_mib, native_adreno_wc_enabled,
     native_adreno_written_imports_owned;
+// patches/native-adreno/0003-wide-aperture-extension-windows.patch: the board asks for the 3 GiB aperture, the bring-up says whether it got it.
+extern volatile uint32_t native_adreno_wide_request, native_adreno_wide_active;
 // ArmCpu's SPI attach (also used by the touch service).
 int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
@@ -253,9 +255,14 @@ bool naContext(Session &s) {
   native_adreno_written_imports_owned = 1;
   // The BO pool, one contiguous block taken early. 4 GiB of RAM: 0 by default: a 256 MiB pool left no contiguous room for the context (e00002bd on guamp); guamp-adreno-pool=<MiB>.
   native_adreno_pool_mib = bootArg("guamp-adreno-pool", 0);
+  // The 3 GiB GPU aperture (patches/native-adreno/0003): four 256 MiB client windows above 2 GiB for the wallpaper extensions, the
+  // three 170 MiB ones and the render server's 1 GiB unchanged. A table pool of 1540 pages instead of 1027; if it cannot be had the
+  // 2 GiB layout is used as before. guamp-adreno-wide=0 keeps the 2 GiB layout.
+  native_adreno_wide_request = bootArg("guamp-adreno-wide", 1);
   const IOReturn ctx = NativeAdrenoGpuContextBringup(reinterpret_cast<volatile uint8_t *>(s.smmu.va), kSmmuBytes, 0, 2, 0, 0, 1, 1,
                                                      naProgress, &s.report);
-  IOLog("GuampAdreno: context bringup %x (step %u, output bits %u)\n", ctx, gContextStep, s.report.output_bits);
+  IOLog("GuampAdreno: context bringup %x (step %u, output bits %u, aperture %s GiB, wide asked %u)\n", ctx, gContextStep,
+        s.report.output_bits, native_adreno_wide_active ? "3" : "2", native_adreno_wide_request);
   if (ctx) return false;
   // CB0 ACTLR without CPRE (arm_mmu500_reset, MMU-500 errata 841119/826419), then TLBIALL, TLBSYNC and TLBSTATUS of that bank.
   const uint32_t bank0 = smmuBank0(s);
@@ -655,7 +662,12 @@ int naAccelerator() {
   // processes whose opens the kernel grants past the sandbox (patches/xnu/zzw-native-adreno-sandbox-grant.patch). The plugin
   // itself is not installed yet (no GPU addon on guamp): Metal discovery will fail to load it and keep the CPU renderer.
   accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
-  accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences");
+  // The grant also covers PosterBoard and the wallpaper extensions that need a Metal device (AegirPoster: NanoUniverse aborts on the nil
+  // pipeline of a nil device; KaleidoscopePoster faults in ClockKitUI addQuad), and their reads of the Native* properties below
+  // (patches/xnu/zzwc-native-sandbox-grant-get-properties.patch: without NativeTurnipDebug "noconform" the A610 gives no device).
+  // Names are compared on their first 16 characters (the process name). Which processes run the plugin stays NativeAdrenoMetal.clients.
+  accelerator->setProperty("NativeSandboxGrantProcess",
+                           "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster");
   accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
   accelerator->setProperty("NativeTurnipDebug", "nocb,noconform,sysmem");
   accelerator->setProperty("NativeMetalWithhold", "apple-families");

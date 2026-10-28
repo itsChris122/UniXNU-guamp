@@ -1,0 +1,65 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index c1c3a9c..9e1a678 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3631,6 +3631,20 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ 	return obj;
+ }
+ 
++static bool native_sandbox_grant(IOService * service);
++/*
++ * The grant of a service (native_sandbox_grant: its NativeSandboxGrantProcess list) also covers reading that service's own "Native*" properties,
++ * the board's configuration for its Metal plugin (NativeTurnipDebug, NativeTurnipTrace, NativeMetalWithhold): app and extension profiles
++ * refuse them (PosterBoard, poster extensions, WidgetRenderer_Default), and the A610 then lost "noconform" and got no device. Other names,
++ * other services and processes not on the list keep the sandbox's verdict.
++ */
++static bool
++native_sandbox_get_grant(IORegistryEntry * entry, const char * name)
++{
++	IOService * service = OSDynamicCast(IOService, entry);
++	return service && name && 0 == strncmp(name, "Native", 6) && native_sandbox_grant(service);
++}
++
+ /* Routine io_registry_entry_get_property */
+ kern_return_t
+ is_io_registry_entry_get_property_bytes(
+@@ -3652,7 +3666,8 @@ is_io_registry_entry_get_property_bytes(
+ 	CHECK( IORegistryEntry, registry_entry, entry );
+ 
+ #if CONFIG_MACF
+-	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
++	if (!native_sandbox_get_grant(entry, property_name)
++	    && 0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -3720,7 +3735,8 @@ is_io_registry_entry_get_property(
+ 	CHECK( IORegistryEntry, registry_entry, entry );
+ 
+ #if CONFIG_MACF
+-	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
++	if (!native_sandbox_get_grant(entry, property_name)
++	    && 0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -3767,7 +3783,8 @@ is_io_registry_entry_get_property_recursively(
+ 	CHECK( IORegistryEntry, registry_entry, entry );
+ 
+ #if CONFIG_MACF
+-	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
++	if (!native_sandbox_get_grant(entry, property_name)
++	    && 0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -3957,7 +3974,8 @@ is_io_registry_entry_get_property_bin_buf(
+ 	CHECK( IORegistryEntry, registry_entry, entry );
+ 
+ #if CONFIG_MACF
+-	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
++	if (!native_sandbox_get_grant(entry, property_name)
++	    && 0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
