@@ -8,6 +8,15 @@ enum Error : int {
   NotReady=-105, Timeout=-106, PeerReset=-107, RemoteError=-108, Unsupported=-109,
   Busy=-110, NotFound=-111, Io=-112, Quarantined=-113
 };
+inline const char *errorName(int e) {
+  switch(e) {
+    case Ok: return "ok"; case Again: return "again"; case Invalid: return "invalid"; case Range: return "range";
+    case NoMemory: return "no-memory"; case Protocol: return "protocol"; case NotReady: return "not-ready";
+    case Timeout: return "timeout"; case PeerReset: return "peer-reset"; case RemoteError: return "remote-error";
+    case Unsupported: return "unsupported"; case Busy: return "busy"; case NotFound: return "not-found";
+    case Io: return "io"; case Quarantined: return "quarantined"; default: return "?";
+  }
+}
 inline uint16_t le16(const uint8_t *p) { return uint16_t(p[0]) | (uint16_t(p[1])<<8); }
 inline uint32_t le32(const uint8_t *p) { return uint32_t(le16(p)) | (uint32_t(le16(p+2))<<16); }
 inline uint64_t le64(const uint8_t *p) { return uint64_t(le32(p)) | (uint64_t(le32(p+4))<<32); }

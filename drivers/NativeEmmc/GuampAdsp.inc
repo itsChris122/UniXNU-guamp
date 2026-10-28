@@ -5,7 +5,11 @@
 //                  placement only: nothing mapped, written or started
 //   guamp-adsp=1   the authenticated start of GuampPas.inc (PAS INIT_IMAGE, MEM_SETUP, load, AUTH_AND_RESET),
 //                  then the ready signal over SMP2P; PAS SHUTDOWN and cleanup on any failure
-//   guamp-adsp-delay=<s>  start later (0..600 s, default 0)
+//   guamp-adsp-delay=<s>  start later (0..600 s, default 0), so the USB mirror (connected ~4 s after boot) sees every
+//                  GuampAdsp line (as guamp-gpu-delay / guamp-wifi-delay); the thread logs the delay it honoured
+//   guamp-adsp-ipc=1|2|3  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 443 before the
+//                  start + inbound negotiation; 2 + GLINK SMEM edge after err-ready and channel apr_audio_svc;
+//                  3 + APR q6core state / framework version queries ("ADSP APR OK"). Default 0 = phase 1 only.
 // Default: nothing runs. The original signed firmware is loaded unchanged; TrustZone authenticates it.
 // Facts (guamp device tree: decompiled ~/moto/guamp.dts = bengal.dtsi + guamp dtbo, guamp kernel sources):
 //   qcom,lpass@ab00000 (qcom,pil-tz-generic): qcom,pas-id 1, qcom,firmware-name "adsp", memory-region
@@ -20,13 +24,14 @@
 //     480 RX FIFO allocated by the ADSP (qcom_glink_smem.c): 480 appearing = the ADSP's GLINK is up.
 //   adsp-loader (guamp dtbo): nvmem "adsp_variant" = qfprom 0x1b40000 + 0x6011 bit 3; value 1 selects "adsp2".
 //   Firmware: modem_<slot> partition (ext4), /image/adsp.mdt + adsp.b00..b35 (the Android /vendor/firmware_mnt).
-// Read-only towards SMEM: nothing allocated there (no 443, no GLINK items): this phase only observes the ADSP's own
-// 429 entry. A graceful force-stop needs 443 (phase 2); the cleanup path uses PAS SHUTDOWN directly.
+// Without guamp-adsp-ipc read-only towards SMEM: nothing allocated there (no 443, no GLINK items), only the ADSP's own
+// 429 entry is observed. The cleanup path uses PAS SHUTDOWN directly (no graceful force-stop through 443).
 
 #include "GuampScm.inc"
 #include "GuampScmArm64.inc"
 #include "GuampPasCore.inc"
 #include "GuampPas.inc"
+#include "GuampAdspIpc.inc"
 
 namespace adsp {
 
@@ -160,11 +165,16 @@ int awaitReady(void *) {
         last = value;
       }
       if (value & kFatal) { result = pas::kFatal; break; }
-      if ((value & kReady) && result != pas::kReady) { result = pas::kReady; readyAt = elapsed; }
+      if ((value & kReady) && result != pas::kReady) {
+        result = pas::kReady;
+        readyAt = elapsed;
+        if (adspipc::gLevel) adspipc::onReady();
+      }
       if (result == pas::kReady && (value & kHandover)) break;
     }
     if (result != pas::kReady && elapsed >= kReadyMs) break;
     if (result == pas::kReady && elapsed >= kProxyMs) break;
+    if (adspipc::gLevel) adspipc::service();
     IOSleep(kPollMs);
   }
   if (result == pas::kReady)
@@ -208,8 +218,8 @@ const char *firmwareName() {
 }
 
 void run(unsigned mode) {
-  IOLog("GuampAdsp: mode %u, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in %u out %u, reason %u\n", mode,
-        kPasId, kBase, kBytes, guamp_phys_base, guamp_phys_size, kSmp2pIn, kSmp2pOut, kReason);
+  IOLog("GuampAdsp: mode %u, ipc %u, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in %u out %u, reason %u\n",
+        mode, adspipc::gLevel, kPasId, kBase, kBytes, guamp_phys_base, guamp_phys_size, kSmp2pIn, kSmp2pOut, kReason);
   if (pas::overlap(kBase, kBytes, guamp_phys_base, guamp_phys_size)) {
     IOLog("GuampAdsp: carveout overlaps XNU RAM: refused\n");
     return;
@@ -258,11 +268,16 @@ void run(unsigned mode) {
         hooks.vote = vote;
         hooks.awaitReady = awaitReady;
         hooks.failure = failure;
+        if (adspipc::gLevel) hooks.prepare = adspipc::prepare;
         const int rc = pas::boot(peripheral, hooks, transport, *fs, mdt, static_cast<uint32_t>(inode.size), *image, chunk,
                                  wifiprep::kChunkBytes, verified, mode, guamp_phys_base, guamp_phys_size);
         IOLog("GuampAdsp: RESULT %d (%s)\n", rc,
               rc == pas::kUp ? "ADSP up" : rc == pas::kQueried ? "queries only" : "not started, cleaned up");
         if (mode == 1) glinkReport("after start");
+        if (rc == pas::kUp && adspipc::gLevel) {
+          adspipc::run();   // returns only on err-fatal or a link error
+          failure(nullptr);
+        }
       }
     }
   } else {
@@ -281,7 +296,11 @@ unsigned gMode;
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-adsp");
   unsigned delay = 0;
-  if (PE_parse_boot_argn("guamp-adsp-delay", &delay, sizeof(delay)) && delay && delay <= 600) IOSleep(delay * 1000);
+  PE_parse_boot_argn("guamp-adsp-delay", &delay, sizeof(delay));
+  if (delay && delay <= 600) {
+    IOSleep(delay * 1000);
+    IOLog("GuampAdsp: start delayed %u s (guamp-adsp-delay)\n", delay);
+  }
   run(gMode);
 }
 
@@ -293,6 +312,8 @@ void start() {
   if (!gCard.online || !gCard.gate) return;
   started = true;
   gMode = mode;
+  unsigned ipc = 0;
+  if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 3) adspipc::gLevel = ipc;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

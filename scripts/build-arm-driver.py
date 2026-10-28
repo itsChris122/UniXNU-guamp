@@ -186,7 +186,8 @@ if args.wifi_runtime:
     duplicates = sorted(name for name, n in defined.items() if n > 1 and name not in weak)
     missing = sorted(name for name in undefined - defined.keys()
                      if 'guampwifi' in name or name.startswith(('_guamp_sm6115_', '_gw_snoc_', '_nw_wifi_', '_guamp_rpm_shared_',
-                                                                    '_guamp_wifi_firmware_', '_guamp_ath10k_', '_lx_', '_gGuampXnuDma')))
+                                                                    '_guamp_wifi_firmware_', '_guamp_ath10k_', '_lx_', '_gGuampXnuDma',
+                                                                    '_guamp_smem_hwlock_')))
     if duplicates or missing or '_strstr' in undefined:
         raise SystemExit(f'Wi-Fi archive symbols: duplicates {duplicates[:20]} missing {missing[:20]} strstr {"_strstr" in undefined}')
     for obj in objects[1:]:

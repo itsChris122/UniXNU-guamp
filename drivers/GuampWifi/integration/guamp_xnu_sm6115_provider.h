@@ -18,6 +18,11 @@
 #include "GuampSmemWrite.inc"
 #include "GuampWifiPower.inc"
 
+// The kernel's one SMEM allocation lock (NativeEmmc GuampSmemLock.inc: local IOLock + TCSR mutex lock 3, owner 1),
+// shared with the ADSP transports of audio phase 2 so that the two SMEM writers exclude each other.
+extern "C" bool guamp_smem_hwlock_acquire(void);
+extern "C" void guamp_smem_hwlock_release(void);
+
 namespace guampwifi {
 struct GuampXnuRegion {
   GuampXnuRegion()=default;
@@ -141,26 +146,22 @@ struct GuampXnuSm6115Provider {
   GuampXnuSm6115Provider &operator=(const GuampXnuSm6115Provider &)=delete;
   GuampXnuSm6115Provider(GuampXnuSm6115Provider &&)=delete;
   GuampXnuSm6115Provider &operator=(GuampXnuSm6115Provider &&)=delete;
-  // Captured Guamp DT: smem_region, qcom,tcsr-mutex syscon and APCS mailbox;
-  // RPM message RAM, apps-SMMU and ICNSS WLAN windows.
+  // Captured Guamp DT: smem_region and APCS mailbox; RPM message RAM,
+  // apps-SMMU and ICNSS WLAN windows. The qcom,tcsr-mutex (0x340000, lock 3)
+  // is owned by guamp_smem_hwlock_acquire/release.
   static constexpr uint64_t SmemPhys=0x46000000ull;
-  static constexpr uint64_t TcsrPhys=0x00340000ull;
   static constexpr uint64_t ApcsPhys=0x0f111000ull;
   static constexpr uint64_t RpmPhys=0x045f0000ull;
   static constexpr uint64_t SmmuPhys=0x0c600000ull;
   static constexpr uint64_t WlanPhys=0x0c800000ull;
   static constexpr uint32_t SmemSize=0x00200000u;
-  static constexpr uint32_t TcsrSize=0x00020000u;
   static constexpr uint32_t ApcsSize=0x00001000u;
   static constexpr uint32_t RpmSize=0x00007000u;
   static constexpr uint32_t SmmuSize=0x00080000u;
   static constexpr uint32_t WlanSize=0x00800000u;
-  static constexpr uint32_t SmemHwlockId=3;
-  static constexpr uint32_t TcsrMutexStride=0x1000;
   static constexpr uint32_t ApcsIpcOffset=8;
 
-  GuampXnuRegion smemMap{},tcsrMap{},apcsMap{},rpmMap{},smmuMap{},wlanMap{};
-  IOLock *localSmemLock=nullptr;
+  GuampXnuRegion smemMap{},apcsMap{},rpmMap{},smmuMap{},wlanMap{};
   Memory sharedMemory{},rpmMemory{},smmuRegisters{},wlanRegisters{};
   SmemArena arena{};
   Allocator allocator{};
@@ -175,19 +176,18 @@ struct GuampXnuSm6115Provider {
     // Do not partially initialize a provider whose physical windows overlap
     // XNU-managed RAM or cannot be mapped in their entirety.
     if(!smemMap.open(SmemPhys,SmemSize,kIODirectionInOut,xnuBase,xnuBytes)||
-       !tcsrMap.open(TcsrPhys,TcsrSize,kIODirectionInOut,xnuBase,xnuBytes)||
        !apcsMap.open(ApcsPhys,ApcsSize,kIODirectionInOut,xnuBase,xnuBytes)||
        !rpmMap.open(RpmPhys,RpmSize,kIODirectionInOut,xnuBase,xnuBytes)||
        !smmuMap.open(SmmuPhys,SmmuSize,kIODirectionInOut,xnuBase,xnuBytes)||
        !wlanMap.open(WlanPhys,WlanSize,kIODirectionInOut,xnuBase,xnuBytes)) {
       closeMaps();return false;
     }
-    localSmemLock=IOLockAlloc();if(!localSmemLock){closeMaps();return false;}
     sharedMemory={this,SmemSize,smemRead,smemWrite,smemBarrier};
     rpmMemory={&rpmMap,RpmSize,regionRead,regionWrite,regionBarrier};
     smmuRegisters={&smmuMap,SmmuSize,regionRead,regionWrite,regionBarrier};
     wlanRegisters={&wlanMap,WlanSize,regionRead,regionWrite,regionBarrier};
     arena.mem=sharedMemory;arena.lockCtx=this;arena.lock=smemLock;arena.unlock=smemUnlock;
+    arena.noteCtx=this;arena.note=smemNote;
     active=true;return true;
   }
   bool stop(bool pasStopped) {
@@ -231,8 +231,7 @@ private:
     // Only used for pre-publication rollback or after stop()'s quiescence
     // contract. Do not call with an in-flight SmemArena lock holder.
     active=false;arena={};sharedMemory={};rpmMemory={};smmuRegisters={};wlanRegisters={};
-    if(localSmemLock){IOLockFree(localSmemLock);localSmemLock=nullptr;}
-    wlanMap.close();smmuMap.close();rpmMap.close();apcsMap.close();tcsrMap.close();smemMap.close();
+    wlanMap.close();smmuMap.close();rpmMap.close();apcsMap.close();smemMap.close();
   }
   static void *allocate(void *,uint32_t bytes) { return bytes?IOMallocZero(bytes):nullptr; }
   static void freeAllocation(void *,void *p,uint32_t bytes) { if(p)IOFree(p,bytes); }
@@ -255,23 +254,13 @@ private:
   static void smemBarrier(void *) { __asm__ volatile("dmb sy" ::: "memory"); }
   static bool smemLock(void *ctx) {
     auto *p=static_cast<GuampXnuSm6115Provider *>(ctx);
-    if(!p||!p->active||!p->localSmemLock)return false;
-    IOLockLock(p->localSmemLock);
-    const uint32_t offset=SmemHwlockId*TcsrMutexStride;
-    // Qualcomm qcom_hwspinlock: write APPS owner ID=1, then read the same
-    // lock register until it returns 1. Timeout releases only our local lock.
-    for(uint32_t n=0;n<1000;n++) {
-      p->tcsrMap.write32(offset,1);
-      if(p->tcsrMap.read32(offset)==1)return true;
-      IOSleep(1);
-    }
-    IOLockUnlock(p->localSmemLock);return false;
+    return p&&p->active&&guamp_smem_hwlock_acquire();
   }
-  static void smemUnlock(void *ctx) {
-    auto *p=static_cast<GuampXnuSm6115Provider *>(ctx);
-    if(!p||!p->localSmemLock)return;
-    p->tcsrMap.write32(SmemHwlockId*TcsrMutexStride,0);
-    IOLockUnlock(p->localSmemLock);
+  static void smemUnlock(void *) { guamp_smem_hwlock_release(); }
+  // An existing SMEM item of another size (smem.c -EEXIST): reused if large enough, else Range (the R1 -102 case)
+  static void smemNote(void *,const SmemArena::Note &n) {
+    IOLog("GuampWiFi: SMEM item %u (host %u) exists with %u bytes, wanted %u: %s\n",
+      n.item,unsigned(n.host),n.found,n.wanted,n.result?"refused":"reused");
   }
 };
 } // namespace guampwifi
