@@ -323,7 +323,13 @@ static void holdModeCdc() {
     static_cast<std::vector<std::vector<uint8_t>> *>(c)->emplace_back(p, p + n);
     return 0;
   };
-  t.hw = [](void *, int, bool) { return 0; };
+  static size_t sentAtPrepare;
+  static std::vector<std::vector<uint8_t>> *gSent;
+  gSent = &sent;
+  t.hw = [](void *, int step, bool) {
+    if (step == apr::AfeTone::HwPrepare) sentAtPrepare = gSent->size();
+    return 0;
+  };
   t.useDtmf = false;
   t.holdPort = true;
   t.port.port = 0xb030;
@@ -350,6 +356,7 @@ static void holdModeCdc() {
   CHECK(t.ok() && ops == (std::vector<uint32_t>{0x100f4, 0x100f4, 0x100f3, 0x100f3, 0x100ef, 0x100e5, 0x100e6, 0x100f3,
                                                 0x100f3, 0x100f6, 0x100f6}));
   CHECK(u32(sent[0], 20) == 4 && u32(sent[1], 20) == 3);                               // DCODEC then MACRO
+  CHECK(sentAtPrepare == 4);   // both votes and both RX macro clocks before the codec side touches the macro
   CHECK(u32(sent[2], 48 + 4) == 0x30e && u32(sent[2], 48 + 8) == 22579200);              // rx_core
   CHECK(u32(sent[3], 48 + 4) == 0x30f && u32(sent[3], 48 + 16) == 1);                    // rx_npl on
   CHECK(u32(sent[4], 40) == 0x102b8 && u16(sent[4], 60) == 1 && u16(sent[4], 20) == 0xb030);

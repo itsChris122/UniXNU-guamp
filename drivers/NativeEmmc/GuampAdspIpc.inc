@@ -149,6 +149,18 @@ int playHw(void *, uint32_t route, uint16_t port, uint32_t channels, int step, b
         e == GUAMP_AUDIO_HW_ABSENT ? " (codec side not linked: DSP part only, no sound expected)" : "");
   return e;
 }
+// guamp_audio_hw_set_lpass_clock_hook (GuampAudioHwExt.h of the HW side): its headphone/earpiece prepare asks for
+// rx_core/rx_npl. They are AFE commands answered on this same thread, so the chain switches them itself (AfeTone
+// ClockOn/ClockOn2, before HwPrepare) and the hook only confirms they run; "off" is a no-op (the chain switches them
+// off after HwRelease).
+int playLpassClock(uint32_t clk, uint32_t hz, int on) {
+  if (!on) return 0;
+  const apr::AfeTone &a = gPlay.afe;
+  const bool held = gPlayStarted && a.port.cdcDma && hz == apr::kRxMacroClkHz &&
+                    ((clk == apr::kClkRxCore && a.clockOn) || (clk == apr::kClkRxNpl && a.clockOn2));
+  IOLog("GuampAdsp: play lpass clock %x %u Hz requested by the codec side: %s\n", clk, hz, held ? "running" : "NOT running");
+  return held ? 0 : -5;
+}
 int aprSend(void *, const uint8_t *p, uint32_t n) { return gGlink && gGlink->send(gApr, p, n) == qipc::Ok ? 0 : -1; }
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   apr::Header h;

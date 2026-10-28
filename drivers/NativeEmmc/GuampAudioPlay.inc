@@ -17,6 +17,10 @@
 #define GUAMP_AUDIO_PLAY_INC
 #include "GuampAsm.inc"
 #include "GuampAudioDev.inc"
+#if __has_include("GuampAudioHwExt.h")   // the HW side (codex/audio-hw-20261029): its RX macro asks for LPASS clocks
+#include "GuampAudioHwExt.h"
+#define GUAMP_AUDIO_PLAY_CLOCK_HOOK 1
+#endif
 
 namespace audioplay {
 
@@ -111,6 +115,9 @@ void start() {
   adspipc::gPlayGlue.source = source;
   adspipc::gPlayGlue.wanted = wanted;
   adspipc::gPlayGlue.attach = attach;
+#ifdef GUAMP_AUDIO_PLAY_CLOCK_HOOK
+  guamp_audio_hw_set_lpass_clock_hook(adspipc::playLpassClock);
+#endif
 }
 
 }  // namespace audioplay

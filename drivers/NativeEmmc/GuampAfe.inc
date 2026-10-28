@@ -259,14 +259,14 @@ private:
     const uint32_t t = token + 1;
     switch (step) {
       case Vote: n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockDcodec, "GUAMP"); break;
-      case VoteMacro:
+      case VoteMacro:   // codec DMA: votes, then the RX macro clocks, THEN the codec side (it touches macro registers)
         if (!port.cdcDma) { step = HwPrepare; return true; }
         n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockMacro, "GUAMPM");
         break;
       case HwPrepare: {
         const int e = callHw(HwPrepare, true);
         note("codec prepare result", static_cast<uint32_t>(e), 0);
-        step = ClockOn;
+        step = port.cdcDma ? PortConfig : ClockOn;
         return true;
       }
       case ClockOn:
@@ -341,7 +341,7 @@ private:
     if (!good && step >= DtmfOff) undoErrors++;
     switch (step) {
       case Vote: voted = good; step = VoteMacro; break;   // no vote: LPI may be unreachable, the DSP part still runs
-      case VoteMacro: votedMacro = good; step = HwPrepare; break;
+      case VoteMacro: votedMacro = good; step = ClockOn; break;
       case ClockOn:
         clockOn = good;
         if (good) step = ClockOn2;
@@ -349,7 +349,7 @@ private:
         break;
       case ClockOn2:
         clockOn2 = good;
-        if (good) step = PortConfig;
+        if (good) step = HwPrepare;
         else fail(status);
         break;
       case PortConfig:
