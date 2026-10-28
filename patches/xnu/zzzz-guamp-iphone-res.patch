@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 2962759..a482dc3 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7485,14 +7485,224 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+@@ -7485,14 +7485,243 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
  		at += (packed + 7) & ~7ULL;
  	}
  }
@@ -15,9 +15,16 @@ index 2962759..a482dc3 100644
 + * (not in the SystemOS cryptex). Never panics: a missing directory or a refused mount only records its status (stage 5 = mounted,
 + * a sealed name and the new name both visible). The two /Library/Wallpaper views give WallpaperKit the lookup files named after
 + * MobileGestalt's DeviceName ("iPhone" here): without Collections~iphone.plist -[WKWallpaperRepresentingCollectionsManager
-+ * _loadSystemWallpaperCollections] raises and PosterBoard and CollectionsPoster abort in a loop (copies of the ~ipad files). */
-+volatile int native_guamp_iphone_res_stage[4] = {0, 0, 0, 0};
-+volatile int native_guamp_iphone_res_status[4] = {-1, -1, -1, -1};
++ * _loadSystemWallpaperCollections] raises and PosterBoard and CollectionsPoster abort in a loop (copies of the ~ipad files).
++ * The /System/Library/ThermalMonitor view gives thermalmonitord a profile for this phone: it loads
++ * /System/Library/ThermalMonitor/<hw.model>-Info.plist, hw.model is the first root compatible string ("motorola,guamp"), and with no
++ * such file it logs "no thermal model for device" and stops there, so it never publishes the battery health notifications
++ * (com.apple.thermalmonitor.ageAwareMitigationState, com.apple.system.batteryHealth.UPOAware and .p0Threshold) that powerd and
++ * Settings > Battery > Battery Health wait for. The profile (iphone-res/ThermalMonitor/motorola,guamp-Info.plist, local file) only
++ * enables the contextual clamp with iPhone-style batteryParams and lists no sensors (thermalmonitord's watchdog check-in reports
++ * every listed sensor that never reports). guamp-thermal-profile=0 skips this view. */
++volatile int native_guamp_iphone_res_stage[5] = {0, 0, 0, 0, 0};
++volatile int native_guamp_iphone_res_status[5] = {-1, -1, -1, -1, -1};
 +static const struct {
 +	const char *source;
 +	const char *point;
@@ -34,12 +41,20 @@ index 2962759..a482dc3 100644
 +	 "/Library/Wallpaper/DefaultWallpapers~ipad.plist", "/Library/Wallpaper/DefaultWallpapers~iphone.plist"},
 +	{"/private/var/ngpu/iphone-res/WallpaperCollections", "/Library/Wallpaper/Collections",
 +	 "/Library/Wallpaper/Collections/Collections~ipad.plist", "/Library/Wallpaper/Collections/Collections~iphone.plist"},
++	{"/private/var/ngpu/iphone-res/ThermalMonitor", "/System/Library/ThermalMonitor",
++	 "/System/Library/ThermalMonitor/J120AP-Info.plist", "/System/Library/ThermalMonitor/motorola,guamp-Info.plist"},
 +};
 +static int
 +native_guamp_iphone_res_enabled(void)
 +{
 +	uint32_t enabled = 1;	/* default on (owner 28/10): guamp-iphone-res=0 disables */
 +	return !PE_parse_boot_argn("guamp-iphone-res", &enabled, sizeof(enabled)) || enabled == 1;
++}
++static int
++native_guamp_thermal_profile_enabled(void)
++{
++	uint32_t enabled = 1;	/* default on (owner 28/10): guamp-thermal-profile=0 keeps the sealed ThermalMonitor directory alone */
++	return !PE_parse_boot_argn("guamp-thermal-profile", &enabled, sizeof(enabled)) || enabled == 1;
 +}
 +/* The addon install creates directories only below /private/var/ngpu; a guamp Data volume does not have that one. */
 +static void
@@ -62,6 +77,10 @@ index 2962759..a482dc3 100644
 +	printf("guamp-iphone-res: addon files %d, written %d, same %d, failed %d (last error %d)\n", native_gpu_addon_files,
 +	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error);
 +	for (size_t i = 0; i < sizeof(native_guamp_iphone_res) / sizeof(native_guamp_iphone_res[0]); i++) {
++		if (!strcmp(native_guamp_iphone_res[i].point, "/System/Library/ThermalMonitor") && !native_guamp_thermal_profile_enabled()) {
++			printf("guamp-iphone-res: %s skipped (guamp-thermal-profile=0)\n", native_guamp_iphone_res[i].point);
++			continue;
++		}
 +		native_gpu_addon_mount(p, scratch, 0x400, native_guamp_iphone_res[i].source, strlen(native_guamp_iphone_res[i].source) + 1,
 +		    native_guamp_iphone_res[i].point, strlen(native_guamp_iphone_res[i].point) + 1, native_guamp_iphone_res[i].visible,
 +		    native_guamp_iphone_res[i].own, &native_guamp_iphone_res_stage[i], &native_guamp_iphone_res_status[i]);
@@ -228,7 +247,7 @@ index 2962759..a482dc3 100644
  	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
  	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
  	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
-@@ -7986,6 +8196,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+@@ -7986,6 +8215,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
  	if (actual != device || (vfs_flags(data_mount) & MNT_RDONLY) ||
  	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
  	if (!error) native_owner_data_stage = 4;

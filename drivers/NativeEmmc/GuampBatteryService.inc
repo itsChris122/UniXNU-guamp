@@ -33,19 +33,24 @@ public:
     if (n) { d->setObject(key, n); n->release(); }
   }
   // BatteryData as AppleSmartBattery publishes it on iOS (subset): powerd reads DesignCapacity, CycleCount and WeightedRa
-  // here, thermalmonitord WeightedRa (ChemID absent: its default P0 threshold); Qmax is the gauge's capacity model.
+  // here, thermalmonitord WeightedRa (ChemID absent: the profile's "-1" P0 threshold); Qmax is the gauge's capacity model.
+  // WeightedRa is an array as on Apple batteries: thermalmonitord (0x100034b60) accepts only an array and uses element 0,
+  // powerd takes firstObject of an array or a plain number.
   void batteryData(const guamp_battery::Gauge &g, unsigned cycles, const guamp_battery::Health &h) {
     const OSSymbol *symbol = OSSymbol::withCString("BatteryData");
     OSDictionary *d = OSDictionary::withCapacity(8);
     OSArray *qmax = OSArray::withCapacity(1);
     OSNumber *q = OSNumber::withNumber(g.capMah, 64);
+    OSArray *wra = OSArray::withCapacity(1);
+    OSNumber *ra = OSNumber::withNumber(guamp_battery::kWeightedRa, 64);
     OSString *serial = OSString::withCString(guamp_battery::kBatterySerial);
-    if (symbol && d && qmax && q && serial) {
+    if (symbol && d && qmax && q && wra && ra && serial) {
       put(d, "DesignCapacity", guamp_battery::kDesignMah);
       put(d, "CycleCount", cycles);
       put(d, "StateOfCharge", static_cast<uint64_t>(g.msoc));
       put(d, "NominalChargeCapacity", h.nominalMah);
-      put(d, "WeightedRa", guamp_battery::kWeightedRa);
+      wra->setObject(ra);
+      d->setObject("WeightedRa", wra);
       qmax->setObject(q);
       d->setObject("Qmax", qmax);
       d->setObject("Serial", serial);
@@ -55,6 +60,8 @@ public:
     if (d) d->release();
     if (qmax) qmax->release();
     if (q) q->release();
+    if (wra) wra->release();
+    if (ra) ra->release();
     if (serial) serial->release();
   }
   void report(const guamp_battery::Gauge &g, unsigned uv, int ua, bool external, unsigned state, bool tempValid,
