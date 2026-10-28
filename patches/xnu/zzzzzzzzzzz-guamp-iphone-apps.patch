@@ -1,0 +1,102 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 0383b9e..cf50a88 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7502,8 +7502,11 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+  * Settings > Battery > Battery Health wait for. The profile (iphone-res/ThermalMonitor/motorola,guamp-Info.plist, local file) only
+  * enables the contextual clamp with iPhone-style batteryParams and lists no sensors (thermalmonitord's watchdog check-in reports
+  * every listed sensor that never reports). guamp-thermal-profile=0 skips this view. */
+-volatile int native_guamp_iphone_res_stage[5] = {0, 0, 0, 0, 0};
+-volatile int native_guamp_iphone_res_status[5] = {-1, -1, -1, -1, -1};
++/* The sixth view (owner 29/10, Wallet from the iPhone XS) adds placeholders of iPhone-only deletable system apps to
++ * /System/Library/AppPlaceholders (iphone-res/AppPlaceholders/<App>.app, local files): SystemAppMigrator and LaunchServices treat an
++ * app in /private/var/staged_system_apps as a deletable system app only when its placeholder exists. */
++volatile int native_guamp_iphone_res_stage[6] = {0, 0, 0, 0, 0, 0};
++volatile int native_guamp_iphone_res_status[6] = {-1, -1, -1, -1, -1, -1};
+ static const struct {
+ 	const char *source;
+ 	const char *point;
+@@ -7522,6 +7525,8 @@ static const struct {
+ 	 "/Library/Wallpaper/Collections/Collections~ipad.plist", "/Library/Wallpaper/Collections/Collections~iphone.plist"},
+ 	{"/private/var/ngpu/iphone-res/ThermalMonitor", "/System/Library/ThermalMonitor",
+ 	 "/System/Library/ThermalMonitor/J120AP-Info.plist", "/System/Library/ThermalMonitor/motorola,guamp-Info.plist"},
++	{"/private/var/ngpu/iphone-res/AppPlaceholders", "/System/Library/AppPlaceholders",
++	 "/System/Library/AppPlaceholders/Weather.app", "/System/Library/AppPlaceholders/Passbook.app"},
+ };
+ static int
+ native_guamp_iphone_res_enabled(void)
+@@ -8952,9 +8957,66 @@ static const uint8_t native_guamp_sad_force_install[] =
+     "\t<string>com.apple.podcasts</string>\n\t<string>com.apple.reminders</string>\n\t<string>com.apple.Translate</string>\n"
+     "\t<string>com.apple.shortcuts</string>\n\t<string>com.apple.stocks</string>\n\t<string>com.apple.tips</string>\n"
+     "\t<string>com.apple.VoiceMemos</string>\n\t<string>com.apple.weather</string>\n"
++    "\t<string>com.apple.Passbook</string>\n"
+     "</array>\n</plist>\n";
+ uint32_t native_guamp_install_staged_cycle;
+ int native_guamp_install_staged_error = -1;
++/* iPhone-only deletable system apps (owner 29/10: Wallet, Passbook.app of the iPhone XS 17.7 converted to arm64 and signed ad hoc, its
++ * CDHashes in the owner trust module) come with the payload addon as iphone-apps/<App>.app/..., which native_gpu_addon_install writes
++ * into Data's /private/var/ngpu/iphone-apps with the addon's modes (executables 0755). In an install cycle each bundle not yet in
++ * /private/var/staged_system_apps is copied there, owned by mobile like the copy of sheng-staged-apps, so the same datamigrator
++ * pass installs it (its identifier is in SADForceInstall, its placeholder comes from the sixth iphone-res view). */
++static const char *const native_guamp_iphone_apps[] = {"Passbook.app"};
++int native_guamp_iphone_apps_copied, native_guamp_iphone_apps_error;
++static int
++native_guamp_install_iphone_apps(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	static const char staged[] = "/private/var/staged_system_apps";
++	const uint32_t chunk = 1024 * 1024;
++	uint8_t *buffer = kalloc_data(chunk, Z_WAITOK);
++	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	int error = buffer && path ? native_staged_apps_mkdir(p, scratch, staged) : ENOMEM;
++	for (size_t i = 0; !error && i < sizeof(native_guamp_iphone_apps) / sizeof(native_guamp_iphone_apps[0]); i++) {
++		char source_path[128];
++		snprintf(source_path, sizeof(source_path), "/private/var/ngpu/iphone-apps/%s", native_guamp_iphone_apps[i]);
++		snprintf(path, MAXPATHLEN, "%s/%s", staged, native_guamp_iphone_apps[i]);
++		vnode_t source = NULLVP, vp = NULLVP;
++		if (!vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++			vnode_put(vp);
++			printf("guamp-install-staged-apps: %s already staged\n", native_guamp_iphone_apps[i]);
++			continue;
++		}
++		int status = vnode_lookup(source_path, VNODE_LOOKUP_NOFOLLOW, &source, ctx);
++		if (!status && vnode_vtype(source) != VDIR) {
++			status = ENOTDIR;
++		}
++		if (!status) {
++			int failed = native_staged_apps_failed;
++			status = native_staged_apps_mkdir(p, scratch, path);
++			if (!status) {
++				native_staged_apps_walk(p, scratch, source, path, MAXPATHLEN, buffer, chunk, ctx);
++				status = native_staged_apps_failed != failed ? native_staged_apps_error : 0;
++			}
++		}
++		if (source != NULLVP) {
++			vnode_put(source);
++		}
++		if (!status) {
++			native_guamp_iphone_apps_copied++;
++		} else {
++			native_guamp_iphone_apps_error = status;
++		}
++		printf("guamp-install-staged-apps: %s from the addon: status %d (files %d, MiB %d)\n", native_guamp_iphone_apps[i], status,
++		    native_staged_apps_files, native_staged_apps_mib);
++	}
++	if (buffer) {
++		kfree_data(buffer, chunk);
++	}
++	if (path) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	return error ? error : native_guamp_iphone_apps_error;
++}
+ static void
+ native_guamp_install_staged_apps(proc_t p, user_addr_t scratch)
+ {
+@@ -8973,6 +9035,7 @@ native_guamp_install_staged_apps(proc_t p, user_addr_t scratch)
+ 		printf("guamp-install-staged-apps: cycle %u already done\n", cycle);
+ 		return;
+ 	}
++	native_guamp_iphone_apps_error = native_guamp_install_iphone_apps(p, scratch, ctx);
+ 	int error = vnode_lookup("/private/var/staged_system_apps", VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+ 	if (!error) {
+ 		error = vnode_vtype(vp) == VDIR ? 0 : ENOTDIR;
