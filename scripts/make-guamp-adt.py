@@ -202,6 +202,14 @@ def main():
         # Codex/cpu-config-8-full2-power-nome-ram-ci2 replaces those 14 entries with 23 (368 bytes): without
         # disableColorFill the symbol goes through a transparency layer, SourceIn fill with
         # options.monochromeForegroundColor or white; analisi/gpu-ci/prepara-fixup-glifi-cg.py.
+        # Screenshot and app-switcher snapshots (29/10): -[CADisplay supportsExtendedColors] said YES, so the display mode
+        # gamut was P3 and _UIRenderDisplay/_FBSSnapshot asked for two-plane b3a8 (30RGB+A8) surfaces. QuartzCore maps b3a8
+        # to a Metal format only with MTLGPUFamilyApple3 (MetalLimits 0x100); the Adreno plugin says Apple2, so backboardd
+        # got pixel format 0, the texture was refused and SpringBoard logged "Render server returned error.".
+        # ...arm64.03,27ace68 (mov w0,#0; ret) reports sRGB (the Himax panel is sRGB): BGRA surfaces, as the framebuffer.
+        # ...arm64.37,253796c makes +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] return PNG (0) instead
+        # of KTX/ATX (Apple twiddled ASTC). ADT Codex/cpu-config-8-cattura-20261029 (52 entries, base sfondo-png),
+        # analisi/gpu-ci/prepara-fixup-cattura.py, analisi/gpu-ci/CATTURA-SCHERMO-20261029.md.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
