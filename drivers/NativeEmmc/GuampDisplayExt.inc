@@ -51,6 +51,29 @@ static void start()
 // microseconds per frame), with the scanout mapping mode (guamp-fb-wc=1: write-combining).
 // scripts/guamp-canvas-variant.py (always applied to the legacy display): source mapping and read-probe counters.
 extern "C" volatile uint64_t guamp_copy_split[16];
+// drivers/NativeAdreno/NativeAdrenoPublish.cpp: the Metal plugin's connections and tunnel calls (only the leading counters of its
+// NativeAdrenoMetalDiag, declared first there) and its telemetry rows, which otherwise reach only the boot page (hidden under Metal).
+struct GuampMetalDiagHead {
+  uint32_t opens, busy, bad, closes, reports, property_reads, foreign_opens, foreign_type, name_reads, calls, last_selector, last_status,
+      ext_entries, ext_selector, ext_status, ext_in, ext_out, tunnel_calls;
+};
+extern "C" GuampMetalDiagHead native_adreno_metal_diag;
+extern "C" char native_adreno_metal_rows[48][96];
+extern "C" volatile uint32_t native_adreno_metal_rows_seq;
+
+static void metalLog()
+{
+  static uint32_t lastCalls = 0, lastTunnel = 0, lastSeq = 0;
+  const GuampMetalDiagHead &d = native_adreno_metal_diag;
+  const uint32_t seq = native_adreno_metal_rows_seq;
+  if (d.calls == lastCalls && d.tunnel_calls == lastTunnel && seq == lastSeq) return;
+  IOLog("GuampMetal: opens %u busy %u bad %u closes %u calls %u last sel %x status %x; ext %u sel %x status %x; tunnel %u\n", d.opens,
+        d.busy, d.bad, d.closes, d.calls, d.last_selector, d.last_status, d.ext_entries, d.ext_selector, d.ext_status, d.tunnel_calls);
+  if (seq != lastSeq)
+    for (unsigned i = 0; i < 48; i++)
+      if (native_adreno_metal_rows[i][0]) IOLog("GuampMetal: row %u %.96s\n", i, native_adreno_metal_rows[i]);
+  lastCalls = d.calls; lastTunnel = d.tunnel_calls; lastSeq = seq;
+}
 
 static void copyLog()
 {
@@ -96,6 +119,7 @@ static void log()
 {
   static unsigned reports = 0;
   copyLog();
+  metalLog();
   if (reports++ >= 30) return;
   IOLog("GuampDisplay: IOMFB seen %u external-before %u (0 absent 1 true 2 false 3 other) builtin %u forced %u\n",
         gSeen, gExternalBefore, gBuiltIn, gForced);
