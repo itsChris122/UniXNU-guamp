@@ -35,6 +35,9 @@ namespace wifiprep {   // GuampWifiPrep.inc: GPT lookup by name, active slot
 bool findPartition(const char *wanted, uint64_t *first, uint64_t *blocks, uint64_t *attributes);
 char activeSlot();
 }
+namespace gpuzap {   // GuampGpuZap.inc (included later): a610_zap through TrustZone PAS, the NativeAdreno zap callback
+int load(void *, unsigned mode);
+}
 
 // M2 (guamp-gpu-m2=1|2|3, only after M1 read the GPU with a running always-on counter), GuampGpuM2.h:
 //   1  read only: GPU SMMU path of stream 0, and a630_sqe.fw from /firmware of the vendor_<slot> logical partition
@@ -467,7 +470,7 @@ void thread(void *, wait_result_t) {
       unsigned freq = 320;   // default 320 MHz (verified 28/10); guamp-gpu-freq=0 keeps XO
       PE_parse_boot_argn("guamp-gpu-freq", &freq, sizeof(freq));
       if (freq) gpug2::setFreq(gBase[GM_GPUCC], gBase[GM_GPU], freq);
-      GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno};
+      GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno, gpuzap::load, nullptr};   // guamp-adreno-zap
       const int started = guamp_adreno_start(&a);
       IOLog("GuampGpu: NativeAdreno start %d\n", started);
       // guamp-gpu-dcvs=1: frequency scaling from the guamp-gpu-freq level (GuampGpuDcvs.inc); off by default.

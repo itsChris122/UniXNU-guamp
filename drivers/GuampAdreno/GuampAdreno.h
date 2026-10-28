@@ -17,12 +17,19 @@ extern "C" {
 //      CP_MEM_WRITE check, RBBM_SECVID_TRUST_CNTL = 0 written directly (no zap shader), the GPU interrupt (SPI 177), then the
 //      device published for user clients
 //   2  1, then the staged AGXAccelerator (IOAcceleratorES) with the Metal plugin keys, when the staged class is linked
+// guamp-adreno-zap=<mode> (default 0: unchanged): after CP_ME_INIT, as mainline a6xx_hw_init (a6xx_zap_shader_init), the
+// ORIGINAL signed zap shader (a610_zap, PAS id 13) is started through TrustZone PAS by the caller's zap callback, then
+// CP_SET_SECURE_MODE 0 goes on ring 0. 1 authenticated start; 2 SCM/PAS queries, integrity and placement only (nothing written,
+// no CP_SET_SECURE_MODE). With the option set RBBM_SECVID_TRUST_CNTL is never written (TrustZone-owned on guamp: no fallback).
+typedef int (*GuampAdrenoZapLoad)(void *context, unsigned mode);   // 0 started, 1 queried only, <0 refused (pas:: codes)
 struct GuampAdrenoStart {
   volatile uint8_t *gpu;     // kgsl_3d0_reg_memory 0x5900000, mapped uncached by the caller
   size_t gpuBytes;           // 0x90000
   const uint8_t *sqe;        // the SQE microcode: a630_sqe.fw without its first dword, as GpuService.inc loadSqe() returns it
   uint32_t sqeBytes;
   unsigned level;            // guamp-adreno
+  GuampAdrenoZapLoad zap;    // NativeEmmc GuampGpuZap.inc (PAS loader); null: guamp-adreno-zap is refused with a log line
+  void *zapContext;
 };
 
 // Result codes (also the last GuampAdreno log line). Runs on the caller's thread and returns when the stages are done; the
@@ -30,7 +37,7 @@ struct GuampAdrenoStart {
 enum {
   GuampAdrenoOk = 0, GuampAdrenoBadArgs = -1, GuampAdrenoSmmuMap = -2, GuampAdrenoContext = -3, GuampAdrenoBuffers = -4,
   GuampAdrenoSqe = -5, GuampAdrenoRing = -6, GuampAdrenoCpInit = -7, GuampAdrenoMemWrite = -8, GuampAdrenoIrq = -9,
-  GuampAdrenoPublish = -10, GuampAdrenoAccelerator = -11
+  GuampAdrenoPublish = -10, GuampAdrenoAccelerator = -11, GuampAdrenoZap = -12
 };
 int guamp_adreno_start(const struct GuampAdrenoStart *start);
 

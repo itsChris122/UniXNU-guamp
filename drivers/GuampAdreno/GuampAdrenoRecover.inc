@@ -172,7 +172,10 @@ void recover(Session &s, grc_reason why, uint32_t stalled, uint32_t fsr) {
     gIrqErrors = 0;
     gIrqMasked = 0;
     gIrqRepeat = 0;
-    if (bootArg("guamp-adreno-secvid", 0) == 1) naSecureFallback(s);
+    // guamp-adreno-zap: the soft reset may put the CP back in secure mode; the zap shader TrustZone loaded stays in its region, so
+    // CP_SET_SECURE_MODE 0 is sent again (no PAS call, no SECVID write). Without the option, as before.
+    if (gZapUp) (void)naSecureMode(s, "recover");
+    else if (bootArg("guamp-adreno-zap", 0) == 0 && bootArg("guamp-adreno-secvid", 0) == 1) naSecureFallback(s);
     (void)grc_done(&gRec.core, true);
     guamp_gpu_recover[1] = guamp_gpu_recover[1] + 1;
     IOLog("GuampAdreno: recover: GPU restarted (%u of %u in this minute): drain acks %x, %u fences signalled (dropped), rbbm status "

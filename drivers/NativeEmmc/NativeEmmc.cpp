@@ -1032,6 +1032,7 @@ static void usbProbe()
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
 #include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
+#include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {

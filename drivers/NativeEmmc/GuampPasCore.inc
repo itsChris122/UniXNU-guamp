@@ -62,7 +62,9 @@ inline int plan(const Peripheral &p,const fw::Image &image,bool verified,uint32_
   out->relocatable=relocatable!=0;
   if(low==~0ULL || high<=low || high-low>p.bytes || (low&4095)) return kRange;
   out->first=out->relocatable?p.base:low;out->span=high-low;
-  if(!fits(p.base,p.bytes,out->first,out->span) || out->metadataBytes>out->span) return kRange;
+  // The metadata may run past the image span inside the carveout (a610_zap: 6860 bytes of metadata, one 4 KiB page of image in
+  // gpu_region 0x2000): it only has to be readable at region_start when INIT_IMAGE runs.
+  if(!fits(p.base,p.bytes,out->first,out->span) || !fits(p.base,p.bytes,out->first,out->metadataBytes)) return kRange;
   for(uint32_t i=0;i<image.count;++i) {
     const fw::Segment &s=image.seg[i];if(!loadable(s))continue;
     uint64_t address=out->relocatable?p.base+(s.paddr-low):s.paddr;

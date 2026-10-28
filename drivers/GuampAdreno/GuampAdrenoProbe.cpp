@@ -4,8 +4,9 @@
 // Adreno 610), with these differences:
 //   - power: NativeEmmc's GPU thread (GpuService.inc, GuampGpuM1.h + RPM votes) has already powered the GPU; this file never
 //     touches GCC/GPUCC
-//   - secure mode: no zap shader (it needs TrustZone PAS, which this port does not use). Mainline a6xx_hw_init's fallback when
-//     no zap shader exists is used instead: RBBM_SECVID_TRUST_CNTL = 0 written directly, then read back and logged
+//   - secure mode: by default no zap shader; guamp-adreno-secvid=1 writes RBBM_SECVID_TRUST_CNTL = 0 (mainline's fallback; it
+//     stalls on guamp: TrustZone-owned). guamp-adreno-zap=1: the original signed a610_zap started through TrustZone PAS by
+//     NativeEmmc (GuampGpuZap.inc), then CP_SET_SECURE_MODE 0 on the ring, as mainline a6xx_hw_init and tb128fu zapLoad
 //   - chip id 0x06010000 (bengal-gpu.dtsi qcom,chipid), the rest of the device facts as on tb128fu (A610: GMEM 128 + 4 KiB,
 //     UBWC 1.0, highest bank bit 14, bengal-gpu.dtsi qcom,ubwc-mode 1 / qcom,highest-bank-bit 14)
 // Default off: guamp-adreno=<level> (GuampAdreno.h). Every step logs a "GuampAdreno:" line before it touches hardware, so a bus
@@ -408,6 +409,62 @@ void naSecureFallback(Session &s) {
   IOLog("GuampAdreno: secvid trust cntl written 0 (not read back: a read stalls the core)\n");
 }
 
+// The GPU SMMU's global fault state, read only (kgsl_smmu GR0 at 0x59a0000: GFSR 0x48, GFSYNR0-2 0x50-0x58, the non-secure
+// copies; naContext already reads GR0). A transaction of a stream no SMR matches (a secure SID 2 access of a GPU left in secure
+// mode) shows up as GFSR.USF (bit 1) with its stream id in GFSYNR1. No GPU register is read here.
+void naGfsr(const Session &s, const char *when) {
+  IOLog("GuampAdreno: zap smmu %s: gfsr %08x gfsynr0 %08x gfsynr1 %08x gfsynr2 %08x, cb0 fsr %08x\n", when, rd(s.smmu, 0x48),
+        rd(s.smmu, 0x50), rd(s.smmu, 0x54), rd(s.smmu, 0x58), rd(s.smmu, smmuBank0(s) + 0x58));
+}
+
+// CP_SET_SECURE_MODE 0 on ring 0 (mainline a6xx_hw_init once a6xx_zap_shader_init succeeded), then its fence. True when the CP
+// retired it.
+bool gZapUp;
+bool naSecureMode(Session &s, const char *when) {
+  uint32_t words[2] = {}, fence = 0, seen = 0;
+  if (AdrenoPM4Type7(0x66, 1, &words[0]) != AdrenoPM4Success) return false;   // CP_SET_SECURE_MODE
+  words[1] = 0;
+  const IOReturn queued = gRing->submit(words, 2, &fence);
+  const unsigned waited = queued ? 0 : unsigned(gRing->wait(fence, &gClock, 200000, &seen));
+  IOLog("GuampAdreno: zap CP_SET_SECURE_MODE 0 (%s): submit %x fence %u wait %u (seen %u)\n", when, queued, fence, waited, seen);
+  cpState(s, "zap after secure mode 0");
+  return !queued && !waited;
+}
+
+// guamp-adreno-zap=1|2 (GuampAdreno.h): true when the option is set, so the caller never writes RBBM_SECVID_TRUST_CNTL; *failed
+// when the CP did not retire CP_SET_SECURE_MODE. A refused zap start leaves the GPU secure, exactly as without the option.
+bool naZap(Session &s, const GuampAdrenoStart *in, bool *failed) {
+  *failed = false;
+  const unsigned mode = bootArg("guamp-adreno-zap", 0);
+  if (mode != 1 && mode != 2) return false;
+  if (!in->zap) {
+    IOLog("GuampAdreno: zap mode %u: no zap loader from the caller; GPU left secure, secvid not touched\n", mode);
+    return true;
+  }
+  naGfsr(s, "before zap");
+  IOLog("GuampAdreno: zap mode %u: a610_zap through TrustZone PAS (id 13)\n", mode);
+  const int loaded = in->zap(in->zapContext, mode);
+  IOLog("GuampAdreno: zap loader %d (%s)\n", loaded,
+        loaded == 0 ? "authenticated start accepted" : loaded == 1 ? "queries only" : "refused: GPU left secure, secvid not touched");
+  if (loaded) return true;
+  gZapUp = naSecureMode(s, "bring-up");
+  *failed = !gZapUp;
+  naGfsr(s, "after secure mode 0");
+  return true;
+}
+
+// guamp-adreno-zap: one more GFSR snapshot once Metal clients have drawn (guamp-adreno-gfsr-delay=<s>, default 60, 0 = none).
+void gfsrLater(void *, wait_result_t) {
+  IOSleep(bootArg("guamp-adreno-gfsr-delay", 60) * 1000);
+  naGfsr(gSession, "later");
+}
+void gfsrArm() {
+  const unsigned delay = bootArg("guamp-adreno-gfsr-delay", 60);
+  if (!delay || delay > 3600) return;
+  thread_t t = nullptr;
+  if (kernel_thread_start(gfsrLater, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
+}
+
 // The GPU interrupt line, then one CP_NOP fence that must raise it.
 int naIrq(Session &s) {
   if (!&armcpu_spi_attach) {
@@ -652,11 +709,16 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}
     if ((result = naCp(s, in))) break;
-    naSecureFallback(s);
+    // guamp-adreno-zap: the zap shader and CP_SET_SECURE_MODE 0 replace the SECVID write (never written with the option set).
+    bool zapFailed = false;
+    const bool zap = naZap(s, in, &zapFailed);
+    if (zapFailed) {result = GuampAdrenoZap; break;}
+    if (!zap) naSecureFallback(s);
     if ((result = naIrq(s))) break;
     if ((result = naPublish(s))) break;
     tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
     IOLog("GuampAdreno: self test %s\n", tested ? "ok" : "FAILED (the stages go on)");
+    if (zap) {naGfsr(s, "after self test"); gfsrArm();}
     recoverArm(s);   // guamp-gpu-recover=1 only (GuampAdrenoRecover.inc)
     // The staged AGXAccelerator (IOAcceleratorES) makes every Metal client of the system (CoreImage in Settings > Screen Time,
     // QuartzCore...) load the plugin; until the plugin is proven on guamp it is registered only with guamp-adreno-accel=1. The

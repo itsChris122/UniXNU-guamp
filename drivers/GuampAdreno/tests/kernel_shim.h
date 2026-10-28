@@ -33,7 +33,7 @@ enum : IOReturn {kIOReturnSuccess = 0, kIOReturnError = 0x2bc, kIOReturnNoMemory
                  kIOReturnInternalError = 0x2c9};
 enum : IOOptionBits {kIOMapAnywhere = 1, kIOMapInhibitCache = 0x100, kIOMapWriteCombineCache = 0x400,
                      kIODirectionInOut = 3, kIOMemoryPhysicallyContiguous = 0x10};
-enum {THREAD_UNINT = 0};
+enum {THREAD_UNINT = 0, KERN_SUCCESS = 0};
 #define NSEC_PER_USEC 1000ull
 #define THREAD_CONTINUE_NULL ((thread_continue_t)0)
 extern task_t kernel_task;
@@ -47,6 +47,10 @@ void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 void thread_wakeup(event_t);
 int assert_wait_timeout(event_t, int, uint32_t, uint64_t);
 int thread_block(thread_continue_t);
+// guamp-adreno-zap GFSR snapshot thread (kern/thread.h KPI, the real continuation type)
+typedef struct thread *thread_t;
+kern_return_t kernel_thread_start(void (*)(void *, wait_result_t), void *, thread_t *);
+void thread_deallocate(thread_t);
 }
 #define IONewData(type, count) static_cast<type *>(nullptr)
 #define IODeleteData(ptr, type, count) do {(ptr) = nullptr;} while (0)

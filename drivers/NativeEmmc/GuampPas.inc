@@ -181,7 +181,9 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
     if(h.failure)h.failure(h.ctx);
     if(initialized) {
       bool down=scmOkay(p,"cleanup-shutdown",transport.shutdown(p.id));
-      if(down) {ram.write(plan->first,nullptr,plan->span,true);ram.synchronize();IOLog("%s: region cleared\n",p.tag);}
+      if(down) {   // the metadata may run past the span (GuampPasCore.inc plan): both cleared
+        ram.write(plan->first,nullptr,plan->span>meta?plan->span:meta,true);ram.synchronize();IOLog("%s: region cleared\n",p.tag);
+      }
       else IOLog("%s: shutdown refused: region left untouched\n",p.tag);
       if(h.cleanup)h.cleanup(h.ctx,down);
     } else if(voted) {

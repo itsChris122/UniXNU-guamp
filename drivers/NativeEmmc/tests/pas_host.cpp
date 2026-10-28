@@ -139,7 +139,7 @@ static unsigned exercise(ext4::Fs &fs,const pas::Peripheral &p,std::vector<uint8
    assert(pas::plan(odd,firmware,true,meta,xnuBase,xnuBytes,&q)==pas::kRange);
    fw::Image mixed=firmware;
    for(uint32_t i=0;i<mixed.count;++i)if(pas::loadable(mixed.seg[i])){mixed.seg[i].flags^=1u<<27;break;}
-   assert(pas::plan(p,mixed,true,meta,xnuBase,xnuBytes,&q)==pas::kMixed);}
+   if(expected.count>1)assert(pas::plan(p,mixed,true,meta,xnuBase,xnuBytes,&q)==pas::kMixed);}   // a610_zap: one segment
   pas::Hooks hooks;hooks.stopped=hookStopped;hooks.vote=hookVote;hooks.awaitReady=hookReady;hooks.failure=hookFailure;
   scm::Transport t={guampScmInstruction,[](void *,uint32_t){},nullptr,true};
   auto run=[&](unsigned mode,bool verified){return pas::boot(p,hooks,t,fs,mdt.data(),ino.size,firmware,chunk.data(),
@@ -148,7 +148,8 @@ static unsigned exercise(ext4::Fs &fs,const pas::Peripheral &p,std::vector<uint8
   reset();assert(run(1,true)==pas::kUp);
   assert(discovers==1 && initializes==1 && memories==1 && authenticates==1 && readyCalls==1 && !shutdowns && !failures);
   assert(votesOn==1 && votesOff==1);verifyLoaded();
-  if(expected.span<p.bytes)assert(at(expected.first+expected.span)==0xcc);
+  const uint64_t used=expected.span>meta?expected.span:meta;   // the metadata may run past the span (a610_zap)
+  if(expected.first-p.base+used<p.bytes)assert(at(expected.first+used)==0xcc);
   // queries only: no mapping, no RAM, no votes
   reset();assert(run(2,true)==pas::kQueried && !maps && !initializes && !votesOn);
   reset();assert(run(0,true)==pas::kQueried && !discovers);
@@ -161,7 +162,7 @@ static unsigned exercise(ext4::Fs &fs,const pas::Peripheral &p,std::vector<uint8
   reset();denyInit=true;assert(run(1,true)==pas::kErrInit && initializes==1 && !memories && !shutdowns && votesOff==1);
   assert(allZero(expected.first,meta));
   reset();denyMemory=true;assert(run(1,true)==pas::kErrMemory && memories==1 && !authenticates && shutdowns==1);
-  assert(allZero(expected.first,expected.span) && votesOff==1);
+  assert(allZero(expected.first,used) && votesOff==1);
   reset();denyAuth=true;assert(run(1,true)==pas::kErrAuth && authenticates==1 && !readyCalls && shutdowns==1 && failures==1);
   assert(allZero(expected.first,expected.span));
   reset();readyState=pas::kNotReady;assert(run(1,true)==pas::kErrReady && readyCalls==1 && shutdowns==1 && votesOff==1);
@@ -182,8 +183,21 @@ int main(int argc,char **argv) {
   // Same loader, modem parameters (the generalisation of GuampModem.inc): pas-id 4, modem_region 0x4ab00000 0x6900000
   const pas::Peripheral modem={"GuampModem",4,0x4ab00000ULL,0x6900000ULL,"/image","modem"};
   unsigned m=exercise(fs,modem,mdt,chunk,0,0);
-  printf("PASS PAS loader: adsp %u segments at %llx+%llx, modem %u segments; metadata bytes, PAS order and encoding, "
+  // GPU zap shader (GuampGpuZap.inc): qcom,kgsl-hyp pas-id 13, a610_zap, gpu_region@53e15000 0x2000; one relocatable page of
+  // image, 6860 bytes of metadata running into the second page
+  const pas::Peripheral zap={"GuampAdreno: zap",13,0x53e15000ULL,0x2000ULL,"/image","a610_zap"};
+  unsigned z=exercise(fs,zap,mdt,chunk,0x53e15000u,0x1000u);
+  assert(expected.relocatable && expected.count==1 && expected.segments[0].index==2 && metadata.size()==6860);
+  {pas::Hooks none;   // as GuampGpuZap.inc: no peer check, no votes, no ready signal
+   scm::Transport t={guampScmInstruction,[](void *,uint32_t){},nullptr,true};
+   reset();votesOn=1;   // the monitor checks the order (map, vote, INIT_IMAGE): no vote hook here
+   char path[128];ext4::Inode ino;
+   assert(fw::joinName(path,sizeof(path),zap.dir,zap.firmware,".mdt",-1) && !fs.lookupPath(path,&ino));
+   assert(pas::boot(zap,none,t,fs,mdt.data(),ino.size,firmware,chunk.data(),chunk.size(),true,1,xnuBase,xnuBytes)==pas::kUp);
+   assert(initializes==1 && memories==1 && authenticates==1 && !shutdowns && !readyCalls && !votesOff);verifyLoaded();}
+  printf("PASS PAS loader: adsp %u segments at %llx+%llx, modem %u segments, a610_zap %u segment at 53e15000+1000 (metadata "
+         "6860 bytes, no hooks); metadata bytes, PAS order and encoding, "
          "byte/BSS comparison, queries-only, peer/integrity/vote refusals, init/mem/auth/ready/fatal cleanup, "
-         "shutdown-refused region untouched, placement limits\n",a,0x52200000ULL,0x1c00000ULL,m);
+         "shutdown-refused region untouched, placement limits\n",a,0x52200000ULL,0x1c00000ULL,m,z);
   close(diskFd);
 }
