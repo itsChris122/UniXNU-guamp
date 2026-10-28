@@ -6,12 +6,14 @@
 // usbin_uv_irq_handler (WEAK_ADAPTER_WA is set for PMI632), input suspend recovery, and a Type-C recovery for a
 // source that shows Rp on CC but never turns VBUS on (C-to-C replug on a PC): CC terminations off, then on again.
 // No hardware access of its own: every register access goes through Bus, so the whole sequence also runs on the host
-// (batteria/test-replug.cpp, simulated PMI632). Bus provides
+// (tests/charge_replug_host.cpp, simulated PMI632). Bus provides
 //   int rd(uint16_t addr, uint8_t *v); int wr(uint16_t addr, uint8_t v);   0 = success (PMI632, SPMI slave 2)
 //   void sleepMs(unsigned ms); void log(const char *format, ...)            one complete line per call
 //   int vbusMv(unsigned *mv)                                                 USBIN voltage (ADC5 USB_IN_V_16)
+//   int ibatMa(int *ma)                                                      battery current (QG), positive = charging
 // Limits: float voltage kFvMv (4.35 V, DT qcom,fv-max-uv 4.40 V), ICL <= 3000 mA and FCC <= 3000 mA (DT usb-icl-ua,
-// fcc-max-ua); an SDP or unknown source gets at most 500 mA, only APSD OCP/CDP/DCP the requested ICL.
+// fcc-max-ua); the input current per source follows Linux's update_sw_icl_max (inputChoice): an SDP, float or unknown
+// source gets at most 500 mA, Type-C Rp 1.5/3.0 A on a non-legacy cable, BC1.2 CDP/DCP/OCP and HVDCP more.
 #ifndef GUAMP_CHARGE_REPLUG_CORE_H
 #define GUAMP_CHARGE_REPLUG_CORE_H
 #include <stdint.h>
@@ -107,10 +109,41 @@ inline uint8_t aiclContCode(unsigned mv) {   // smblib_set_aicl_cont_threshold: 
 inline uint8_t typecMode(uint8_t value, bool drp) {
   return static_cast<uint8_t>((value & 0xe0u) | (drp ? 0x10u : 0x02u));
 }
-// Input current by source (APSD_RESULT_STATUS 0x1308: bit 0 SDP, 1 OCP, 2 CDP, 3 DCP, 4 float, 5 QC2, 6 QC3)
-inline unsigned inputMa(unsigned requested, uint8_t result) {
-  if (requested > kIclMaxMa) requested = kIclMaxMa;
-  return (result & 0x0e) || requested < kSdpMa ? requested : kSdpMa;
+// Type-C current the source advertises on CC, as smblib_get_prop_typec_mode reads it in the sink role: 0 none (not
+// attached), 1 default USB, 2 1.5 A, 3 3.0 A (TYPE_C_SNK_STATUS 0x1506 bit 3 / 2 / 1, only while 0x1509 bit 5 attached)
+inline uint8_t rpLevel(uint8_t sm, uint8_t snk) {
+  if (!(sm & 0x20)) return 0;
+  return (snk & 0x02) ? 3 : (snk & 0x04) ? 2 : (snk & 0x08) ? 1 : 0;
+}
+// Input current by source, smb5-lib.c update_sw_icl_max / get_rp_based_dcp_current for a PMI632 (no PD: a PD charger
+// is a Type-C source at 5 V with its Rp): HVDCP 3000 (HVDCP_CURRENT_UA; this port never raises VBUS above 5 V), a
+// non-legacy Type-C cable with Rp 1.5/3.0 A the Rp current (typec_rp_med_high), else BC1.2 (APSD_RESULT_STATUS 0x1308:
+// bit 0 SDP, 1 OCP, 2 CDP, 3 DCP, 4 float, 5 QC2, 6 QC3): DCP/OCP 3000 with Rp 3.0 A else 1500, CDP 1500, SDP 500
+// (Linux: 100 mA until USB enumeration votes 500), float/unknown 500 (Linux 100 mA until the USB stack decides; with
+// no USB current vote here the SDP level). Capped by cap (guamp-icl-ma) and kIclMaxMa; apsdDone false = no BC1.2 result.
+struct InputChoice {
+  unsigned ma;
+  const char *source, *rule;
+};
+inline InputChoice inputChoice(unsigned cap, bool apsdDone, uint8_t result, uint8_t rp, bool legacy) {
+  if (cap > kIclMaxMa) cap = kIclMaxMa;
+  const uint8_t r = apsdDone ? result : 0;
+  InputChoice c = {kSdpMa, "none", "unknown source, SDP level"};
+  if (r & 0x40) c = {3000, "QC3", "HVDCP at 5 V"};
+  else if (r & 0x20) c = {3000, "QC2", "HVDCP at 5 V"};
+  else if (rp >= 2 && !legacy) c = {rp == 3 ? 3000u : 1500u, r & 0x08 ? "DCP" : r & 0x04 ? "CDP" : r & 0x01 ? "SDP" :
+                                    r & 0x10 ? "FLOAT" : r & 0x02 ? "OCP" : "none", "Type-C Rp"};
+  else if (r & 0x08) c = {rp == 3 ? 3000u : 1500u, "DCP", "BC1.2 DCP, Rp based"};
+  else if (r & 0x02) c = {rp == 3 ? 3000u : 1500u, "OCP", "BC1.2 OCP, Rp based"};
+  else if (r & 0x04) c = {1500, "CDP", "BC1.2 CDP"};
+  else if (r & 0x01) c = {kSdpMa, "SDP", "BC1.2 SDP"};
+  else if (r & 0x10) c = {kSdpMa, "FLOAT", "float, SDP level"};
+  if (c.ma > cap) c.ma = cap;
+  return c;
+}
+inline const char *rpLevelName(uint8_t rp) {
+  static const char *const k[4] = {"none", "default", "1.5A", "3.0A"};
+  return k[rp & 3];
 }
 inline const char *apsdName(uint8_t result) {
   if (result & 0x40) return "QC3";
@@ -143,6 +176,8 @@ struct Snapshot {
   bool apsdDone() const { return (apsd & 0x01) != 0; }
   bool hwSuspended() const { return (pp & 0x40) != 0 && !(cmdIl & 0x01); }
   bool typecAttached() const { return (sm & 0x20) != 0; }
+  bool legacyCable() const { return (legacy & 0x02) != 0; }   // LEGACY_CABLE_STATUS TYPEC_LEGACY_CABLE_STATUS_BIT
+  uint8_t rp() const { return rpLevel(sm, snk); }
   // No input current although the cable is in: PAUSE/DISABLED or a 0 mA ICL, with the input collapsed or under
   // voltage (USBIN UV/VASHDN/COLLAPSE or AICL USBIN collapse). Battery-temperature hard limits and BAT_OV are real
   // reasons to stop and never count; FULLON/TAPER with a passing collapse bit do not either.
@@ -158,7 +193,7 @@ enum Phase : uint8_t { kAbsent, kDetecting, kConfigured };
 
 struct Controller {
   // configuration (PmicService.inc fills these from boot arguments)
-  unsigned iclMa = 1500, fccMa = 2000;
+  unsigned iclMa = kIclMaxMa, fccMa = 2000;   // iclMa: ceiling of the per-source input current (inputChoice)
   bool typecDrp = false, recover = true;
   // state
   Phase phase = kAbsent;
@@ -175,6 +210,11 @@ struct Controller {
   unsigned otgOffs = 0;
   uint8_t iclCode = 0, fccCode = 0, lastIcl = 0xff, lastAicl = 0xff, lastResult = 0xff;
   unsigned appliedMa = 0;
+  // Type-C Rp / cable re-evaluation while configured (smblib_handle_rp_change): the new choice must be seen on two
+  // polls in a row; settleAt: one "input after 15 s" line with the measured values after every configuration
+  unsigned pendingMa = 0, rpChanges = 0;
+  uint64_t settleAt = 0;
+  InputChoice choice = {0, "none", ""};
   Snapshot snap = {};
 
   template <class Bus> int masked(Bus &b, uint16_t a, uint8_t mask, uint8_t value, uint8_t *old = nullptr) {
@@ -486,13 +526,15 @@ struct Controller {
           if (!e) iclCode = static_cast<uint8_t>(kSdpMa / 50);
         }
         if (e) fail(b, "unplug reset", e);
-        b.log("GuampChg: unplug %u, USBIN %02x, %s, AICL %u/%u mV, ICL %u mA, input on\n", unplugs, s.usbin,
-              stateName(s.s1), aicl5vMv, aiclContMv, kSdpMa);
+        b.log("GuampChg: unplug %u, USBIN %02x, %s, AICL %u/%u mV, ICL %u mA, input on (was source %s, %u mA)\n",
+              unplugs, s.usbin, stateName(s.s1), aicl5vMv, aiclContMv, kSdpMa, choice.source, appliedMa);
         if (unplugs == 1) linuxDiff(b, "unplug");
         present = false;
         phase = kAbsent;
         absentSince = ms;
         lastResult = 0xff;
+        settleAt = 0;
+        pendingMa = 0;
       }
       if (ms < settleUntil) return;   // the state machine is still re-attaching after a recovery
       if (!s.partnerWithoutVbus()) {
@@ -561,14 +603,21 @@ struct Controller {
     if (phase == kDetecting) {
       if (s.apsdDone() || (apsdReruns >= 2 && ms - phaseAt >= 10000)) {
         const uint8_t result = s.apsdDone() ? s.result : 0;
-        const unsigned ma = inputMa(iclMa, result);
+        const InputChoice ch = inputChoice(iclMa, s.apsdDone(), result, s.rp(), s.legacyCable());
         int c = linuxConfig(b, "configure");
-        if (!c) c = configure(b, ma);
-        b.log("GuampChg: APSD %s result %02x %s -> ICL %u mA FCC %u mA FV %u mV: %s (SPMI %d)\n",
-              s.apsdDone() ? "done" : "timeout", result, apsdName(result), ma, fccCode * 50u, kFvMv,
-              c ? "error" : "configured", c);
+        if (!c) c = configure(b, ch.ma);
+        unsigned mv = 0;
+        const int ve = c ? -1 : b.vbusMv(&mv);
+        b.log("GuampChg: APSD %s result %02x %s, Type-C %s Rp %s%s -> source %s (%s): ICL %u mA FCC %u mA FV %u mV, "
+              "VBUS %u mV%s: %s (SPMI %d)\n",
+              s.apsdDone() ? "done" : "timeout", result, apsdName(result), s.typecAttached() ? "attached" : "unattached",
+              rpLevelName(s.rp()), s.legacyCable() ? " legacy cable" : "", ch.source, ch.rule, ch.ma, fccCode * 50u, kFvMv,
+              ve ? 0u : mv, ve ? " (no ADC)" : "", c ? "error" : "configured", c);
         if (c) { fail(b, "configure", c); return; }   // retried on the next poll
         lastResult = result;
+        choice = ch;
+        pendingMa = 0;
+        settleAt = ms + 15000;
         phase = kConfigured;
         phaseAt = ms;
         stuckSince = 0;
@@ -588,6 +637,39 @@ struct Controller {
       b.log("GuampChg: APSD result %02x %s -> %02x %s\n", lastResult, apsdName(lastResult), s.result, apsdName(s.result));
       beginDetection(b, ms, false, "source change");
       return;
+    }
+    if (settleAt && ms >= settleAt) {   // what the input really does with the chosen ICL (AICL settled by now)
+      settleAt = 0;
+      unsigned mv = 0;
+      int ma = 0;
+      const int ve = b.vbusMv(&mv), ie = b.ibatMa(&ma);
+      b.log("GuampChg: input after 15 s: source %s, ICL set %u mA, ICL status %u mA, AICL %02x%s%s, VBUS %u mV%s, "
+            "battery %d mA%s, %s\n",
+            choice.source, appliedMa, s.icl * 50u, s.aicl, (s.aicl & 0x01) ? " DONE" : "",
+            (s.aicl & 0x10) ? " USBIN_COLLAPSE" : "", ve ? 0u : mv, ve ? " (no ADC)" : "", ie ? 0 : ma,
+            ie ? " (no QG)" : "", stateName(s.s1));
+    }
+    // smblib_handle_rp_change: a changed Type-C Rp (or cable flag) changes the input current; not while the weak-adapter
+    // work-around holds the ICL at 100 mA
+    if (!aiclMax) {
+      const InputChoice ch = inputChoice(iclMa, true, lastResult, s.rp(), s.legacyCable());
+      if (ch.ma == appliedMa) {
+        pendingMa = 0;
+      } else if (pendingMa != ch.ma) {
+        pendingMa = ch.ma;
+      } else {
+        const unsigned before = appliedMa;
+        rpChanges = rpChanges + 1;
+        int c = configure(b, ch.ma);
+        b.log("GuampChg: Type-C Rp %s%s -> source %s (%s): ICL %u -> %u mA, change %u: %s (SPMI %d)\n",
+              rpLevelName(s.rp()), s.legacyCable() ? " legacy cable" : "", ch.source, ch.rule, before, ch.ma, rpChanges,
+              c ? "error" : "configured", c);
+        if (c) { fail(b, "Rp change", c); return; }
+        choice = ch;
+        pendingMa = 0;
+        settleAt = ms + 15000;
+        return;
+      }
     }
     if (!recover) return;
     if (s.hwSuspended() && ms - lastRecovery >= 30000) {
