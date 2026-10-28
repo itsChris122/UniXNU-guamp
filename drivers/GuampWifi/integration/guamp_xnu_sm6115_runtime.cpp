@@ -122,6 +122,8 @@ struct Sm6115Runtime {
       int e=smmu.start(owner.smmuRegisters,pageTables.memory,pageTables.physical,
         owner.xnuBase,owner.xnuBytes,true,this,delayUs);
       if(e)return e;
+      IOLog("GuampWiFi: SMMU SID 0x%x/0x%x -> context bank %u (SMR slot %u), tables PA 0x%llx, IOVA 0x%llx-0x%llx, NC walks\n",
+        WlanSmmu::Stream,WlanSmmu::StreamMask,smmu.cb,smmu.slot,pageTables.physical,WlanSmmu::IovaBase,WlanSmmu::IovaEnd);
     }
     if(!dmaStarted) {
       extern GuampXnuDma gGuampXnuDma;
@@ -208,20 +210,21 @@ struct Sm6115Runtime {
       nw_wifi_status_get(&status);
       bool mac=false;for(unsigned i=0;i<6;i++)mac|=status.mac[i]!=0;
       if(status.state==NW_STA_IDLE&&status.channels&&mac&&!(status.mac[0]&1))break;
-      if(nowMs()>=deadline){fail(Timeout,"ath10k station ready");return;}
+      if(nowMs()>=deadline){dmaReport("probe timeout");fail(Timeout,"ath10k station ready");return;}
       IOSleep(1);
     }
     IOLog("GuampWiFi: ath10k ready, MAC %02x:%02x:%02x:%02x:%02x:%02x, %u channels\n",
       status.mac[0],status.mac[1],status.mac[2],status.mac[3],status.mac[4],status.mac[5],status.channels);
+    dmaReport("after probe");
     scanDone=false;scanResult=NW_RES_FAILED;transition(Scanning);
     e=nw_wifi_scan(nullptr,0);if(e){fail(e,"scan request");return;}
     deadline=nowMs()+35000;
     while(!scanDone) {
       e=nw_wifi_step();if(e<0||error){fail(error?error:e,"scan pump");return;}
-      if(nowMs()>=deadline){fail(Timeout,"scan completion");return;}
+      if(nowMs()>=deadline){dmaReport("scan timeout");fail(Timeout,"scan completion");return;}
       IOSleep(1);
     }
-    if(scanResult!=NW_RES_OK){fail(Io,"scan aborted");return;}
+    if(scanResult!=NW_RES_OK){dmaReport("scan aborted");fail(Io,"scan aborted");return;}
     const int count=nw_wifi_bss_count();
     IOLog("GuampWiFi: SCAN COMPLETE: %d BSS entries (zero is a valid completed scan)\n",count);
     for(int i=0;i<count;i++) {
@@ -232,6 +235,7 @@ struct Sm6115Runtime {
         bss.bssid[0],bss.bssid[1],bss.bssid[2],bss.bssid[3],bss.bssid[4],bss.bssid[5],
         bss.freq_mhz,int(bss.signal_dbm),unsigned(bss.ie_len));
     }
+    dmaReport("scan complete");
     transition(ScanComplete);
     // Retain the single dispatcher and firmware services for this boot.
     while(!error) { e=nw_wifi_step();if(e<0){fail(e,"radio worker");break;}if(!e)IOSleep(1); }
@@ -252,6 +256,7 @@ struct Sm6115Runtime {
     pageTables.close(true);msaPayload.close(true);owner.stop(true);
   }
 
+  static void dmaReport(const char *when) { extern GuampXnuDma gGuampXnuDma; gGuampXnuDma.report(when); }
   static Sm6115Runtime &instance();
   static void delayUs(void *,uint32_t us) { IODelay(us); }
   static void smpKick(void *p) { static_cast<Sm6115Runtime *>(p)->owner.kickSmp2p(); }

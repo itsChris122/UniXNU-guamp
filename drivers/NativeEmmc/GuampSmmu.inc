@@ -82,7 +82,11 @@ struct WlanSmmu {
     // define how subsequent TTBR fields are interpreted. Keep that order even
     // while the context bank is disabled.
     registers.w32(bank+0x10,encoding|(7u<<15)); // PASIZE, sign-extension upstream
-    registers.w32(bank+0x30,32u|(1u<<8)|(1u<<10)|(3u<<12)|(1u<<23)); // 32-bit VA, WB walks, EPD1
+    // 32-bit VA, 4K granule, EPD1. Table walks Non-cacheable/Outer-shareable:
+    // the guamp apps SMMU has no dma-coherent property, so like Linux
+    // io-pgtable-arm (!coherent_walk) the walker must not use cacheable
+    // attributes; the tables are written through an uncached CPU view.
+    registers.w32(bank+0x30,32u|(0u<<8)|(0u<<10)|(2u<<12)|(1u<<23));
     uint64_t ttbr=tablePhysical|(uint64_t(asid)<<48);
     registers.w32(bank+0x24,uint32_t(ttbr>>32)); registers.w32(bank+0x20,uint32_t(ttbr));
     // 0x28/0x2c are the low/high halves of TTBR1. TTBR1 is disabled through

@@ -180,9 +180,17 @@ const char *reg_initiator_name(enum nl80211_reg_initiator who) {
   return "unknown";
 }
 int regulatory_hint(struct wiphy *w,const char *alpha2) {
-  /* No userspace regulatory database is provided. Retain the more restrictive
-   * world table, rather than claiming that an arbitrary hint was installed. */
-  (void)w; (void)alpha2; return -EOPNOTSUPP;
+  /* No regulatory database is provided. In Linux the hint is only queued and
+   * returns 0 when no database answers: the wiphy keeps the custom table that
+   * ath_regd_init() already applied (the restrictive ath default world table
+   * for a non-world EEPROM domain), and the firmware still receives the
+   * EEPROM regpair through ath10k_regd_update(). Returning an error here made
+   * ath10k_mac_register() fail for every BDF with a country/default domain
+   * (e.g. 0x0 -> "US"), i.e. before the first scan. */
+  (void)w;
+  lx_log(5,"ath10k: regulatory hint %c%c kept as driver world table (no regdb)",
+    alpha2&&alpha2[0]?alpha2[0]:'?',alpha2&&alpha2[0]&&alpha2[1]?alpha2[1]:'?');
+  return 0;
 }
 
 static unsigned long stoppedQueues;
