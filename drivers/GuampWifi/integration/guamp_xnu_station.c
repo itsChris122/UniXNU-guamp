@@ -105,10 +105,17 @@ static int guamp_fw_get(const char *name, const uint8_t **data, size_t *size)
 static struct redwood_net_link g_link;
 static struct redwood_sta_state g_public_state;
 static volatile int g_worker_started;
+enum { GUAMP_WORKER_STOPPED = 0, GUAMP_WORKER_ATTACHING = -1,
+       GUAMP_WORKER_RUNNING = 1, GUAMP_WORKER_FAILED = -2 };
 static int g_scan_done, g_scan_result;
 static int g_join_done, g_join_result;
 static int g_power_done, g_power_result, g_power_value;
 static int g_disconnect_done, g_disconnect_result;
+
+static bool worker_online(void)
+{
+  return __atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_RUNNING;
+}
 
 static void public_state_set(enum redwood_sta_phase phase, int error)
 {
@@ -132,17 +139,83 @@ static void public_state_copy(struct redwood_sta_state *state)
   lck_spin_unlock(guamp_wifi_state_lock);
 }
 
+static enum redwood_sta_phase public_phase(void)
+{
+  lck_spin_lock(guamp_wifi_state_lock);
+  enum redwood_sta_phase phase = g_public_state.phase;
+  lck_spin_unlock(guamp_wifi_state_lock);
+  return phase;
+}
+
+static void request_failed(enum redwood_sta_phase pending,
+    enum redwood_sta_phase previous, int error)
+{
+  lck_spin_lock(guamp_wifi_state_lock);
+  /* A concurrent loss/power-off notification takes precedence over the
+   * caller's saved phase, especially when an operation timed out. */
+  if (g_public_state.phase == pending) g_public_state.phase = previous;
+  g_public_state.last_error = error;
+  lck_spin_unlock(guamp_wifi_state_lock);
+}
+
+/* Worker callbacks can safely take the station's current driver snapshot.
+ * Caller threads use only g_public_state, never the mutable driver state. */
+static bool public_state_from_driver(int error)
+{
+  struct nw_wifi_status status;
+  nw_wifi_status_get(&status);
+  enum redwood_sta_phase phase = REDWOOD_STA_IDLE;
+  if (status.state == NW_STA_OFF) phase = REDWOOD_STA_OFF;
+  else if (status.state == NW_STA_UP) phase = REDWOOD_STA_JOINED;
+  else if (status.state >= NW_STA_AUTH) phase = REDWOOD_STA_JOINING;
+  else if (status.state == NW_STA_SCANNING) phase = REDWOOD_STA_SCANNING;
+  lck_spin_lock(guamp_wifi_state_lock);
+  g_public_state.phase = phase; g_public_state.last_error = error;
+  bzero(&g_public_state.bss, sizeof(g_public_state.bss));
+  if (status.state >= NW_STA_AUTH) {
+    memcpy(g_public_state.bss.bssid, status.bssid, sizeof(status.bssid));
+    size_t ssid_length = status.ssid_len < sizeof(g_public_state.bss.ssid) ?
+        status.ssid_len : sizeof(g_public_state.bss.ssid);
+    memcpy(g_public_state.bss.ssid, status.ssid, ssid_length);
+    g_public_state.bss.ssid_length = (uint8_t)ssid_length;
+    g_public_state.bss.frequency = (uint16_t)status.freq_mhz;
+    g_public_state.bss.rssi = status.signal_dbm;
+  }
+  lck_spin_unlock(guamp_wifi_state_lock);
+  return status.state == NW_STA_UP;
+}
+
+static void worker_failed(int error)
+{
+  /* Keep this terminal: a stopped worker cannot be reattached to its live
+   * firmware/net link. Do not call sta_attach(NULL) here: it can wait for a
+   * station call that is itself waiting for this worker. */
+  __atomic_store_n(&g_worker_started, GUAMP_WORKER_FAILED, __ATOMIC_RELEASE);
+  public_state_set(REDWOOD_STA_OFF, error);
+  redwood_net_link_state(false);
+  lck_mtx_lock(guamp_wifi_event_lock);
+  g_scan_result = g_join_result = g_power_result = g_disconnect_result = NW_RES_FAILED;
+  g_scan_done = g_join_done = g_power_done = g_disconnect_done = 1;
+  lck_mtx_unlock(guamp_wifi_event_lock);
+  thread_wakeup((event_t)&g_scan_done); thread_wakeup((event_t)&g_join_done);
+  thread_wakeup((event_t)&g_power_done); thread_wakeup((event_t)&g_disconnect_done);
+  redwood_sta_lost(error);
+}
+
 static int
 wait_event(int *done, int timeout_ms)
 {
   uint64_t deadline;
   clock_interval_to_deadline((uint32_t)timeout_ms, NSEC_PER_MSEC, &deadline);
   lck_mtx_lock(guamp_wifi_event_lock);
-  while (!*done) {
+  for (;;) {
+    if (!worker_online()) { lck_mtx_unlock(guamp_wifi_event_lock); return ENETDOWN; }
+    if (*done) break;
     if (lck_mtx_sleep_deadline(guamp_wifi_event_lock, LCK_SLEEP_DEFAULT,
         (event_t)done, THREAD_UNINT, deadline) == THREAD_TIMED_OUT) {
+      int error = worker_online() ? ETIMEDOUT : ENETDOWN;
       lck_mtx_unlock(guamp_wifi_event_lock);
-      return ETIMEDOUT;
+      return error;
     }
   }
   *done = 0;
@@ -163,9 +236,20 @@ static int result_to_errno(int result)
   }
 }
 
+/* The reusable station is compiled with Linux errno values; Darwin's
+ * ENETDOWN differs numerically, so translate the C ABI explicitly. */
+static int request_to_errno(int result)
+{
+  if (result == -19 || result == -100) return ENETDOWN;
+  if (result == -16) return EBUSY;
+  if (result == -12) return ENOMEM;
+  return EINVAL;
+}
+
 static void on_scan(int result)
 {
-  public_state_set(REDWOOD_STA_IDLE, result_to_errno(result));
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return;
+  (void)public_state_from_driver(result_to_errno(result));
   lck_mtx_lock(guamp_wifi_event_lock);
   g_scan_result = result; g_scan_done = 1;
   lck_mtx_unlock(guamp_wifi_event_lock);
@@ -174,30 +258,18 @@ static void on_scan(int result)
 
 static void on_join(int result)
 {
-  if (result == NW_RES_OK) {
-    struct nw_wifi_status status;
-    nw_wifi_status_get(&status); /* this event is dispatched on the driver worker */
-    lck_spin_lock(guamp_wifi_state_lock);
-    g_public_state.phase = REDWOOD_STA_JOINED;
-    g_public_state.last_error = 0;
-    memcpy(g_public_state.bss.bssid, status.bssid, sizeof(g_public_state.bss.bssid));
-    memcpy(g_public_state.bss.ssid, status.ssid, status.ssid_len);
-    g_public_state.bss.ssid_length = status.ssid_len;
-    g_public_state.bss.frequency = (uint16_t)status.freq_mhz;
-    g_public_state.bss.rssi = status.signal_dbm;
-    lck_spin_unlock(guamp_wifi_state_lock);
-  } else {
-    public_state_set(REDWOOD_STA_IDLE, result_to_errno(result));
-  }
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return;
+  bool joined = public_state_from_driver(result_to_errno(result));
   lck_mtx_lock(guamp_wifi_event_lock);
   g_join_result = result; g_join_done = 1;
   lck_mtx_unlock(guamp_wifi_event_lock);
-  redwood_net_link_state(result == NW_RES_OK);
+  redwood_net_link_state(joined);
   thread_wakeup((event_t)&g_join_done);
 }
 
 static void on_lost(int reason)
 {
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return;
   public_state_set(REDWOOD_STA_IDLE, reason ? ECONNRESET : 0);
   redwood_net_link_state(false);
   redwood_sta_lost(ECONNRESET);
@@ -206,23 +278,24 @@ static void on_lost(int reason)
 static void on_rx(const uint8_t *frame, size_t length)
 {
   /* nw_wifi_step dispatches RX in worker context, never from the CE interrupt. */
-  redwood_net_input(frame, length);
+  if (worker_online()) redwood_net_input(frame, length);
 }
 
 static void on_power(int on, int result)
 {
-  public_state_set(on ? REDWOOD_STA_IDLE : REDWOOD_STA_OFF,
-      result_to_errno(result));
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return;
+  bool joined = public_state_from_driver(result_to_errno(result));
   lck_mtx_lock(guamp_wifi_event_lock);
   g_power_value = on; g_power_result = result; g_power_done = 1;
   lck_mtx_unlock(guamp_wifi_event_lock);
-  if (!on) redwood_net_link_state(false);
+  redwood_net_link_state(joined);
   thread_wakeup((event_t)&g_power_done);
 }
 
 static void on_disconnect(int result)
 {
-  public_state_set(REDWOOD_STA_IDLE, result_to_errno(result));
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return;
+  (void)public_state_from_driver(result_to_errno(result));
   lck_mtx_lock(guamp_wifi_event_lock);
   g_disconnect_result = result; g_disconnect_done = 1;
   lck_mtx_unlock(guamp_wifi_event_lock);
@@ -241,6 +314,7 @@ static const struct nw_wifi_events g_events = {
 
 static bool link_transmit(mbuf_t packet, size_t length)
 {
+  if (!worker_online()) return false;
   uint8_t frame[REDWOOD_NET_FRAME_MAX];
   if (length < ETHER_HDR_LEN || length > sizeof(frame) ||
       mbuf_copydata(packet, 0, length, frame) != 0) return false;
@@ -249,9 +323,11 @@ static bool link_transmit(mbuf_t packet, size_t length)
 
 static int station_power(bool on)
 {
+  if (!worker_online()) return ENETDOWN;
   lck_mtx_lock(guamp_wifi_event_lock); g_power_done = 0;
   lck_mtx_unlock(guamp_wifi_event_lock);
-  if (nw_wifi_power(on) != 0) return EIO;
+  int queued = nw_wifi_power(on);
+  if (queued) return request_to_errno(queued);
   int error = wait_event(&g_power_done, 2000);
   if (error) return error;
   if (g_power_value != !!on) return EIO;
@@ -260,6 +336,9 @@ static int station_power(bool on)
 
 static int station_scan(const struct redwood_sta_scan *request)
 {
+  if (!worker_online()) return ENETDOWN;
+  if (!request) return EINVAL;
+  enum redwood_sta_phase previous = public_phase();
   lck_mtx_lock(guamp_wifi_event_lock); g_scan_done = 0;
   lck_mtx_unlock(guamp_wifi_event_lock);
   struct nw_wifi_scan_request scan;
@@ -274,18 +353,19 @@ static int station_scan(const struct redwood_sta_scan *request)
   public_state_set(REDWOOD_STA_SCANNING, 0);
   int error = nw_wifi_scan_ex(&scan);
   if (error) {
-    error = error == -19 ? ENETDOWN : EINVAL;
-    public_state_set(REDWOOD_STA_IDLE, error);
+    error = request_to_errno(error);
+    request_failed(REDWOOD_STA_SCANNING, previous, error);
     return error;
   }
   error = wait_event(&g_scan_done, 35000);
   if (!error) error = result_to_errno(g_scan_result);
-  public_state_set(REDWOOD_STA_IDLE, error);
+  if (error) request_failed(REDWOOD_STA_SCANNING, previous, error);
   return error;
 }
 
 static void station_heard(void (*each)(const struct redwood_sta_bss *, void *), void *context)
 {
+  if (!worker_online() || !each) return;
   int count = nw_wifi_bss_count();
   for (int i = 0; i < count; ++i) {
     struct nw_bss_info in;
@@ -305,6 +385,9 @@ static void station_heard(void (*each)(const struct redwood_sta_bss *, void *), 
 
 static int station_join(const struct redwood_sta_join *request)
 {
+  if (!worker_online()) return ENETDOWN;
+  if (!request) return EINVAL;
+  enum redwood_sta_phase previous = public_phase();
   char pmk_hex[64];
   const char *pass = NULL; size_t pass_len = 0;
   static const char hex[] = "0123456789abcdef";
@@ -336,24 +419,28 @@ static int station_join(const struct redwood_sta_join *request)
   int error = nw_wifi_connect(request->ssid, request->ssid_length, bssid, pass, pass_len);
   bzero(pmk_hex, sizeof(pmk_hex));
   if (error) {
-    error = error == -19 ? ENETDOWN : EINVAL;
-    public_state_set(REDWOOD_STA_IDLE, error);
+    error = request_to_errno(error);
+    request_failed(REDWOOD_STA_JOINING, previous, error);
     return error;
   }
   error = wait_event(&g_join_done, 30000);
   if (!error) error = result_to_errno(g_join_result);
-  public_state_set(error ? REDWOOD_STA_IDLE : REDWOOD_STA_JOINED, error);
+  if (error) request_failed(REDWOOD_STA_JOINING, previous, error);
   return error;
 }
 
 static int station_leave(void)
 {
+  if (!worker_online()) return ENETDOWN;
   lck_mtx_lock(guamp_wifi_event_lock); g_disconnect_done = 0;
   lck_mtx_unlock(guamp_wifi_event_lock);
   nw_wifi_disconnect();
-  int error = wait_event(&g_disconnect_done, 3000) ? ETIMEDOUT :
-      result_to_errno(g_disconnect_result);
-  public_state_set(REDWOOD_STA_IDLE, error);
+  int error = wait_event(&g_disconnect_done, 3000);
+  if (!error) error = result_to_errno(g_disconnect_result);
+  if (error) {
+    lck_spin_lock(guamp_wifi_state_lock); g_public_state.last_error = error;
+    lck_spin_unlock(guamp_wifi_state_lock);
+  }
   return error;
 }
 
@@ -366,6 +453,7 @@ static void station_state(struct redwood_sta_state *state)
 
 static unsigned station_channels(struct redwood_sta_channel *out, unsigned most)
 {
+  if (!worker_online() || (!out && most)) return 0;
   unsigned count = (unsigned)nw_wifi_channel_count();
   if (count > most) count = most;
   for (unsigned i = 0; i < count; ++i) {
@@ -392,11 +480,11 @@ static void wifi_worker(void *arg, wait_result_t result)
     int work = nw_wifi_step();
     if (work < 0) {
       if (g_platform && g_platform->log) g_platform->log(3, "guamp wifi worker stopped on driver error");
+      worker_failed(EIO);
       break;
     }
     if (work == 0) g_platform->sleep_ms(1);
   }
-  __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE);
 }
 
 int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_snoc_board *board)
@@ -404,6 +492,7 @@ int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_sn
   struct nw_wifi_status status;
   thread_t worker = NULL;
   int expected = 0;
+  if (__atomic_load_n(&g_worker_started, __ATOMIC_ACQUIRE) == GUAMP_WORKER_FAILED) return ENETDOWN;
   if (!platform || !platform->sleep_ms ||
       !__atomic_compare_exchange_n(&g_worker_started, &expected, -1, false,
           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return EBUSY;
@@ -423,7 +512,8 @@ int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_sn
   bool have_address = false;
   for (unsigned ms = 0; ms < 10000; ++ms) {
     nw_wifi_status_get(&status);
-    if (!(status.mac[0] & 1) && bcmp(status.mac, "\0\0\0\0\0\0", 6) != 0) { have_address = true; break; }
+    if (status.state == NW_STA_IDLE && status.channels && !(status.mac[0] & 1) &&
+        bcmp(status.mac, "\0\0\0\0\0\0", 6) != 0) { have_address = true; break; }
     int work = nw_wifi_step();
     if (work < 0) { nw_wifi_stop(); __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE); return EIO; }
     g_platform->sleep_ms(1);
@@ -440,11 +530,16 @@ int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_sn
   __atomic_store_n(&g_worker_started, 1, __ATOMIC_RELEASE);
   error = kernel_thread_start(wifi_worker, NULL, &worker);
   if (error != KERN_SUCCESS) {
-    redwood_sta_attach(NULL); nw_wifi_stop();
-    __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE); return EAGAIN;
+    nw_wifi_stop(); worker_failed(EAGAIN); return EAGAIN;
   }
   thread_deallocate(worker);
-  public_state_set(REDWOOD_STA_IDLE, 0);
+  /* The new worker may already have failed; do not publish a healthy station
+   * or overwrite its terminal OFF/error snapshot after that handoff. */
+  lck_spin_lock(guamp_wifi_state_lock);
+  bool online = worker_online();
+  if (online) { g_public_state.phase = REDWOOD_STA_IDLE; g_public_state.last_error = 0; }
+  lck_spin_unlock(guamp_wifi_state_lock);
+  if (!online) return ENETDOWN;
   redwood_sta_attach(&g_station);
-  return 0;
+  return worker_online() ? 0 : ENETDOWN;
 }

@@ -29,16 +29,44 @@ static struct bss g_bss[MAX_BSS]; static int g_nbss;
 
 static u8 g_no_bssid[6];   /* the driver compares received frames with the interface's access point address, so it is never a null pointer */
 static struct ieee80211_hw *g_hw; static const struct ieee80211_ops *g_ops; static struct ieee80211_vif *g_vif;
+static bool g_hw_started,g_vif_added;
 static struct nw_wifi_events g_ev;
 
 enum { REQ_NONE, REQ_SCAN, REQ_CONNECT, REQ_DISCONNECT, REQ_POWER };
 struct nw_request { int kind; int power_on; u8 ssid[32]; u8 ssid_len; u8 bssid[6]; int has_bssid; char pass[65]; int pass_len; int has_pass; };
 static struct nw_request g_req, g_pending_connect;
 static int g_has_pending_connect;
-static volatile int g_radio_enabled = 1;
+static volatile int g_radio_enabled, g_station_ready, g_link_authorized;
+static unsigned g_request_inflight, g_current_link_frames;
+static int g_disconnect_requested;
+/* One queue slot plus per-operation admission: an accepted request keeps its
+ * completion ownership until its callback. Callers receive EBUSY instead of
+ * silently replacing a scan/connect/power request that another thread awaits. */
+static int request_begin_locked(int kind) {
+  if(!__atomic_load_n(&g_station_ready,__ATOMIC_ACQUIRE))return -ENODEV;
+  if((kind==REQ_SCAN||kind==REQ_CONNECT)&&!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE))return -ENETDOWN;
+  if(g_req.kind!=REQ_NONE||(g_request_inflight&(1u<<kind))||g_disconnect_requested)return -EBUSY;
+  g_request_inflight|=1u<<kind;return 0;
+}
+static int request_finish(int kind) {
+  lock();int had=!!(g_request_inflight&(1u<<kind));g_request_inflight&=~(1u<<kind);unlock();return had;
+}
+static int request_active(int kind) {
+  lock();int active=!!(g_request_inflight&(1u<<kind));unlock();return active;
+}
+static void scan_request_done(int result) {
+  if(request_finish(REQ_SCAN)&&g_ev.scan_done)g_ev.scan_done(result);
+}
+static void connect_request_done(int result) {
+  if(request_finish(REQ_CONNECT)&&g_ev.connect_done)g_ev.connect_done(result);
+}
 
 struct txq_item { struct txq_item *next; u16 len; u8 data[]; };
 static struct txq_item *g_txq_head, *g_txq_tail; static unsigned g_txq_n;
+static void purge_tx_queue(void) {
+  lock();struct txq_item *at=g_txq_head;g_txq_head=g_txq_tail=0;g_txq_n=0;unlock();
+  while(at){struct txq_item *next=at->next;lx_free(at);at=next;}
+}
 
 /* ---- the connection ---- */
 static struct {
@@ -132,14 +160,14 @@ int nw_wifi_channel_get(int index, struct nw_wifi_channel *out) {
 /* ---- scanning ---- */
 static void do_scan(const struct nw_wifi_scan_request *scan) {
   if (!g_hw || !g_vif || g_scan_running || g_connect_waits || (C.state >= NW_STA_AUTH && C.state != NW_STA_UP)) {
-    if (g_ev.scan_done) g_ev.scan_done(NW_RES_FAILED);
+    scan_request_done(NW_RES_FAILED);
     return;
   }
   int n = scan->frequency_count;
   if (!n) for (int b = 0; b < NUM_NL80211_BANDS; b++) if (g_hw->wiphy->bands[b] && b != NL80211_BAND_6GHZ) n += g_hw->wiphy->bands[b]->n_channels;
-  if (!n) { if (g_ev.scan_done) g_ev.scan_done(NW_RES_FAILED); return; }
+  if (!n) { scan_request_done(NW_RES_FAILED); return; }
   struct ieee80211_scan_request *rq = lx_alloc(sizeof *rq + sizeof(struct ieee80211_channel *) * n + 2 * sizeof(struct cfg80211_ssid), 1);
-  if (!rq) { if (g_ev.scan_done) g_ev.scan_done(NW_RES_FAILED); return; }
+  if (!rq) { scan_request_done(NW_RES_FAILED); return; }
   struct cfg80211_ssid *ss = (struct cfg80211_ssid *)((u8 *)rq + sizeof *rq + sizeof(struct ieee80211_channel *) * n);
   int k = 0;
   /* 6 GHz stays excluded; an explicit iOS frequency list is mapped to real wiphy channels. */
@@ -153,7 +181,7 @@ static void do_scan(const struct nw_wifi_scan_request *scan) {
           rq->req.channels[k++] = &sb->channels[i]; found = 1; break;
         }
       }
-      if (!found) { lx_free(rq); if (g_ev.scan_done) g_ev.scan_done(NW_RES_UNSUPPORTED); return; }
+      if (!found) { lx_free(rq); scan_request_done(NW_RES_UNSUPPORTED); return; }
     }
   } else {
     for (int b = 0; b < NUM_NL80211_BANDS; b++) { struct ieee80211_supported_band *sb = g_hw->wiphy->bands[b]; if (!sb || b == NL80211_BAND_6GHZ) continue;
@@ -168,13 +196,13 @@ static void do_scan(const struct nw_wifi_scan_request *scan) {
   g_scan_running = 1; nw_wifi_stats.stage = 5;
   lx_log(6, "wifi: scan starts on %d channels", k);
   int r = g_ops->hw_scan(g_hw, g_vif, rq);
-  if (r) { lx_log(3, "wifi: scan request failed: %d", r); nw_wifi_stats.last_err = r; g_scan_running = 0; if (g_ev.scan_done) g_ev.scan_done(NW_RES_FAILED); }
+  if (r) { lx_log(3, "wifi: scan request failed: %d", r); nw_wifi_stats.last_err = r; g_scan_running = 0; scan_request_done(NW_RES_FAILED); }
   lx_free(rq); }
 void nw_sta_scan_done(bool aborted) {
   g_scan_running = 0; nw_wifi_stats.scans++; nw_wifi_stats.stage = 6;
   lx_log(6, "wifi: scan %u finished%s, %u networks", nw_wifi_stats.scans, aborted ? " (aborted)" : "", nw_wifi_stats.bss_seen);
   if (C.state == NW_STA_SCANNING) C.state = NW_STA_IDLE;
-  if (g_ev.scan_done) g_ev.scan_done(aborted ? NW_RES_FAILED : NW_RES_OK); }
+  scan_request_done(aborted||!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)?NW_RES_FAILED:NW_RES_OK); }
 
 /* ---- element helpers ---- */
 static const u8 *find_ie(const u8 *ies, unsigned len, u8 id) { const struct element *e = cfg80211_find_elem_match(id, ies, len, 0, 0, 0); return e ? (const u8 *)e : 0; }
@@ -410,12 +438,19 @@ static void tx_eth(const u8 *e, unsigned len) {
   C.last_tx = lx_now_ms(); g_ops->tx(g_hw, &ctl, skb); }
 
 /* ---- the access point's frames ---- */
+static int rx_destination(const u8 *address) {
+  return g_vif && (!memcmp(address,g_vif->addr,6) || is_multicast_ether_addr(address));
+}
+static int rx_snap(const u8 *llc) {
+  return llc[0]==0xaa && llc[1]==0xaa && llc[2]==3 && !llc[3] && !llc[4] &&
+    (llc[5]==0 || llc[5]==0xf8); /* RFC1042 or bridge-tunnel SNAP */
+}
 static void to_eth(struct sk_buff *skb) {
   struct ieee80211_hdr *h = (void *)skb->data; unsigned hl = ieee80211_hdrlen(h->frame_control);
   struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb);
   if (ieee80211_has_protected(h->frame_control) && !(st->flag & RX_FLAG_IV_STRIPPED)) hl += 8;
   if (skb->len < hl + 8) return;
-  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) return;
+  const u8 *llc = skb->data + hl; if (!rx_snap(llc)) return;
   unsigned plen = skb->len - hl - 8; if (plen > 2000) return;
   static u8 eth[14 + 2000]; memcpy(eth, h->addr1, 6); memcpy(eth + 6, h->addr3, 6); memcpy(eth + 12, llc + 6, 2); memcpy(eth + 14, llc + 8, plen);
   if (eth[12] == 0x88 && eth[13] == 0x8e) return;   /* EAPOL belongs to the handshake */
@@ -500,6 +535,7 @@ static void finish_authorized(void) {
   if (set_sta_state(IEEE80211_STA_AUTHORIZED)) { connect_done(NW_RES_FAILED); return; }
   m4_wait_cancel(); secure_zero(C.gtk,sizeof C.gtk); C.gtk_len=0;
   C.state = NW_STA_UP; C.bmiss_at = 0; nw_wifi_stats.stage = 8; C.hb_at = lx_now_ms(); C.hb_frames = nw_wifi_stats.frames; C.hb_beacons = nw_wifi_stats.beacons; C.hb_quiet = 0;
+  __atomic_store_n(&g_link_authorized,1,__ATOMIC_RELEASE);
   lx_log(6, "wifi: connected"); connect_done(NW_RES_OK); }
 /* Once a second while connected: what arrived. A second with nothing at all is logged with the receive rings and the transmit outcomes, and the
  * firmware is asked for its ring and receive statistics once per quiet spell; every tenth second the same line is logged anyway. */
@@ -591,7 +627,12 @@ static void handle_eapol(const u8 *p, unsigned len) {
 /* ---- association results ---- */
 static void on_mgmt(struct sk_buff *skb) {
   struct ieee80211_mgmt *m = (void *)skb->data; u16 fc = le16_to_cpu(m->frame_control);
-  if (memcmp(m->sa, C.ap.bssid, 6)) return;
+  if(skb->len<24 || memcmp(m->sa,C.ap.bssid,6) || memcmp(m->bssid,C.ap.bssid,6) ||
+     !rx_destination(m->da) || ieee80211_has_protected(m->frame_control))return;
+  // Authentication and association responses are addressed to this station;
+  // a broadcast deauthentication/disassociation can apply to the whole BSS.
+  if((ieee80211_is_auth(m->frame_control)||ieee80211_is_assoc_resp(m->frame_control)) &&
+     memcmp(m->da,g_vif->addr,6))return;
   if (C.state == NW_STA_AUTH && ieee80211_is_auth(m->frame_control) && skb->len >= 30) {
     u16 status = le16_to_cpu(m->u.auth.status_code), seq = le16_to_cpu(m->u.auth.auth_transaction);
     if (seq != 2) return;
@@ -615,33 +656,70 @@ static void on_mgmt(struct sk_buff *skb) {
     if (C.secure) { C.state = NW_STA_KEYS; lx_log(6, "wifi: associated, waiting for the key handshake"); }
     else finish_authorized();
     return; }
-  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH) {
+  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH && skb->len >= 26) {
     u16 reason = le16_to_cpu(m->u.deauth.reason_code); lx_log(4, "wifi: access point ended the connection: reason %u (%s)", reason, tx_reasons()); nw_wifi_htt_stats(8);
     if (C.state == NW_STA_UP) { teardown(1, reason); } else connect_done(NW_RES_REJECTED); }
   (void)fc; }
 void nw_sta_rx(struct sk_buff *skb) {
-  { struct ieee80211_rx_status *rs = IEEE80211_SKB_RXCB(skb);
-    if (rs->flag & RX_FLAG_8023) {   /* the hardware already made an Ethernet frame of it */
-      nw_wifi_stats.frames++;
-      if (skb->len >= 14 && !(skb->data[12] == 0x88 && skb->data[13] == 0x8e) && C.state >= NW_STA_KEYS && g_ev.rx) g_ev.rx(skb->data, skb->len);
-      return; } }
+  if(!skb||!g_vif)return;
+  struct ieee80211_rx_status *rs=IEEE80211_SKB_RXCB(skb);
+  // This shim replaces mac80211 RX, so its station admission checks are not
+  // performed elsewhere. HTT explicitly marks extra management as monitor-only.
+  if(rs->flag&(RX_FLAG_FAILED_FCS_CRC|RX_FLAG_FAILED_PLCP_CRC|RX_FLAG_MMIC_ERROR|RX_FLAG_ONLY_MONITOR))return;
+  if(rs->flag&RX_FLAG_8023) {
+    // The present ath10k SNOC path reconstructs 802.11; retain a correct path
+    // for drivers that supply Ethernet. Its metadata must still identify
+    // successful hardware decryption before data on a secure link is admitted.
+    if(skb->len<14||skb->len>2014||C.state<NW_STA_AUTH||!rx_destination(skb->data))return;
+    nw_wifi_stats.frames++;
+    if(skb->data[12]==0x88&&skb->data[13]==0x8e) {
+      if(C.secure&&!memcmp(skb->data,g_vif->addr,6)&&!memcmp(skb->data+6,C.ap.bssid,6)) {
+        if(skb->len>=113)g_current_link_frames++;
+        handle_eapol(skb->data+14,skb->len-14);
+      }
+      return;
+    }
+    if(C.state==NW_STA_UP&&(!C.secure||(rs->flag&RX_FLAG_DECRYPTED))&&g_ev.rx) {
+      g_current_link_frames++;g_ev.rx(skb->data,skb->len);
+    }
+    return;
+  }
   if (skb->len < 24) return; nw_wifi_stats.frames++;
   struct ieee80211_hdr *h = (void *)skb->data;
-  if (ieee80211_is_beacon(h->frame_control) || ieee80211_is_probe_resp(h->frame_control)) { nw_wifi_stats.beacons++; static int n; if (n < 12) lx_log(6, "wifi: beacon %d: %u bytes", ++n, skb->len); note_bss(skb); return; }
+  if (ieee80211_is_beacon(h->frame_control) || ieee80211_is_probe_resp(h->frame_control)) {
+    nw_wifi_stats.beacons++;static int n;if(n<12)lx_log(6,"wifi: beacon %d: %u bytes",++n,skb->len);
+    if(skb->len>=36&&C.state>=NW_STA_AUTH&&!memcmp(h->addr2,C.ap.bssid,6)&&!memcmp(h->addr3,C.ap.bssid,6))g_current_link_frames++;
+    note_bss(skb);return;
+  }
   if (C.state < NW_STA_AUTH) return;
   if (ieee80211_is_mgmt(h->frame_control)) { on_mgmt(skb); return; }
-  if (ieee80211_is_data(h->frame_control) && !memcmp(h->addr2, C.ap.bssid, 6)) {
+  if (ieee80211_is_data(h->frame_control) && ieee80211_has_fromds(h->frame_control) &&
+      !ieee80211_has_tods(h->frame_control) && !memcmp(h->addr2,C.ap.bssid,6) && rx_destination(h->addr1)) {
+    // Fragment reassembly is not implemented in this minimal station. Never
+    // hand an individual fragment to the OS as if it were a complete Ethernet frame.
+    if(ieee80211_has_morefrags(h->frame_control)||(le16_to_cpu(h->seq_ctrl)&15))return;
+    if(ieee80211_has_protected(h->frame_control)&&!(rs->flag&RX_FLAG_DECRYPTED))return;
     unsigned hl = ieee80211_hdrlen(h->frame_control); struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb);
     if (ieee80211_has_protected(h->frame_control) && !(st->flag & RX_FLAG_IV_STRIPPED)) hl += 8;
-    if (skb->len >= hl + 8 && skb->data[hl + 6] == 0x88 && skb->data[hl + 7] == 0x8e && skb->data[hl] == 0xaa) { if (C.secure) handle_eapol(skb->data + hl + 8, skb->len - hl - 8); return; }
-    if (C.state == NW_STA_UP || (C.state == NW_STA_KEYS && C.ptk_key)) to_eth(skb); } }
+    if (skb->len >= hl + 8 && rx_snap(skb->data+hl) && !skb->data[hl+5] &&
+        skb->data[hl+6]==0x88 && skb->data[hl+7]==0x8e) {
+      if(C.secure&&!memcmp(h->addr1,g_vif->addr,6)) {
+        if(skb->len-hl-8>=99)g_current_link_frames++;
+        handle_eapol(skb->data+hl+8,skb->len-hl-8);
+      }
+      return;
+    }
+    if(C.state==NW_STA_UP&&(!C.secure||(rs->flag&RX_FLAG_DECRYPTED))&&skb->len>=hl+8&&
+       skb->len-hl-8<=2000&&rx_snap(skb->data+hl)) {g_current_link_frames++;to_eth(skb);} } }
 
 /* ---- the connection's life ---- */
 static void connect_done(int res) {
-  C.result = res; lx_cancel_delayed(&g_timer);
+  C.result = res;
+  if(res==NW_RES_OK)lx_queue_delayed(&g_timer,100);else lx_cancel_delayed(&g_timer);
   if (res != NW_RES_OK) { teardown(0, 0); C.state = NW_STA_IDLE; C.result = res; } nw_wifi_stats.last_err = -res;
-  if (g_ev.connect_done) g_ev.connect_done(res); }
+  connect_request_done(res); }
 static void teardown(int notify_lost, int reason) {
+  __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);purge_tx_queue();
   if (C.sta) {
     if (C.ptk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, C.sta, C.ptk_key); lx_free(C.ptk_key); C.ptk_key = 0; }
     for (int i=0;i<4;i++) if (C.gtk_keys[i]) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.gtk_keys[i]); lx_free(C.gtk_keys[i]); C.gtk_keys[i]=0; }
@@ -676,7 +754,7 @@ static void timer_fn(struct work_struct *w) {
 
 static void start_connect(const struct nw_request *request) {
   if (C.state != NW_STA_IDLE && C.state != NW_STA_SCANNING) {
-    if (g_ev.connect_done) g_ev.connect_done(NW_RES_REJECTED);
+    connect_request_done(NW_RES_REJECTED);
     return;
   }
   struct bss *best = 0;
@@ -714,23 +792,30 @@ static void send_queued(void) {
     if (!it) return;
     if (C.state == NW_STA_UP && it->len >= 14) tx_eth(it->data, it->len);
     lx_free(it); } }
-int nw_sta_tx_pending(void) { return g_txq_n != 0; }
+int nw_sta_tx_pending(void) { lock();int pending=g_txq_n!=0;unlock();return pending; }
 int nw_wifi_tx(const uint8_t *eth, size_t len) {
-  if (!__atomic_load_n(&g_radio_enabled, __ATOMIC_ACQUIRE)) return -19;
-  if (len < 14 || len > 2000) return -1; if (g_txq_n >= 128) return -2;
+  if (!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)||!__atomic_load_n(&g_link_authorized,__ATOMIC_ACQUIRE))return -ENETDOWN;
+  if (!eth || len < 14 || len > 2000) return -EINVAL;
   struct txq_item *it = lx_plat->alloc(sizeof *it + len); if (!it) return -3; it->len = len; it->next = 0; memcpy(it->data, eth, len);
-  lock(); if (g_txq_tail) g_txq_tail->next = it; else g_txq_head = it; g_txq_tail = it; g_txq_n++; unlock(); return 0; }
+  lock();
+  if(!__atomic_load_n(&g_link_authorized,__ATOMIC_ACQUIRE)||!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)||g_txq_n>=128) {
+    int error=g_txq_n>=128?-ENOBUFS:-ENETDOWN;unlock();lx_free(it);return error;
+  }
+  if (g_txq_tail) g_txq_tail->next = it; else g_txq_head = it; g_txq_tail = it; g_txq_n++; unlock(); return 0; }
 
 /* ---- requests from the board ---- */
 void nw_wifi_set_events(const struct nw_wifi_events *ev) { if (ev) g_ev = *ev; else memset(&g_ev, 0, sizeof g_ev); }
 int nw_wifi_power(int on) {
-  lock(); secure_zero(g_req.pass, sizeof g_req.pass); memset(&g_req, 0, sizeof(g_req));
+  if(!__atomic_load_n(&g_station_ready,__ATOMIC_ACQUIRE))return -ENODEV;
+  lock();int e=request_begin_locked(REQ_POWER);if(e){unlock();return e;}
+  memset(&g_req, 0, sizeof(g_req));
   g_req.kind = REQ_POWER; g_req.power_on = !!on; unlock(); return 0;
 }
 int nw_wifi_scan_ex(const struct nw_wifi_scan_request *request) {
   if (!request || request->ssid_len > 32 || request->frequency_count > 64) return -1;
   if (!__atomic_load_n(&g_radio_enabled, __ATOMIC_ACQUIRE)) return -19;
-  lock(); secure_zero(g_req.pass, sizeof g_req.pass); memset(&g_req, 0, sizeof(g_req));
+  lock();int e=request_begin_locked(REQ_SCAN);if(e){unlock();return e;}
+  memset(&g_req, 0, sizeof(g_req));
   g_scan_request = *request; g_req.kind = REQ_SCAN; unlock(); return 0;
 }
 int nw_wifi_scan(const uint8_t *ssid, size_t len) {
@@ -745,39 +830,51 @@ int nw_wifi_connect(const uint8_t *ssid, size_t len, const uint8_t *bssid, const
   if (len > 32 || (!ssid && len) || plen > 64 || (!pass && plen)) return -1;
   if (pass && plen < 8) return -1;
   if (pass && plen == 64) for(size_t i=0;i<64;i++) if(hex_nibble(pass[i])<0) return -1;
-  lock(); secure_zero(g_req.pass, sizeof g_req.pass); memset(&g_req, 0, sizeof(g_req));
+  lock();int e=request_begin_locked(REQ_CONNECT);if(e){unlock();return e;}
+  memset(&g_req, 0, sizeof(g_req));
   g_req.kind = REQ_CONNECT; g_req.ssid_len = len; if (len) memcpy(g_req.ssid, ssid, len);
   g_req.has_bssid = bssid != 0; if (bssid) memcpy(g_req.bssid, bssid, 6); g_req.has_pass = pass != 0; g_req.pass_len = pass ? plen : 0; if (pass) memcpy(g_req.pass, pass, plen); unlock(); return 0; }
 void nw_wifi_disconnect(void) {
-  lock(); secure_zero(g_req.pass, sizeof g_req.pass); memset(&g_req, 0, sizeof(g_req));
-  g_req.kind = REQ_DISCONNECT; unlock();
+  lock();g_disconnect_requested=1;unlock();
 }
 void nw_wifi_status_get(struct nw_wifi_status *st) {
   memset(st, 0, sizeof *st); st->state = C.state; st->result = C.result; if (g_vif) memcpy(st->mac, g_vif->addr, 6);
   if (C.state >= NW_STA_AUTH) { memcpy(st->bssid, C.ap.bssid, 6); st->ssid_len = C.ssid_len; memcpy(st->ssid, C.ssid, 32); st->freq_mhz = C.ap.freq; st->signal_dbm = C.ap.signal; }
   if (g_hw) for (int b = 0; b < NUM_NL80211_BANDS; b++) if (g_hw->wiphy->bands[b]) st->channels += g_hw->wiphy->bands[b]->n_channels; }
+static void cancel_connect_request(void) {
+  secure_zero(&g_pending_connect,sizeof(g_pending_connect));g_has_pending_connect=g_connect_waits=0;
+  if(request_active(REQ_CONNECT)) {
+    if(C.state>=NW_STA_AUTH&&C.state!=NW_STA_UP)connect_done(NW_RES_FAILED);
+    else connect_request_done(NW_RES_FAILED);
+  }
+}
 void nw_sta_run(void) {
-  int kind, requested_power; struct nw_wifi_scan_request scan; struct nw_request request;
+  int kind, requested_power,canceled=REQ_NONE; struct nw_wifi_scan_request scan; struct nw_request request;
   memset(&request, 0, sizeof(request));
   lock(); kind = g_req.kind; requested_power = g_req.power_on; request = g_req;
   if (kind == REQ_SCAN) scan = g_scan_request;
+  if(g_disconnect_requested){g_disconnect_requested=0;canceled=kind;kind=REQ_DISCONNECT;}
   secure_zero(g_req.pass, sizeof(g_req.pass));
   memset(&g_req, 0, sizeof(g_req)); g_req.kind = REQ_NONE; unlock();
+  if(canceled==REQ_SCAN)scan_request_done(NW_RES_FAILED);
+  else if(canceled==REQ_CONNECT)connect_request_done(NW_RES_FAILED);
+  else if(canceled==REQ_POWER&&request_finish(REQ_POWER)&&g_ev.power_done)g_ev.power_done(request.power_on,NW_RES_FAILED);
   if (g_vif) {
     if (kind == REQ_POWER) {
       int on = requested_power;
       if (!on) {
-        secure_zero(g_pending_connect.pass, sizeof(g_pending_connect.pass));
-        memset(&g_pending_connect, 0, sizeof(g_pending_connect)); g_has_pending_connect = 0; g_connect_waits = 0;
-        if (g_scan_running) g_ops->cancel_hw_scan(g_hw, g_vif);
+        __atomic_store_n(&g_radio_enabled,0,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);
+        cancel_connect_request();
         if (C.state >= NW_STA_AUTH) teardown(0, 0);
+        purge_tx_queue();lx_cancel_delayed(&g_timer);
         C.state = NW_STA_OFF;
-        __atomic_store_n(&g_radio_enabled, 0, __ATOMIC_RELEASE);
+        if (g_scan_running) g_ops->cancel_hw_scan(g_hw, g_vif);
       } else {
         __atomic_store_n(&g_radio_enabled, 1, __ATOMIC_RELEASE);
-        C.state = NW_STA_IDLE;
+        if(C.state==NW_STA_OFF)C.state=NW_STA_IDLE;
       }
-      if (g_ev.power_done) g_ev.power_done(on, NW_RES_OK);
+      if(request_finish(REQ_POWER)&&g_ev.power_done)g_ev.power_done(on,NW_RES_OK);
     }
     else if (kind == REQ_SCAN) do_scan(&scan);
     else if (kind == REQ_CONNECT && g_scan_running) {   /* the radio leaves the channel while it scans: the join waits for its end */
@@ -794,45 +891,74 @@ void nw_sta_run(void) {
       }
     }
     else if (kind == REQ_DISCONNECT) {
-      secure_zero(g_pending_connect.pass, sizeof(g_pending_connect.pass));
-      memset(&g_pending_connect, 0, sizeof(g_pending_connect)); g_has_pending_connect = 0; g_connect_waits = 0;
+      cancel_connect_request();
+      if (C.state >= NW_STA_AUTH)teardown(0,0);
+      __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);purge_tx_queue();lx_cancel_delayed(&g_timer);
+      C.state=__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)?NW_STA_IDLE:NW_STA_OFF;
       if (g_scan_running) g_ops->cancel_hw_scan(g_hw, g_vif);
-      if (C.state >= NW_STA_AUTH) { teardown(0, 0); C.state = NW_STA_IDLE; }
       if (g_ev.disconnect_done) g_ev.disconnect_done(NW_RES_OK);
     }
-    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); }
+    if (C.state == NW_STA_UP) send_queued(); }
   secure_zero(request.pass, sizeof(request.pass));
 }
 /* The firmware's beacon miss while connected is held for 5 s, the way the wireless stack probes the access point first: frames that still arrive
  * in that time keep the connection (a few missed beacons on a busy channel). */
 void nw_sta_link_lost(void) {
-  if (C.state == NW_STA_UP) { if (!C.bmiss_at) { C.bmiss_at = lx_now_ms(); C.bmiss_frames = nw_wifi_stats.frames; lx_log(6, "wifi: beacon miss reported, waiting 5 s for frames"); } return; }
-  if (C.state >= NW_STA_AUTH) teardown(1, 0); }
+  if (C.state == NW_STA_UP) { if (!C.bmiss_at) { C.bmiss_at = lx_now_ms(); C.bmiss_frames = g_current_link_frames; lx_log(6, "wifi: beacon miss reported, waiting 5 s for frames"); } return; }
+  if(C.state>=NW_STA_AUTH) {if(request_active(REQ_CONNECT))connect_done(NW_RES_REJECTED);else teardown(1,0);} }
 static void beacon_miss_check(u64 now) {
   if (!C.bmiss_at) return;
-  if (nw_wifi_stats.frames - C.bmiss_frames >= 2) { lx_log(6, "wifi: beacon miss, but %u frames arrived: staying", nw_wifi_stats.frames - C.bmiss_frames); C.bmiss_at = 0; return; }
+  if (g_current_link_frames - C.bmiss_frames >= 2) { lx_log(6, "wifi: beacon miss, but %u frames arrived from this AP: staying", g_current_link_frames - C.bmiss_frames); C.bmiss_at = 0; return; }
   if (now - C.bmiss_at >= 5000) { lx_log(4, "wifi: beacon miss and nothing received for 5 s: link lost"); C.bmiss_at = 0; teardown(1, 0); } }
+static void release_station_setup(void) {
+  if(g_vif) {
+    if(g_vif_added) {nw_wifi_vif_del(g_vif);g_ops->remove_interface(g_hw,g_vif);}
+    lx_free(g_vif);g_vif=0;
+  }
+  g_vif_added=false;
+  if(g_hw_started) {g_hw_started=false;g_ops->stop(g_hw,false);}
+  g_hw=0;g_ops=0;
+}
+static void station_setup_failed(int error,const char *where) {
+  nw_wifi_stats.last_err=error;
+  __atomic_store_n(&g_station_ready,0,__ATOMIC_RELEASE);__atomic_store_n(&g_radio_enabled,0,__ATOMIC_RELEASE);
+  __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);
+  lx_log(3,"wifi: %s failed: %d",where,error);release_station_setup();C.state=NW_STA_OFF;
+}
 void nw_sta_ready(struct ieee80211_hw *hw) {
-  int r; g_hw = hw; g_ops = nw_wifi_ops(); nw_wifi_stats.stage = 3;
-  r = g_ops->start(hw); if (r) { lx_log(3, "wifi: start failed: %d", r); nw_wifi_stats.last_err = r; return; }
-  g_vif = lx_alloc(sizeof *g_vif + hw->vif_data_size + 64, 1); if (!g_vif) return;
+  if(g_hw_started||g_vif) {nw_wifi_stats.last_err=-EBUSY;return;}
+  int r;g_hw=hw;g_ops=nw_wifi_ops();nw_wifi_stats.stage=3;nw_wifi_stats.last_err=0;
+  if(!hw||!hw->wiphy||!g_ops||!g_ops->start||!g_ops->stop||!g_ops->add_interface||!g_ops->remove_interface) {
+    station_setup_failed(-EINVAL,"station callbacks");return;
+  }
+  r=g_ops->start(hw);if(r) {station_setup_failed(r,"start");return;}
+  g_hw_started=true;
+  g_vif=lx_alloc(sizeof *g_vif+hw->vif_data_size+64,1);
+  if(!g_vif) {station_setup_failed(-ENOMEM,"interface allocation");return;}
   g_vif->type = NL80211_IFTYPE_STATION; g_vif->bss_conf.vif = g_vif; g_vif->bss_conf.link_id = 0; g_vif->link_conf[0] = &g_vif->bss_conf;
   memcpy(g_vif->addr, hw->wiphy->perm_addr, 6); g_vif->addr_valid = true; memcpy(g_vif->bss_conf.addr, hw->wiphy->perm_addr, 6); g_vif->bss_conf.bssid = g_no_bssid;   /* a link's own address: the driver makes its vdev with it */ g_vif->cab_queue = IEEE80211_INVAL_HW_QUEUE;
   for (int i = 0; i < IEEE80211_NUM_ACS; i++) g_vif->hw_queue[i] = IEEE80211_INVAL_HW_QUEUE;
   g_vif->offload_flags = 0; /* ath10k station uses native 802.11 frames */
-  r = g_ops->add_interface(hw, g_vif); if (r) { lx_log(3, "wifi: add interface failed: %d", r); nw_wifi_stats.last_err = r; return; }
+  r=g_ops->add_interface(hw,g_vif);if(r) {station_setup_failed(r,"add interface");return;}
+  g_vif_added=true;
   nw_wifi_vif_add(g_vif); nw_wifi_stats.stage = 4; C.state = NW_STA_IDLE;
+  __atomic_store_n(&g_radio_enabled,1,__ATOMIC_RELEASE);__atomic_store_n(&g_station_ready,1,__ATOMIC_RELEASE);
+  __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);
   INIT_DELAYED_WORK(&g_timer, timer_fn);
   g_req.kind = REQ_NONE; }   /* scanning is requested by the OS station interface */
 
 /* guamp lifecycle: stop userspace-facing station while firmware still answers. */
 void gw_sta_shutdown(void) {
+  __atomic_store_n(&g_station_ready,0,__ATOMIC_RELEASE);__atomic_store_n(&g_radio_enabled,0,__ATOMIC_RELEASE);
+  __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);purge_tx_queue();
   cancel_delayed_work_sync(&g_timer); cancel_delayed_work_sync(&g_scan_timer);
-  if (g_vif) {
-    teardown(0,0); nw_wifi_vif_del(g_vif);
-    g_ops->remove_interface(g_hw,g_vif); lx_free(g_vif); g_vif=0;
-  }
-  if (g_hw && g_ops) g_ops->stop(g_hw,false);
+  if(g_vif&&g_scan_running)g_ops->cancel_hw_scan(g_hw,g_vif);
+  g_scan_running=0;scan_request_done(NW_RES_FAILED);cancel_connect_request();
+  lock();int power_on=g_req.power_on,disconnect=g_disconnect_requested;g_disconnect_requested=0;unlock();
+  if(request_finish(REQ_POWER)&&g_ev.power_done)g_ev.power_done(power_on,NW_RES_FAILED);
+  if(disconnect&&g_ev.disconnect_done)g_ev.disconnect_done(NW_RES_FAILED);
+  if(g_vif_added)teardown(0,0);
+  release_station_setup();
   volatile unsigned char *p=(volatile unsigned char *)&C;
   for (size_t i=0;i<sizeof C;i++) p[i]=0;
   p=(volatile unsigned char *)&g_req;
@@ -842,5 +968,6 @@ void gw_sta_shutdown(void) {
   p=(volatile unsigned char *)&g_scan_request;
   for (size_t i=0;i<sizeof g_scan_request;i++) p[i]=0;
   g_has_pending_connect=0; g_connect_waits=0;
+  g_request_inflight=0;g_disconnect_requested=0;
   g_hw=0; g_ops=0;
 }

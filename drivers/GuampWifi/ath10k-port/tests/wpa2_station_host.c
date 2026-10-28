@@ -13,13 +13,14 @@
 
 struct nw_wifi_stats nw_wifi_stats; unsigned int ath12k_debug_mask;
 static u64 g_ms; static int fails;
+static int g_fail_next_alloc;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL: " __VA_ARGS__); printf("\n"); fails++; } else if (getenv("V")) { printf("ok:   " __VA_ARGS__); printf("\n"); } } while (0)
 static u64 p_now(void) { return g_ms; }
 static void p_sleep(unsigned ms) { g_ms += ms; }
 static void p_poll(void) {}
 static void p_log(int l, const char *s) { if (getenv("V") || l <= 3) printf("[%d %llu] %s\n", l, (unsigned long long)g_ms, s); }
 static void p_halt(void) { abort(); }
-static void *p_alloc(size_t n) { return malloc(n); }
+static void *p_alloc(size_t n) { if(g_fail_next_alloc){g_fail_next_alloc--;return NULL;}return malloc(n); }
 static void p_free(void *p) { free(p); }
 static void *p_dma_alloc(size_t n, uint64_t *b) { void *p = calloc(1, n + 64); *b = (uint64_t)p; return p; }
 static void p_dma_free(size_t n, void *p, uint64_t b) { (void)n; (void)b; free(p); }
@@ -93,8 +94,11 @@ static void send_rekey_msg1(void) { g_replay++; for(int i=0;i<32;i++) g_anonce[i
 /* ---- the fake driver ---- */
 static int n_tx, n_setkey, n_state, n_disable_group, n_disable_pairwise, g_expect_gtk_id=1, g_fail_pairwise, g_fail_group; static int g_states[8]; static struct ieee80211_key_conf *g_pk, *g_gk; static struct sk_buff *g_last_data, *g_pending_m2_skb, *g_pending_m4_skb;
 static u8 g_auth_seen, g_assoc_seen, g_msg2_seen, g_msg4_seen; static int g_scan_req, g_scan_ssids, g_scan_duration, g_scan_result, g_msg4_tx_count, g_group_m4_count; static u32 g_scan_first_freq;
-static int op_start(struct ieee80211_hw *hw) { (void)hw; return 0; }
-static int op_add_if(struct ieee80211_hw *hw, struct ieee80211_vif *v) { (void)hw; (void)v; return 0; }
+static int g_ready_start_error,g_ready_add_error,n_ready_starts,n_ready_stops,n_ready_adds,n_ready_removes;
+static int op_start(struct ieee80211_hw *hw) { (void)hw;n_ready_starts++;return g_ready_start_error; }
+static void op_stop(struct ieee80211_hw *hw,bool suspend) { (void)hw;(void)suspend;n_ready_stops++; }
+static int op_add_if(struct ieee80211_hw *hw, struct ieee80211_vif *v) { (void)hw;(void)v;n_ready_adds++;return g_ready_add_error; }
+static void op_remove_if(struct ieee80211_hw *hw,struct ieee80211_vif *v) { (void)hw;(void)v;n_ready_removes++; }
 static int op_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *v, struct ieee80211_scan_request *r) { (void)hw; (void)v; g_scan_req = r->req.n_channels; g_scan_ssids=r->req.n_ssids; g_scan_duration=r->req.duration; g_scan_first_freq=g_scan_req?r->req.channels[0]->center_freq:0; return 0; }
 static void op_cancel_scan(struct ieee80211_hw *hw, struct ieee80211_vif *v) { (void)hw; (void)v; nw_sta_scan_done(true); }
 static int op_add_ctx(struct ieee80211_hw *hw, struct ieee80211_chanctx_conf *c) { (void)hw; CHECK(c->def.chan->center_freq == 2437, "chanctx on the AP's channel"); return 0; }
@@ -135,7 +139,7 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     else if (info == 0x0302) { g_group_m4_count++; CHECK(check_mic(k,n),"group-key message 2 MIC verifies"); } }
   else if (ieee80211_is_data(h->frame_control)) { if (g_last_data) kfree_skb(g_last_data); g_last_data = skb; (void)fc; return; }
   kfree_skb(skb); }
-static const struct ieee80211_ops ops = { .start = op_start, .add_interface = op_add_if, .hw_scan = op_hw_scan, .cancel_hw_scan = op_cancel_scan, .add_chanctx = op_add_ctx, .remove_chanctx = op_rm_ctx,
+static const struct ieee80211_ops ops = { .start=op_start,.stop=op_stop,.add_interface=op_add_if,.remove_interface=op_remove_if,.hw_scan = op_hw_scan, .cancel_hw_scan = op_cancel_scan, .add_chanctx = op_add_ctx, .remove_chanctx = op_rm_ctx,
   .assign_vif_chanctx = op_assign, .unassign_vif_chanctx = op_unassign, .sta_state = op_state, .bss_info_changed = op_link, .set_key = op_setkey, .tx = op_tx };
 
 static int g_scan_done, g_conn_done = -1, g_rx_n; static u8 g_rx_eth[200]; static size_t g_rx_len;
@@ -156,6 +160,9 @@ static void complete_tx(struct sk_buff **pending, bool acked) {
   struct ieee80211_tx_status status; memset(&status,0,sizeof status); status.skb=skb; ieee80211_tx_status_ext(0,&status);
 }
 static void spin(int ms) { for (int i = 0; i < ms; i++) { nw_sta_run(); lx_pump(); g_ms++; } }
+#include "wpa2_rx_cases.inc"
+#include "wpa2_control_cases.inc"
+#include "wpa2_ready_cases.inc"
 
 int main(void) {
   lx_plat = &plat; lx_root_init();
@@ -195,6 +202,7 @@ int main(void) {
   g_right = 1; g_conn_done = -1; g_stage = 0; n_state = 0; n_setkey = 0; g_msg2_seen = g_msg4_seen = 0; g_msg4_tx_count = 0;
   nw_wifi_connect((const u8 *)SSID, strlen(SSID), 0, pskhex, 64); spin(500);
   CHECK(g_msg4_seen && g_conn_done == -1 && n_setkey == 0, "message 4 alone does not authorize or install keys before TX completion");
+  rx_regression_unauthorized();
   complete_tx(&g_pending_m2_skb,true);
   CHECK(g_conn_done == -1 && n_setkey == 0, "a late ACK for message 2 cannot complete message 4");
   complete_tx(&g_pending_m4_skb,false);
@@ -206,6 +214,7 @@ int main(void) {
   CHECK(g_conn_done == NW_RES_OK, "connected (%d)", g_conn_done); CHECK(n_setkey == 2, "two keys installed (%d)", n_setkey);
   CHECK(n_state >= 4 && g_states[0] == IEEE80211_STA_NONE && g_states[n_state - 1] == IEEE80211_STA_AUTHORIZED, "station state ends authorized");
   struct nw_wifi_status st; nw_wifi_status_get(&st); CHECK(st.state == NW_STA_UP && st.freq_mhz == 2437, "status says up");
+  rx_regression_secure_up();
   /* Group rekey: corrupt MIC must not install; same valid replay is accepted once. */
   { static const u8 gtk2[16]={0xb0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}; memcpy(g_ap_gtk,gtk2,16); g_ap_gtk_id=2; g_expect_gtk_id=2;
     send_group_update(1); CHECK(n_setkey==2 && g_group_m4_count==0,"invalid group-key MIC is ignored");
@@ -242,9 +251,12 @@ int main(void) {
   nw_wifi_disconnect(); spin(5); CHECK(n_disable_group==2 && n_disable_pairwise>=1,"disconnect releases every active GTK slot and PTK"); g_open = 1; beacon(); g_conn_done = -1; n_state = 0;
   nw_wifi_connect((const u8 *)SSID, strlen(SSID), 0, 0, 0); spin(3000);
   CHECK(g_conn_done == NW_RES_OK, "open network connects (%d)", g_conn_done);
+  rx_regression_open_up();
   nw_wifi_power(0); spin(3); nw_wifi_status_get(&st);
   CHECK(st.state==NW_STA_OFF && g_power_done==1 && g_power_on==0 && g_power_result==NW_RES_OK,"software radio-off disconnects and acknowledges");
   CHECK(nw_wifi_scan(0,0)<0 && nw_wifi_tx(eth,27)<0,"station scan and TX are rejected while radio is disabled");
   nw_wifi_power(1); spin(3); nw_wifi_status_get(&st);
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
+  control_regression_cases();
+  ready_regression_cases(hw);
   printf("%s\n", fails ? "FAILED" : "all passed"); return fails ? 1 : 0; }

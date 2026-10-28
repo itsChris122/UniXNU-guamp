@@ -14,9 +14,12 @@ parser.add_argument('--verified-root', action='store_true', help='Authenticate a
 parser.add_argument('--verified-root-bundle', action='store_true', help='Select exactly one capacity-matching policy per device, then independently authenticate it')
 parser.add_argument('--negative-verified-block', action='store_true', help='Negative own-buffer control: corrupt only the completed DMA snapshot')
 parser.add_argument('--wifi-runtime', action='store_true', help='guamp NativeEmmc: GUAMP_WIFI_RUNTIME=1 plus the SM6115/WCN3990 provider (drivers/GuampWifi) in the same archive; still opt-in at boot (guamp-wifi-start=1)')
+parser.add_argument('--wifi-redwood', action='store_true', help='with --wifi-runtime: GUAMP_WIFI_REDWOOD=1, Wi-Fi mode 2 (iOS station, en0, Apple80211 ioctls, GuampWLAN registry entries); still opt-in at boot (guamp-wifi-start=2)')
 args = parser.parse_args()
 if args.wifi_runtime and args.component != 'NativeEmmc':
     parser.error('The Wi-Fi runtime is part of NativeEmmc')
+if args.wifi_redwood and not args.wifi_runtime:
+    parser.error('Wi-Fi mode 2 (--wifi-redwood) is built on the Wi-Fi runtime (--wifi-runtime)')
 if args.verified_root_bundle and not args.verified_root:
     parser.error('A policy bundle requires verified block mode')
 if args.verified_root_bundle and args.negative_verified_block:
@@ -93,6 +96,9 @@ if args.wifi_runtime:
     # Same C++ flags for NativeEmmc.cpp and the two provider objects: one definition of every shared inline
     # (guampwifi::Rpm becomes the shared-client variant in all of them, see GuampWifiRpm.inc).
     command += ['-DGUAMP_WIFI_RUNTIME=1', '-I', str(wifi / 'integration'), '-I', str(source.parent)]
+if args.wifi_redwood:
+    # Mode 2 in the same three C++ objects: the runtime's iOS worker, NativeEmmc's GuampWlanNub.inc and the Prep start.
+    command += ['-DGUAMP_WIFI_REDWOOD=1', '-I', str(wifi / 'ios')]
 (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
 result = subprocess.run(command, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 (out / 'compile.log').write_text(result.stdout)
@@ -104,7 +110,7 @@ if args.wifi_runtime:
     # the ath10k port (vendored Linux ath10k + NativeWifi shim, see drivers/GuampWifi/ath10k-port) with the kernel's C
     # code-generation flags (bsd_init recipe) but their own freestanding headers: the recipe's include paths, defines,
     # -include, -std and warning flags are dropped, the Linux sources are compiled with -w (third-party code, as Codex's
-    # prepara-ath10k.py). iOS mode 2 (guamp_xnu_station.c, GUAMP_WIFI_REDWOOD) is deliberately not built.
+    # prepara-ath10k.py). iOS mode 2 (guamp_xnu_station.c, GUAMP_WIFI_REDWOOD) is built only with --wifi-redwood, below.
     for name in ('guamp_xnu_sm6115_runtime', 'guamp_xnu_dma'):
         target = out / (name + '.o')
         cxx = [str(wifi / 'integration' / (name + '.cpp')) if value == str(source) else value for value in command]
@@ -153,6 +159,39 @@ if args.wifi_runtime:
             raise SystemExit(str(path) + ':\n' + run.stdout[-3500:])
         objects.append(target)
     (out / 'compile-ath10k-flags.json').write_text(json.dumps(codegen + ath_flags, indent=2) + '\n')
+if args.wifi_redwood:
+    # Mode 2, C side: the station bridge (drivers/GuampWifi/integration/guamp_xnu_station.c) and the en0 / station /
+    # Apple80211 layer it is written against (drivers/GuampWifi/ios, from HakiOS, APSL). XNU code: the bsd_init recipe
+    # with its own include paths, defines and -include, but at the public KPI level (the XNU/BSD private defines are
+    # undone, so kalloc and the lock groups are the exported functions and nothing lands in XNU's startup sections), with
+    # -std=gnu11 and the NativeEmmc warning set under -Werror; LTO, dependency and warning flags of the recipe dropped.
+    xnu_c, index = [], 0
+    while index < len(c_arguments):
+        value = c_arguments[index]
+        if value == c_record['file']:
+            pass
+        elif value in ('-o', '-MF', '-MJ', '-MT', '-MQ'):
+            index += 1
+        elif value == '-Xclang' and index + 1 < len(c_arguments) and c_arguments[index + 1].startswith('-W'):
+            index += 1
+        elif value.startswith(('-W', '-std=', '-flto')) or value in ('-MD', '-MP', '-MMD', '-w', '-c'):
+            pass
+        else:
+            xnu_c.append(value)
+        index += 1
+    xnu_c += ['-std=gnu11', '-UXNU_KERNEL_PRIVATE', '-UBSD_KERNEL_PRIVATE', '-UDRIVER_PRIVATE', '-UMACH_KERNEL_PRIVATE',
+              '-Wall', '-Wextra', '-Werror', '-Wno-error=unknown-warning-option', '-Wno-unused-parameter',
+              '-I', str(wifi / 'ios'), '-I', str(wifi / 'integration')]
+    for path in [wifi / 'integration/guamp_xnu_station.c'] + [wifi / 'ios' / (name + '.c') for name in (
+            'guamp_net', 'guamp_sta', 'guamp_apple80211')]:
+        target = out / ('redwood-' + path.stem + '.o')
+        run = subprocess.run(xnu_c + ['-c', str(path), '-o', str(target)], cwd=c_record['directory'],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        (out / ('compile-redwood-' + path.stem + '.log')).write_text(run.stdout)
+        if run.returncode:
+            raise SystemExit(str(path) + ':\n' + run.stdout[-3500:])
+        objects.append(target)
+    (out / 'compile-redwood-flags.json').write_text(json.dumps(xnu_c, indent=2) + '\n')
 for obj in objects:
     data = obj.read_bytes()
     magic, cpu, subtype, kind, count, size = struct.unpack_from('<6I', data)
@@ -187,12 +226,20 @@ if args.wifi_runtime:
     missing = sorted(name for name in undefined - defined.keys()
                      if 'guampwifi' in name or name.startswith(('_guamp_sm6115_', '_gw_snoc_', '_nw_wifi_', '_guamp_rpm_shared_',
                                                                     '_guamp_wifi_firmware_', '_guamp_ath10k_', '_lx_', '_gGuampXnuDma',
-                                                                    '_guamp_smem_hwlock_')))
+                                                                    '_guamp_smem_hwlock_', '_hakios_', '_guamp_xnu_wifi_',
+                                                                    '_guamp_wlan_', '_guamp_sta_', '_guamp_apple80211_',
+                                                                    '_guamp_wifi_bsd_')))
     if duplicates or missing or '_strstr' in undefined:
         raise SystemExit(f'Wi-Fi archive symbols: duplicates {duplicates[:20]} missing {missing[:20]} strstr {"_strstr" in undefined}')
+    if args.wifi_redwood and '_guamp_wifi_bsd_network_ready' not in defined:
+        raise SystemExit('Wi-Fi mode 2: the bsd_init hook guamp_wifi_bsd_network_ready is not defined')
     for obj in objects[1:]:
         sections = subprocess.run(['xcrun', 'otool', '-l', obj], capture_output=True, text=True).stdout
         if '__mod_init_func' in sections:
             raise SystemExit(f'Static initialiser in {obj.name}')
-    print(f'NativeEmmc Wi-Fi runtime: {len(objects) - 1} provider/ath10k objects archived, {len(undefined - defined.keys())} kernel imports')
+        # XNU-private startup/kalloc registrations would only work compiled as part of XNU itself
+        if any(name in sections for name in ('__init_entry_set', '__kalloc_type', '__kalloc_var', '__zone_view')):
+            raise SystemExit(f'XNU startup or kalloc registration section in {obj.name}')
+    print(f'NativeEmmc Wi-Fi runtime{" + mode 2 (iOS station)" if args.wifi_redwood else ""}: {len(objects) - 1} '
+          f'provider/ath10k objects archived, {len(undefined - defined.keys())} kernel imports')
 print(f'{component}: -Werror build and actual ARM64/iOS 17 object audit passed')

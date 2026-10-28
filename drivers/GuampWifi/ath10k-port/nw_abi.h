@@ -33,7 +33,11 @@ struct nw_board {
 struct nw_wifi_stats { uint32_t stage, scans, frames, beacons, bss_seen; int last_err; };
 /* ---- station interface, as the board's network code uses it ----
  * Calls may come from any board thread; each only queues a request (or copies a snapshot) and returns. The work runs, and the events below
- * are called, from whichever thread calls nw_wifi_step, so event handlers must not block. */
+ * are called, from whichever thread calls nw_wifi_step, so event handlers must not block.
+ * Scan/connect/power return -EBUSY when another accepted request owns their
+ * completion or the queue slot is occupied. A nonzero return has no callback.
+ * Ethernet TX is accepted only on an authorized association; disconnect and
+ * power-off discard queued frames before a later association can transmit them. */
 struct nw_bss_info {
   uint8_t bssid[6]; uint8_t ssid_len; uint8_t ssid[32];
   uint32_t freq_mhz; int8_t signal_dbm; uint16_t caps, beacon_int; uint32_t age_ms;
