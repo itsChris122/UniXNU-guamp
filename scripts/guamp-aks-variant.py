@@ -16,7 +16,7 @@ import hashlib
 root=Path(__file__).resolve().parents[1]
 path=root/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp'
 PRISTINE='273b030afee897e48c30bc917c4df8a9c4d94a189d073ef80c0e0a15caef82ee'
-FINAL_RECORDED='145d1297b9385ac03b716d12849d18353b781502e347d7de18233ad567aa8437'
+FINAL_RECORDED='200b02f2817be3966e1d9da5593b70d4b5974f8a7521ac390f5c7d1e666730ad'
 raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
 if digest==FINAL_RECORDED:
     print('GuampAks: pinned key-wrap variant already prepared')
@@ -94,6 +94,14 @@ edits=[
   '            if (native_aks_wrap_enabled()) rc = keyOp(selector, args);\n'
   '            break;\n'
   '        default: break;\n'),
+ ('extern "C" uint32_t native_aks_lock_state(void);\n',
+  'extern "C" uint32_t native_aks_lock_state(void);\nextern "C" uint32_t native_aks_state_flags(void);   // guamp-aks-nopass (scripts/guamp-aks-variant.py)\n'),
+ ('constexpr uint64_t kUnlockedSinceBoot = 4;\nconstexpr uint32_t kStateFlags = 4;\n',
+  '// guamp-aks-nopass=1 (default): the keybag state flags come from native_aks_state_flags() = 0x6 (bit 0x2\n// "no passcode" | bit 0x4 "unlocked since boot"); =0 restores the old 0x4-only value (scripts/guamp-aks-variant.py).\n'),
+ ('            if (rc == kIOReturnSuccess) args->scalarOutput[0] = kUnlockedSinceBoot;\n',
+  '            if (rc == kIOReturnSuccess) args->scalarOutput[0] = native_aks_state_flags();\n'),
+ ('    const Entry entries[] = {{"ss", kStateFlags}, {"sls", lockState}, {"sb", 0}, {"sfa", 0}, {"sgs", 0},\n',
+  '    const Entry entries[] = {{"ss", native_aks_state_flags()}, {"sls", lockState}, {"sb", 0}, {"sfa", 0}, {"sgs", 0},\n'),
 ]
 for old,new in edits:
     assert text.count(old)==1,'AKS key-wrap variant: anchor not unique: '+old
