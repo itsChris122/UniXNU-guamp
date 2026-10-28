@@ -32,6 +32,17 @@ clang -std=gnu17 "${IOS[@]}" -I "$SRC" -O1 -S -o "$OUT/abi.s" "$OUT/abi.c"
 paste <(printf '%s\n' GET_INFO START STOP SET_VOLUME SET_ROUTE GET_ROUTE) \
       <(sed -n 's/^[[:space:]]*\.long[[:space:]]\+\([0-9]\+\).*/\1/p' "$OUT/abi.s") |
   while read -r name value; do printf '  GUAMP_AUDIO_%-12s 0x%08x\n' "$name" "$value"; done
+cat > "$OUT/mic.c" <<'C'
+#include "guamp_mic_dev.h"
+const unsigned int mic_numbers[] = {GUAMP_MIC_IOC_INFO, GUAMP_MIC_IOC_START, GUAMP_MIC_IOC_STOP, GUAMP_MIC_IOC_POSITION,
+                                    GUAMP_MIC_IOC_GAIN, GUAMP_MIC_IOC_SET_MIC};
+C
+clang -std=gnu17 "${IOS[@]}" -I "$SRC" -O1 -S -o "$OUT/mic.s" "$OUT/mic.c"
+paste <(printf '%s\n' INFO START STOP POSITION GAIN SET_MIC) \
+      <(sed -n 's/^[[:space:]]*\.long[[:space:]]\+\([0-9]\+\).*/\1/p' "$OUT/mic.s") |
+  while read -r name value; do printf '  GUAMP_MIC_IOC_%-9s 0x%08x\n' "$name" "$value"; done
+KERNEL_MIC="$SRC/../../drivers/NativeEmmc/guamp_mic_dev.h"
+if [ -f "$KERNEL_MIC" ]; then cmp "$SRC/guamp_mic_dev.h" "$KERNEL_MIC" && echo "guamp_mic_dev.h identical to the kernel copy"; fi
 echo "arm64-apple-ios17 syntax: OK"
 
 cat > "$OUT/k.cpp" <<'CXX'

@@ -28,7 +28,7 @@ on a Mac yet, not booted.
 |---|---|---|---|
 | `Speaker` | out 2 ch (`spkr`), in 2 ch silent | volume `vlme` −48…0 dB, mute `mute` | VirtualAudio's built-in speaker port |
 | `Hawking` | in 1 ch silent | — | VirtualAudio's `vhaw` companion VAD (hackios: without it every route stays on the null port) |
-| `Codec` | in 1 ch silent (`micr`) | data source `imic` "Microphone" | built-in microphone port |
+| `Codec` | in 1 ch (`micr`): the built-in microphone from `/dev/guamp-mic` (`guamp_mic_dev.h`, s16 mono 48 kHz; silence without the node) | data source `imic` "Microphone" | built-in microphone port |
 
 Format to the HAL: Float32 interleaved 48 kHz (other rates/formats refused). Clock: `mach_absolute_time()`, zero time stamp
 every 16384 frames, one period per call (NullAudio model), seed bumped on each restart. Unknown properties are logged once

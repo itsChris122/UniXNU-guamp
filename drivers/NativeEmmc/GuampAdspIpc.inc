@@ -32,6 +32,14 @@
 #include "GuampApr.inc"
 #include "GuampAfe.inc"
 #include "GuampAudioHwWeak.inc"
+#ifndef GUAMP_MIC_DEV_INC   // without the microphone glue (host tests of this file): no mic
+namespace micglue {
+inline bool configure() { return false; }
+inline bool enabled() { return false; }
+inline bool receive(const uint8_t *, uint32_t, uint32_t) { return false; }
+inline void service(uint32_t, int (*)(void *, const uint8_t *, uint32_t)) {}
+}  // namespace micglue
+#endif
 
 namespace adspipc {
 
@@ -119,6 +127,7 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
         n, ok ? "ok" : "MALFORMED", ok ? h.srcDomain : 0, ok ? h.srcSvc : 0, ok ? h.srcPort : 0, ok ? h.destDomain : 0,
         ok ? h.destSvc : 0, ok ? h.destPort : 0, ok ? h.token : 0, ok ? h.opcode : 0, bytes);
   if (gLevel < 3 || channel != gApr || !ok) return;
+  if (micglue::receive(p, n, nowMs())) return;   // microphone chain (GuampMicDev.inc): mic token / ASM session 2
   if (h.srcSvc == apr::kSvcAfe && gToneStarted) gTone.receive(p, n, nowMs());
   else gCore.receive(p, n, nowMs());
 }
@@ -240,6 +249,7 @@ void service() {
       gCore.begin(nowMs());
     }
     gCore.step(nowMs());
+    if (micglue::enabled() && gCore.finished() && gCore.stateAnswered) micglue::service(nowMs(), aprSend);
     if (gLevel >= 4 && gCore.finished() && gCore.stateAnswered && !gToneStarted) {
       gToneStarted = true;
       gTone.ctx = nullptr;

@@ -5,10 +5,14 @@
 // of leaving everything on Null_Device:
 //   "Speaker"  stereo output (+ a silent stereo input, the amplifier sense of an iPhone/iPad), volume 'vlme' and mute 'mute'
 //   "Hawking"  one silent input (VirtualAudio's 'vhaw' companion device; J120 has an audio-hawking-device node)
-//   "Codec"    one silent input with a data source selector (VirtualAudio asks for DataSources on the codec input)
+//   "Codec"    one input with a data source selector (VirtualAudio asks for DataSources on the codec input): the
+//              built-in microphone, read from the kernel's /dev/guamp-mic (guamp_mic_dev.h, 48 kHz s16 mono) when it exists
 // Output: when the kernel's /dev/guamp-audio exists (guamp_audio_dev.h), the Speaker mix is converted to s16 48 kHz stereo and
 // written to it (non-blocking, through a small staging FIFO); volume/mute go to the kernel by ioctl, or are applied here when
-// the ioctl is refused. Without the device the output is dropped (null device). Input is always silence (microphone: later).
+// the ioctl is refused. Without the device the output is dropped (null device). Input: the Codec input carries the
+// microphone (/dev/guamp-mic, opened by the Codec's first StartIO, closed by its last StopIO; silence without the node);
+// the Speaker and Hawking inputs stay silent. The Microphone privacy prompt is TCC's (tccd, kTCCServiceMicrophone) for the
+// recording app; nothing here bypasses it.
 // Clock: kRate frames per second of mach_absolute_time(), zero time stamp every kRingFrames frames (GuampAudioCore.h).
 // No Apple code: written from the public macOS AudioServerPlugIn documentation (declarations in GuampAudioServerPlugIn.h).
 // Diagnostics: os_log subsystem "com.guamp.audio" (Initialize, devices, StartIO/StopIO, backend open/close and counters, every
@@ -16,6 +20,8 @@
 #include "GuampAudioServerPlugIn.h"
 #include "GuampAudioCore.h"
 #include "guamp_audio_dev.h"
+#include "GuampMicCore.h"
+#include "guamp_mic_dev.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
@@ -160,6 +166,94 @@ static void backendWrite(const Float32 *mix, UInt32 frames) {
     }
   }
   pthread_mutex_unlock(&gIOLock);
+}
+
+// ---- kernel capture backend (/dev/guamp-mic) ----------------------------------------------------------------------------------
+// Opened by the Codec's first StartIO, closed by its last StopIO. gMicLock serialises the IO thread (ReadInput) against
+// open/close; never taken while gLock is held.
+static pthread_mutex_t gMicLock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+  int fd;              // -1: silence
+  int lastOpenErrno;
+  UInt64 frames, padded, skipped, cycles;
+} gMic = {.fd = -1};
+
+static void micOpen(void) {
+  pthread_mutex_lock(&gMicLock);
+  if (gMic.fd < 0) {
+    const int fd = open(GUAMP_MIC_DEV_PATH, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    struct guamp_mic_info info;
+    memset(&info, 0, sizeof(info));
+    int why = fd < 0 ? errno : 0;
+    if (fd >= 0 && ioctl(fd, GUAMP_MIC_IOC_INFO, &info)) why = errno;
+    else if (fd >= 0 && (info.abi != GUAMP_MIC_ABI || info.rate != GUAMP_MIC_RATE || info.channels != GUAMP_MIC_CHANNELS ||
+                         info.bits != GUAMP_MIC_BITS))
+      why = EPROTO;
+    if (!why && ioctl(fd, GUAMP_MIC_IOC_START)) why = errno;
+    if (why) {
+      if (fd >= 0) close(fd);
+      if (why != gMic.lastOpenErrno)
+        os_log(gLog, "GuampAudio: %{public}s unavailable (errno %d, abi %u): silent microphone", GUAMP_MIC_DEV_PATH, why, info.abi);
+      gMic.lastOpenErrno = why;
+    } else {
+      gMic.fd = fd;
+      gMic.lastOpenErrno = 0;
+      gMic.frames = gMic.padded = gMic.skipped = gMic.cycles = 0;
+      os_log(gLog, "GuampAudio: %{public}s open: source %{public}s, amic%u, ring %u bytes, period %u", GUAMP_MIC_DEV_PATH,
+             info.source == GUAMP_MIC_SOURCE_ADSP ? "adsp" : "null", info.mic, info.ring_bytes, info.period_frames);
+    }
+  }
+  pthread_mutex_unlock(&gMicLock);
+}
+
+static void micClose(void) {
+  pthread_mutex_lock(&gMicLock);
+  if (gMic.fd >= 0) {
+    struct guamp_mic_info info;
+    memset(&info, 0, sizeof(info));
+    (void)ioctl(gMic.fd, GUAMP_MIC_IOC_INFO, &info);
+    (void)ioctl(gMic.fd, GUAMP_MIC_IOC_STOP);
+    close(gMic.fd);
+    gMic.fd = -1;
+    os_log(gLog, "GuampAudio: %{public}s closed: captured %llu, overruns %u, last peak %u; plug-in got %llu frames, padded "
+           "%llu, skipped %llu in %llu cycles", GUAMP_MIC_DEV_PATH, (unsigned long long)info.frames_captured, info.overruns,
+           info.peak, (unsigned long long)gMic.frames, (unsigned long long)gMic.padded, (unsigned long long)gMic.skipped,
+           (unsigned long long)gMic.cycles);
+  }
+  pthread_mutex_unlock(&gMicLock);
+}
+
+// IO thread: one ReadInput buffer (Float32, `channels` interleaved) from the device; silence for what is missing.
+static void micRead(Float32 *out, UInt32 frames, UInt32 channels) {
+  int16_t chunk[512];
+  UInt32 done = 0;
+  pthread_mutex_lock(&gMicLock);
+  if (gMic.fd >= 0) {
+    gMic.cycles++;
+    struct guamp_mic_position pos;
+    if (ioctl(gMic.fd, GUAMP_MIC_IOC_POSITION, &pos) == 0) {
+      for (UInt32 drop = guamp_mic_excess(pos.queued_frames, frames); drop;) {
+        const UInt32 n = drop < 512 ? drop : 512;
+        const ssize_t got = read(gMic.fd, chunk, (size_t)n * GUAMP_MIC_FRAME_BYTES);
+        if (got <= 0) break;
+        gMic.skipped += (UInt64)got / GUAMP_MIC_FRAME_BYTES;
+        drop -= (UInt32)got / GUAMP_MIC_FRAME_BYTES;
+      }
+    }
+    while (done < frames) {
+      const UInt32 n = frames - done < 512 ? frames - done : 512;
+      const ssize_t got = read(gMic.fd, chunk, (size_t)n * GUAMP_MIC_FRAME_BYTES);
+      if (got <= 0) break;
+      const UInt32 f = (UInt32)got / GUAMP_MIC_FRAME_BYTES;
+      guamp_s16_to_f32_dup(chunk, out + (size_t)done * channels, f, channels);
+      done += f;
+      if (f < n) break;
+    }
+    gMic.frames += done;
+    gMic.padded += frames - done;
+  }
+  pthread_mutex_unlock(&gMicLock);
+  if (done < frames) memset(out + (size_t)done * channels, 0, (size_t)(frames - done) * channels * sizeof(Float32));
 }
 
 // ---- object model -------------------------------------------------------------------------------------------------------------
@@ -445,9 +539,10 @@ static OSStatus initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
   mach_timebase_info(&tb);
   const double ticksPerFrame = guamp_ticks_per_frame(tb.numer, tb.denom, kRate);
   for (UInt32 i = 0; i < kDeviceCount; i++) guamp_clock_init(&gDevices[i].clock, ticksPerFrame, kRingFrames);
-  const Boolean present = access(GUAMP_AUDIO_DEV_PATH, F_OK) == 0;
-  os_log(gLog, "GuampAudio: initialized, %u devices (Speaker, Hawking, Codec), %.0f Hz, ring %u frames, %{public}s %{public}s",
-         kDeviceCount, kRate, kRingFrames, GUAMP_AUDIO_DEV_PATH, present ? "present" : "absent (null output)");
+  const Boolean present = access(GUAMP_AUDIO_DEV_PATH, F_OK) == 0, mic = access(GUAMP_MIC_DEV_PATH, F_OK) == 0;
+  os_log(gLog, "GuampAudio: initialized, %u devices (Speaker, Hawking, Codec), %.0f Hz, ring %u frames, %{public}s %{public}s, "
+         "%{public}s %{public}s", kDeviceCount, kRate, kRingFrames, GUAMP_AUDIO_DEV_PATH,
+         present ? "present" : "absent (null output)", GUAMP_MIC_DEV_PATH, mic ? "present" : "absent (silent microphone)");
   return kAudioHardwareNoError;
 }
 static OSStatus createDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *c,
@@ -599,6 +694,7 @@ static OSStatus startIO(AudioServerPlugInDriverRef d, AudioObjectID device, UInt
   const UInt32 mute = gMute;
   pthread_mutex_unlock(&gLock);
   if (first && dev->out) backendOpen(db, mute);
+  if (first && dev->object == kCodec) micOpen();
   os_log(gLog, "GuampAudio: StartIO %{public}@ (%u clients)", dev->uid, n);
   return kAudioHardwareNoError;
 }
@@ -612,6 +708,7 @@ static OSStatus stopIO(AudioServerPlugInDriverRef d, AudioObjectID device, UInt3
   const UInt32 n = dev->running;
   pthread_mutex_unlock(&gLock);
   if (!s && !n && dev->out) backendClose();
+  if (!s && !n && dev->object == kCodec) micClose();
   os_log(gLog, "GuampAudio: StopIO %{public}@ (%u clients)", dev->uid, n);
   return s;
 }
@@ -648,8 +745,9 @@ static OSStatus doIO(AudioServerPlugInDriverRef d, AudioObjectID device, AudioOb
   (void)d; (void)client; (void)cycle; (void)secondary;
   Device *dev = deviceOwning(device);
   if (!dev || !isStream(dev, stream) || !main) return kAudioHardwareBadObjectError;
-  if (op == kAudioServerPlugInIOOperationReadInput) {
-    // microphone samples from the kernel later (/dev/guamp-mic); now: silence
+  if (op == kAudioServerPlugInIOOperationReadInput && stream == kCodecIn) {
+    micRead(main, frames, streamChannels(dev, stream));   // the built-in microphone (silence without /dev/guamp-mic)
+  } else if (op == kAudioServerPlugInIOOperationReadInput) {
     memset(main, 0, (size_t)frames * streamChannels(dev, stream) * sizeof(Float32));
   } else if (op == kAudioServerPlugInIOOperationWriteMix && stream == kSpeakerOut) {
     backendWrite(main, frames);   // no-op while /dev/guamp-audio is not open (null device)

@@ -1095,6 +1095,7 @@ static void usbProbe()
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
+#include "GuampMicDev.inc"     // microphone: /dev/guamp-mic + codec TX/VA/SoundWire/wcd937x + ASM read (guamp-audio-mic=1)
 #include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
 #include "GuampAsm.inc"        // q6asm/q6adm PCM path skeleton (not wired yet), after GuampAdsp.inc
 #include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
@@ -1242,6 +1243,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
   camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
+  micglue::configure();  // guamp-audio-mic=1: /dev/guamp-mic (null source until the ADSP capture runs)
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
 }
 

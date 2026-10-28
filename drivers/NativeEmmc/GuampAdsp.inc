@@ -317,6 +317,10 @@ void start() {
   gMode = mode;
   unsigned ipc = 0;
   if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 4) adspipc::gLevel = ipc;
+  if (micglue::configure() && mode == 1 && adspipc::gLevel < 3) {   // guamp-audio-mic=1 needs APR (level 3)
+    IOLog("GuampAdsp: guamp-audio-mic=1: ipc level %u raised to 3\n", adspipc::gLevel);
+    adspipc::gLevel = 3;
+  }
   unsigned toneMs = 0, toneGain = 0;
   if (PE_parse_boot_argn("guamp-adsp-tone", &toneMs, sizeof(toneMs)) && toneMs >= 100 && toneMs <= 20000)
     adspipc::gToneMs = toneMs;
