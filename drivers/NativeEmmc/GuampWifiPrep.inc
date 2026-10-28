@@ -413,6 +413,10 @@ void firmwareReport() {
 
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-wifi-prep");
+  // guamp-wifi-delay=<s>: start later, so the USB mirror (connected from ~4 s) sees every line (as guamp-gpu-delay)
+  unsigned delay=0;
+  PE_parse_boot_argn("guamp-wifi-delay",&delay,sizeof(delay));
+  if(delay&&delay<=600)IOSleep(delay*1000);
   smemReport();
   firmwareReport();
   unsigned modemMode=0;
