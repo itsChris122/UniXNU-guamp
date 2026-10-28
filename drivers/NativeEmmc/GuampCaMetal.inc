@@ -115,6 +115,7 @@ static void thread(void *, wait_result_t) {
   for (;;) {
     IOSleep(5000);
     now += 5;
+    if (!guamp_ca_metal_enabled) return;   // the GPU was parked (guamp_ca_metal_gpu_lost): the state is already settled
     const int pid = backboardd();
     const gcm_verdict v = gcm_step(&s, now, pid, haveFrames, native_legacy_swap_accepted_count);
     if (v == GCM_WAIT) continue;
@@ -165,4 +166,32 @@ extern "C" void guamp_ca_metal_gpu_ready(int ok) {
     return;
   }
   camtl::restartBackboardd("the Metal device is published (guamp-ca-metal=1, no watchdog)");
+}
+
+// GuampAdrenoProbe.cpp (guamp-gpu-recover=1, GuampAdrenoRecover.inc) after it parked the GPU: hangs it could not recover. The same
+// as an unhealthy session: marker parked, "attempts <max>" in mode 2 (software renderer from the next boot), and unless
+// guamp-ca-metal-recover=0 backboardd restarted now so it composites in software. On its own thread: the caller holds the GPU lock
+// inside a client call, and the state file is VFS work.
+namespace camtl {
+static void lost(void *, wait_result_t) {
+  thread_set_thread_name(current_thread(), "guamp-gpu-lost");
+  unsigned recover = 1;
+  PE_parse_boot_argn("guamp-ca-metal-recover", &recover, sizeof(recover));
+  const int parked = park();
+  const int e = guamp_ca_metal_mode == 2 ? writeState(kMaxAttempts) : 0;
+  const bool kill = recover && !parked;
+  IOLog("GuampCaMetal: GPU parked after unrecoverable hangs: marker parked (%d), software renderer from the next boot%s, status %d\n",
+        parked, kill ? " and now" : "", e);
+  if (kill) restartBackboardd("the GPU is parked");
+}
+}  // namespace camtl
+
+extern "C" void guamp_ca_metal_gpu_lost(void) {
+  if (!guamp_ca_metal_enabled) {
+    IOLog("GuampCaMetal: GPU parked; gate closed (guamp-ca-metal=%u): nothing to switch\n", guamp_ca_metal_mode);
+    return;
+  }
+  guamp_ca_metal_enabled = 0;   // the watchdog thread stops at its next sample
+  thread_t t = nullptr;
+  if (kernel_thread_start(camtl::lost, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

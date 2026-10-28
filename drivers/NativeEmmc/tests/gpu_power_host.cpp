@@ -264,12 +264,103 @@ static void testSlumberWake() {
   CHECK(gp_slumber(&kIo, &kOps, &s, false, &sv) == GP_OK && sv.level == GP_LEVEL_320);
 }
 
+// The RBBM_STATUS governor of GuampGpuDcvs.inc: limits, windows, hysteresis, the rail order of the switches it makes
+// and the failure path, driven through gp_set_level on the fake register file.
+static void testGovernor() {
+  CHECK(GP_RBBM_STATUS * 4u < 0xf000u);   // the only GPU register the governor reads
+  CHECK(gp_gov_busy(0x2u) && !gp_gov_busy(0x1u) && !gp_gov_busy(0x80000001u) && gp_gov_busy(0x00800000u));
+  // speed bin: 0x6006 bits 5..12 = dword 0x6004 bits 21..28
+  CHECK(gp_speed_bin(0) == 0 && gp_speed_bin(206u << 21) == 206 && gp_speed_bin((157u << 21) | 0x1fffffu | (7u << 29)) == 157);
+  // limits: bin top, cap in MHz, never slower than 320
+  CHECK(gp_gov_top(0, 0) == 0 && gp_gov_top(206, 0) == 0 && gp_gov_top(157, 0) == 3 && gp_gov_top(99, 0) == 4);
+  CHECK(gp_gov_top(0, 980) == 0 && gp_gov_top(0, 979) == 1 && gp_gov_top(0, 600) == 4 && gp_gov_top(0, 465) == 5);
+  CHECK(gp_gov_top(0, 320) == GP_LEVEL_320 && gp_gov_top(0, 100) == GP_LEVEL_320 && gp_gov_top(127, 900) == 4);
+  // windows
+  gp_state s;
+  s.level = GP_LEVEL_320;
+  s.top = 0;
+  gp_gov g;
+  CHECK(gp_gov_window(&g, &s, GP_GOV_UP) == 0);              // 70 % busy: straight to the top
+  CHECK(gp_gov_window(&g, &s, GP_GOV_UP - 1) == GP_LEVEL_320);
+  s.level = 0;
+  for (unsigned i = 1; i < GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&g, &s, GP_GOV_DOWN - 1) == 0);
+  CHECK(gp_gov_window(&g, &s, 0) == 1 && g.quiet == 0);      // tenth quiet window: one level down
+  for (unsigned i = 1; i < GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&g, &s, 0) == 0);
+  CHECK(gp_gov_window(&g, &s, GP_GOV_DOWN) == 0 && g.quiet == 0);   // a middle window restarts the quiet run
+  for (unsigned i = 1; i < GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&g, &s, 0) == 0);
+  CHECK(gp_gov_window(&g, &s, 0) == 1);
+  s.level = GP_LEVEL_320;
+  for (unsigned i = 0; i < 3 * GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&g, &s, 0) == GP_LEVEL_320);   // the bottom holds
+  s.level = GP_LEVEL_XO;
+  CHECK(gp_gov_window(&g, &s, 0) == GP_LEVEL_320 && gp_gov_window(&g, &s, GP_GOV_WINDOW) == 0);
+  // a cap: busy goes to the capped top only
+  s.level = GP_LEVEL_320;
+  s.top = gp_gov_top(0, 465);
+  CHECK(gp_gov_window(&g, &s, GP_GOV_WINDOW) == 5);
+  // failure bookkeeping
+  s.top = 0;
+  CHECK(gp_gov_failed(&s, 0, GP_LEVEL_320) == GP_LEVEL_320 && s.top == 1);
+  CHECK(gp_gov_failed(&s, 4, 5) == 5 && s.top == 5);
+  CHECK(gp_gov_failed(&s, 2, 5) == 5 && s.top == 5);           // already capped lower
+  CHECK(gp_gov_failed(&s, GP_LEVEL_320, 5) == 5 && s.top == 5); // a failed step down caps nothing
+  CHECK(gp_gov_failed(&s, GP_LEVEL_320, GP_LEVEL_XO) == GP_LEVEL_320);
+  // A switch the governor asks for, through gp_set_level: up raises CX then MX before the PLL and the RCG, down
+  // lowers them after the RCG.
+  Fake f;
+  gF = &f;
+  gp_state r;
+  r.level = GP_LEVEL_320;
+  r.pllOn = GP_PLL1;
+  r.cx = GP_RPM_LOW_SVS;
+  r.mx = GP_RPM_MIN_SVS;
+  r.top = gp_gov_top(0, 0);
+  gp_gov h;
+  unsigned t = gp_gov_window(&h, &r, GP_GOV_WINDOW);
+  CHECK(t == 0 && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == 0 && r.pllOn == GP_PLL0);
+  CHECK(indexOf(f, "cx 416") >= 0 && indexOf(f, "cx 416") < indexOf(f, "mx 256"));
+  CHECK(indexOf(f, "mx 256") < indexOf(f, "pll0 L 102") && indexOf(f, "pll0 L 102") < indexOf(f, "rcg 2/3"));
+  CHECK((f.cc[GG2_PLL1 + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
+  for (unsigned i = 0; i < GP_GOV_QUIET; ++i) t = gp_gov_window(&h, &r, 0);
+  f.ev.clear();
+  CHECK(t == 1 && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == 1 && r.cx == GP_RPM_TURBO);
+  CHECK(indexOf(f, "rcg 2/3") >= 0 && indexOf(f, "rcg 2/3") < indexOf(f, "cx 384") && indexOf(f, "mx 256") < 0);
+  // down to 320 one level per quiet run: PLL1 back, MX and CX released after the RCG
+  f.ev.clear();
+  for (unsigned lv = 2; lv <= GP_LEVEL_320; ++lv) {
+    for (unsigned i = 0; i < GP_GOV_QUIET; ++i) t = gp_gov_window(&h, &r, 0);
+    CHECK(t == lv && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == lv);
+  }
+  CHECK(r.pllOn == GP_PLL1 && r.cx == GP_RPM_LOW_SVS && r.mx == GP_RPM_MIN_SVS);
+  CHECK(indexOf(f, "rcg 3/3") >= 0 && indexOf(f, "rcg 3/3") < indexOf(f, "mx 48"));   // 600 -> 465: PLL1, then MX
+  CHECK(indexOf(f, "mx 48") < indexOf(f, "cx 128") && indexOf(f, "cx 128") < indexOf(f, "cx 64"));
+  CHECK((f.cc[GP_PLL0_BASE + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
+  // a PLL0 that never locks: the switch fails on XO, the top drops below it and 320 comes back on PLL1
+  f.lockable = false;
+  t = gp_gov_window(&h, &r, GP_GOV_WINDOW);
+  CHECK(t == 0 && gp_set_level(&kIo, &kOps, &r, t) == GP_E_PLL && r.level == GP_LEVEL_XO);
+  f.lockable = true;
+  const unsigned back = gp_gov_failed(&r, t, GP_LEVEL_320);
+  CHECK(back == GP_LEVEL_320 && r.top == 1);
+  CHECK(r.cx == GP_RPM_TURBO_L1 && r.mx == GP_RPM_NOM);   // raised before the PLL failed
+  f.ev.clear();
+  CHECK(gp_set_level(&kIo, &kOps, &r, back) == GP_OK && r.level == GP_LEVEL_320 && r.pllOn == GP_PLL1);
+  CHECK(r.cx == GP_RPM_LOW_SVS && r.mx == GP_RPM_MIN_SVS);   // released once 320 runs again, after its RCG switch
+  CHECK(indexOf(f, "rcg 3/3") >= 0 && indexOf(f, "rcg 3/3") < indexOf(f, "mx 48") && indexOf(f, "mx 48") < indexOf(f, "cx 64"));
+  CHECK(gp_set_level(&kIo, &kOps, &r, 0) == GP_E_LEVEL && r.level == GP_LEVEL_320);   // never retried
+  // a refused CX raise: nothing switched, the level stays
+  f.refuseCorner = GP_RAIL_CX;
+  f.ev.clear();
+  CHECK(gp_set_level(&kIo, &kOps, &r, 1) == GP_E_CORNER && r.level == GP_LEVEL_320 && f.ev.empty());
+  f.refuseCorner = -1;
+}
+
 int main() {
   testHwcgProtect();
   testLalpha();
   testLevels();
   testDcvs();
   testSlumberWake();
+  testGovernor();
   printf("gpu_power_host: %d checks, %d failures\n", gChecks, gFails);
   return gFails ? 1 : 0;
 }

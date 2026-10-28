@@ -343,6 +343,9 @@ namespace gpug2 {   // below gpum1
 void run(volatile uint8_t *gpucc, unsigned level);
 uint64_t setFreq(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz);
 }
+namespace gpudcvs {   // GuampGpuDcvs.inc, below gpug2
+void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz);
+}
 
 namespace gpum1 {
 volatile uint8_t *gBase[3];
@@ -465,7 +468,10 @@ void thread(void *, wait_result_t) {
       PE_parse_boot_argn("guamp-gpu-freq", &freq, sizeof(freq));
       if (freq) gpug2::setFreq(gBase[GM_GPUCC], gBase[GM_GPU], freq);
       GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno};
-      IOLog("GuampGpu: NativeAdreno start %d\n", guamp_adreno_start(&a));
+      const int started = guamp_adreno_start(&a);
+      IOLog("GuampGpu: NativeAdreno start %d\n", started);
+      // guamp-gpu-dcvs=1: frequency scaling from the guamp-gpu-freq level (GuampGpuDcvs.inc); off by default.
+      if (started == GuampAdrenoOk && freq) gpudcvs::start(gBase[GM_GPUCC], gBase[GM_GPU], freq);
     }
     if (sqe) IOFree(sqe, gpum2::kSqeCap);
   } else if (m2 && st.gpuRead && st.aonOk) gpum2::run(gBase[GM_GPU], m2, smmuMode, smmuCb);
@@ -683,3 +689,5 @@ void run(volatile uint8_t *gpucc, unsigned level) {
         gIrq.hang, gIrq.masked ? ", MASKED: storm" : "", recovery, gpum2::gReady ? "ready" : "off");
 }
 }  // namespace gpug2
+
+#include "GuampGpuDcvs.inc"

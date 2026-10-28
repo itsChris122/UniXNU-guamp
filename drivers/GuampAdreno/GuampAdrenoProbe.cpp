@@ -32,10 +32,19 @@
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoUserClient.h"
 #include "GuampAdreno.h"
+#include "GuampGpuRecoverCore.h"
 
 extern "C" {
-// GuampCaMetal.inc (NativeEmmc): the render server gate learns that the Metal device is up (1) or unusable (0).
+// GuampCaMetal.inc (NativeEmmc): the render server gate learns that the Metal device is up (1) or unusable (0), and that the GPU
+// was parked after hangs it could not recover (guamp-gpu-recover, GuampAdrenoRecover.inc).
 void guamp_ca_metal_gpu_ready(int ok);
+void guamp_ca_metal_gpu_lost(void);
+// GuampAdrenoRecover.inc: [0] hangs detected, [1] recoveries that passed their check, [2] that failed, [3] 1 once parked, [4] the
+// last reason (grc_reason), [5] the last stuck fence, [6] fences signalled by the last recovery, [7] hangs injected.
+volatile uint32_t guamp_gpu_recover[8];
+// GuampGpuDcvs.inc (NativeEmmc): nonzero pauses the frequency governor; held during a reset and re-init, and for good once parked.
+// Weak stand-in for a kernel built without the governor (static link: no weak_import).
+__attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_hold;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -130,21 +139,39 @@ uint32_t gr(const Session &s, uint32_t dword) {
 }
 void gw64(const Session &s, uint32_t dword, uint64_t value) {gw(s, dword, uint32_t(value)); gw(s, dword + 1, uint32_t(value >> 32));}
 
+// guamp-gpu-recover=1 (GuampAdrenoRecover.inc): read at start, armed after the self test. The ring object's write index as its last
+// CP_RB_WPTR write left it, the new submissions counted there, and the parked state in which CP_RB_RPTR reads as a full ring.
+bool gRecEnabled;
+volatile bool gRecArmed, gGpuParked;
+volatile uint32_t gLastWptr, gSubmitCount;
+void recoverNoteWptr(uint32_t value);
+void recoverPoll();
+
 // NativeAdreno's register, cache and clock callbacks: GPU registers by dword index through the caller's uncached window.
 int naWrite(void *c, uint32_t reg, uint32_t value) {
   if (reg >= 0x90000 / 4) return 1;
+  if (gRecEnabled && reg == 0x807) recoverNoteWptr(value);            // CP_RB_WPTR
   gw(*static_cast<Session *>(c), reg, value);
   return 0;
 }
 int naRead(void *c, uint32_t reg, uint32_t *value) {
   if (reg >= 0x90000 / 4) return 1;
+  if (gGpuParked && reg == 0x806) {                                    // CP_RB_RPTR of a parked GPU: one past the write index
+    *value = (gLastWptr + 1) & (uint32_t(gSession.nb[1].bytes / 4) - 1);
+    return 0;
+  }
   *value = gr(*static_cast<Session *>(c), reg);
   return 0;
 }
 int naBarrier(void *) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 // The kernel buffers are Normal non-cacheable for the GPU and write-combined for the CPU: ordering only, no cache maintenance.
+// Every fence read of the ring passes here, so the armed hang detector runs here too (under the GPU lock of the client call).
 int cachePublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
-int cacheAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
+int cacheAcquire(void *, volatile uint32_t *, size_t) {
+  __asm__ volatile("dsb sy" ::: "memory");
+  if (gRecArmed) recoverPoll();
+  return 0;
+}
 uint64_t naNow(void *) {
   uint64_t ns = 0;
   absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
@@ -154,10 +181,14 @@ uint64_t naNow(void *) {
 // before the EOI. The same non-error status 100000 times in a row masks the GPU interrupts (the waiters then poll every 100 us).
 volatile bool gIrqAttached;
 volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+// Error causes the hang detector counts (guamp-gpu-recover): RBBM_INT_0 AHB error, CP_HW_ERROR, RBBM_HANG_DETECT, UCHE out of bounds.
+constexpr uint32_t kRecoverIrqErrors = (1u << 1) | (1u << 9) | (1u << 23) | (1u << 24);
+volatile uint32_t gIrqErrors;
 void gpuIrq(void *c) {
   Session &s = *static_cast<Session *>(c);
   const uint32_t status = gr(s, 0x201);
   if (status) gw(s, 0x37, status);
+  if (gRecEnabled && (status & kRecoverIrqErrors)) gIrqErrors = gIrqErrors | (status & kRecoverIrqErrors);
   gIrqRepeat = (status == gIrqLast && !(status & (1u << 20))) ? gIrqRepeat + 1 : 0;
   gIrqLast = status;
   gIrqSeen = gIrqSeen | status;
@@ -413,6 +444,8 @@ int naPublish(Session &s) {
   return sub || pub ? GuampAdrenoPublish : GuampAdrenoOk;
 }
 
+#include "GuampAdrenoRecover.inc"
+
 // The user-client self test, ported from UniXNU-tb128fu package/GpuProbe.cpp (naSelfTest / ucRound, BSD-2-Clause-Patent): a kernel
 // connection of the plugin's open type, Query and GetDeviceInfo, two 4 KiB BOs mapped in the client window and in the kernel, an IB
 // of three CP_MEM_WRITEs submitted and waited for, the target read back, then clientClose. Two rounds: the second proves the client
@@ -585,6 +618,7 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   IOLog("GuampAdreno: start level %u: rbbm status %08x, sqe %u bytes\n", in->level, gr(s, 0x210), in->sqeBytes);
   int result = GuampAdrenoOk;
   bool tested = false;
+  gRecEnabled = bootArg("guamp-gpu-recover", 0) == 1;   // before the ring: its write index is followed from attach on
   do {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}
@@ -594,6 +628,7 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     if ((result = naPublish(s))) break;
     tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
     IOLog("GuampAdreno: self test %s\n", tested ? "ok" : "FAILED (the stages go on)");
+    recoverArm(s);   // guamp-gpu-recover=1 only (GuampAdrenoRecover.inc)
     // The staged AGXAccelerator (IOAcceleratorES) makes every Metal client of the system (CoreImage in Settings > Screen Time,
     // QuartzCore...) load the plugin; until the plugin is proven on guamp it is registered only with guamp-adreno-accel=1. The
     // user clients of level 1 (NativeAdrenoGpuPublished, used by adrenoprobed and the self test) stay published either way.

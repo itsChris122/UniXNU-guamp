@@ -2,7 +2,8 @@
 // guamp Adreno 610 power management (analisi/gpu-ios/POWER-A610.md): hardware clock gating, CP register protection,
 // the bengal power levels (PLL0/PLL1 + gfx3d RCG + RPM CX/MX corners + GPU bus vote), a simple DCVS governor and the
 // nap / slumber idle states of a GPU without GMU. Pure code behind gg2_io (GuampGpuG2.h, read only here) and the
-// gp_ops callbacks; host-tested by tests/gpu_power_host.cpp. Nothing here is wired into the boot path yet.
+// gp_ops callbacks; host-tested by tests/gpu_power_host.cpp. Only gp_set_level and the RBBM_STATUS governor (gp_gov_*)
+// are wired, by GuampGpuDcvs.inc behind guamp-gpu-dcvs=1; HWCG, protect, the counter DCVS and nap / slumber are not.
 // Sources, Motorola kernel sm6225 (msm-4.19):
 //   HWCG     drivers/gpu/msm/adreno-gpulist.h a612_hwcg_regs (used by adreno_gpu_core_a610 .hwcg) and
 //            adreno_a6xx.c a6xx_hwcg_set: every register to its value (0 when off), then RBBM_CLOCK_CNTL
@@ -251,7 +252,7 @@ struct gp_state {
 static inline int gp_set_level(const gg2_io *io, const gp_ops *ops, gp_state *s, unsigned target) {
   if (target >= GP_NLEVELS || (target < s->top && target != GP_LEVEL_XO)) return s->lastErr = GP_E_LEVEL;
   const gp_level &t = kGpLevels[target];
-  const bool faster = t.mhz > kGpLevels[s->level].mhz;
+  const bool faster = t.mhz > kGpLevels[s->level].mhz;   // raises first; releases (below) always after the clock
   const uint32_t busKhz = gp_bus_bimc_khz(t.bus);
   if (faster) {
     if (t.cx > s->cx) {
@@ -287,14 +288,14 @@ static inline int gp_set_level(const gg2_io *io, const gp_ops *ops, gp_state *s,
     if (old != GP_PLL_XO && old != t.pll) gp_pll_down(io, old);
     s->level = target;
   }
-  if (!faster) {
-    if (busKhz < s->busKhz) {
-      if (ops->bus(ops->ctx, busKhz)) return s->lastErr = GP_E_BUS;
-      s->busKhz = busKhz;
-    }
-    if (t.mx < s->mx && !ops->corner(ops->ctx, GP_RAIL_MX, t.mx)) s->mx = t.mx;   // a refused release keeps the vote
-    if (t.cx < s->cx && !ops->corner(ops->ctx, GP_RAIL_CX, t.cx)) s->cx = t.cx;
+  // Releases run after every successful switch, faster ones too: votes a failed switch raised (its clock left on XO)
+  // come down once a level is reached again.
+  if (busKhz < s->busKhz) {
+    if (ops->bus(ops->ctx, busKhz)) return s->lastErr = GP_E_BUS;
+    s->busKhz = busKhz;
   }
+  if (t.mx < s->mx && !ops->corner(ops->ctx, GP_RAIL_MX, t.mx)) s->mx = t.mx;   // a refused release keeps the vote
+  if (t.cx < s->cx && !ops->corner(ops->ctx, GP_RAIL_CX, t.cx)) s->cx = t.cx;
   return s->lastErr = GP_OK;
 }
 
@@ -364,6 +365,61 @@ static inline unsigned gp_dcvs_next(const gp_state *s, gp_action a) {
   if (a == GP_ACT_UP) return s->level == GP_LEVEL_XO ? GP_LEVEL_320 : (s->level > s->top ? s->level - 1 : s->level);
   if (a == GP_ACT_DOWN) return s->level < s->bottom ? s->level + 1 : s->level;
   return s->level;
+}
+
+// --- DCVS on RBBM_STATUS samples (GuampGpuDcvs.inc) -------------------------------------------------------------
+// The governor tb128fu runs on its A610 (UniXNU-tb128fu package/GpuProbe.cpp dvfsThread), on the bengal levels above:
+// RBBM_STATUS read every millisecond, busy when any unit but the CX / CP AHB masters is (kgsl a6xx_hw_isidle; bits 24
+// and up left out as tb128fu does). Per window of GP_GOV_WINDOW samples: GP_GOV_UP busy or more jumps to the fastest
+// allowed level, fewer than GP_GOV_DOWN for GP_GOV_QUIET windows in a row steps one level down (hysteresis: 500 ms of
+// near idle per step), anything in between restarts the quiet run. RBBM_STATUS is dword 0x210 (byte 0x840), far from
+// the 0xF000 bytes no GPU read may reach.
+#define GP_GOV_BUSY_MASK 0x00fffffeu
+#define GP_GOV_WINDOW 50u      // samples (ms) per window
+#define GP_GOV_UP 35u          // 70 % busy
+#define GP_GOV_DOWN 8u         // under 16 % busy
+#define GP_GOV_QUIET 10u       // windows
+#define GP_GOV_MAX_FAILS 8u    // failed switches before the glue gives up
+// RPM rails of kgsl's vdd_cx / vdd_mx on bengal (rpm-regulator-smpa3 "rwcx", rpm-regulator-smpa5 "rwmx", id 0) and the
+// rpm-smd-regulator keys: "swen" once, "vlvl" per level (qcom,use-voltage-level).
+#define GP_RPM_RES_RWCX 0x78637772u   // "rwcx"
+#define GP_RPM_RES_RWMX 0x786d7772u   // "rwmx"
+#define GP_RPM_KEY_VLVL 0x6c766c76u   // "vlvl"
+// qfprom (0x1b40000) gpu_speed_bin@6006: reg 2 bytes, bits <5 8>; the dword at 0x6004 holds it in bits 21..28.
+#define GP_QFPROM_PHYS 0x1b40000u
+#define GP_SPEED_BIN_DWORD 0x6004u
+static inline uint32_t gp_speed_bin(uint32_t dword6004) { return (dword6004 >> 21) & 0xffu; }
+
+struct gp_gov { unsigned quiet = 0; };
+static inline bool gp_gov_busy(uint32_t rbbmStatus) { return (rbbmStatus & GP_GOV_BUSY_MASK) != 0; }
+// Fastest level for a speed bin under a MHz cap (guamp-gpu-max, 0 = none); never slower than the 320 MHz level.
+static inline unsigned gp_gov_top(uint32_t speedBin, uint32_t capMhz) {
+  unsigned top = gp_bin_top(speedBin);
+  while (capMhz && top < GP_LEVEL_320 && kGpLevels[top].mhz > capMhz) top = top + 1;
+  return top;
+}
+// One window with busy samples out of GP_GOV_WINDOW: the level to go to (s->level when nothing changes). A GPU left on
+// XO by a failed switch comes back to the slowest DCVS level.
+static inline unsigned gp_gov_window(gp_gov *g, const gp_state *s, unsigned busy) {
+  if (busy >= GP_GOV_UP) {
+    g->quiet = 0;
+    return s->top;
+  }
+  if (s->level > s->bottom) return s->bottom;
+  if (busy >= GP_GOV_DOWN) {
+    g->quiet = 0;
+    return s->level;
+  }
+  g->quiet = g->quiet + 1;
+  if (g->quiet < GP_GOV_QUIET) return s->level;
+  g->quiet = 0;
+  return s->level < s->bottom ? s->level + 1 : s->level;
+}
+// After gp_set_level(target) failed coming from prev: a faster target (and everything faster) is never tried again;
+// returns the level to put back (prev, or the slowest DCVS level when prev was XO).
+static inline unsigned gp_gov_failed(gp_state *s, unsigned target, unsigned prev) {
+  if (target < prev && target < GP_LEVEL_320 && target + 1 > s->top) s->top = target + 1;
+  return prev > s->bottom ? s->bottom : prev;
 }
 
 // --- idle states ----------------------------------------------------------------------------------------------------

@@ -30,7 +30,7 @@ echo '#include "GuampGpuG2.h"' | clang++ --target=arm64-apple-ios17 -std=gnu++20
 clang++ $FLAGS "$HERE/gpu_g2_host.cpp" -o "$WORK/gpu_g2_host" && "$WORK/gpu_g2_host" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/gpu_g2_host.cpp" -o "$WORK/gpu_g2_host_gcc" && "$WORK/gpu_g2_host_gcc" >/dev/null || rc=1
 echo "== GPU power (GuampGpuPower.h): literals, arm64-apple-ios syntax check, host test"
-(cd "$HERE/.." && python3 -I tests/check_literals.py GuampGpuPower.h) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GuampGpuPower.h GuampGpuDcvs.inc) || rc=1
 echo '#include "GuampGpuPower.h"' | clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -fsyntax-only -I "$HERE/.." -x c++ - && echo "power: compiled" || rc=1
 clang++ $FLAGS "$HERE/gpu_power_host.cpp" -o "$WORK/gpu_power_host" && "$WORK/gpu_power_host" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/gpu_power_host.cpp" -o "$WORK/gpu_power_host_gcc" && "$WORK/gpu_power_host_gcc" >/dev/null || rc=1

@@ -1031,6 +1031,7 @@ static void usbProbe()
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
+#include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1163,6 +1164,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (rails, SE3 UART, HCI version); =2 adds M1 (rampatch/NVM, 3 Mbit/s)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
   camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
+  adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
