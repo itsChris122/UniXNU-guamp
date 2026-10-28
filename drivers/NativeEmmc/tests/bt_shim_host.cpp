@@ -493,6 +493,17 @@ static void testCtl() {
     both.insert(both.end(), r2.begin(), r2.end());
     CHECK(drain(&s) == both && l.sent.size() == sentBefore);
     CHECK(s.lastCmd == 0x0c5a && s.lastReply == 0x0c5a && s.lastReplyStatus == 0);
+
+    // RAM test 8: Apple's multiplexed VSC 0xfce2 gets status 0 with its sub-opcode echoed, never reaches the chip;
+    // other unknown vendor commands still get 0x01 and land in the ring the disconnect line prints.
+    const uint32_t unk = s.st.unknownVendor;
+    Bytes oly = pktCmd(0xfce2, {0x2b, 1, 2, 3}), other = pktCmd(0xfca0, {0x07});
+    bts_shim_host_write(&s, oly.data(), oly.size());
+    bts_shim_host_write(&s, other.data(), other.size());
+    Bytes ans = cc(0xfce2, {0, 0x2b}), ans2 = cc(0xfca0, {BTS_STATUS_UNKNOWN_COMMAND});
+    ans.insert(ans.end(), ans2.begin(), ans2.end());
+    CHECK(drain(&s) == ans && l.sent.size() == sentBefore);
+    CHECK(s.st.unknownVendor == unk + 1 && s.unknownRing[unk % BTS_UNKNOWN_RING] == (0xfca0u << 8 | 0x07));
 }
 
 int main() {

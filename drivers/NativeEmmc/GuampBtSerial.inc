@@ -338,7 +338,20 @@ errno_t kctlDisconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo) {
   const uint64_t speed = gTty.speed;
   const uint16_t cmd = gShim->lastCmd, reply = gShim->lastReply;
   const uint8_t status = gShim->lastReplyStatus;
+  uint32_t ring[BTS_UNKNOWN_RING];
+  for (unsigned i = 0; i < BTS_UNKNOWN_RING; i = i + 1) ring[i] = gShim->unknownRing[i];
   IOLockUnlock(gLock);
+  if (mine && st.unknownVendor) {   // the vendor commands answered 0x01 (Unknown HCI Command): oldest first
+    char line[BTS_UNKNOWN_RING * 9 + 1];
+    unsigned at = 0;
+    const uint32_t n = st.unknownVendor < BTS_UNKNOWN_RING ? st.unknownVendor : BTS_UNKNOWN_RING;
+    for (uint32_t i = st.unknownVendor - n; i < st.unknownVendor; i = i + 1) {
+      const uint32_t e = ring[i % BTS_UNKNOWN_RING];
+      at += static_cast<unsigned>(snprintf(line + at, sizeof line - at, " %04x/%02x", e >> 8, e & 0xff));
+    }
+    line[sizeof line - 1] = 0;
+    IOLog("GuampBtShim: %u unknown vendor commands, last (opcode/first byte):%s\n", st.unknownVendor, line);
+  }
   if (mine)
     IOLog("GuampBtShim: disconnect %s unit %u; host %u pkts (%u cmds, %u forwarded, %u emulated, %u tx errors), "
           "controller %u pkts; socket %llu bytes in %llu out, %u full %u lost; baud %u, termios speed %llu; last cmd "

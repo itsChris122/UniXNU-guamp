@@ -70,6 +70,7 @@ size_t mbuf_len(const mbuf_t mbuf);
 void *mbuf_data(mbuf_t mbuf);
 void mbuf_freem(mbuf_t mbuf);
 size_t strlcpy(char *dst, const char *src, size_t size);
+int snprintf(char *str, size_t size, const char *format, ...) __attribute__((format(printf, 3, 4)));
 }
 #define ENOTCONN 57
 #define ENOPROTOOPT 42
