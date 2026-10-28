@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '4bdb5c74c0f2e09b7c2b82d06a6b1994aae3d20d40e83267029998276e833f59'
+PATCHED_SHA256 = '74bf7811ea4360cc7bef2a392a6fe82f2505920a4498d88674d01442ad59c389'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -196,9 +196,18 @@ EDITS.append((r'''        uint32_t width=0,height=0;getDisplayDimensions(&width,
            !memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(sourceWidth,sourceHeight,sourceStride,allocation,memory->getLength()) ||
            native_legacy_surface_width(surface)<sourceWidth || native_legacy_surface_height(surface)<sourceHeight ||
 '''))
-# 6. The GPU hand-off and the differential copy only move unscaled frames.
+# 6. Latest-frame-wins (section 10) takes the frame here. Otherwise the GPU hand-off: a scaled frame is offered at its source size (the
+#    presenter of AdrenoMetal 2ff4be9 scales it with ScaleKernelAir) unless guamp-gpu-scaled=0. The differential copy stays unscaled only.
 EDITS.append(('        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {',
-              '        if(!gpuBypass && !scaled && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {'))
+              r'''        // guamp latest-frame-wins (canvas variant section 10): the swap retires now, in order, and its frame becomes the newest one; the
+        // GPU presenter or the copy thread takes it when the frame before it is done.
+        if(latestOn()) {
+            const GuampFrame frame={memory,sourceStride,allocation,length,video.v_rowBytes,width,height,
+                                    scaled?sourceWidth:width,scaled?sourceHeight:height,scaled,false};
+            memory->retain();latestRetire(request,frame);return;
+        }
+        if(!gpuBypass && (!scaled || gpuScaled) &&
+           native_legacy_gpu_offer(this,memory,sourceStride,scaled?sourceWidth:width,scaled?sourceHeight:height)) {'''))
 EDITS.append(('            if(!diffOff && shadow && shadowBytes>=need)', '            if(!diffOff && !scaled && shadow && shadowBytes>=need)'))
 # 7. The scaled copy.
 EDITS.append((r'''        if(stored==UINT64_MAX) {
@@ -283,10 +292,17 @@ EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint
               'extern "C" void flush_dcache64(addr64_t,unsigned,int);\n'
               '// guamp-copy-gpu-wait: drivers/GuampAdreno defines it; a kernel without the GPU probe has no ring (static link: weak definition).\n'
               'extern "C" {volatile uint64_t guamp_copy_gpu_wait[8];\n'
-              '__attribute__((weak)) int guamp_adreno_wait_submitted(uint32_t,uint32_t *waited){if(waited)*waited=0;return -1;}}'))
+              '__attribute__((weak)) int guamp_adreno_wait_submitted(uint32_t,uint32_t *waited){if(waited)*waited=0;return -1;}\n'
+              '__attribute__((weak)) int guamp_adreno_ring_marks(uint32_t *submitted,uint32_t *retired)\n'
+              '    {if(submitted)*submitted=0;if(retired)*retired=0;return -1;}\n'
+              '// Section 10 counters: [0] frames started, [1] coalesced (replaced before they started), [2] stale-skipped (a newer frame was\n'
+              '// queued when the GPU wait ended), [3] GPU frames, [4] CPU frames, [5] in-thread refreshes, [6] trailing re-shows, [7] GPU\n'
+              '// failures, [8] CPU copy failures, [9] latest-frame-wins on.\n'
+              'volatile uint64_t guamp_copy_latest[10];}'))
 EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
     int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=0;
+    bool latestWanted=false,gpuScaled=true;unsigned trailMs=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
@@ -298,8 +314,17 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
         PE_parse_boot_argn("guamp-copy-gpu-wait",&gpuWaitMs,sizeof gpuWaitMs);if(gpuWaitMs>1000)gpuWaitMs=1000;
         if(gpuWaitMs)asyncMode=1;
         guamp_copy_gpu_wait[6]=gpuWaitMs;
+        // Section 10: latest-frame-wins with the deferred copy (asyncMode 1) or the GPU hand-off (sheng-fb-gpu=1); the trailing check
+        // and the GPU's own scaling of canvas frames.
+        v=1;PE_parse_boot_argn("guamp-swap-latest",&v,sizeof v);
+        unsigned handoff=0;PE_parse_boot_argn("sheng-fb-gpu",&handoff,sizeof handoff);
+        latestWanted=v==1 && (asyncMode==1 || handoff==1);
+        trailMs=25;PE_parse_boot_argn("guamp-copy-trail",&trailMs,sizeof trailMs);if(trailMs>200)trailMs=200;
+        v=1;PE_parse_boot_argn("guamp-gpu-scaled",&v,sizeof v);gpuScaled=v!=0;
+        guamp_copy_latest[9]=latestWanted?1:0;
         copyOptions=1;
-        guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32|(gpuWaitMs?64:0);
+        guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32|(gpuWaitMs?64:0)|
+                             (latestWanted?128:0)|(gpuScaled?256:0);
     }
     struct GuampMapSlot {IOMemoryDescriptor *memory;IOMemoryMap *map;uint64_t used;bool cacheable;};
     GuampMapSlot mapSlots[4]={};uint64_t mapUse=0;
@@ -343,19 +368,22 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     uint64_t asyncStride=0,asyncAllocation=0,asyncLength=0,asyncRowBytes=0;uint32_t asyncWidth=0,asyncHeight=0;bool asyncScaled=false;
     bool asyncBusy=false,asyncSnapshot=false;void *snapshot=nullptr;vm_size_t snapshotSize=0;uint64_t snapshotBytes=0;
     static void asyncCopyEntry(thread_call_param_t owner,thread_call_param_t) {static_cast<NativeLegacyDisplay *>(owner)->asyncCopy();}
+    // guamp-copy-gpu-wait: at most gpuWaitMs until the GPU retired everything handed out by now (thread context only).
+    void guampGpuWait() {
+        if(!gpuWaitMs)return;
+        uint32_t waited=0;const int r=guamp_adreno_wait_submitted(gpuWaitMs*1000,&waited);
+        if(r<0)guamp_copy_gpu_wait[2]=guamp_copy_gpu_wait[2]+1;
+        else {
+            if(r)guamp_copy_gpu_wait[1]=guamp_copy_gpu_wait[1]+1;else guamp_copy_gpu_wait[0]=guamp_copy_gpu_wait[0]+1;
+            if(!r && waited<20)guamp_copy_gpu_wait[5]=guamp_copy_gpu_wait[5]+1;
+            guamp_copy_gpu_wait[3]=guamp_copy_gpu_wait[3]+waited;
+            if(waited>guamp_copy_gpu_wait[4])guamp_copy_gpu_wait[4]=waited;
+        }
+    }
     void asyncCopy() {
         IOMemoryDescriptor *memory=asyncMemory;asyncMemory=nullptr;
         int status=-1;
-        if(gpuWaitMs && memory) {
-            uint32_t waited=0;const int r=guamp_adreno_wait_submitted(gpuWaitMs*1000,&waited);
-            if(r<0)guamp_copy_gpu_wait[2]=guamp_copy_gpu_wait[2]+1;
-            else {
-                if(r)guamp_copy_gpu_wait[1]=guamp_copy_gpu_wait[1]+1;else guamp_copy_gpu_wait[0]=guamp_copy_gpu_wait[0]+1;
-                if(!r && waited<20)guamp_copy_gpu_wait[5]=guamp_copy_gpu_wait[5]+1;
-                guamp_copy_gpu_wait[3]=guamp_copy_gpu_wait[3]+waited;
-                if(waited>guamp_copy_gpu_wait[4])guamp_copy_gpu_wait[4]=waited;
-            }
-        }
+        if(memory)guampGpuWait();
         IOMemoryMap *source=memory?guampSourceMap(memory,asyncAllocation):nullptr;
         const uintptr_t from=asyncSnapshot?(uintptr_t)snapshot:(source?(uintptr_t)source->getVirtualAddress():0);
         const uint64_t fromBytes=asyncSnapshot?snapshotBytes:(source?source->getLength():0);
@@ -433,6 +461,208 @@ r'''        readCopyOptions();
             guamp_copy_split[3]=guamp_copy_split[3]+(probeEnd-probeStart);guamp_copy_split[6]=words*8;
         }
 '''))
+# 10. Latest-frame-wins (guamp-swap-latest, default 1; on with the deferred copy, i.e. guamp-async-copy=1 or guamp-copy-gpu-wait, or with
+#     the GPU hand-off sheng-fb-gpu=1). Every validated swap retires at once, in queue order (the render server never waits behind a copy
+#     or a GPU wait), and its frame becomes the newest: a frame that has not started yet is replaced (coalesced). One frame is in flight at
+#     a time, with the GPU presenter when it takes the offer, else with the copy thread. The copy thread waits for the GPU (guamp-copy-gpu-
+#     wait), drops the frame when a newer one was queued meanwhile (stale-skipped), copies it, and while the GPU took more work since its
+#     wait (the frame's own rendering may have reached the ring after the swap) waits and copies it again, at most twice. When nothing is
+#     queued, the frame on screen is checked again every guamp-copy-trail=<ms> (default 25, 0 off, at most 4 times after a swap): if the
+#     GPU ran anything since it was copied, it is shown again. A blank swap is a frame too (filled by the thread). A frame the GPU loses
+#     goes to the copy thread. guamp-swap-latest=0 keeps the previous one-frame-in-flight latch.
+EDITS.append(('struct GuampScaler {', r'''// guamp latest-frame-wins (scripts/guamp-canvas-variant.py section 10). The text between the two markers is the host-tested core
+// (drivers/NativeEmmc/tests/latest_host.cpp extracts it). Runs on the display's work loop, except superseded() (any thread).
+// Env: latestOffer(frame) (true if the GPU took it), latestStartCpu() (the copy thread takes cpuFrame), latestRetain/latestRelease.
+// guamp-latest-core-begin
+template<class Frame,class Env> struct GuampLatest {
+    Frame next{},cpuFrame{},gpuFrame{},shown{};
+    bool queued=false,cpu=false,gpu=false,hasShown=false,cpuOnce=false;
+    uint64_t started=0,coalesced=0,stale=0,gpuFrames=0,cpuFrames=0,gpuFailures=0,cpuFailures=0,trails=0;
+    void setQueued(bool value) {__atomic_store_n(&queued,value,__ATOMIC_RELEASE);}
+    // A retired swap's frame (holding one reference, handed over) becomes the newest; a queued frame that never started is dropped.
+    void swapped(Env &env,const Frame &frame) {
+        if(queued){env.latestRelease(next);coalesced=coalesced+1;}
+        next=frame;setQueued(true);dispatch(env);
+    }
+    // Starts the newest frame when none is in flight: the GPU presenter if it takes it, else the copy thread.
+    void dispatch(Env &env) {
+        if(!queued || cpu || gpu)return;
+        const Frame frame=next;next=Frame{};setQueued(false);started=started+1;
+        if(!cpuOnce && env.latestOffer(frame)){gpuFrame=frame;gpu=true;return;}
+        cpuOnce=false;cpuFrame=frame;cpu=true;env.latestStartCpu();
+    }
+    // The copy thread, after its GPU wait: a newer frame is queued, so this one need not be copied.
+    bool superseded() const {return __atomic_load_n(&queued,__ATOMIC_ACQUIRE);}
+    // The copy thread is done: 0 copied, 1 dropped as superseded, 2 the copy failed.
+    void cpuDone(Env &env,int result) {
+        const Frame frame=cpuFrame;cpuFrame=Frame{};cpu=false;
+        if(!result){cpuFrames=cpuFrames+1;keep(env,frame);}
+        else {if(result==1)stale=stale+1;else cpuFailures=cpuFailures+1;env.latestRelease(frame);}
+        dispatch(env);
+    }
+    // The GPU presenter is done (0) or lost the frame: a lost frame goes to the copy thread unless a newer one is queued.
+    void gpuDone(Env &env,int status) {
+        const Frame frame=gpuFrame;gpuFrame=Frame{};gpu=false;
+        if(!status){gpuFrames=gpuFrames+1;keep(env,frame);}
+        else {
+            gpuFailures=gpuFailures+1;cpuOnce=true;
+            if(queued)env.latestRelease(frame);else{next=frame;setQueued(true);}
+        }
+        dispatch(env);
+    }
+    // Shows the frame on screen again (its surface may have changed since it was copied).
+    bool trail(Env &env) {
+        if(queued || cpu || gpu || !hasShown)return false;
+        next=shown;env.latestRetain(next);setQueued(true);trails=trails+1;dispatch(env);return true;
+    }
+    void keep(Env &env,const Frame &frame) {if(hasShown)env.latestRelease(shown);shown=frame;hasShown=true;}
+    bool idle() const {return !queued && !cpu && !gpu;}
+    // Teardown, with the copy thread stopped: every reference held is dropped.
+    void clear(Env &env) {
+        if(queued)env.latestRelease(next);
+        if(cpu)env.latestRelease(cpuFrame);
+        if(gpu)env.latestRelease(gpuFrame);
+        if(hasShown)env.latestRelease(shown);
+        next=cpuFrame=gpuFrame=shown=Frame{};setQueued(false);cpu=gpu=hasShown=cpuOnce=false;
+    }
+};
+// guamp-latest-core-end
+// One frame of section 10: the surface (retained; null for a blank swap) and how it reaches the scanout.
+struct GuampFrame {
+    IOMemoryDescriptor *memory;uint64_t stride,allocation,length,rowBytes;
+    uint32_t width,height,offerWidth,offerHeight;bool scaled,blank;
+};
+struct GuampScaler {'''))
+EDITS.append(('    void freeAsync() {\n', r'''    // Section 10: latest-frame-wins.
+    template<class,class> friend struct GuampLatest;
+    GuampLatest<GuampFrame,NativeLegacyDisplay> latest;
+    thread_call_t latestCall=nullptr,trailCall=nullptr;
+    uint32_t shownMark=0;unsigned trailLeft=0;
+    static void latestCopyEntry(thread_call_param_t owner,thread_call_param_t) {static_cast<NativeLegacyDisplay *>(owner)->latestCopy();}
+    static void trailEntry(thread_call_param_t owner,thread_call_param_t) {
+        NativeLegacyDisplay *display=static_cast<NativeLegacyDisplay *>(owner);IOWorkLoop *loop=display->getWorkLoop();
+        auto action=[](OSObject *target,void *,void *,void *,void *)->IOReturn {
+            static_cast<NativeLegacyDisplay *>(target)->trailTick();return kIOReturnSuccess;
+        };
+        if(loop)loop->runAction(action,display);
+    }
+    bool latestOn() {
+        readCopyOptions();
+        if(!latestWanted)return false;
+        if(!latestCall)latestCall=thread_call_allocate_with_options(latestCopyEntry,this,THREAD_CALL_PRIORITY_KERNEL_HIGH,0);
+        if(!trailCall && trailMs)trailCall=thread_call_allocate_with_options(trailEntry,this,THREAD_CALL_PRIORITY_KERNEL_HIGH,0);
+        return latestCall!=nullptr;
+    }
+    void latestRetain(const GuampFrame &frame) {if(frame.memory)frame.memory->retain();}
+    void latestRelease(const GuampFrame &frame) {if(frame.memory)frame.memory->release();}
+    bool latestOffer(const GuampFrame &frame) {
+        return frame.memory && (!frame.scaled || gpuScaled) &&
+               native_legacy_gpu_offer(this,frame.memory,frame.stride,frame.offerWidth,frame.offerHeight);
+    }
+    void latestStartCpu() {guamp_copy_split[8]=guamp_copy_split[8]+1;thread_call_enter(latestCall);}
+    void latestPublish() {
+        guamp_copy_latest[0]=latest.started;guamp_copy_latest[1]=latest.coalesced;guamp_copy_latest[2]=latest.stale;
+        guamp_copy_latest[3]=latest.gpuFrames;guamp_copy_latest[4]=latest.cpuFrames;guamp_copy_latest[6]=latest.trails;
+        guamp_copy_latest[7]=latest.gpuFailures;guamp_copy_latest[8]=latest.cpuFailures;
+    }
+    // The validated head: retired now (in queue order), its frame handed to the latest-frame machine.
+    void latestRetire(const OriginalLegacySwapRequest *request,const GuampFrame &frame) {
+        native_legacy_swap_stage(1);shadowValid=false;trailLeft=4;
+        latest.swapped(*this,frame);latestPublish();
+        transferred=true;native_legacy_transfer_observed(kIOReturnSuccess,request,frame.length);
+        finishTransfer(request,true);
+    }
+    // Nothing queued or in flight: look at the frame on screen again later (trailTick).
+    void latestIdle() {
+        if(!latest.idle() || !latest.hasShown || !trailCall || !trailMs || !trailLeft)return;
+        uint64_t deadline=0;clock_interval_to_deadline(trailMs,kMillisecondScale,&deadline);
+        thread_call_enter_delayed(trailCall,deadline);
+    }
+    void trailTick() {
+        if(!trailLeft || !latest.idle() || !latest.hasShown)return;
+        trailLeft=trailLeft-1;
+        uint32_t now=0;
+        if(guamp_adreno_ring_marks(&now,nullptr))return;   // no GPU ring: nothing can have changed the surface behind the swap
+        if(now!=shownMark)latest.trail(*this);else latestIdle();
+        latestPublish();
+    }
+    void latestCpuDone(int result) {latest.cpuDone(*this,result);latestPublish();latestIdle();}
+    void latestGpuDone(int status) {
+        uint32_t now=0;
+        if(!status && !guamp_adreno_ring_marks(&now,nullptr))shownMark=now;
+        latest.gpuDone(*this,status);latestPublish();latestIdle();
+    }
+    // One copy of the frame into the scanout (copy thread).
+    bool latestCopyOnce(const GuampFrame &frame) {
+        IOMemoryMap *source=guampSourceMap(frame.memory,frame.allocation);
+        bool ok=false;
+        if(source && source->getVirtualAddress() && source->getLength()>=frame.allocation && bootMapping) {
+            uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+            ok=(frame.scaled
+                ?guampScalePixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),frame.rowBytes,
+                    reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),frame.stride,scaler)
+                :native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
+                    frame.rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),frame.stride,
+                    frame.width,frame.height))!=0;
+            __asm__ volatile("dsb sy" ::: "memory");
+            uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+            if(ok){native_legacy_copy_timing_observed(copyEnd-copyStart,frame.length);if(frame.scaled)guamp_canvas_frames=guamp_canvas_frames+1;}
+        }
+        OSSafeReleaseNULL(source);return ok;
+    }
+    // The copy thread: one frame (latest.cpuFrame, set before the call was entered), then back to the work loop.
+    void latestCopy() {
+        const GuampFrame frame=latest.cpuFrame;
+        int result=2;uint32_t mark=0;
+        const bool marked=guamp_adreno_ring_marks(&mark,nullptr)==0;
+        if(frame.blank) {
+            if(bootMapping && native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),frame.rowBytes,frame.width,frame.height,0xff000000U)) {
+                __asm__ volatile("dsb sy" ::: "memory");result=0;
+            }
+        } else if(frame.memory) {
+            guampGpuWait();
+            if(latest.superseded())result=1;
+            else if(latestCopyOnce(frame)) {
+                result=0;
+                // The GPU took more work since the wait: perhaps this frame's own rendering, submitted after its swap. Wait for it and
+                // copy again, at most twice, unless a newer frame is queued.
+                for(unsigned again=0;marked && gpuWaitMs && again<2 && !latest.superseded();++again) {
+                    uint32_t now=0;
+                    if(guamp_adreno_ring_marks(&now,nullptr) || now==mark)break;
+                    mark=now;guampGpuWait();
+                    if(latest.superseded() || !latestCopyOnce(frame))break;
+                    guamp_copy_latest[5]=guamp_copy_latest[5]+1;
+                }
+            }
+        }
+        shownMark=mark;
+        IOWorkLoop *loop=getWorkLoop();
+        auto action=[](OSObject *target,void *value,void *,void *,void *)->IOReturn {
+            static_cast<NativeLegacyDisplay *>(target)->latestCpuDone((int)(uintptr_t)value);return kIOReturnSuccess;
+        };
+        if(loop)loop->runAction(action,this,reinterpret_cast<void *>((uintptr_t)result));else latestCpuDone(result);
+    }
+    void freeAsync() {
+        if(latestCall){thread_call_cancel_wait(latestCall);thread_call_free(latestCall);latestCall=nullptr;}
+        if(trailCall){thread_call_cancel_wait(trailCall);thread_call_free(trailCall);trailCall=nullptr;}
+        latest.clear(*this);
+'''))
+# The GPU presenter's completion of a section-10 frame.
+EDITS.append(('''    void finishGpuSwap(int status) {
+        const OriginalLegacySwapRequest *request=gpuRequest;
+''', '''    void finishGpuSwap(int status) {
+        if(latest.gpu){latestGpuDone(status);return;}   // guamp latest-frame-wins (canvas variant section 10)
+        const OriginalLegacySwapRequest *request=gpuRequest;
+'''))
+# A blank swap is a section-10 frame as well, so it cannot be overtaken by an older frame's copy.
+EDITS.append(('''            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(!native_legacy_fill_pixels(''', '''            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(latestOn()) {   // guamp latest-frame-wins (canvas variant section 10): the copy thread fills it in its turn
+                const GuampFrame frame={nullptr,0,0,blankLength,blank.v_rowBytes,bw,bh,bw,bh,false,true};
+                latestRetire(request,frame);return;
+            }
+            if(!native_legacy_fill_pixels('''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
