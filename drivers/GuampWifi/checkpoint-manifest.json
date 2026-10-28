@@ -1,5 +1,5 @@
 {
-  "saved_at": "2026-10-28T15:14:02+0100",
+  "saved_at": "2026-10-28T15:54:45+0100",
   "status": "active WIP; host-tested station, no hardware validation",
   "linux_commit": "458c6079fc1d41d564c37679c8ace02cd83ee817",
   "unixnu_wifi_reference": "f6bf561f92cc42761bdd417fce1d53fe1db9477c",
@@ -33,8 +33,8 @@
     },
     {
       "path": "ath10k-port/gw_snoc_tail.inc",
-      "bytes": 8887,
-      "sha256": "492965c35afa92488a720b0796e44499ac9ce7969132ea36c1a707f680d320bd"
+      "bytes": 9089,
+      "sha256": "a2ebfd5cf75239877613fe810592d6e928083e05c6a4c9f6ca93be8d8007e798"
     },
     {
       "path": "ath10k-port/linux-util-provenance.txt",
@@ -43,8 +43,8 @@
     },
     {
       "path": "ath10k-port/nw_abi.h",
-      "bytes": 5458,
-      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+      "bytes": 5772,
+      "sha256": "12a965985dad94b519b8b42344ed9a63ac59c65afb43cd5c36ff89b4ec757e94"
     },
     {
       "path": "ath10k-port/nw_mac80211.h",
@@ -53,8 +53,8 @@
     },
     {
       "path": "ath10k-port/nw_sta.c",
-      "bytes": 61839,
-      "sha256": "870184fc12be9574798236534c0eb6c5e04b6f2806cf3472a3eb22add7ff4f4c"
+      "bytes": 68412,
+      "sha256": "0e3e9b69eaf22a8735d11e5b941c5eaec20cb845bfbf57b0a10e187b87992759"
     },
     {
       "path": "ath10k-port/nw_sta.h",
@@ -142,19 +142,34 @@
       "sha256": "52a083385f4271be7c04efe3287124183aba4efd813e39097c12a903e7360a0e"
     },
     {
+      "path": "ath10k-port/tests/wpa2_control_cases.inc",
+      "bytes": 2786,
+      "sha256": "3e23f026b53783423c226d5d3d962789571da665e54ff8c2cbe665f7068e17a6"
+    },
+    {
       "path": "ath10k-port/tests/wpa2_crypto_host.c",
       "bytes": 1955,
       "sha256": "8f51607511dc0729fb465df8189de954827ebdf7262217bbcc3eabc1b0fd7596"
     },
     {
+      "path": "ath10k-port/tests/wpa2_ready_cases.inc",
+      "bytes": 3354,
+      "sha256": "5c86c03e822b15e03046f3108dd770397a3511120e0cd6ffe30140de67d3a408"
+    },
+    {
+      "path": "ath10k-port/tests/wpa2_rx_cases.inc",
+      "bytes": 5281,
+      "sha256": "c268b54974b890852b0e279860b9f72d0ffe3aafb745487ba2b6cbf540eefa4c"
+    },
+    {
       "path": "ath10k-port/tests/wpa2_station_host.c",
-      "bytes": 24772,
-      "sha256": "6e0aec54df45fd5534bba7d051b92c3e9842f608eac55238f403350e81ec8931"
+      "bytes": 25526,
+      "sha256": "8342cb33d4bdafc4b5673ccedd820d80d5054eb20602ff62c3685607158e854d"
     },
     {
       "path": "ath10k-port/vendor/include/nw_abi.h",
-      "bytes": 5458,
-      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+      "bytes": 5772,
+      "sha256": "12a965985dad94b519b8b42344ed9a63ac59c65afb43cd5c36ff89b4ec757e94"
     },
     {
       "path": "ath10k-port/vendor/out/ath.h",
@@ -1268,13 +1283,13 @@
     },
     {
       "path": "ath10k-port/vendor/src/gw_snoc_tail.inc",
-      "bytes": 8887,
-      "sha256": "492965c35afa92488a720b0796e44499ac9ce7969132ea36c1a707f680d320bd"
+      "bytes": 9089,
+      "sha256": "a2ebfd5cf75239877613fe810592d6e928083e05c6a4c9f6ca93be8d8007e798"
     },
     {
       "path": "ath10k-port/vendor/src/nw_abi.h",
-      "bytes": 5458,
-      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+      "bytes": 5772,
+      "sha256": "12a965985dad94b519b8b42344ed9a63ac59c65afb43cd5c36ff89b4ec757e94"
     },
     {
       "path": "ath10k-port/vendor/src/nw_crypto.c",
@@ -1303,8 +1318,8 @@
     },
     {
       "path": "ath10k-port/vendor/src/nw_sta.c",
-      "bytes": 61839,
-      "sha256": "870184fc12be9574798236534c0eb6c5e04b6f2806cf3472a3eb22add7ff4f4c"
+      "bytes": 68412,
+      "sha256": "0e3e9b69eaf22a8735d11e5b941c5eaec20cb845bfbf57b0a10e187b87992759"
     },
     {
       "path": "ath10k-port/vendor/src/nw_sta.h",
@@ -1368,8 +1383,8 @@
     },
     {
       "path": "integration/guamp_xnu_station.c",
-      "bytes": 17382,
-      "sha256": "9779893bf64bbeecf2b15bae5d7f4d3180ff332282898771a3a118e483578792"
+      "bytes": 21747,
+      "sha256": "4776067226327d8883c40f641da8a87c1d6da3b0dd5a5da225ec8ef3148ae076"
     },
     {
       "path": "integration/guamp_xnu_station.h",
@@ -1535,6 +1550,11 @@
       "path": "checkpoint-sorgenti/NativeEmmc/tests/run-prep-runtime-check.sh",
       "bytes": 1564,
       "sha256": "05b21e182ab2bd28a1bd048e31a928678887efa028f84b25e3281c4a130e73e6"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/run-tests.sh",
+      "bytes": 2682,
+      "sha256": "863b47fa02a8ee2a4c464ed8e718c2236da7f68586a7b1a18246eba1eed6e2e8"
     },
     {
       "path": "checkpoint-sorgenti/NativeEmmc/tests/run-transport-tests.sh",

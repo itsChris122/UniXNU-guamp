@@ -100,6 +100,10 @@ static void gw_on_registered(struct ieee80211_hw *hw) {
   hw->wiphy->interface_modes=BIT(NL80211_IFTYPE_STATION);
   hw->wiphy->flags&=~WIPHY_FLAG_SUPPORTS_TDLS;
   nw_sta_ready(hw); // this calls .start and creates a station only after core registration
+  if(nw_wifi_stats.stage!=4||nw_wifi_stats.last_err) {
+    gw_boot_error=nw_wifi_stats.last_err?nw_wifi_stats.last_err:-EIO;
+    lx_log(3,"ath10k: station initialization failed: %d",gw_boot_error);
+  }
 }
 static const struct nw_wifi_hooks gw_hooks={.registered=gw_on_registered,.rx=gw_on_rx,
   .scan_done=gw_on_scan,.beacon_loss=gw_on_lost,.eapol_status=gw_on_status};
