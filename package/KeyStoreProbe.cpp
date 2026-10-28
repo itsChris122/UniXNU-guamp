@@ -55,6 +55,21 @@ uint32_t native_aks_lock_state(void) {
     }
     return (uint32_t)cached;
 }
+// guamp-aks-nopass=<n> (default 1, =0 off): the keybag STATE FLAGS the owned AppleKeyStore reports for
+// aks_get_lock_state (selector 7) and the device-state DER field "ss". A passcode-less iPhone reports bit
+// 0x2 ("no passcode") together with bit 0x4 ("unlocked since boot") = 0x6. Reporting only 0x4 makes
+// LocalAuthentication/coreauthd believe a passcode exists, so Photos Hidden/Recently-Deleted ask for a code
+// (whose entry view cannot show a keyboard without a SEP/ACM context). With 0x6, DeviceOwnerAuthentication
+// fails with passcodeNotSet and Photos opens the album directly. guamp-aks-nopass=0 restores the old 0x4.
+uint32_t native_aks_state_flags(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        unsigned value = 1;
+        PE_parse_boot_argn("guamp-aks-nopass", &value, sizeof(value));
+        cached = value == 1 ? 6 : 4;   // 0x2 no passcode | 0x4 unlocked since boot
+    }
+    return (uint32_t)cached;
+}
 static void aks_publish(void) {
     // Slot 0: counters; slot 1: selector:count tokens ('e' = the last answer was an error). Slots 2-3 belong to the Data store.
     char row[48];
