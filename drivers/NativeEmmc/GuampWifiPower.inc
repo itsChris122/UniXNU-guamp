@@ -24,6 +24,11 @@ struct WifiPower {
     if(!forWlan) {
       pair(word('c','l','k','0'),0,word('E','n','a','b'),1); // shared XO branch
       pair(word('r','w','c','x'),0,word('v','l','v','l'),384); // CX TURBO, as PIL DTS
+      // What rpm-smd-regulator sends with that level for subsys-pil-tz's proxy vote (29/10): the load of
+      // qcom,vdd_cx-uV-uA (100000 uA -> "ma" 100 through get_optimum_mode, >= hpm-min-load: HPM) and the
+      // regulator_enable ("swen" 1), both sets (qcom,set 3). Without them CX may stay in low-power mode.
+      pair(word('r','w','c','x'),0,word('m','a'),100);
+      pair(word('r','w','c','x'),0,word('s','w','e','n'),1);
     } else {
       static const uint32_t rail[4]={8,16,17,23};
       // Intersect ICNSS requests with the actual PM6125 regulator ranges.

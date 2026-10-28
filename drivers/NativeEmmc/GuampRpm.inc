@@ -85,11 +85,42 @@ void logRequest(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *kv, u
           rpm_err_name(rc), r.msg_id, r.us, r.text[0] ? " rpm: " : "", r.text, r.code);
 }
 
-int request(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *kv, unsigned n, unsigned timeoutMs = 500) {
-  if (!gLock || !kv || !n || n > RPM_MAX_KVP) return RPM_ERR_PARAM;
+// Rail floors (modem init 29/10). Linux aggregates the consumers of pm6125_s3_level / s5_level (max of the levels)
+// before one rpm-smd request; here every client votes the APPS "rwcx" / "rwmx" 0 "vlvl" itself and the last request
+// wins on the RPM. A holder that must not be undercut (the modem proxy vote at TURBO, kept for the boot) sets a floor
+// with holdFloor(); any later lower "vlvl" on that rail and set (GPU DCVS down to LOW_SVS) is raised to it.
+constexpr uint32_t kRailCx = 0x78637772u, kRailMx = 0x786d7772u, kKeyVlvl = 0x6c766c76u;   // "rwcx" "rwmx" "vlvl"
+uint32_t gFloor[2][2];   // [cx, mx][active, sleep]
+unsigned gRaised;
+int railIndex(uint32_t type) { return type == kRailCx ? 0 : type == kRailMx ? 1 : -1; }
+void holdFloor(uint32_t type, unsigned which, uint32_t level) {
+  const int r = railIndex(type);
+  if (r < 0 || which > RPM_SET_SLEEP || !gLock) return;
+  IOLockLock(gLock);
+  if (level > gFloor[r][which]) gFloor[r][which] = level;
+  IOLockUnlock(gLock);
+}
+uint32_t floorOf(uint32_t type, unsigned which) {
+  const int r = railIndex(type);
+  return r < 0 || which > RPM_SET_SLEEP ? 0 : gFloor[r][which];
+}
+
+int request(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *in, unsigned n, unsigned timeoutMs = 500) {
+  if (!gLock || !in || !n || n > RPM_MAX_KVP) return RPM_ERR_PARAM;
   if (!timeoutMs || timeoutMs > 10000) timeoutMs = 500;
   rpm_result r{};
+  rpm_kvp kv[RPM_MAX_KVP];
+  for (unsigned i = 0; i < n; i++) kv[i] = in[i];
   IOLockLock(gLock);
+  const int rail = id == 0 && which <= RPM_SET_SLEEP ? railIndex(type) : -1;
+  uint32_t raisedFrom = 0, raisedTo = 0;
+  for (unsigned i = 0; rail >= 0 && i < n; i++)
+    if (kv[i].key == kKeyVlvl && kv[i].value < gFloor[rail][which]) {
+      raisedFrom = static_cast<uint32_t>(kv[i].value);
+      raisedTo = gFloor[rail][which];
+      kv[i].value = raisedTo;
+    }
+  const unsigned raisedCount = raisedTo ? ++gRaised : gRaised;
   int rc = openLocked();
   if (!rc) {
     rc = rpm_link_request(&gLink, which, type, id, kv, n, timeoutMs * 1000u, 50, &r);
@@ -101,6 +132,9 @@ int request(unsigned which, uint32_t type, uint32_t id, const rpm_kvp *kv, unsig
     }
   }
   IOLockUnlock(gLock);
+  if (raisedTo && (raisedCount <= 8 || !(raisedCount % 100)))
+    IOLog("GuampRpm: %s %s vlvl %u raised to the held floor %u (raise #%u)\n", which == RPM_SET_SLEEP ? "slp" : "act",
+          rail ? "rwmx" : "rwcx", raisedFrom, raisedTo, raisedCount);
   logRequest(which, type, id, kv, n, rc, r);
   return rc;
 }
@@ -173,6 +207,8 @@ extern "C" int guamp_rpm_shared_ready(void) { return rpm::gLock != nullptr; }
 extern "C" int guamp_rpm_shared_vote(uint32_t resource, uint32_t id, uint32_t key, uint32_t value, uint32_t state,
                                      uint32_t timeoutMs) {
   if (state > RPM_SET_SLEEP) return RPM_ERR_PARAM;
+  // The provider's proxy vote (rwcx vlvl 384) is held for the boot: make it the floor before sending it.
+  if (id == 0 && key == rpm::kKeyVlvl) rpm::holdFloor(resource, state, value);
   return rpm::set(resource, id, key, value, state, timeoutMs);
 }
 #endif

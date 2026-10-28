@@ -26,8 +26,16 @@ struct ModemBootHooks {
 
 static const ModemBootHooks *gModemHooks;   // valid only during modemBoot (prep thread, one call at a time)
 static bool modemHookStopped(void *) {return modemStopped();}
-static int modemHookPrepare(void *) {return gModemHooks->prepare(gModemHooks->ctx);}
+static int modemHookPrepare(void *) {
+#if defined(GUAMP_MODEM_INIT)
+  modemInitPrepare();   // Linux-side prerequisites before any modem RAM write (GuampModemInit.inc)
+#endif
+  return gModemHooks&&gModemHooks->prepare?gModemHooks->prepare(gModemHooks->ctx):0;
+}
 static int modemHookReady(void *) {
+#if defined(GUAMP_MODEM_INIT)
+  modemWatchStart();    // watchdog / SMEM / SFR observation from AUTH_AND_RESET on
+#endif
   if(gModemHooks && gModemHooks->started) {
     const int e=gModemHooks->started(gModemHooks->ctx);
     if(e)IOLog("GuampModem: board readiness failed %d\n",e);
@@ -37,7 +45,12 @@ static int modemHookReady(void *) {
 }
 static void modemHookCleanup(void *,bool stopped) {gModemHooks->shutdown(gModemHooks->ctx,stopped);}
 // log_failure_reason of subsys-pil-tz: SMP2P 428 bits and SMEM item 421 (qcom,smem-id of qcom,mss), before SHUTDOWN.
-static void modemHookFailure(void *) {modemFailureReport();}
+static void modemHookFailure(void *) {
+  modemFailureReport();
+#if defined(GUAMP_MODEM_INIT)
+  modemInitReport();
+#endif
+}
 // pil_proxy_vote of qcom,mss (guamp DT): proxy clock "xo" (cxo_pil_mss voter = RPM clk0 0 Enab) and vdd_cx =
 // pm6125_s3_level ("rwcx" 0, qcom,set 3: active + sleep) at qcom,vdd_cx-uV-uA 384 (TURBO), swen 1 as rpm-smd-regulator
 // enable. Only for guamp-modem-start=1 without Wi-Fi: the Wi-Fi owner votes the same resources itself (provider stage 3).
@@ -48,10 +61,13 @@ static void modemHookFailure(void *) {modemFailureReport();}
 static bool modemHookVote(void *,bool on) {
   if(!on)return true;
   const int xo=rpm::set(RPM_RES_CLK0,RPM_CLK0_XO,RPM_KEY_ENAB,1,RPM_SET_ACTIVE,500);
-  const rpm_kvp kv[2]={{RPM_KEY_SWEN,4,1},{0x6c766c76u /* vlvl */,4,384}};
-  int cx=xo?xo:rpm::request(RPM_SET_ACTIVE,0x78637772u /* rwcx */,0,kv,2,500);
-  if(!cx && !xo)cx=rpm::request(RPM_SET_SLEEP,0x78637772u,0,kv,2,500);
-  IOLog("GuampModem: proxy vote xo %s, cx level 384 %s\n",rpm_err_name(xo),xo?"-":rpm_err_name(cx));
+  if(!xo)(void)rpm::set(RPM_RES_CLK0,RPM_CLK0_XO,RPM_KEY_ENAB,1,RPM_SET_SLEEP,500);   // cxo_pil_mss: not an _ao voter
+  // rpm-smd-regulator for the pil proxy vote: swen 1, vlvl 384 and the load (100000 uA -> "ma" 100, HPM), both sets
+  const rpm_kvp kv[3]={{RPM_KEY_SWEN,4,1},{0x6c766c76u /* vlvl */,4,384},{0x616du /* ma */,4,100}};
+  rpm::holdFloor(rpm::kRailCx,RPM_SET_ACTIVE,384);rpm::holdFloor(rpm::kRailCx,RPM_SET_SLEEP,384);
+  int cx=xo?xo:rpm::request(RPM_SET_ACTIVE,0x78637772u /* rwcx */,0,kv,3,500);
+  if(!cx && !xo)cx=rpm::request(RPM_SET_SLEEP,0x78637772u,0,kv,3,500);
+  IOLog("GuampModem: proxy vote xo %s, cx level 384 + 100 mA %s (floor held)\n",rpm_err_name(xo),xo?"-":rpm_err_name(cx));
   return !xo && !cx;
 }
 #endif
@@ -90,7 +106,11 @@ static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
 #else
     IOLog("GuampModem: no rpm client in this build: proxy votes not sent\n");
 #endif
+#if defined(GUAMP_MODEM_INIT)
+    h.prepare=modemHookPrepare;   // always: modemInitPrepare, then the owner's prepare if any
+#else
     if(hooks && hooks->prepare)h.prepare=modemHookPrepare;
+#endif
     if(hooks && hooks->shutdown)h.cleanup=modemHookCleanup;
     gModemHooks=hooks;
     const int rc=pas::boot(peripheral,h,transport,fs,mdt,static_cast<uint32_t>(inode.size),*image,chunk,kChunkBytes,
