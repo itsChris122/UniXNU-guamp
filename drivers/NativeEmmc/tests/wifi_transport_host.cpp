@@ -20,6 +20,7 @@
 #include "../GuampMsa.inc"
 #include "../GuampQftp.inc"
 #include "../GuampServreg.inc"
+#include "../GuampRmtfs.inc"
 #include "../GuampWifiControl.inc"
 using namespace guampwifi;
 static unsigned checks=0;
@@ -263,6 +264,19 @@ static void msaTest() {
     monitor.reject=true; CHECK(m.assign(0x51900000,4096,false)==RemoteError&&m.assigned==1);
   }
   scm::Transport t; auto invalid=t.callExtended(12,22,7,0,0,0,1); CHECK(invalid.transport==scm::kInvalid);
+  // rmtfs shared region (msm_sharedmem setup_shared_ram_perms, vm-nav-path): HLOS -> HLOS/MSS_MSA/NAV RW
+  for(bool wide:{true,false}) {
+    Fixture f(512); MsaMonitor monitor; scm::Transport ts={MsaMonitor::call,nullptr,&monitor,wide};
+    MsaAssignment m={f.memory(),0x60000000,&ts,0};
+    static const uint32_t vm[3]={3,15,0x2b};
+    CHECK(m.assignShared(0x7f001000,0x200000,vm,3)==Ok&&monitor.calls==1&&monitor.last.x[1]==0x1117);
+    CHECK(le64(f.bytes.data())==0x7f001000&&le64(f.bytes.data()+8)==0x200000&&le32(f.bytes.data()+64)==3);
+    CHECK(le32(f.bytes.data()+128)==3&&le32(f.bytes.data()+132)==6&&le32(f.bytes.data()+152)==15&&
+          le32(f.bytes.data()+156)==6&&le32(f.bytes.data()+176)==0x2b&&le32(f.bytes.data()+180)==6);
+    if(wide) CHECK(le64(f.bytes.data()+272)==72); else CHECK(le32(f.bytes.data()+264)==72);
+    CHECK(m.assignShared(0x51900000,4096,vm,3)==Range&&m.assignShared(0x7f001800,4096,vm,3)==Range&&
+          m.assignShared(0x100000000ull,4096,vm,3)==Range&&m.assignShared(0x7f001000,4096,vm,0)==Range&&monitor.calls==1);
+  }
 }
 static void powerPlanTest() {
   auto r=std::make_unique<Rpm>(); r->channel=1; r->glink.running=true;
@@ -542,8 +556,9 @@ struct ControlRig {
   }
   bool saw(const char *s) const { for(auto &l:lines) if(l.find(s)!=std::string::npos) return true; return false; }
   explicit ControlRig(uint16_t items) { f.init(true); siii(f,items); a=f.arena(); }
+  const Rmtfs::Storage *rmtfs=nullptr;
   int prepare() {
-    WifiControl::Ops o{}; o.ctx=this; o.trace=trace;
+    WifiControl::Ops o{}; o.ctx=this; o.trace=trace; o.rmtfs=rmtfs;
     o.smpKick=[](void *p){ static_cast<ControlRig *>(p)->f.kicks++; }; o.glinkKick=o.smpKick;
     o.wlan={this,nullptr,[](void *,const Wlfw::Region *,uint32_t)->int{return Ok;},[](void *,bool)->int{return Ok;},
       [](void *,const char *,uint32_t *n)->int{*n=0;return NotFound;},
@@ -579,6 +594,21 @@ static void controlTest() {
     CHECK(!strcmp(r.c->where(),"glink version (mpss edge)"));
     CHECK(r.c->step(1004+WifiControl::ServiceMs)==Ok);   // the WLFW deadline counts from the GLINK start (1005)
     CHECK(r.c->step(1005+WifiControl::ServiceMs)==Timeout&&r.saw("FAILED")&&r.saw(" glink running/negotiated/rx 0 1 0 0"));
+  }
+  { // RMTFS registered next to QFTP/SERVREG (announced by Qrtr::start); released with the transport
+    ControlRig r(512); std::vector<uint8_t> shared(0x202000),part(0x10000);
+    Rmtfs::Storage io{}; io.ctx=&shared;
+    io.shared={&shared,uint32_t(shared.size()),[](void *p,uint32_t at)->uint32_t{return le32(static_cast<std::vector<uint8_t> *>(p)->data()+at);},
+      [](void *p,uint32_t at,uint32_t v){put32(static_cast<std::vector<uint8_t> *>(p)->data()+at,v);},[](void *){}};
+    io.sharedOffset=0x1000; io.physical=0x7f001000; io.bytes=0x200000; io.allocator=r.f.allocator();
+    io.partition=[](void *,uint32_t,const char *,uint64_t *n)->int{*n=0x10000;return Ok;};
+    io.read=[](void *,uint32_t,uint64_t,uint8_t *o,uint32_t n)->int{memset(o,0,n);return Ok;};
+    r.rmtfs=&io;
+    CHECK(r.prepare()==Ok&&r.c->rmtfs.ready);
+    bool found=false; for(auto &l:r.c->qrtr.local) found|=l.used&&l.service==14&&l.instance==1&&l.port==0x4300;
+    CHECK(found&&r.f.live>0);
+    CHECK(r.c->modemStarted(0)==Ok&&r.c->step(WifiControl::ReadyMs)==Timeout&&!r.c->rmtfs.ready);
+    CHECK(r.c->release(true)==Ok);
   }
   { ControlRig r(400);   // Linux semantics: item ids >= num_items are refused
     CHECK(r.prepare()==Range&&!strcmp(r.c->where(),"smem 435 smp2p out")&&r.saw("FAILED"));

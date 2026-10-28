@@ -19,14 +19,26 @@ struct MsaAssignment {
     if(!validPayload()) return Invalid;
     if(!bytes||address<0x51900000ull||address>=0x51a00000ull||bytes>0x51a00000ull-address||
        (address&4095)||(bytes&4095)) return Range;
+    static constexpr uint32_t wlan[3]={15u,24u,25u};
+    return call(address,bytes,wlan,secure?2u:3u);
+  }
+  // The same documented MEM_PROT_ASSIGN for the dynamic rmtfs shared region, as msm_sharedmem.c
+  // setup_shared_ram_perms (client-id 1): HLOS -> {HLOS, MSS_MSA, NAV} RW. Never on the MSA itself.
+  int assignShared(uint64_t address,uint32_t bytes,const uint32_t *vmids,uint32_t count) {
+    if(!validPayload()) return Invalid;
+    if(!vmids||!count||count>4||!bytes||(address&4095)||(bytes&4095)||address>=0x100000000ull||
+       bytes>0x100000000ull-address||(address<0x51a00000ull&&address+bytes>0x51900000ull)) return Range;
+    return call(address,bytes,vmids,count);
+  }
+private:
+  int call(uint64_t address,uint32_t bytes,const uint32_t *vmids,uint32_t count) {
     auto available=transport->available(0xc,0x16);
     if(available.transport||available.value!=1) return Unsupported;
-    const uint32_t count=secure?2u:3u;
     payload.zero(0,512);
     uint8_t region[16]; put64(region,address); put64(region+8,bytes); payload.copyIn(0,region,16);
     payload.w32(64,3); // source VMID_HLOS
     for(uint32_t i=0;i<count;i++) {
-      payload.w32(128+24*i,i==0?15u:(i==1?24u:25u));
+      payload.w32(128+24*i,vmids[i]);
       payload.w32(132+24*i,6); // PERM_READ(4) | PERM_WRITE(2)
     }
     uint8_t extra[56]={};

@@ -9,6 +9,7 @@
 #include "GuampQftp.inc"
 #include "GuampQmi.inc"
 #include "GuampServreg.inc"
+#include "GuampRmtfs.inc"
 #include "GuampWlfw.inc"
 #include "GuampSnocCe.inc"
 #include "GuampWifiRpm.inc"
@@ -23,13 +24,16 @@ struct WifiControl {
     void (*event)(void *,Stage,int);
     // Optional one-line diagnostics: what names the gate and the meaning of a/b/c. Never called under the SMEM lock.
     void (*trace)(void *,const char *what,int e,uint32_t a,uint32_t b,uint32_t c);
+    // Optional RMTFS backing (shared region + EFS partitions). When set, service 14 is registered on QRTR next to
+    // QFTP/SERVREG and announced as soon as IPCRTR opens, before the modem looks up its EFS server.
+    const Rmtfs::Storage *rmtfs;
   };
   // Gate timeouts after the modem PAS start (Linux: subsys err_ready 10 s; icnss has no WLFW timeout, the WLAN PD
   // only registers 0x45 after the modem has fetched wlanmdsp.mbn over QRTR TFTP).
   static constexpr uint32_t ReadyMs=10000,FifoMs=10000,ServiceMs=60000,BeatMs=5000;
   SmemArena *arena=nullptr; Allocator allocator={}; Ops ops={};
   Smp2pEdge smp={}; Glink glink={}; Qrtr qrtr={}; QftpReadOnly tftp={};
-  GuampServreg servreg={}; Wlfw wlan={};
+  GuampServreg servreg={}; Rmtfs rmtfs={}; Wlfw wlan={};
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
   uint64_t deadline=0,now=0,started=0,beat=0;
@@ -53,6 +57,11 @@ struct WifiControl {
     e=servreg.start(this,serviceTx);if(e)return fail(e);
     e=qrtr.addLocalService(GuampServreg::Service,GuampServreg::Instance,GuampServreg::Port,this,serviceRx);
     if(e)return fail(e);
+    if(ops.rmtfs) {
+      gate="qrtr rmtfs";
+      e=rmtfs.start(*ops.rmtfs,this,serviceTx);if(e)return fail(e);
+      e=qrtr.addLocalService(Rmtfs::Service,Rmtfs::ServiceInstance,Rmtfs::Port,this,rmtfsRx);if(e)return fail(e);
+    }
     smemSummary();
     // qcom_smp2p probe (before the modem boots): outbound 435 in the APPS-MPSS partition, kick bit 14.
     gate="smem 435 smp2p out"; e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
@@ -116,6 +125,7 @@ struct WifiControl {
       deadline=now+ServiceMs; transition(Running); gate="glink version (mpss edge)";
     }
     e=tftp.step(now);if(e!=Ok&&e!=Again)return fail(e);
+    rmtfs.step();
     e=glink.step(); if(e||error) return fail(e?e:error);
     if(glink.negotiated&&!sawNegotiated) {
       sawNegotiated=true; gate="glink IPCRTR open/ack";
@@ -144,7 +154,7 @@ struct WifiControl {
   int release(bool pasStopped) {
     if(!pasStopped) return Busy;
     qrtr.stop(); glink.stop(); routerStarted=wlanStarted=false;
-    tftp.stop(); servreg.stop();
+    tftp.stop(); servreg.stop(); rmtfs.stop();
     stage=Off; return Ok;
   }
 private:
@@ -158,6 +168,7 @@ private:
     trace(" glink running/negotiated/rx",0,glink.running,glink.negotiated,glink.rxPackets);
     trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);
     trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
+    if(rmtfs.ready) trace(" rmtfs requests/failures/overlay bytes",0,rmtfs.requests,rmtfs.failures,rmtfs.shadowBytes);
   }
   void smemSummary() {
     smem::Info i={};
@@ -174,7 +185,7 @@ private:
     if(ops.trace) { trace("FAILED: stage/ms (gate on the next line)",e,stage,uint32_t(now-started),0); heartbeat(); }
     error=e; stage=Failed; wlan.peerLost();
     qrtr.stop(); glink.stop(e); routerStarted=wlanStarted=false;
-    tftp.stop(); servreg.stop();
+    tftp.stop(); servreg.stop(); rmtfs.stop();
     error=e;
     if(ops.event) ops.event(ops.ctx,Failed,e); return e;
   }
@@ -192,6 +203,10 @@ private:
   static void serviceRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p);int e=c.servreg.receive(node,port,v,n);
     if(e!=NotFound&&e!=Unsupported&&e!=Again)c.error=e;
+  }
+  // RMTFS answers every request itself (QMI failure results included); a bad request never fails the transport.
+  static void rmtfsRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
+    (void)static_cast<WifiControl *>(p)->rmtfs.receive(node,port,v,n);
   }
   static int qftpSize(void *p,const char *name,uint32_t *n) {
     auto &c=*static_cast<WifiControl *>(p);return c.ops.wlan.fileSize(c.ops.wlan.ctx,name,n);

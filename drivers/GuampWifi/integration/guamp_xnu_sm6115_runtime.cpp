@@ -34,6 +34,12 @@ struct Sm6115Runtime {
     Firmware,RadioProbe,Scanning,ScanComplete,IosAttached,Failed,AwaitNetwork };
   GuampXnuSm6115Provider owner{};
   GuampXnuBuffer msaPayload{},pageTables{};
+  // qcom,rmtfs_sharedmem (msm_sharedmem client "rmtfs"): reg <0 0x200000> = dynamic 2 MiB, qcom,guard-memory
+  // (4 KiB before and after), qcom,client-id 1 (MPSS RMTS), qcom,vm-nav-path.
+  static constexpr uint32_t RmtfsRegion=0x200000,RmtfsGuard=0x1000;
+  GuampXnuBuffer rmtfsMem{};
+  Rmtfs::Storage rmtfsIo{};
+  bool rmtfsReady=false,rmtfsAssigned=false;
   scm::Transport transport{guampScmInstruction,scmSleep,nullptr,true};
   MsaAssignment msa{};
   WlanSmmu smmu{};
@@ -86,9 +92,47 @@ struct Sm6115Runtime {
     WifiControl::Ops ops{};ops.ctx=this;ops.smpKick=smpKick;ops.glinkKick=glinkKick;
     ops.wlan={this,nullptr,assignMsa,wlanPower,fileSize,fileRead,wlfwEvent};
     ops.event=controlEvent;ops.trace=controlTrace;
+    rmtfsReady=setupRmtfs(base,bytes);ops.rmtfs=rmtfsReady?&rmtfsIo:nullptr;
     e=control.prepare(&owner.arena,owner.allocator,ops,true);
     if(e)return fail(e,"APPS SMP2P/GLINK prepare");
     transition(Prepared);return Ok;
+  }
+
+  // Before the PAS start: the region the modem's EFS client is told about (alloc_buff) must already exist with the
+  // permissions Linux gives it. msm_sharedmem.c: dma_alloc_coherent(size + 8 KiB), base + 4 KiB, then
+  // setup_shared_ram_perms() = hyp_assign_phys(HLOS -> HLOS, MSS_MSA, NAV, all RW), because the DT address is 0
+  // (dynamic) and client-id is 1. The boot chain never assigns this region (it has no fixed address), so this is
+  // the one assignment the DT asks for; guamp-rmtfs-assign=0 skips it. A failure leaves Wi-Fi as before (no server).
+  bool setupRmtfs(uint64_t base,uint64_t bytes) {
+    unsigned enabled=1;PE_parse_boot_argn("guamp-rmtfs",&enabled,sizeof(enabled));
+    if(!enabled) {IOLog("GuampRmtfs: disabled by guamp-rmtfs=0: service 14 not published\n");return false;}
+    // rw_iovec phys_offset is a 32-bit physical address: the region must sit below 4 GiB (Linux: 32-bit DMA mask).
+    if(!rmtfsMem.open(RmtfsRegion+2*RmtfsGuard,0xfffff000ull,base,bytes)) {
+      IOLog("GuampRmtfs: shared memory allocation FAILED (2 MiB + 8 KiB contiguous below 4 GiB): service 14 not published\n");
+      return false;
+    }
+    const uint64_t region=rmtfsMem.physical+RmtfsGuard;
+    IOLog("GuampRmtfs: shared memory %llx + %x (allocation %llx + %x, 4 KiB guards), uncached, client-id 1\n",
+          region,RmtfsRegion,rmtfsMem.physical,rmtfsMem.size);
+    // From here the pages may be handed to the modem: they are never returned to XNU during this boot.
+    rmtfsMem.retainForDevice();
+    unsigned assign=1;PE_parse_boot_argn("guamp-rmtfs-assign",&assign,sizeof(assign));
+    if(assign) {
+      static constexpr uint32_t vmids[3]={3u,15u,0x2bu};   // VMID_HLOS, VMID_MSS_MSA, VMID_NAV (secure_buffer.h)
+      int e=msaPayload.retainForDevice()?msa.assignShared(region,RmtfsRegion,vmids,3):Invalid;
+      rmtfsAssigned=!e;
+      IOLog("GuampRmtfs: hyp_assign %llx + %x HLOS -> HLOS/MSS_MSA/NAV RW (msm_sharedmem, vm-nav-path): %d %s%s\n",
+            region,RmtfsRegion,e,errorName(e),e?" (continuing as Linux does; the modem may fault on the region)":"");
+    } else {
+      IOLog("GuampRmtfs: hyp_assign skipped (guamp-rmtfs-assign=0): region stays HLOS-only\n");
+    }
+    unsigned write=0;PE_parse_boot_argn("guamp-rmtfs-write",&write,sizeof(write));
+    rmtfsIo={this,rmtfsMem.memory,RmtfsGuard,region,RmtfsRegion,owner.allocator,
+             rmtfsPartition,rmtfsRead,write==1?rmtfsWrite:nullptr,rmtfsTrace};
+    IOLog("GuampRmtfs: modem EFS writes %s\n",write==1?
+          "go to eMMC for modemst1/modemst2 (guamp-rmtfs-write=1); fsc/fsg writes stay in RAM":
+          "stay in RAM for this boot (eMMC read-only; guamp-rmtfs-write=1 writes modemst1/2 to eMMC)");
+    return true;
   }
 
   int modemStarted() {
@@ -266,6 +310,7 @@ struct Sm6115Runtime {
     if(dmaStarted&&!gGuampXnuDma.stop(true))return;
     dmaStarted=false;
     if(smmu.stop(true))return;
+    // rmtfsMem stays allocated: it may be assigned to MSS_MSA/NAV, and Linux never frees it either.
     pageTables.close(true);msaPayload.close(true);owner.stop(true);
   }
 
@@ -313,6 +358,19 @@ struct Sm6115Runtime {
   static void controlTrace(void *,const char *what,int e,uint32_t a,uint32_t b,uint32_t c) {
     IOLog("GuampWiFi: transport %s: %u/%u/%u (0x%x/0x%x/0x%x) result %d %s at %llu ms\n",
       what,a,b,c,a,b,c,e,errorName(e),nowMs());
+  }
+  static int rmtfsPartition(void *,uint32_t index,const char *label,uint64_t *bytes) {
+    return guamp_rmtfs_partition(index,label,bytes);
+  }
+  static int rmtfsRead(void *,uint32_t index,uint64_t at,uint8_t *out,uint32_t bytes) {
+    return guamp_rmtfs_partition_read(index,at,out,bytes);
+  }
+  static int rmtfsWrite(void *,uint32_t index,uint64_t at,const uint8_t *in,uint32_t bytes) {
+    return guamp_rmtfs_partition_write(index,at,in,bytes);
+  }
+  static void rmtfsTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
+    IOLog("GuampRmtfs: %s%s%s: %llu/%llu/%llu (0x%llx/0x%llx/0x%llx) result %d %s at %llu ms\n",
+      name?name:"",name?" ":"",what,a,b,c,a,b,c,e,errorName(e),nowMs());
   }
   static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
