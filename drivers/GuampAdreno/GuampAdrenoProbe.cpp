@@ -609,6 +609,35 @@ int naAccelerator() {
 }
 }  // namespace
 
+// guamp-copy-gpu-wait (scripts/guamp-canvas-variant.py): the deferred CPU copy of a swapped surface first waits until the CP has
+// retired every submission handed out so far (the render server swaps after waitUntilScheduled, before its frame is done). Reads
+// only the ring object's newest fence number and the CP-written timestamp of the fence page (+4, write-combined kernel memory, no
+// GPU register); never retires or accounts a fence and never runs the hang detector, so it needs no GPU lock. Sleeps until the GPU
+// interrupt or 200 us per round; with interrupts off or preemption disabled it spins 20 us per round.
+extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited_us) {
+  if (waited_us) *waited_us = 0;
+  NativeAdrenoRing *ring = gRing;
+  const volatile uint8_t *page = gSession.ncpu[2];
+  if (!ring || !page || gSession.nb[2].bytes < 8 || ring->poisoned() || gGpuParked) return -1;
+  const uint32_t target = ring->lastSubmitted();
+  if (!target) return 0;
+  const uint64_t start = naNow(nullptr);
+  for (;;) {
+    __asm__ volatile("dsb sy" ::: "memory");
+    const uint32_t done = *reinterpret_cast<const volatile uint32_t *>(page + 4);
+    const uint64_t spent = naNow(nullptr) - start;
+    if (waited_us) *waited_us = spent > 0xffffffffull ? 0xffffffffu : uint32_t(spent);
+    if (int32_t(done - target) >= 0) return 0;
+    if (spent >= timeout_us || ring->poisoned() || gGpuParked) return 1;
+    if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
+      assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 200, NSEC_PER_USEC);
+      thread_block(THREAD_CONTINUE_NULL);
+    } else {
+      IODelay(20);
+    }
+  }
+}
+
 extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   static bool started = false;
   if (!in || !in->gpu || in->gpuBytes < 0x90000 || !in->sqe || !in->level || started) return GuampAdrenoBadArgs;

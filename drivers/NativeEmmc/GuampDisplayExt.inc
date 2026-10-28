@@ -51,6 +51,9 @@ static void start()
 // microseconds per frame), with the scanout mapping mode (guamp-fb-wc=1: write-combining).
 // scripts/guamp-canvas-variant.py (always applied to the legacy display): source mapping and read-probe counters.
 extern "C" volatile uint64_t guamp_copy_split[16];
+// The same variant's guamp-copy-gpu-wait counters ([0] reached, [1] timed out, [2] no ring, [3] us waited, [4] longest us,
+// [5] reached at once, [6] the bound in ms; 0 = off).
+extern "C" volatile uint64_t guamp_copy_gpu_wait[8];
 // drivers/NativeAdreno/NativeAdrenoPublish.cpp: the Metal plugin's connections and tunnel calls (only the leading counters of its
 // NativeAdrenoMetalDiag, declared first there) and its telemetry rows, which otherwise reach only the boot page (hidden under Metal).
 struct GuampMetalDiagHead {
@@ -90,10 +93,26 @@ static void copyLog()
   const uint64_t frames = n - lastN;
   const uint64_t meanUs = frames ? (sum - lastSum) / frames * 1000000 / f : 0;
   const uint64_t kib = frames ? ((bytes - lastBytes) / frames) >> 10 : 0;
-  IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
-        "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
-        max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
-        guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+  // guamp-copy-gpu-wait=<ms>: the deferred copies' waits for the GPU since the previous report (reached / timed out / no ring,
+  // of which already reached), the mean and all-time longest wait.
+  static uint64_t lastWaits = 0, lastTimeouts = 0, lastNoRing = 0, lastWaitUs = 0, lastReady = 0;
+  const uint64_t waits = guamp_copy_gpu_wait[0], timeouts = guamp_copy_gpu_wait[1], noRing = guamp_copy_gpu_wait[2];
+  const uint64_t waitUs = guamp_copy_gpu_wait[3], ready = guamp_copy_gpu_wait[5];
+  const uint64_t waited = (waits - lastWaits) + (timeouts - lastTimeouts);
+  if (guamp_copy_gpu_wait[6])
+    IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
+          "swaps accepted +%u rejected +%u, scanout %s; gpu wait %llu ms: waits +%llu (ready +%llu) timeouts +%llu no ring +%llu, "
+          "mean %llu ms max %llu ms\n", frames, n, meanUs, max * 1000000 / f,
+          max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
+          guamp_fb_wc_enabled == 1 ? "write-combining" : "device", guamp_copy_gpu_wait[6], waits - lastWaits, ready - lastReady,
+          timeouts - lastTimeouts, noRing - lastNoRing, waited ? (waitUs - lastWaitUs) / waited / 1000 : 0,
+          guamp_copy_gpu_wait[4] / 1000);
+  else
+    IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
+          "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
+          max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
+          guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+  lastWaits = waits; lastTimeouts = timeouts; lastNoRing = noRing; lastWaitUs = waitUs; lastReady = ready;
   {
     // Mapping (and, with guamp-fast-copy=1, cache maintenance) per frame and the read-only probe of guamp-copy-probe=N.
     static uint64_t lastMaps = 0, lastMapTicks = 0, lastProbes = 0, lastProbeTicks = 0;

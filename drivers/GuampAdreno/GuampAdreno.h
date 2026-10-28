@@ -34,6 +34,11 @@ enum {
 };
 int guamp_adreno_start(const struct GuampAdrenoStart *start);
 
+// guamp-copy-gpu-wait: waits (sleeping, thread context) until the CP timestamp reaches the newest fence handed out at the call, at
+// most timeout_us. 0 done (also when nothing was ever submitted), 1 timed out, -1 no ring (not started, poisoned or parked).
+// *waited_us: the time spent. NativeLegacyDisplay (scripts/guamp-canvas-variant.py) holds a weak stand-in that answers -1.
+int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited_us);
+
 #ifdef __cplusplus
 }
 #endif

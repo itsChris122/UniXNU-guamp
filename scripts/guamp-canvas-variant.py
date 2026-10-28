@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'e8a045bb557aa03667d1981e6bb87182ed5b7ff3d60a1f98e286bf889e04b953'
+PATCHED_SHA256 = '4bdb5c74c0f2e09b7c2b82d06a6b1994aae3d20d40e83267029998276e833f59'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -265,16 +265,28 @@ EDITS.append((r'''            installBootDimensions((uint32_t)video.v_width,(uin
 #    guamp_copy_split: [0] frames mapped, [1] map + cache maintenance ticks, [2] probed frames, [3] probe ticks, [4] mapping cache
 #    mode, [5] last mapping cacheable, [6] probe bytes, [7] cacheable mappings refused, [8] asynchronous copies, [9] cached mappings
 #    reused, [10] async skipped: option off, [11] skipped: GPU bypass after a failure, [12] skipped: no thread call, [13] skipped:
-#    a copy still in flight, [14] options read (bit0 fast, bit1 flush, bit2 map cache, bits3-4 async mode, bit5 read), [15] snapshot
+#    a copy still in flight, [14] options read (bit0 fast, bit1 flush, bit2 map cache, bits3-4 async mode, bit5 read, bit6 GPU wait), [15] snapshot
 #    ticks (copy into the internal buffer).
+#    guamp-copy-gpu-wait=<ms> (default 0, off; at most 1000): the copy is deferred to the thread call (guamp-async-copy is taken as
+#                             1, no snapshot) and first waits, at most <ms>, until the GPU has retired every submission handed out
+#                             by then (drivers/GuampAdreno guamp_adreno_wait_submitted: the CP timestamp of the fence page against
+#                             the ring's newest fence), because the render server swaps after waitUntilScheduled, before its Metal
+#                             frame is written. The swap still retires at once; the surface stays held until the next swap, which
+#                             is not transferred before this copy ends. Then it maps (and cleans/invalidates) and copies as before.
+#    guamp_copy_gpu_wait: [0] waits that saw the fence reached, [1] timed out (copied anyway), [2] no GPU ring (copied at once),
+#    [3] microseconds waited in total ([0] and [1]), [4] longest wait (us), [5] fence already reached (under 20 us), [6] the bound
+#    in milliseconds.
 EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}',
               'extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}\n'
               '#include <kern/thread_call.h>\n'
               'extern "C" {volatile uint64_t guamp_copy_split[16];volatile uint64_t guamp_copy_probe_sink;}\n'
-              'extern "C" void flush_dcache64(addr64_t,unsigned,int);'))
+              'extern "C" void flush_dcache64(addr64_t,unsigned,int);\n'
+              '// guamp-copy-gpu-wait: drivers/GuampAdreno defines it; a kernel without the GPU probe has no ring (static link: weak definition).\n'
+              'extern "C" {volatile uint64_t guamp_copy_gpu_wait[8];\n'
+              '__attribute__((weak)) int guamp_adreno_wait_submitted(uint32_t,uint32_t *waited){if(waited)*waited=0;return -1;}}'))
 EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
-    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0;
+    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
@@ -282,8 +294,12 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
         v=1;PE_parse_boot_argn("guamp-map-cache",&v,sizeof v);mapCache=v==1;   // default on (owner 28/10)
         v=0;PE_parse_boot_argn("guamp-async-copy",&v,sizeof v);asyncMode=v<=2?v:0;
         PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;
+        // guamp-copy-gpu-wait: the GPU wait runs in the deferred copy, after the swap retired; a snapshot would read too early.
+        PE_parse_boot_argn("guamp-copy-gpu-wait",&gpuWaitMs,sizeof gpuWaitMs);if(gpuWaitMs>1000)gpuWaitMs=1000;
+        if(gpuWaitMs)asyncMode=1;
+        guamp_copy_gpu_wait[6]=gpuWaitMs;
         copyOptions=1;
-        guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32;
+        guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32|(gpuWaitMs?64:0);
     }
     struct GuampMapSlot {IOMemoryDescriptor *memory;IOMemoryMap *map;uint64_t used;bool cacheable;};
     GuampMapSlot mapSlots[4]={};uint64_t mapUse=0;
@@ -330,6 +346,16 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     void asyncCopy() {
         IOMemoryDescriptor *memory=asyncMemory;asyncMemory=nullptr;
         int status=-1;
+        if(gpuWaitMs && memory) {
+            uint32_t waited=0;const int r=guamp_adreno_wait_submitted(gpuWaitMs*1000,&waited);
+            if(r<0)guamp_copy_gpu_wait[2]=guamp_copy_gpu_wait[2]+1;
+            else {
+                if(r)guamp_copy_gpu_wait[1]=guamp_copy_gpu_wait[1]+1;else guamp_copy_gpu_wait[0]=guamp_copy_gpu_wait[0]+1;
+                if(!r && waited<20)guamp_copy_gpu_wait[5]=guamp_copy_gpu_wait[5]+1;
+                guamp_copy_gpu_wait[3]=guamp_copy_gpu_wait[3]+waited;
+                if(waited>guamp_copy_gpu_wait[4])guamp_copy_gpu_wait[4]=waited;
+            }
+        }
         IOMemoryMap *source=memory?guampSourceMap(memory,asyncAllocation):nullptr;
         const uintptr_t from=asyncSnapshot?(uintptr_t)snapshot:(source?(uintptr_t)source->getVirtualAddress():0);
         const uint64_t fromBytes=asyncSnapshot?snapshotBytes:(source?source->getLength():0);
