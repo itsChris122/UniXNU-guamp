@@ -169,7 +169,7 @@ struct bts_identity {
     uint8_t usbProduct[4];     // 0xfc5a return parameters after status (vid le16, pid le16)
     bool rewriteVersion, rewriteName, passVendorEvents;
     bool translateBdaddr;      // also send 0xfc01's address to the WCN3950 as Qualcomm EDL_WRITE_BD_ADDR 0xfc14
-    uint8_t unknownVendorStatus;   // Command Complete status for unlisted OGF 0x3f commands
+    uint8_t unknownVendorStatus;   // Command Complete status for unlisted OGF 0x3f commands (0: + BTS_VENDOR_ZEROS)
 };
 static inline void bts_identity_default(struct bts_identity *id) {
     bts_zero(id, sizeof *id);
@@ -181,7 +181,7 @@ static inline void bts_identity_default(struct bts_identity *id) {
     const char n[] = "BCM4355C0";
     for (size_t i = 0; i < sizeof n; i = i + 1) id->name[i] = n[i];
     id->rewriteVersion = true; id->rewriteName = true; id->passVendorEvents = false;
-    id->unknownVendorStatus = BTS_STATUS_UNKNOWN_COMMAND;
+    id->unknownVendorStatus = 0;   // RAM tests 8-10: bluetoothd gives up on 0x01 (0xfce2, then 0xfd1b ReadFactoryCalTable)
 }
 
 enum bts_bcm_action {
@@ -194,11 +194,19 @@ enum bts_bcm_action {
     BTS_BCM_VERBOSE,      // ACK with bts_identity::verbose
     BTS_BCM_FEATURES,     // ACK with bts_identity::features
     BTS_BCM_USB_PRODUCT,  // ACK with bts_identity::usbProduct
-    BTS_BCM_ZERO8,        // ACK followed by 8 zero bytes (Apple 0xfce2 sub-commands, see the table)
+    BTS_BCM_ZEROS,        // ACK followed by BTS_VENDOR_ZEROS zero bytes (Apple 0xfce2 sub-commands, see the table)
 };
 struct bts_bcm_cmd { uint16_t opcode; enum bts_bcm_action action; const char *name; };
 // Linux drivers/bluetooth btbcm.c / hci_bcm.c opcodes. Entries marked (?) are less certain; an unlisted vendor command
 // still gets an answer (unknownVendorStatus), so a wrong entry costs a status code, not a hang.
+//
+// Unlisted vendor commands: bluetoothd 21H461 sends about 200 Broadcom/Apple VSC opcodes (0xfc00-0xffff, all through
+// its VSC sender 0x100050818), none of which the WCN3950 knows; one rejected at HCI init is enough for bluetoothd to
+// give up and restart (RAM tests 8-10: 0xfce2, then 0xfd1b _BCM_ReadFactoryCalTable). Their reply parsers check a
+// minimum length: status only (0x10004eec4), one byte (_BCM_U8EventParser 0x100195180), the raw stream to the caller
+// (_BCM_ByteStreamEventParser 0x100075f94, asserts on an empty stream: ReadFactoryCalTable, CountryCodeSel, ...),
+// fixed structs of up to a few le32. So every unlisted vendor command gets status 0 and BTS_VENDOR_ZEROS zero bytes:
+// values 0, counts 0 (empty lists and tables), and a 0 first byte where a caller reads a status. Never forwarded.
 static const struct bts_bcm_cmd kBtsBcmCmds[] = {
     {0xfc01, BTS_BCM_BDADDR, "write_bdaddr"},          // btbcm_set_bdaddr
     {0xfc18, BTS_BCM_BAUD, "update_baud"},             // hci_bcm bcm_set_baudrate
@@ -219,9 +227,9 @@ static const struct bts_bcm_cmd kBtsBcmCmds[] = {
     // GetExtendedAdvNumDropped 0x2d, SetExtendedAdvLimits 0x2e, ...). Reply parsers: status only (0x10004eec4), one
     // byte (_BCM_U8EventParser 0x100195180: 5, 0x0a), the raw stream to the caller (_BCM_ByteStreamEventParser
     // 0x100075f94, which asserts on an empty stream), le32 (0x100075e88: 0x2d), 4 x le16 (0x100195518: 0x0d). Status 0
-    // with 8 zero bytes satisfies every parser: values 0 (no WBS, default LE settings, nothing dropped) and a 0 first
+    // with BTS_VENDOR_ZEROS (64) zero bytes satisfies every parser: values 0 (no WBS, default LE settings, nothing dropped) and a 0 first
     // byte where a stream consumer reads a status. RAM test 9 (sub-opcode echoed) still stopped right after it.
-    {0xfce2, BTS_BCM_ZERO8, "apple_olympic"},
+    {0xfce2, BTS_BCM_ZEROS, "apple_olympic"},
 };
 static inline const struct bts_bcm_cmd *bts_bcm_find(uint16_t opcode) {
     for (size_t i = 0; i < sizeof kBtsBcmCmds / sizeof kBtsBcmCmds[0]; i = i + 1)
@@ -289,6 +297,9 @@ static inline void bts_shim_queue(struct bts_shim *s, const uint8_t *pkt, size_t
     }
 }
 
+#define BTS_VENDOR_ZEROS 64
+static const uint8_t kBtsVendorZeros[BTS_VENDOR_ZEROS] = {0};
+
 static inline void bts_vendor_note(struct bts_shim *s, uint16_t opcode, const uint8_t *p, size_t plen, uint8_t status) {
     s->vendorRing[s->vendorCount % BTS_VENDOR_RING] = (uint32_t)opcode << 16 | (uint32_t)(plen ? p[0] : 0u) << 8 | status;
     s->vendorCount = s->vendorCount + 1;
@@ -302,7 +313,8 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
     if (!c) {
         bts_vendor_note(s, opcode, p, plen, s->id.unknownVendorStatus);
         s->st.unknownVendor = s->st.unknownVendor + 1;
-        n = bts_cmd_complete(o, sizeof s->scratch, opcode, s->id.unknownVendorStatus, nullptr, 0);
+        n = bts_cmd_complete(o, sizeof s->scratch, opcode, s->id.unknownVendorStatus, kBtsVendorZeros,
+                             s->id.unknownVendorStatus ? 0 : BTS_VENDOR_ZEROS);
         bts_shim_queue(s, o, n);
         return;
     }
@@ -337,8 +349,7 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
     if (c->action == BTS_BCM_VERBOSE) {ret = s->id.verbose; rn = sizeof s->id.verbose;}
     if (c->action == BTS_BCM_FEATURES) {ret = s->id.features; rn = sizeof s->id.features;}
     if (c->action == BTS_BCM_USB_PRODUCT) {ret = s->id.usbProduct; rn = sizeof s->id.usbProduct;}
-    static const uint8_t zero8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    if (c->action == BTS_BCM_ZERO8) {ret = zero8; rn = sizeof zero8;}
+    if (c->action == BTS_BCM_ZEROS) {ret = kBtsVendorZeros; rn = BTS_VENDOR_ZEROS;}
     n = bts_cmd_complete(o, sizeof s->scratch, opcode, 0, ret, rn);
     bts_shim_queue(s, o, n);
 }

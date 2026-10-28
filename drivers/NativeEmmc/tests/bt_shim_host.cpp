@@ -134,7 +134,7 @@ static void testShim() {
     Bytes want;
     for (uint16_t op : {0xfc18, 0xfc01, 0xfc2e, 0xfc4c, 0xfc4c, 0xfc4e}) { Bytes c = cc(op, {0}); want.insert(want.end(), c.begin(), c.end()); }
     Bytes cv = cc(0xfc79, {0, 0x55, 0, 0, 0, 1, 0}); want.insert(want.end(), cv.begin(), cv.end());
-    Bytes cu = cc(0xfc00, {BTS_STATUS_UNKNOWN_COMMAND}); want.insert(want.end(), cu.begin(), cu.end());
+    Bytes cu = cc(0xfc00, Bytes(1 + BTS_VENDOR_ZEROS, 0)); want.insert(want.end(), cu.begin(), cu.end());
     CHECK(got == want);
     // A failed command transmit answers Command Status hardware failure; a failed ACL is only counted.
     l.fail = 1;
@@ -497,15 +497,19 @@ static void testCtl() {
     // RAM tests 8/9: Apple's multiplexed VSC 0xfce2 gets status 0 and 8 zero bytes, never reaches the chip; other
     // unknown vendor commands still get 0x01. Both land in the ring the disconnect line prints.
     const uint32_t unk = s.st.unknownVendor, vc = s.vendorCount;
-    Bytes oly = pktCmd(0xfce2, {0x2b, 1, 2, 3}), other = pktCmd(0xfca0, {0x07});
+    Bytes oly = pktCmd(0xfce2, {0x2b, 1, 2, 3}), other = pktCmd(0xfd1b, {0x07});   // ReadFactoryCalTable(7)
     bts_shim_host_write(&s, oly.data(), oly.size());
     bts_shim_host_write(&s, other.data(), other.size());
-    Bytes ans = cc(0xfce2, {0, 0, 0, 0, 0, 0, 0, 0, 0}), ans2 = cc(0xfca0, {BTS_STATUS_UNKNOWN_COMMAND});
+    Bytes ans = cc(0xfce2, Bytes(1 + BTS_VENDOR_ZEROS, 0)), ans2 = cc(0xfd1b, Bytes(1 + BTS_VENDOR_ZEROS, 0));
     ans.insert(ans.end(), ans2.begin(), ans2.end());
     CHECK(drain(&s) == ans && l.sent.size() == sentBefore);
     CHECK(s.st.unknownVendor == unk + 1 && s.vendorCount == vc + 2);
     CHECK(s.vendorRing[vc % BTS_VENDOR_RING] == (0xfce2u << 16 | 0x2b << 8 | 0));
-    CHECK(s.vendorRing[(vc + 1) % BTS_VENDOR_RING] == (0xfca0u << 16 | 0x07 << 8 | BTS_STATUS_UNKNOWN_COMMAND));
+    CHECK(s.vendorRing[(vc + 1) % BTS_VENDOR_RING] == (0xfd1bu << 16 | 0x07 << 8 | 0));
+    s.id.unknownVendorStatus = BTS_STATUS_UNKNOWN_COMMAND;   // the old behaviour stays selectable: status only
+    bts_shim_host_write(&s, other.data(), other.size());
+    CHECK(drain(&s) == cc(0xfd1b, {BTS_STATUS_UNKNOWN_COMMAND}));
+    s.id.unknownVendorStatus = 0;
 }
 
 int main() {
