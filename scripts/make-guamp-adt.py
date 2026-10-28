@@ -188,6 +188,15 @@ def main():
         # (cbz w0 after the strcmp with the sk name -> nop): bluetoothd then uses the plain read()/write() path on the
         # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc).
         # The kernel table holds 64 fixups (zzzzz-guamp-text-fixup-64.patch, 28/10); this ADT uses 32.
+        # Apps that are not Metal clients get a nil device, so -[CIContext initWithOptions:] falls back to
+        # +[CIContext(Internal) internalGLContextWithOptions:] and CI::GLContext::init calls through the empty GL macro
+        # context table: PC 0 (MobileSMS icons via MobileIcons _LICGImageCreateCoreImageLanczosScaled, 29/10).
+        # dyld_shared_cache_arm64.07,2cd8654,e30302aac8f127f0,000080d2c0035fd6 makes it return nil (initWithOptions: then
+        # returns nil and MobileIcons draws the unscaled image with CoreGraphics). MobileSafari aborts on the
+        # UIBlurEffect.m:971 assertion (status_bar_blur_mask "returned NULL from -CGImage" in
+        # -[_UIBlurEffectVariableImpl _updateEffectDescriptor:forEnvironment:usage:]); ...arm64.03,3495cfc (16 bytes) and
+        # ...,3495d0c (4 bytes) turn the failure block into the normal cleanup without the variable-blur filter.
+        # ADT Codex/cpu-config-8-full2-power-nome-ram-ci, see analisi/gpu-ci/SAFARI-SMS-20261029.md.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
