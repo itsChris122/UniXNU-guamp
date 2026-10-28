@@ -13,6 +13,8 @@ volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
 namespace btshim {
 extern bool gEnabled;
 extern uint32_t gOpens, gReads, gWrites, gIoctls, gNodes, gCtlOpens[3];
+extern uint32_t gKctlRegs, gKctlConnects, gKctlBusy, gKctlSends, gKctlOpts, gKctlOptErrs, gKctlFull;
+extern uint64_t gKctlTxBytes, gKctlRxBytes;
 void start();
 void attach(const bts_link *link);
 void controllerBytes(const uint8_t *data, size_t len);

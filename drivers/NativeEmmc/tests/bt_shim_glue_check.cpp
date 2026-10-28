@@ -38,6 +38,41 @@ void selthreadclear(struct selinfo *);
 int uiomove(const char *cp, int n, struct uio *uio);
 user_ssize_t uio_resid(struct uio *a_uio);
 }
+// bsd/sys/kern_control.h (KERNEL_PRIVATE layout of struct kern_ctl_reg) and bsd/sys/kpi_mbuf.h
+typedef int errno_t;
+typedef uint32_t u_int32_t;
+typedef struct kern_ctl *kern_ctl_ref;
+typedef struct __mbuf *mbuf_t;
+struct sockaddr_ctl { uint8_t sc_len, sc_family; uint16_t ss_sysaddr; uint32_t sc_id, sc_unit, sc_reserved[5]; };
+typedef errno_t (*ctl_connect_func)(kern_ctl_ref, struct sockaddr_ctl *, void **);
+typedef errno_t (*ctl_disconnect_func)(kern_ctl_ref, u_int32_t, void *);
+typedef errno_t (*ctl_send_func)(kern_ctl_ref, u_int32_t, void *, mbuf_t, int);
+typedef errno_t (*ctl_setopt_func)(kern_ctl_ref, u_int32_t, void *, int, void *, size_t);
+typedef errno_t (*ctl_getopt_func)(kern_ctl_ref, u_int32_t, void *, int, void *, size_t *);
+typedef void (*ctl_rcvd_func)(kern_ctl_ref, u_int32_t, void *, int);
+typedef errno_t (*ctl_send_list_func)(kern_ctl_ref, u_int32_t, void *, mbuf_t, int);
+typedef errno_t (*ctl_bind_func)(kern_ctl_ref, struct sockaddr_ctl *, void **);
+typedef errno_t (*ctl_setup_func)(u_int32_t *, void **);
+struct kern_ctl_reg {
+  char ctl_name[96]; u_int32_t ctl_id, ctl_unit, ctl_flags, ctl_sendsize, ctl_recvsize;
+  ctl_connect_func ctl_connect; ctl_disconnect_func ctl_disconnect; ctl_send_func ctl_send;
+  ctl_setopt_func ctl_setopt; ctl_getopt_func ctl_getopt; ctl_rcvd_func ctl_rcvd; ctl_send_list_func ctl_send_list;
+  ctl_bind_func ctl_bind; ctl_setup_func ctl_setup;
+};
+#define CTL_FLAG_REG_SOCK_STREAM 0x4
+#define CTL_FLAG_REG_EXTENDED 0x8
+extern "C" {
+errno_t ctl_register(struct kern_ctl_reg *userkctl, kern_ctl_ref *kctlref);
+errno_t ctl_enqueuedata(kern_ctl_ref kctlref, u_int32_t unit, void *data, size_t len, u_int32_t flags);
+errno_t ctl_getenqueuespace(kern_ctl_ref kctlref, u_int32_t unit, size_t *space);
+mbuf_t mbuf_next(const mbuf_t mbuf);
+size_t mbuf_len(const mbuf_t mbuf);
+void *mbuf_data(mbuf_t mbuf);
+void mbuf_freem(mbuf_t mbuf);
+size_t strlcpy(char *dst, const char *src, size_t size);
+}
+#define ENOTCONN 57
+#define ENOPROTOOPT 42
 #define minor(x) ((int32_t)((x) & 0xffffff))
 #define makedev(x, y) ((dev_t)(((x) << 24) | (y)))
 #define ENXIO 6
@@ -64,4 +99,5 @@ void use() {
   btshim::controllerBytes(evt, sizeof evt);
   bts_link l = {};
   btshim::attach(&l);
+  btshim::pumpCtl();
 }

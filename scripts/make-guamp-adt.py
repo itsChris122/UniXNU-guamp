@@ -179,6 +179,10 @@ def main():
         # bluetoothd also picks its platform with MGIsDeviceOneOfType, which compares /product/product-id (20 bytes, read by
         # libMobileGestalt from IODeviceTree:/product); without it MGGetProductType is -1, bluetoothd logs "Unknown platform
         # 0x-1" and restarts. The Bluetooth ADT (cpu-config-8-bt4) carries the D22 product-id fd079b29...d8f0e7eb (iPhone X).
+        # bluetoothd's UART is the kernel control com.apple.uart.sk.bluetooth (0x1000ddaa8); for the sk name it moves the
+        # data to a Skywalk os_channel, which this kernel lacks. cpu-config-8-bt6 adds bluetoothd,ddd20,a0050034,1f2003d5
+        # (cbz w0 after the strcmp with the sk name -> nop): bluetoothd then uses the plain read()/write() path on the
+        # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc). 32 fixups, the max.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the

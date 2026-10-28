@@ -503,4 +503,53 @@ static inline enum bts_ioctl_result bts_tty_ioctl(struct bts_tty *t, uint32_t cm
     return BTS_IOCTL_NOTTY;
 }
 
+// ---- kernel control socket (GuampBtSerial.inc, guamp-bt-ctl=1) ------------------------------------------------------
+// iOS 17 opens the Bluetooth UART as a PF_SYSTEM kernel control, not as /dev/cu.bluetooth: BlueTool 21H461
+// (0x10001e988; "device -D" = getenv BT_UART or "com.apple.uart.bluetooth", "device -d <name>" the same with <name>) and
+// bluetoothd (0x1000ddaa8, default "com.apple.uart.sk.bluetooth") do socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL),
+// ioctl CTLIOCGINFO, connect with sc_unit 0. AppleOnboardSerialBSDClient (kernelcache 21H461, 0xfffffff005c5eb00)
+// registers "com.apple.uart.%s" and "com.apple.uart.sk.%s" with CTL_FLAG_REG_SOCK_STREAM and recvsize 64 KiB.
+//   data      the same H4 byte stream as the tty: write() = whole H4 packets, read() = type, header, body.
+//   options   the tty ioctls travel as socket options at level SYSPROTO_CONTROL whose name is the ioctl number:
+//             getsockopt(TIOCGETA 0x40487413, 72 bytes), cfmakeraw + cfsetspeed, setsockopt(TIOCSETA 0x80487414, 72)
+//             with c_cflag CS8|CREAD|CLOCAL|CCTS_OFLOW|CRTS_IFLOW. The kext's option handler answers ENOPROTOOPT where
+//             its ioctl switch says ENOTTY.
+//   sk        the "sk" control adds Skywalk options (setsockopt IOAOSSKYSETCHANNELSPEC 0x800c5414, getsockopt
+//             IOAOSSKYGETCHANNELUUID 0x40105412) and moves the data to an os_channel. There is no Skywalk nexus here:
+//             they answer ENOPROTOOPT, and bluetoothd stays on its plain read()/write() path only with its strcmp
+//             against the sk name skipped (ADT text fixup bluetoothd,ddd20,a0050034,1f2003d5).
+enum bts_ctl_opt_result {
+    BTS_CTL_OPT_OK = 0,
+    BTS_CTL_OPT_NOPROTO = 1,   // not a serial option: ENOPROTOOPT
+    BTS_CTL_OPT_INVAL = 2,     // wrong direction or length: EINVAL
+    BTS_CTL_OPT_FLUSH = 3,     // OK; caller flushes per *flush (bit 0 read side, bit 1 write side)
+};
+#define BTS_CTL_OPT_MAX BTS_TERMIOS64   // largest serial ioctl argument answered here (the 64-bit termios)
+// set = setsockopt (data, *len in), else getsockopt (*len = buffer size in, bytes written out). The argument is
+// IOCPARM_LEN(opt) bytes; a larger buffer is accepted (only that many bytes are used or written).
+static inline enum bts_ctl_opt_result bts_ctl_sockopt(struct bts_tty *t, uint32_t opt, bool set, uint8_t *data,
+                                                      size_t *len, size_t readable, int *flush) {
+    const size_t need = BTS_IOC_LEN(opt);
+    *flush = 0;
+    if (need > BTS_CTL_OPT_MAX) return BTS_CTL_OPT_NOPROTO;
+    if (need && !(opt & (set ? BTS_IOC_IN : BTS_IOC_OUT))) return BTS_CTL_OPT_INVAL;
+    if (need && (!data || !len || *len < need)) return BTS_CTL_OPT_INVAL;
+    uint8_t arg[BTS_CTL_OPT_MAX];
+    bts_zero(arg, sizeof arg);
+    if (need && set) bts_copy(arg, data, need);
+    const enum bts_ioctl_result r = bts_tty_ioctl(t, opt, need ? arg : (uint8_t *)0, readable, flush);
+    if (r == BTS_IOCTL_NOTTY) return BTS_CTL_OPT_NOPROTO;
+    if (r == BTS_IOCTL_INVAL) return BTS_CTL_OPT_INVAL;
+    if (!set && len) {
+        if (need) bts_copy(data, arg, need);
+        *len = need;
+    }
+    return r == BTS_IOCTL_FLUSH ? BTS_CTL_OPT_FLUSH : BTS_CTL_OPT_OK;
+}
+// Bytes for the socket: no more than the receive buffer has room for (space, from ctl_getenqueuespace) nor cap.
+// Packets may be split across enqueues (stream socket; the client reassembles by H4 header).
+static inline size_t bts_ctl_take(struct bts_shim *s, uint8_t *out, size_t cap, size_t space) {
+    return bts_shim_read(s, out, space < cap ? space : cap);
+}
+
 #endif

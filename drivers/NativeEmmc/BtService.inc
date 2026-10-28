@@ -939,10 +939,13 @@ void transport() {
       lastLog = now;
       IOLog("GuampBt: transport: tx %u packets (%u errors), rx %u bytes (%u packets, %u noise), IBS wake rx %u ack tx %u "
             "sleep rx %u wake tx %u, %s, re-inits %u; shim nodes %u opens %u ioctls %u reads %u writes %u, btreset %u btwake %u "
-            "btpoweroff %u opens\n", gTxPkts, gTxErr, gRxBytes, gScan.packets, gScan.noise, gScan.wake,
+            "btpoweroff %u opens; kctl %u regs %u connects %u busy %u sends %u opts (%u refused) %llu bytes in %llu out "
+            "%u full\n", gTxPkts, gTxErr, gRxBytes, gScan.packets, gScan.noise, gScan.wake,
             gIbsAcks, gScan.sleep, gIbsWakeSent, gOff ? "off" : gAsleep ? "asleep" : "awake", gReinits, btshim::gNodes,
             btshim::gOpens, btshim::gIoctls, btshim::gReads, btshim::gWrites, btshim::gCtlOpens[0], btshim::gCtlOpens[1],
-            btshim::gCtlOpens[2]);
+            btshim::gCtlOpens[2], btshim::gKctlRegs, btshim::gKctlConnects, btshim::gKctlBusy, btshim::gKctlSends,
+            btshim::gKctlOpts, btshim::gKctlOptErrs, static_cast<unsigned long long>(btshim::gKctlTxBytes),
+            static_cast<unsigned long long>(btshim::gKctlRxBytes), btshim::gKctlFull);
     }
   }
 }
