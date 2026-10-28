@@ -126,6 +126,8 @@ static void guampMemSample() {
 // running, so current_thread() is the sampled thread). Only the thread's saved user state (upcb) is read, never user
 // memory; a thread interrupted in the kernel shows the user PC it entered the kernel from. PCs inside the dyld shared
 // cache are logged as offsets from the region's first mapping (strumenti/simboli-prof.py resolves them).
+// guamp-prof=2: same sampler with 0.5 s pauses instead of 10 + 19 s (1 s sampled every ~2 s), for short interactive tests such as typing
+// on the keyboard; the targets still come from the 30 s GuampCpu walk.
 extern "C" struct arm_saved_state *get_user_regs(thread_t);
 extern "C" struct proc *proc_find(int);
 extern "C" int proc_rele(struct proc *);
@@ -140,6 +142,7 @@ static volatile int gNextPid[kTargets] = {-1, -1, -1};
 static char gNextName[kTargets][20];
 static volatile uint32_t gActive;
 static uint64_t gPeriod;
+static uint32_t gPauseMs = 19000;   // guamp-prof=2: 1000
 static timer_call_data_t gCall[kCpus];
 static bool gStarted;
 
@@ -239,7 +242,7 @@ static void report(unsigned k) {
 
 static void loop(void *, wait_result_t) {
   for (;;) {
-    IOSleep(10000);
+    IOSleep(gPauseMs < 19000 ? 500 : 10000);
     bool any = false;
     for (unsigned k = 0; k < kTargets; k = k + 1) {
       gPid[k] = gNextPid[k];
@@ -263,7 +266,7 @@ static void loop(void *, wait_result_t) {
     IOSleep(40);
     for (unsigned k = 0; k < kTargets; k = k + 1)
       if (gPid[k] > 0) report(k);
-    IOSleep(19000);
+    IOSleep(gPauseMs);
   }
 }
 
@@ -272,7 +275,8 @@ static void setTargets(const int *pids, const char (*names)[20], unsigned n) {
   static int enabled = -1;
   if (enabled < 0) {
     unsigned v = 0;
-    enabled = PE_parse_boot_argn("guamp-prof", &v, sizeof(v)) && v == 1;
+    enabled = PE_parse_boot_argn("guamp-prof", &v, sizeof(v)) && (v == 1 || v == 2);
+    if (enabled && v == 2) gPauseMs = 500;
   }
   if (!enabled) return;
   unsigned k = 0;
@@ -292,7 +296,7 @@ static void setTargets(const int *pids, const char (*names)[20], unsigned n) {
   if (kernel_thread_start(loop, nullptr, &th) == KERN_SUCCESS) {
     thread_set_thread_name(th, "guamp-prof");
     thread_deallocate(th);
-    IOLog("GuampProf: sampler on (1 s every 30 s, 10 ms per CPU)\n");
+    IOLog("GuampProf: sampler on (1 s every %s, 10 ms per CPU)\n", gPauseMs < 19000 ? "2 s" : "30 s");
   }
 }
 }  // namespace guampprof
