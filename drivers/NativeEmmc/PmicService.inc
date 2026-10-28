@@ -15,8 +15,9 @@
 //             with page 0x0B usage 0x2E to -_processRingerSwitchEvent:down: (down != 0 -> "tone1", 0 -> "silent") and
 //             SpringBoard -__handleHIDEvent: 0xB002E -> -_handleRingerSwitchEvent: (gated by MobileGestalt ringer-switch
 //             = ADT /buttons property function-button_ringerab, see make-guamp-adt.py) -> _updateRingerState:.
-// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 1500, used for OCP/CDP/DCP only, SDP 500) and
-// guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
+// Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 3000, the ceiling of the per-source input current
+// of Linux update_sw_icl_max: Type-C Rp 1.5/3.0 A, DCP/OCP 1500 or 3000 with Rp 3.0 A, CDP 1500, HVDCP 3000 at 5 V,
+// SDP/float/unknown 500) and guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
 // instead of sink only; guamp-chg-recover=0 turns off the stuck-input recovery (weak-adapter steps, re-detection);
 // guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
 //   torch     the camera flash LED (PMI632 slave 3, 0xd300) as a torch, GuampTorch.inc: opt-in guamp-torch=1, driven
@@ -173,6 +174,20 @@ struct ChargeBus {
     *mv = code > 0x7fff ? 0 : static_cast<unsigned>((static_cast<uint64_t>(code) * 1875u * 16u) / 0x70e4u);
     return 0;
   }
+  // Battery current from the QG fuel gauge (QG_LAST_BURST_AVG_I 0x48c6, guamp_battery::decode units), mA, positive =
+  // charging; read only, also without guamp-battery=1
+  int ibatMa(int *ma) {
+    uint8_t subtype = 0;
+    uint16_t raw = 0;
+    int error = read8(kPmi632, 0x4805, &subtype);
+    if (!error && subtype != 3 && subtype != 4) error = SPMI_ERR_NODEV;
+    if (!error) error = batteryRead16(0x48c6, raw);
+    if (!error && raw == guamp_battery::kRawReset) error = SPMI_ERR_PARAM;
+    if (error) return error;
+    const int signedRaw = raw >= 0x8000 ? static_cast<int>(raw) - 65536 : raw;
+    *ma = -static_cast<int>((static_cast<int64_t>(signedRaw) * (subtype == 3 ? 152588 : 305176)) / 1000000);
+    return 0;
+  }
   __attribute__((format(printf, 2, 3))) void log(const char *format, ...) {
     va_list ap;
     va_start(ap, format);
@@ -280,7 +295,7 @@ void thread(void *, wait_result_t) {
   gBatterySdamStore = batterySdam == 1;
   IOLog("GuampBattery: QG fuel gauge and power-source publisher %s, BAT_THERM ADC %s, SDAM store %s\n",
         gBatteryEnabled ? "enabled" : "disabled", gBatteryTempEnabled ? "on" : "off", gBatterySdamStore ? "on" : "off");
-  unsigned iclMa = 1500, fccMa = 2000;
+  unsigned iclMa = guamp_charge::kIclMaxMa, fccMa = 2000;
   PE_parse_boot_argn("guamp-icl-ma", &iclMa, sizeof(iclMa));
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
   if (iclMa > 3000) iclMa = 3000;
@@ -292,7 +307,7 @@ void thread(void *, wait_result_t) {
   gCharge.fccMa = fccMa;
   gCharge.typecDrp = typecDrp == 1;
   gCharge.recover = chgRecover != 0;
-  IOLog("GuampChg: controller ICL %u mA (SDP %u) FCC %u mA FV %u mV, Type-C %s, recovery %s\n", iclMa,
+  IOLog("GuampChg: controller ICL up to %u mA per source (SDP %u) FCC %u mA FV %u mV, Type-C %s, recovery %s\n", iclMa,
         guamp_charge::kSdpMa, fccMa, guamp_charge::kFvMv, gCharge.typecDrp ? "DRP try.SNK" : "sink only",
         gCharge.recover ? "on" : "off");
   ChargeBus chargeBus;
@@ -382,9 +397,9 @@ void thread(void *, wait_result_t) {
       if (tick % 1200 == 0)
         IOLog("GuampPmic: ringer %s presses %u\n", gRingerState ? "ring" : "silent", gRingerPresses);
       if (tick % 1200 == 0)
-        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u, SPMI errors %u; touch step %u error %d events %u\n",
+        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u source %s, SPMI errors %u; touch step %u error %d events %u\n",
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, gCharge.iclCode,
-              gCharge.fccCode, gErrors,
+              gCharge.fccCode, gCharge.choice.source, gErrors,
               touch::gStep, touch::gError, touch::gEvents);
     }
     if (torchRuns) torch::poll(tick);
