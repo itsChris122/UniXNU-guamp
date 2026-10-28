@@ -1,0 +1,64 @@
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index 7aa4c34..63a3ebc 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -50,6 +50,8 @@
+ #include <sys/xattr.h>
+ #include <sys/fsevents.h>
+ #include <kern/zalloc.h>
++#include <pexpert/pexpert.h>
++#include <sys/content_protection.h>
+ #include <miscfs/specfs/specdev.h>
+ #include <security/audit/audit.h>
+ 
+@@ -2480,6 +2482,31 @@ attr_pack_common_extended(mount_t mp, struct vnode *vp, struct attrlist *alp,
+ 	return 0;
+ }
+ 
++/* guamp: the owner Data volume (APFS on /private/var) is mounted without content protection ("not content protected",
++ * ADT DoNotUseSEP: this phone has no Secure Enclave), so every file on it can be read at any time: that is class D,
++ * NSFileProtectionNone. APFS leaves va_dataprotect_class unsupported on such a volume, so getattrlist drops
++ * ATTR_CMN_DATA_PROTECT_FLAGS: CoreServicesInternal reports NSURLFileProtectionKey as nil and Foundation's NSFileProtectionKey
++ * read fails with EINVAL. PosterBoard requires NSURLFileProtectionKey == NSURLFileProtectionNone on its data store, so the
++ * store was never migrated and the wallpaper stayed black. Only this read changes: class D is filled in when the file system
++ * gave no class (unsupported, or 0 = PROTECTION_CLASS_DIR_NONE, which only means "the mount default" and that default is D
++ * here), on that volume only, and never a stronger class. statfs keeps no MNT_CPROTECT (sqlite and Foundation keep
++ * stripping or ignoring protection requests), F_GETPROTECTIONCLASS, F_SETPROTECTIONCLASS, setattrlist and open_dprotected_np
++ * are unchanged. Default on; boot-arg guamp-dp-class-d=0 disables it. */
++static int native_guamp_dp_class_d_mode = -1;	/* -1 boot-arg not read yet, 0 off, 1 on */
++volatile int native_guamp_dp_class_d_reported = 0;
++static int
++native_guamp_dp_class_d(mount_t mp)
++{
++	if (native_guamp_dp_class_d_mode < 0) {
++		uint32_t enabled = 1;
++		native_guamp_dp_class_d_mode = !PE_parse_boot_argn("guamp-dp-class-d", &enabled, sizeof(enabled)) || enabled == 1;
++	}
++	if (!native_guamp_dp_class_d_mode || mp == NULL || (mp->mnt_flag & (MNT_CPROTECT | MNT_RDONLY))) {
++		return 0;
++	}
++	return strcmp(mp->mnt_vfsstat.f_fstypename, "apfs") == 0 && strcmp(mp->mnt_vfsstat.f_mntonname, "/private/var") == 0;
++}
++
+ static void
+ vattr_get_alt_data(vnode_t vp, struct attrlist *alp, struct vnode_attr *vap,
+     int return_valid, int is_bulk,
+@@ -2795,6 +2822,18 @@ vfs_attr_pack_internal(mount_t mp, vnode_t vp, uio_t auio, struct attrlist *alp,
+ 		bcopy(&(alp->commonattr), &ab.valid, sizeof(attribute_set_t));
+ 	}
+ 
++	/* guamp: class D (NSFileProtectionNone) on the Data volume without content protection, see native_guamp_dp_class_d */
++	if ((alp->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) && VATTR_IS_ACTIVE(vap, va_dataprotect_class) &&
++	    (!VATTR_IS_SUPPORTED(vap, va_dataprotect_class) || vap->va_dataprotect_class == PROTECTION_CLASS_DIR_NONE) &&
++	    native_guamp_dp_class_d(vp ? vnode_mount(vp) : mp)) {
++		VATTR_RETURN(vap, va_dataprotect_class, PROTECTION_CLASS_D);
++		if (!native_guamp_dp_class_d_reported) {
++			native_guamp_dp_class_d_reported = 1;
++			printf("guamp: dp class D: /private/var (apfs, not content protected) reports NSFileProtectionNone (class %d), "
++			    "first read by %s; guamp-dp-class-d=0 disables\n", PROTECTION_CLASS_D, proc_best_name(vfs_context_proc(ctx)));
++		}
++	}
++
+ 	/* did we ask for something the filesystem doesn't support? */
+ 	if (vap->va_active &&
+ 	    (!VATTR_ALL_SUPPORTED(vap)
