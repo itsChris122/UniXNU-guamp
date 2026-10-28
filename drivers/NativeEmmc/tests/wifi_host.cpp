@@ -486,7 +486,7 @@ static void buildSmem(Region &r, bool with428, bool corruptGlobal) {
   }
   uint32_t info = t + 32 + 48 * 3;
   memcpy(r.mem.data() + info, "SIII", 4);
-  r.w16(info + 12, 512);
+  r.w16(info + 16, 512);   // smem_info.num_items (+12 is reserved)
   PartBuilder g(r, 0x8000, 0x20000, 0xfffe, 0xfffe, 64);
   g.uncached(137, 40);
   uint32_t reason = g.uncached(421, 100);

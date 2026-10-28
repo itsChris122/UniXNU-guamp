@@ -58,8 +58,10 @@ struct Sm6115Runtime {
   }
   int fail(int e,const char *where) {
     error=e?e:Io;guamp_wifi_provider_error=error;
-    IOLog("GuampWiFi: %s failed %d (control %u WLFW %u SMMU fault %x); resources retained while remote may run\n",
-      where,error,unsigned(control.stage),unsigned(control.wlan.state),smmu.faultStatus());
+    // control: 0 Off 1 Prepared 2 AwaitModem 3 AwaitFifo 4 Running 5 Failed; WLFW 15 = Failed (set by peerLost()
+    // whenever the control layer fails, so it is a consequence, not a WLFW error); gate = the step that failed.
+    IOLog("GuampWiFi: %s failed %d %s (control %u gate \"%s\" WLFW %u SMMU fault %x); resources retained while remote may run\n",
+      where,error,errorName(error),unsigned(control.stage),control.where(),unsigned(control.wlan.state),smmu.faultStatus());
     transition(Failed);return error;
   }
 
@@ -82,7 +84,7 @@ struct Sm6115Runtime {
     transition(ProxyVotes);e=applyVotes(false);if(e)return fail(e,"proxy votes");
     WifiControl::Ops ops{};ops.ctx=this;ops.smpKick=smpKick;ops.glinkKick=glinkKick;
     ops.wlan={this,nullptr,assignMsa,wlanPower,fileSize,fileRead,wlfwEvent};
-    ops.event=controlEvent;
+    ops.event=controlEvent;ops.trace=controlTrace;
     e=control.prepare(&owner.arena,owner.allocator,ops,true);
     if(e)return fail(e,"APPS SMP2P/GLINK prepare");
     transition(Prepared);return Ok;
@@ -271,6 +273,10 @@ struct Sm6115Runtime {
   static int fileSize(void *,const char *name,uint32_t *bytes) { return guamp_wifi_firmware_file_size(name,bytes); }
   static int fileRead(void *,const char *name,uint32_t at,uint8_t *out,uint32_t bytes) { return guamp_wifi_firmware_file_read(name,at,out,bytes); }
   static void controlEvent(void *,WifiControl::Stage state,int e) { IOLog("GuampWiFi: control %u error %d\n",unsigned(state),e); }
+  static void controlTrace(void *,const char *what,int e,uint32_t a,uint32_t b,uint32_t c) {
+    IOLog("GuampWiFi: transport %s: %u/%u/%u (0x%x/0x%x/0x%x) result %d %s at %llu ms\n",
+      what,a,b,c,a,b,c,e,errorName(e),nowMs());
+  }
   static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
   static int boardPower(void *p,int on) {

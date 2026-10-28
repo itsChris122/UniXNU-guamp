@@ -21,14 +21,22 @@ struct WifiControl {
     void (*glinkKick)(void *);// same register, bit12
     Wlfw::Ops wlan;
     void (*event)(void *,Stage,int);
+    // Optional one-line diagnostics: what names the gate and the meaning of a/b/c. Never called under the SMEM lock.
+    void (*trace)(void *,const char *what,int e,uint32_t a,uint32_t b,uint32_t c);
   };
+  // Gate timeouts after the modem PAS start (Linux: subsys err_ready 10 s; icnss has no WLFW timeout, the WLAN PD
+  // only registers 0x45 after the modem has fetched wlanmdsp.mbn over QRTR TFTP).
+  static constexpr uint32_t ReadyMs=10000,FifoMs=10000,ServiceMs=60000,BeatMs=5000;
   SmemArena *arena=nullptr; Allocator allocator={}; Ops ops={};
   Smp2pEdge smp={}; Glink glink={}; Qrtr qrtr={}; QftpReadOnly tftp={};
   GuampServreg servreg={}; Wlfw wlan={};
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
-  uint64_t deadline=0,now=0;
+  uint64_t deadline=0,now=0,started=0,beat=0;
   bool routerStarted=false,wlanStarted=false;
+  // Diagnostics: the gate being waited for or the step that failed, and transitions already reported.
+  const char *gate="idle";
+  bool sawInbound=false,sawNegotiated=false,sawOpenSent=false,sawRemote=false,sawServer=false;
   int prepare(SmemArena *shared,const Allocator &a,const Ops &platform,bool pasStopped) {
     int e=Ok;
     if(stage!=Off&&stage!=Failed) return Busy;
@@ -37,23 +45,33 @@ struct WifiControl {
        !platform.wlan.assignMsa||!platform.wlan.power||!platform.wlan.fileSize||!platform.wlan.fileRead) return Invalid;
     arena=shared; allocator=a; ops=platform; error=0; channel=0;
     routerStarted=wlanStarted=false; descriptor=outboundFifo=outboundBytes=0;
+    sawInbound=sawNegotiated=sawOpenSent=sawRemote=sawServer=false;
+    gate="qrtr tftp/servreg";
     e=tftp.start(this,qftpTx,qftpSize,qftpRead);if(e)return fail(e);
     e=qrtr.addLocalService(QftpReadOnly::Service,QftpReadOnly::ServiceInstance,QftpReadOnly::Port,this,qftpRx);
     if(e)return fail(e);
     e=servreg.start(this,serviceTx);if(e)return fail(e);
     e=qrtr.addLocalService(GuampServreg::Service,GuampServreg::Instance,GuampServreg::Port,this,serviceRx);
     if(e)return fail(e);
-    e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
-    e=arena->allocate(1,478,32,&descriptor); if(e) return fail(e);
+    smemSummary();
+    // qcom_smp2p probe (before the modem boots): outbound 435 in the APPS-MPSS partition, kick bit 14.
+    gate="smem 435 smp2p out"; e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
+    itemTrace(435);
+    // glink_smem items. Linux (glink_probe SUBSYS_AFTER_POWERUP / remoteproc glink subdev start) allocates them only
+    // once the modem is up; they live in SMEM (found already present on guamp), so allocating them here only makes a
+    // size/partition problem fail before PAS writes RAM. Descriptor words and the first IRQ are written by
+    // glink.start() after the modem is ready, as qcom_glink_smem_register does (*rx_pipe->tail = *tx_pipe->head = 0).
+    gate="smem 478 glink descriptor"; e=arena->allocate(1,478,32,&descriptor); if(e) return fail(e);
+    itemTrace(478);
     // An existing TX FIFO is reused with its own size (glink_smem: the pipe length is the item size).
-    e=arena->allocate(1,479,16384,&outboundFifo,nullptr,&outboundBytes); if(e) return fail(e);
-    // Local TX head / RX tail only. The firmware owns descriptor words 0 and 3.
-    arena->mem.w32(descriptor+4,0); arena->mem.w32(descriptor+8,0);
-    arena->mem.fence(); ops.glinkKick(ops.ctx); transition(Prepared); return Ok;
+    gate="smem 479 glink tx fifo"; e=arena->allocate(1,479,16384,&outboundFifo,nullptr,&outboundBytes); if(e) return fail(e);
+    itemTrace(479);
+    gate="prepared"; transition(Prepared); return Ok;
   }
   int modemStarted(uint64_t millis) {
     if(stage!=Prepared) return NotReady;
-    now=millis; deadline=now+10000; transition(AwaitModem); return Ok;
+    now=started=beat=millis; deadline=now+ReadyMs; gate="smp2p 428 slave-kernel ready (bit 1)";
+    transition(AwaitModem); return Ok;
   }
   // The board/ath10k owner supplies the exact CE, service-pipe and shadow
   // tables for this WCN3990 target after the WLFW capabilities were read.
@@ -75,24 +93,44 @@ struct WifiControl {
     if(stage==Failed) return error;
     if(stage==Off||stage==Prepared) return NotReady;
     if(error) return fail(error);
+    if(now>=beat+BeatMs) { beat=now; heartbeat(); }
     int e=smp.poll();
+    if(smp.inPresent&&!sawInbound) {
+      sawInbound=true; trace("smp2p 428 inbound present: size/valid/features",0,smp.inSize,smp.inValid,smp.inFeatures);
+    }
     if(e!=Ok&&e!=Again) return fail(e);
     if(stage==AwaitModem) {
       if(!smp.ready()) return now>=deadline?fail(Timeout):Ok;
-      transition(AwaitFifo); deadline=now+10000;
+      trace("smp2p modem ready: slave/wlan/ms",0,smp.slave,smp.wlan,uint32_t(now-started));
+      transition(AwaitFifo); deadline=now+FifoMs; gate="smem 480 glink rx fifo (allocated by the modem)";
     }
     if(stage==AwaitFifo) {
       uint32_t incoming=0,size=0; e=arena->find(1,480,&incoming,&size);
       if(e==NotFound) return now>=deadline?fail(Timeout):Ok;
       if(e) return fail(e);
+      trace("smem 480 found: offset/bytes/ms",0,incoming,size,uint32_t(now-started));
+      gate="glink start";
       GlinkPipe out={arena->mem,outboundFifo,outboundBytes,descriptor+4,descriptor,true};
       GlinkPipe in={arena->mem,incoming,size,descriptor+12,descriptor+8,false};
       e=glink.start(out,in,allocator,this,kick,channelEvent,glinkRx); if(e) return fail(e);
-      deadline=now+30000; transition(Running);
+      deadline=now+ServiceMs; transition(Running); gate="glink version (mpss edge)";
     }
     e=tftp.step(now);if(e!=Ok&&e!=Again)return fail(e);
     e=glink.step(); if(e||error) return fail(e?e:error);
+    if(glink.negotiated&&!sawNegotiated) {
+      sawNegotiated=true; gate="glink IPCRTR open/ack";
+      trace("glink negotiated: features/rx/ms",0,glink.features,glink.rxPackets,uint32_t(now-started));
+    }
     if(glink.negotiated&&!channel) { e=glink.open("IPCRTR",&channel); if(e!=Again&&e) return fail(e); }
+    if(channel&&!sawOpenSent) { sawOpenSent=true; trace("glink IPCRTR open sent: lcid",0,channel,0,0); }
+    if(routerStarted&&qrtr.remoteKnown&&!sawRemote) {
+      sawRemote=true; gate="qrtr NEW_SERVER 0x45 (WLFW) from the modem ns";
+      trace("qrtr first packet from node",0,qrtr.remoteNode,0,uint32_t(now-started));
+    }
+    if(qrtr.serviceReady()&&!sawServer) {
+      sawServer=true; gate="wlfw qmi";
+      trace("qrtr WLFW 0x45 server: node/port/ms",0,qrtr.serverNode,qrtr.serverPort,uint32_t(now-started));
+    }
     if(!routerStarted||!qrtr.serviceReady()) {
       if(now>=deadline) return fail(Timeout);
     }
@@ -100,6 +138,7 @@ struct WifiControl {
     if(wlanStarted) { e=wlan.step(now); if(e) return fail(e); }
     return Ok;
   }
+  const char *where() const { return gate; }
   // Call after PAS shutdown. This releases CPU buffers only, never powers off
   // or remaps an active peripheral behind the firmware's back.
   int release(bool pasStopped) {
@@ -110,7 +149,29 @@ struct WifiControl {
   }
 private:
   void transition(Stage s) { stage=s; if(ops.event) ops.event(ops.ctx,s,0); }
+  void trace(const char *what,int e,uint32_t a,uint32_t b,uint32_t c) { if(ops.trace) ops.trace(ops.ctx,what,e,a,b,c); }
+  // One line with the state of every layer (also printed on failure): enough to tell which gate stalled.
+  void heartbeat() {
+    trace(gate,error,stage,uint32_t(now-started),0);
+    trace(" smp2p 428 present/valid/slave",0,smp.inPresent,smp.inValid,smp.slave);
+    trace(" smp2p wlan/flags/entries",0,smp.wlan,smp.inFlags,smp.inEntries);
+    trace(" glink running/negotiated/rx",0,glink.running,glink.negotiated,glink.rxPackets);
+    trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);
+    trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
+  }
+  void smemSummary() {
+    smem::Info i={};
+    const int e=arena->parse(&i);
+    const auto *p=smem::partitionFor(i,smem::kHostModem);
+    trace("smem version/num_items/infoPresent",e,i.version,i.numItems,i.infoPresent);
+    trace("smem apps-mpss partition offset/size/items",p?Ok:NotFound,p?p->offset:0,p?p->size:0,p?p->items:0);
+  }
+  void itemTrace(uint32_t id) {
+    uint32_t at=0,size=0; const int e=arena->find(1,id,&at,&size);
+    trace("smem item id/offset/bytes",e,id,at,size);
+  }
   int fail(int e) {
+    if(ops.trace) { trace("FAILED: stage/ms (gate on the next line)",e,stage,uint32_t(now-started),0); heartbeat(); }
     error=e; stage=Failed; wlan.peerLost();
     qrtr.stop(); glink.stop(e); routerStarted=wlanStarted=false;
     tftp.stop(); servreg.stop();

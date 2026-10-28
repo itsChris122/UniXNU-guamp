@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <string>
 #include "../GuampSmem.inc"
 #include "../GuampSmp2p.inc"
 #include "../GuampGlink.inc"
@@ -19,6 +20,7 @@
 #include "../GuampMsa.inc"
 #include "../GuampQftp.inc"
 #include "../GuampServreg.inc"
+#include "../GuampWifiControl.inc"
 using namespace guampwifi;
 static unsigned checks=0;
 #define CHECK(x) do { ++checks; if(!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while(0)
@@ -526,7 +528,66 @@ static void malformedTest() {
     Qrtr::decode(p.data(),n,&h); q.receive(p.data(),n);
   }
 }
+// guamp SMEM as read on the phone (28/10): smem_info "SIII" with reserved (+12) = 0 and num_items at +16. Reading
+// +12 gave 0 items and every allocation was Range: the Wi-Fi R1 "APPS SMP2P/GLINK prepare failed -102".
+static void siii(Fixture &f,uint16_t items) {
+  uint32_t t=uint32_t(f.bytes.size())-4096,info=t+32+48*1;
+  memcpy(f.bytes.data()+info,"SIII",4); f.w(info+4,0); f.w(info+8,0); f.w(info+12,0); f.w(info+16,items);
+}
+struct ControlRig {
+  Fixture f; SmemArena a; std::unique_ptr<WifiControl> c=std::make_unique<WifiControl>();
+  std::vector<std::string> lines;
+  static void trace(void *p,const char *what,int e,uint32_t x,uint32_t y,uint32_t z) {
+    char b[256]; snprintf(b,sizeof b,"%s %d %u %u %u",what,e,x,y,z); static_cast<ControlRig *>(p)->lines.emplace_back(b);
+  }
+  bool saw(const char *s) const { for(auto &l:lines) if(l.find(s)!=std::string::npos) return true; return false; }
+  explicit ControlRig(uint16_t items) { f.init(true); siii(f,items); a=f.arena(); }
+  int prepare() {
+    WifiControl::Ops o{}; o.ctx=this; o.trace=trace;
+    o.smpKick=[](void *p){ static_cast<ControlRig *>(p)->f.kicks++; }; o.glinkKick=o.smpKick;
+    o.wlan={this,nullptr,[](void *,const Wlfw::Region *,uint32_t)->int{return Ok;},[](void *,bool)->int{return Ok;},
+      [](void *,const char *,uint32_t *n)->int{*n=0;return NotFound;},
+      [](void *,const char *,uint32_t,uint8_t *,uint32_t)->int{return NotFound;},nullptr};
+    return c->prepare(&a,f.allocator(),o,true);
+  }
+};
+static void controlTest() {
+  { ControlRig r(512);
+    smem::Info i={}; CHECK(r.a.parse(&i)==Ok&&i.infoPresent&&i.numItems==512);
+    CHECK(r.prepare()==Ok&&r.c->stage==WifiControl::Prepared);
+    uint32_t at=0,n=0;
+    CHECK(r.a.find(1,435,&at,&n)==Ok&&n==340&&r.a.find(1,478,&at,&n)==Ok&&n==32&&r.a.find(1,479,&at,&n)==Ok&&n==16384);
+    // outbound "master-kernel" + "ipa" (bengal.dtsi order), version published
+    const uint8_t *o=r.f.bytes.data()+r.c->smp.outbound;
+    CHECK(le32(o+4)==0x101&&le32(o+12)==(16u|(2u<<16))&&!strcmp((const char *)o+20,"master-kernel")&&!strcmp((const char *)o+40,"ipa"));
+    CHECK(r.saw("smem version/num_items/infoPresent 0 12 512 1")&&r.saw("smem item id/offset/bytes 0 478"));
+    const uint32_t kicks=r.f.kicks; CHECK(kicks==1);   // only the SMP2P probe kick before the modem runs
+    CHECK(r.c->step(5)==NotReady);
+    CHECK(r.c->modemStarted(1000)==Ok&&r.c->step(1001)==Ok&&r.c->stage==WifiControl::AwaitModem);
+    // inbound allocated but not published yet: keep waiting (it used to be a fatal Protocol)
+    uint32_t in=0; CHECK(r.a.allocate(1,428,340,&in)==Ok);
+    CHECK(r.c->step(1002)==Ok&&r.c->stage==WifiControl::AwaitModem&&r.saw("smp2p 428 inbound present"));
+    r.f.w(in,0x504d5324); r.f.w(in+8,1); r.f.w(in+12,16u|(1u<<16));
+    memcpy(r.f.bytes.data()+in+20,"slave-kernel",13); r.f.w(in+36,2); r.f.w(in+4,0x101);
+    CHECK(r.c->step(1003)==Ok&&r.c->stage==WifiControl::AwaitFifo&&r.saw("smp2p modem ready"));
+    CHECK(r.c->step(1004)==Ok&&r.c->stage==WifiControl::AwaitFifo);
+    uint32_t rx=0; CHECK(r.a.allocate(1,480,16384,&rx)==Ok);
+    CHECK(r.c->step(1005)==Ok&&r.c->stage==WifiControl::Running&&r.c->glink.running&&r.saw("smem 480 found"));
+    // GLINK VERSION(1, features 1) is the first frame in the TX FIFO 479, head advanced, IRQ kicked
+    CHECK(le16(r.f.bytes.data()+r.c->outboundFifo)==0&&le16(r.f.bytes.data()+r.c->outboundFifo+2)==1&&
+          le32(r.f.bytes.data()+r.c->descriptor+4)==8&&r.f.kicks>kicks);
+    CHECK(!strcmp(r.c->where(),"glink version (mpss edge)"));
+    CHECK(r.c->step(1004+WifiControl::ServiceMs)==Ok);   // the WLFW deadline counts from the GLINK start (1005)
+    CHECK(r.c->step(1005+WifiControl::ServiceMs)==Timeout&&r.saw("FAILED")&&r.saw(" glink running/negotiated/rx 0 1 0 0"));
+  }
+  { ControlRig r(400);   // Linux semantics: item ids >= num_items are refused
+    CHECK(r.prepare()==Range&&!strcmp(r.c->where(),"smem 435 smp2p out")&&r.saw("FAILED"));
+  }
+  { ControlRig r(512); CHECK(r.prepare()==Ok&&r.c->modemStarted(0)==Ok);
+    CHECK(r.c->step(WifiControl::ReadyMs)==Timeout&&!strcmp(r.c->where(),"smp2p 428 slave-kernel ready (bit 1)"));
+  }
+}
 int main() {
-  smemTest(); smpTest(); glinkTest(); rpmTest(); msaTest(); powerPlanTest(); qrtrTest(); firmwareServiceTest(); wlanTest(); ceTest(); malformedTest();
+  smemTest(); smpTest(); glinkTest(); rpmTest(); msaTest(); powerPlanTest(); qrtrTest(); firmwareServiceTest(); wlanTest(); ceTest(); controlTest(); malformedTest();
   printf("PASS %u checks: SMEM/SMP2P/GLINK/QRTR/QMI/WLFW/SNOC-CE actual sources, independent wire peer, malformed inputs\n",checks);
 }

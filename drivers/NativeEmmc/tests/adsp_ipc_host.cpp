@@ -109,7 +109,7 @@ static void buildSmem(std::vector<uint8_t> &m) {
   partition(m, 1, kPartGlobal, kPartGlobalBytes, 0xfffe, 0xfffe);
   partition(m, 2, kPartModem, kPartModemBytes, 0, 1);
   wr(m, table + 32 + 48 * 3, 0x49494953);
-  wr(m, table + 32 + 48 * 3 + 12, 512);
+  wr(m, table + 32 + 48 * 3 + 16, 512);   // smem_info.num_items (+12 is reserved)
 }
 // independent qcom_smem_alloc_private / qcom_smem_get_private of the simulated remote
 static uint32_t remoteAlloc(std::vector<uint8_t> &m, uint32_t part, uint16_t item, uint32_t bytes) {
