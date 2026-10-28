@@ -128,10 +128,12 @@ constexpr uint16_t kChgEnableCmd = 0x1042, kTypecModeCfg = 0x1544, kAiclOptions 
                    kPowerPath = 0x110b;
 
 #include "GuampTorch.inc"
+#include "GuampPonCore.h"
 
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
 volatile uint32_t gButtons, gErrors;
+volatile uint8_t gPonRaw, gVolUpRaw = 1;   // last raw PON_RT_STS and GPIO5 STATUS1 (diagnostics)
 volatile uint8_t gChg[8], gTypecMode;
 
 uint32_t readButtons() {
@@ -139,11 +141,15 @@ uint32_t readButtons() {
   uint32_t mask = 0;
   if (read8(kPm6125, kPonRtSts, &pon)) gErrors = gErrors + 1;
   else {
+    gPonRaw = pon;
     if (pon & 1u) mask |= 1u << 1;     // Power
     if (pon & 2u) mask |= 1u << 3;     // Volume Down (RESIN)
   }
   if (read8(kPm6125, kVolUpStatus, &vup)) gErrors = gErrors + 1;
-  else if (!(vup & 1u)) mask |= 1u << 2;   // Volume Up, active low
+  else {
+    gVolUpRaw = vup;
+    if (!(vup & 1u)) mask |= 1u << 2;   // Volume Up, active low
+  }
   return mask;
 }
 
@@ -287,6 +293,49 @@ void sinkFromHid(void (*sink)(void *, uint32_t), void *context) {
   IOLog("GuampPmic: HID button sink %s\n", sink ? "attached" : "detached");
 }
 
+// PON diagnostics (GuampPonCore.h, BLOCCO-SCHERMO-20261029): what the PMIC does by itself while keys are held, why
+// the last power-off/reset happened, pull-ups and debounce as the boot loader left them. Read only, unless
+// guamp-pon-pullup=1 sets the KPDPWR/RESIN pull-ups like the Linux DT (qcom,pull-up = <1>).
+guamp_pon::Reset gPonReset[3];
+void ponReport() {
+  using namespace guamp_pon;
+  uint8_t sub = 0, pull = 0, dbc = 0, s3 = 0, rt = 0, ps[2] = {0, 0};
+  read8(kPm6125, kSubtype, &sub);
+  read8(kPm6125, kPullCtl, &pull);
+  read8(kPm6125, kDbcCtl, &dbc);
+  read8(kPm6125, kS3Src, &s3);
+  read8(kPm6125, kRtSts, &rt);
+  read8(kPm6125, static_cast<uint16_t>(kBase + 0x5A), &ps[0]);
+  read8(kPm6125, static_cast<uint16_t>(kBase + 0x5B), &ps[1]);
+  // reasons, raw: gen1 +0x08..0x0F and gen2 +0xC0..0xCB (decode by subtype as Linux qpnp-power-on)
+  uint8_t g1[8] = {}, g2[12] = {};
+  for (unsigned k = 0; k < 8; ++k) read8(kPm6125, static_cast<uint16_t>(kBase + 0x08 + k), &g1[k]);
+  for (unsigned k = 0; k < 12; ++k) read8(kPm6125, static_cast<uint16_t>(kBase + 0xC0 + k), &g2[k]);
+  IOLog("GuampPon: subtype %02x (%s) rt %02x pull %02x (RESIN pull-up %s, KPDPWR pull-up %s) dbc %02x s3-src %02x "
+        "ps-hold %02x/%02x; reasons +08: %02x %02x %02x %02x %02x %02x %02x %02x; +C0: %02x %02x %02x %02x %02x %02x "
+        "%02x %02x %02x %02x %02x %02x\n", sub, gen2(sub) ? "gen2" : "gen1", rt, pull,
+        pull & kPullResin ? "on" : "OFF", pull & kPullKpdpwr ? "on" : "OFF", dbc, s3, ps[0], ps[1], g1[0], g1[1], g1[2],
+        g1[3], g1[4], g1[5], g1[6], g1[7], g2[0], g2[1], g2[2], g2[3], g2[4], g2[5], g2[6], g2[7], g2[8], g2[9], g2[10],
+        g2[11]);
+  for (unsigned src = 0; src < 3; ++src) {
+    uint8_t r[4] = {0, 0, 0, 0};
+    for (unsigned k = 0; k < 4; ++k) read8(kPm6125, static_cast<uint16_t>(sourceBase(src) + k), &r[k]);
+    gPonReset[src] = decode(r);
+    const Reset &x = gPonReset[src];
+    IOLog("GuampPon: %s hold reset %s: S1 %u ms + S2 %u ms = %u ms, type %x %s (regs %02x %02x %02x %02x)\n",
+          sourceName(src), x.enabled ? "ENABLED" : "disabled", x.s1, x.s2, x.totalMs(), x.type, resetType(x.type), r[0],
+          r[1], r[2], r[3]);
+  }
+  unsigned pullup = 0;
+  PE_parse_boot_argn("guamp-pon-pullup", &pullup, sizeof(pullup));
+  if (pullup == 1 && (pull & (kPullResin | kPullKpdpwr)) != (kPullResin | kPullKpdpwr)) {
+    const int w = write8(kPm6125, kPullCtl, static_cast<uint8_t>(pull | kPullResin | kPullKpdpwr));
+    uint8_t after = 0;
+    read8(kPm6125, kPullCtl, &after);
+    IOLog("GuampPon: pull-ups set (guamp-pon-pullup=1): write %d, PULL_CTL %02x -> %02x\n", w, pull, after);
+  }
+}
+
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-pmic");
   int r = ensureArb();   // usually done already by rtc::boot
@@ -324,6 +373,9 @@ void thread(void *, wait_result_t) {
   const bool torchRuns = torch::init();
   bool keyLast = false, keyStable = false;
   unsigned keyCount = 0;
+  ponReport();
+  guamp_pon::ComboWatch combo, powerHold;
+  powerHold.mask = guamp_pon::kKpdpwr;
   uint32_t sinkSeen = gSinkGeneration;
   for (unsigned tick = 0;; ++tick) {
     if (ringer) {
@@ -349,7 +401,8 @@ void thread(void *, wait_result_t) {
       sent = now;
       gButtons = now;
       if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, now);
-      IOLog("GuampPmic: buttons %x, HID sink %s\n", now, gSink ? "attached" : "absent");
+      IOLog("GuampPmic: buttons %x, HID sink %s (pon %02x vol-up %02x)\n", now, gSink ? "attached" : "absent",
+            gPonRaw, gVolUpRaw);
     } else if (tick % 40 == 0 || gSinkGeneration != sinkSeen) {
       // The latched ringer level must reach the HID element even when the sink or its event driver came after the last
       // change (NativeHidInput drops reports until its IOHIDEventDriver exists). The same report again is no event:
@@ -409,6 +462,22 @@ void thread(void *, wait_result_t) {
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, gCharge.iclCode,
               gCharge.fccCode, gCharge.choice.source, gErrors,
               touch::gStep, touch::gError, touch::gEvents);
+    }
+    {   // held keys: countdown to the PMIC key reset (S1+S2); the last line before such a reset says how far it was
+      uint64_t ns = 0;
+      absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+      const uint32_t ms = static_cast<uint32_t>(ns / 1000000u);
+      uint32_t held = 0;
+      if (combo.feed(gPonRaw, ms, &held)) {
+        const guamp_pon::Reset &x = gPonReset[guamp_pon::kSrcCombo];
+        IOLog("GuampPon: Power+RESIN held %u ms (pon %02x); PMIC %s %s at %u ms\n", held, gPonRaw,
+              guamp_pon::resetType(x.type), x.enabled ? "armed" : "disabled", x.totalMs());
+      }
+      if (powerHold.feed(gPonRaw, ms, &held) && held >= 2000) {
+        const guamp_pon::Reset &x = gPonReset[guamp_pon::kSrcKpdpwr];
+        IOLog("GuampPon: Power held %u ms (pon %02x); PMIC %s %s at %u ms\n", held, gPonRaw,
+              guamp_pon::resetType(x.type), x.enabled ? "armed" : "disabled", x.totalMs());
+      }
     }
     if (torchRuns) torch::poll(tick);
     IOSleep(25);
