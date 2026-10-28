@@ -6,7 +6,7 @@ index 3edb139..e03d4d7 100644
  		    native_guamp_iphone_res_status[i]);
  	}
  }
-+/* guamp-bt-tool=1 (with guamp-iphone-res=1, after its views): BlueTool's override scripts for the Bluetooth shim. BlueTool runs
++/* guamp-bt-tool=1 (with sheng-gpu-addon=1 or guamp-iphone-res=1, after the iPhone views when present): BlueTool's override scripts for the Bluetooth shim. BlueTool runs
 + * /etc/bluetool/<HWModel>.<script>.script in place of its built-in Broadcom sequence when that file exists (strings "HW Model there
 + * is override script file %s", "/etc/bluetool/%s.%s.script"); this iPadOS has no /private/etc/bluetool. The kernel writes reduced
 + * boot/init/deepsleep scripts (no firmware download "bcm -W", no calibration "bcm -Q"; the WCN3950 is brought up by the kernel's
@@ -72,7 +72,7 @@ index 3edb139..e03d4d7 100644
  	native_gpu_addon_install(p, scratch);
  	if (iphone_res) {
  		native_guamp_iphone_res_mount(p, scratch);
-+		native_guamp_bt_tool(p, scratch);
  	}
++	native_guamp_bt_tool(p, scratch);	/* guamp-bt-tool=1 with sheng-gpu-addon=1 or guamp-iphone-res=1 */
  	if (enabled != 1) {
  		return;

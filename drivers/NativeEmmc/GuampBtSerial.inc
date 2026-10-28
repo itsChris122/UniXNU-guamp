@@ -41,7 +41,8 @@ struct selinfo gSel;
 bool gEnabled = false, gOpen = false;
 bool gCtl[3] = {};                 // btreset, btwake, btpoweroff currently open
 int gMajor = -1, gCtlMajor = -1;
-uint32_t gOpens = 0, gReads = 0, gWrites = 0;
+uint32_t gOpens = 0, gReads = 0, gWrites = 0, gIoctls = 0, gNodes = 0;
+uint32_t gCtlOpens[3] = {};        // btreset, btwake, btpoweroff opens (the periodic GuampBt line shows them)
 const char *const kTtyNames[2] = {"cu.bluetooth", "uart.bluetooth"};
 const char *const kCtlNames[3] = {"btreset", "btwake", "btpoweroff"};
 
@@ -140,6 +141,7 @@ int bsWrite(dev_t dev, struct uio *uio, int ioflag) {
 }
 
 int bsIoctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p) {
+  gIoctls = gIoctls + 1;
   IOLockLock(gLock);
   int flush = 0;
   const bts_ioctl_result r = bts_tty_ioctl(&gTty, static_cast<uint32_t>(cmd), reinterpret_cast<uint8_t *>(data),
@@ -185,6 +187,7 @@ int ctlOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   IOLockLock(gLock);
   if (gCtl[m]) { IOLockUnlock(gLock); return EBUSY; }
   gCtl[m] = true;
+  gCtlOpens[m] = gCtlOpens[m] + 1;
   IOLockUnlock(gLock);
   ctlCall(static_cast<unsigned>(m), true);
   return 0;
@@ -254,6 +257,7 @@ void start() {
     nodes += devfs_make_node(makedev(gMajor, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", kTtyNames[m]) ? 1 : 0;
   for (int m = 0; m < 3; m = m + 1)
     nodes += devfs_make_node(makedev(gCtlMajor, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", kCtlNames[m]) ? 1 : 0;
+  gNodes = nodes;
   gEnabled = nodes != 0;
   IOLog("GuampBtShim: tty major %d (kqueue %d), control major %d, %u/5 nodes; identity %s manufacturer %u subver "
         "%04x, fc01->fc14 %u (%u bytes state)\n", gMajor, kq, gCtlMajor, nodes, gShim->id.name,

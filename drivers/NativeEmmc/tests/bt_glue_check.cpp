@@ -12,6 +12,7 @@ volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
 #include "../GuampBtShim.h"
 namespace btshim {
 extern bool gEnabled;
+extern uint32_t gOpens, gReads, gWrites, gIoctls, gNodes, gCtlOpens[3];
 void start();
 void attach(const bts_link *link);
 void controllerBytes(const uint8_t *data, size_t len);

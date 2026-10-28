@@ -938,8 +938,11 @@ void transport() {
     if (now - lastLog > 60000000000ULL) {
       lastLog = now;
       IOLog("GuampBt: transport: tx %u packets (%u errors), rx %u bytes (%u packets, %u noise), IBS wake rx %u ack tx %u "
-            "sleep rx %u wake tx %u, %s, re-inits %u\n", gTxPkts, gTxErr, gRxBytes, gScan.packets, gScan.noise, gScan.wake,
-            gIbsAcks, gScan.sleep, gIbsWakeSent, gOff ? "off" : gAsleep ? "asleep" : "awake", gReinits);
+            "sleep rx %u wake tx %u, %s, re-inits %u; shim nodes %u opens %u ioctls %u reads %u writes %u, btreset %u btwake %u "
+            "btpoweroff %u opens\n", gTxPkts, gTxErr, gRxBytes, gScan.packets, gScan.noise, gScan.wake,
+            gIbsAcks, gScan.sleep, gIbsWakeSent, gOff ? "off" : gAsleep ? "asleep" : "awake", gReinits, btshim::gNodes,
+            btshim::gOpens, btshim::gIoctls, btshim::gReads, btshim::gWrites, btshim::gCtlOpens[0], btshim::gCtlOpens[1],
+            btshim::gCtlOpens[2]);
     }
   }
 }
