@@ -470,6 +470,29 @@ static void testCtl() {
     CHECK(bts_ctl_admit(true, true, 1, 1) == BTS_CTL_REFUSE);
     CHECK(bts_ctl_admit(true, true, 0, 0) == BTS_CTL_REFUSE);
     CHECK(bts_ctl_admit(true, false, 0, 1) == BTS_CTL_REFUSE);   // the tty holds it
+
+    // RAM test 7: the WCN3950 mask (octet 18 = 0x83) lacks Read/Write Default Erroneous Data Reporting; the shim
+    // advertises them and answers them, everything else in the mask is untouched.
+    static const uint8_t wcn[64] = {0xff, 0xff, 0xff, 0x03, 0xce, 0xff, 0xef, 0xff, 0xff, 0xff, 0xff, 0x1f, 0xf2, 0x0f,
+                                    0xe8, 0xfe, 0x3f, 0xf7, 0x83, 0xff, 0x1c, 0x00, 0x04, 0x00, 0x61, 0xff, 0xff, 0xff,
+                                    0x7f, 0x3e, 0x20, 0x00, 0xfe, 0xf0, 0xff, 0x0f, 0x00, 0x00, 0x80, 0x04, 0x00, 0x08};
+    Bytes rc = cc(BTS_OP_READ_LOCAL_COMMANDS, Bytes(1, 0));
+    rc.insert(rc.end(), wcn, wcn + 64);
+    rc[2] = (uint8_t)(rc.size() - 3);
+    bts_shim_flush_rx(&s);
+    bts_shim_ctrl_input(&s, rc.data(), rc.size());
+    Bytes mask = drain(&s);
+    CHECK(mask.size() == rc.size() && mask[7 + 18] == (0x83 | 0x0c));
+    mask[7 + 18] = 0x83;
+    CHECK(mask == rc);
+    const size_t sentBefore = l.sent.size();
+    Bytes wr = pktCmd(0x0c5b, {0}), rd = pktCmd(0x0c5a, {});
+    bts_shim_host_write(&s, wr.data(), wr.size());
+    bts_shim_host_write(&s, rd.data(), rd.size());
+    Bytes both = cc(0x0c5b, {0}), r2 = cc(0x0c5a, {0, 0});
+    both.insert(both.end(), r2.begin(), r2.end());
+    CHECK(drain(&s) == both && l.sent.size() == sentBefore);
+    CHECK(s.lastCmd == 0x0c5a && s.lastReply == 0x0c5a && s.lastReplyStatus == 0);
 }
 
 int main() {

@@ -33,6 +33,7 @@
 #define BTS_EVT_VENDOR 0xff
 #define BTS_OP_READ_LOCAL_VERSION 0x1001
 #define BTS_OP_READ_LOCAL_NAME 0x0c14
+#define BTS_OP_READ_LOCAL_COMMANDS 0x1002       // Read Local Supported Commands: status + 64-byte mask
 #define BTS_OGF_VENDOR 0x3f
 #define BTS_STATUS_UNKNOWN_COMMAND 0x01
 #define BTS_STATUS_HARDWARE_FAILURE 0x03
@@ -320,6 +321,22 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
     bts_shim_queue(s, o, n);
 }
 
+// Standard HCI commands the WCN3950 lacks (absent from its Read Local Supported Commands mask) that bluetoothd's
+// HCI initialisation requires (RAM test 7: "OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", then "HCI
+// initialization failed", reason 108; the stack refuses a command whose mask bit is clear without sending it). The
+// shim sets their bits in the Read Local Supported Commands reply and answers them itself. Erroneous Data Reporting
+// only concerns eSCO (HFP wideband): reporting stays off, which is what the controller does anyway.
+struct bts_std_emu { uint16_t opcode; uint8_t octet, bit, retLen; };
+static const struct bts_std_emu kBtsStdEmu[] = {
+    {0x0c5a, 18, 2, 1},   // Read Default Erroneous Data Reporting: status, Erroneous_Data_Reporting = 0 (disabled)
+    {0x0c5b, 18, 3, 0},   // Write Default Erroneous Data Reporting: status
+};
+static inline const struct bts_std_emu *bts_std_emu_find(uint16_t opcode) {
+    for (size_t i = 0; i < sizeof kBtsStdEmu / sizeof kBtsStdEmu[0]; i = i + 1)
+        if (kBtsStdEmu[i].opcode == opcode) return &kBtsStdEmu[i];
+    return (const struct bts_std_emu *)0;
+}
+
 static inline void bts_shim_host_pkt(void *ctx, const uint8_t *pkt, size_t len) {
     struct bts_shim *s = (struct bts_shim *)ctx;
     s->st.hostPkts = s->st.hostPkts + 1;
@@ -328,6 +345,14 @@ static inline void bts_shim_host_pkt(void *ctx, const uint8_t *pkt, size_t len) 
         const uint16_t opcode = bts_le16(pkt + 1);
         s->lastCmd = opcode;
         if ((opcode >> 10) == BTS_OGF_VENDOR) {bts_shim_vendor(s, opcode, pkt + 4, len - 4); return;}
+        const struct bts_std_emu *e = bts_std_emu_find(opcode);
+        if (e) {
+            static const uint8_t zeros[4] = {0, 0, 0, 0};
+            s->st.emulated = s->st.emulated + 1;
+            const size_t n = bts_cmd_complete(s->scratch, sizeof s->scratch, opcode, 0, zeros, e->retLen);
+            bts_shim_queue(s, s->scratch, n);
+            return;
+        }
         if (!s->link.tx || s->link.tx(s->link.ctx, pkt, len)) {
             s->st.txErrors = s->st.txErrors + 1;
             const size_t n = bts_cmd_status(s->scratch, sizeof s->scratch, opcode, BTS_STATUS_HARDWARE_FAILURE);
@@ -366,6 +391,15 @@ static inline void bts_shim_ctrl_pkt(void *ctx, const uint8_t *pkt, size_t len) 
                 bts_copy(o, pkt, len);
                 o[7] = s->id.hciVer; bts_put16(o + 8, s->id.hciRev); o[10] = s->id.lmpVer;
                 bts_put16(o + 11, s->id.manufacturer); bts_put16(o + 13, s->id.lmpSubver);
+                s->st.rewritten = s->st.rewritten + 1;
+                bts_shim_queue(s, o, len);
+                return;
+            }
+            // Read Local Supported Commands: status + 64 octets; advertise the commands answered by kBtsStdEmu.
+            if (opcode == BTS_OP_READ_LOCAL_COMMANDS && plen >= 4 + 64 && pkt[6] == 0) {
+                bts_copy(o, pkt, len);
+                for (size_t i = 0; i < sizeof kBtsStdEmu / sizeof kBtsStdEmu[0]; i = i + 1)
+                    o[7 + kBtsStdEmu[i].octet] = (uint8_t)(o[7 + kBtsStdEmu[i].octet] | 1u << kBtsStdEmu[i].bit);
                 s->st.rewritten = s->st.rewritten + 1;
                 bts_shim_queue(s, o, len);
                 return;
