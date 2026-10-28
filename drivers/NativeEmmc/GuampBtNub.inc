@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// guamp Bluetooth registry nub, included by NativeEmmc.cpp after BtService.inc. Off unless guamp-bt-nub=1.
+// guamp Bluetooth registry nub, included by NativeEmmc.cpp after BtService.inc. Off unless guamp-bt-nub=1 (default 1 with
+// guamp-bt=2, GuampBtDefaults.h).
 //
 // bluetoothd (iPadOS 17.7 /usr/sbin/bluetoothd, FindLocalMacAddress at 0x10009abc0) reads the controller address as
 //   IOServiceGetMatchingService(IOServiceNameMatching("marconi-bt"), then "bluetooth")
@@ -51,7 +52,7 @@ static void status(thread_call_param_t, thread_call_param_t) {
 }
 static void publish();
 void start() {
-  unsigned enabled = 0;
+  unsigned enabled = guamp_bt_default(1);
   PE_parse_boot_argn("guamp-bt-nub", &enabled, sizeof(enabled));
   if (enabled != 1) return;
   publish();

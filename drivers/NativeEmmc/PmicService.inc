@@ -20,7 +20,7 @@
 // SDP/float/unknown 500) and guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
 // instead of sink only; guamp-chg-recover=0 turns off the stuck-input recovery (weak-adapter steps, re-detection);
 // guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
-//   torch     the camera flash LED (PMI632 slave 3, 0xd300) as a torch, GuampTorch.inc: opt-in guamp-torch=1, driven
+//   torch     the camera flash LED (PMI632 slave 3, 0xd300) as a torch, GuampTorch.inc: guamp-torch (default 1 since 28/10), driven
 //             only by the GuampTorch IOKit service / guamp_torch_request() (no button), applied by this thread.
 // Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, SPMI errors.
 
@@ -285,7 +285,7 @@ void thread(void *, wait_result_t) {
   if (r) return;
   __asm__ volatile("dmb ish" ::: "memory");
   gArbReady = 1;
-  unsigned battery = 0;
+  unsigned battery = 1;   // default on (verified 28/10): guamp-battery=0 disables
   PE_parse_boot_argn("guamp-battery", &battery, sizeof(battery));
   gBatteryEnabled = battery == 1;
   unsigned batteryTemp = 1, batterySdam = 0;
@@ -420,7 +420,7 @@ void start() {
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) { pmic::sinkFromHid(sink, context); }
 
 // Torch request from any thread (in-kernel callers; user space uses the GuampTorch service): level in permille of
-// guamp-torch-ma, 0 = off. The PMIC thread applies the newest one within 25 ms; ignored unless guamp-torch=1 and the
+// guamp-torch-ma, 0 = off. The PMIC thread applies the newest one within 25 ms; ignored with guamp-torch=0 or unless the
 // flash peripheral checked out.
 extern "C" void guamp_torch_request(uint32_t permille) { pmic::torch::request(permille); }
 // Current torch state in mA (0 = off), for property readback.

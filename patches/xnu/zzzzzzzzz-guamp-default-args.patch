@@ -1,0 +1,94 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index dd54140..8f6233a 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -552,15 +552,16 @@ native_mobile_graphics_probe_checkpoint(void)
+ static void
+ native_mobile_graphics_load_probe(void)
+ {
+-	int enabled = 0;
+-	if (!PE_parse_boot_argn("offline-mobile-graphics-load", &enabled, sizeof(enabled)) || !enabled) {
++	int enabled = 1;	/* guamp default on (28/10): offline-mobile-graphics-load=0 disables */
++	PE_parse_boot_argn("offline-mobile-graphics-load", &enabled, sizeof(enabled));
++	if (!enabled) {
+ 		return;
+ 	}
+ 	native_mobile_graphics_load_status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOMobileGraphicsFamily");
+ 	native_mobile_graphics_probe_checkpoint();
+-	int legacy_register = 0;
+-	if (native_mobile_graphics_load_status == 0 &&
+-	    PE_parse_boot_argn("offline-legacy-register", &legacy_register, sizeof(legacy_register)) && legacy_register) {
++	int legacy_register = 1;	/* guamp default on (28/10): offline-legacy-register=0 disables */
++	PE_parse_boot_argn("offline-legacy-register", &legacy_register, sizeof(legacy_register));
++	if (native_mobile_graphics_load_status == 0 && legacy_register) {
+ 		extern void native_legacy_display_probe(void);
+ 		native_legacy_display_probe();
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b27ae47..8582ad5 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7561,8 +7561,13 @@ volatile int native_guamp_bt_tool_written = 0;
+ static void
+ native_guamp_bt_tool(proc_t p, user_addr_t scratch)
+ {
+-	uint32_t enabled = 0;
+-	if (!PE_parse_boot_argn("guamp-bt-tool", &enabled, sizeof(enabled)) || enabled != 1) {
++	uint32_t enabled = 0, bt = 0;
++	/* guamp default (28/10): on with guamp-bt=2, as NativeEmmc GuampBtDefaults.h; guamp-bt-tool=0|1 still wins */
++	if (PE_parse_boot_argn("guamp-bt", &bt, sizeof(bt)) && bt == 2) {
++		enabled = 1;
++	}
++	PE_parse_boot_argn("guamp-bt-tool", &enabled, sizeof(enabled));
++	if (enabled != 1) {
+ 		return;
+ 	}
+ 	static const char *const directories[] = {"/private/var/ngpu/etc", "/private/var/ngpu/etc/bluetool"};
+@@ -7744,7 +7749,7 @@ native_guamp_cc_reset(proc_t p, user_addr_t scratch)
+  *   here, before launchd, and cleared by the runtime monitor (GuampCaMetal.inc) after a healthy render server session, so a hang, a
+  *   panic or a crash loop with Metal leaves it raised; from GUAMP_CA_METAL_MAX on the boot falls back to software by itself.
+  *   guamp-ca-metal-reset=1 clears the count first. Never panics: every failure only records its status. */
+-unsigned int guamp_ca_metal_mode = 0;
++unsigned int guamp_ca_metal_mode = 2;	/* guamp default 2 (verified 28/10), as GuampCaMetal.inc: guamp-ca-metal=0 keeps software */
+ volatile int guamp_ca_metal_enabled = 0;
+ volatile int guamp_ca_metal_attempts = -1;
+ volatile int guamp_ca_metal_status = -1;
+@@ -7874,10 +7879,8 @@ native_guamp_audio_plugin_mount(proc_t p, user_addr_t scratch)
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+-	uint32_t enabled = 0;
+-	if (!PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled))) {
+-		enabled = 0;
+-	}
++	uint32_t enabled = 1;	/* guamp default on (verified 28/10): sheng-gpu-addon=0 disables */
++	PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled));
+ 	/* guamp-iphone-res=1 installs the payload addon too (it carries the iPhone resources) and mounts their views right after it. */
+ 	int iphone_res = native_guamp_iphone_res_enabled();
+ 	/* guamp-audio-plugin=1 likewise installs the addon (it carries GuampAudio.driver) and mounts the HAL view after it. */
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index d1d7823..55744e9 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1006,7 +1006,7 @@ DebuggerXCallEnter(
+ 	cpu_data_t      *target_cpu_datap;
+ 	cpu_data_t      *cpu_data_ptr = getCpuDatap();
+ 
+-	unsigned int guamp_guard = 0;
++	unsigned int guamp_guard = 1;	/* guamp default on (verified 28/10): guamp-smp-snapshot-guard=0 disables */
+ 	PE_parse_boot_argn("guamp-smp-snapshot-guard", &guamp_guard, sizeof(guamp_guard));
+ 	bool guamp_refuse_incoherent_snapshot = false;
+ 	if (guamp_stuck_mode < 0) {
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 092a4ba..f586f19 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2178,7 +2178,7 @@ pmap_get_arm64_prot(
+  */
+ 
+ /* guamp: immutable after bootstrap; read by native diagnostic logger. */
+-unsigned int guamp_ram_nc_enabled = 0;
++unsigned int guamp_ram_nc_enabled = 1;	/* guamp default on (verified 28/10): guamp-ram-nc=0 disables */
+ /* guamp: the GOP scanout (cont_splash_region, reserved DRAM outside the managed range) mapped write-combining
+  * (Normal non-cacheable) instead of Device when guamp-fb-wc=1: the display copy stores 4.6 MB per frame into it. */
+ unsigned int guamp_fb_wc_enabled = 0;

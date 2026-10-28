@@ -335,8 +335,9 @@ static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
   static uint32_t previous[CPU_STATE_MAX] = {};
   if (!checked) {
-    unsigned value = 0;
-    enabled = PE_parse_boot_argn("guamp-perf", &value, sizeof(value)) && value == 1;
+    unsigned value = 1;   // default on (verified 28/10): guamp-perf=0 disables
+    PE_parse_boot_argn("guamp-perf", &value, sizeof(value));
+    enabled = value == 1;
     checked = true;
   }
   if (!enabled) return;

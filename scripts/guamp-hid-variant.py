@@ -6,6 +6,8 @@ padding bits after Menu/Power/VolUp/VolDown become one Telephony (0x0B) usage 0x
 bits. backboardd (BKButtonHIDEventProcessor, page 0x0B usage 0x2E -> _processRingerSwitchEvent:down:) and SpringBoard
 (__handleHIDEvent: 0xB002E -> _handleRingerSwitchEvent:) read it as a level: 1 ring, 0 silent. IOHIDEventDriver
 stores Telephony elements as keyboard elements and dispatches them on value change. The button sink keeps bit 4.
+Step 3 (28/10): sheng-touch-hid defaults to 1 (the touch screen collection the USB mirror's touches use, verified on every
+guamp boot line); sheng-touch-hid=0 turns it off.
 """
 from pathlib import Path
 import hashlib
@@ -14,7 +16,8 @@ path=root/'drivers/NativeHidInput/NativeHidInput.cpp'
 PRISTINE='0445e5f451ffcc827bdd603e822180444d998427fa3a6d63559b1a7b8f850998'
 CONSUMER='dc43b25ae0dc0191ab7a23674c3604262149769d7fa55c1372abe5135eea2929'
 FINAL=None
-FINAL_RECORDED='f5fa8fa8d63f498d648435957e0e2f5fa3dabba09d59cff930a34fc4e9bc58d0'
+RINGER='f5fa8fa8d63f498d648435957e0e2f5fa3dabba09d59cff930a34fc4e9bc58d0'
+FINAL_RECORDED='08eff226eb1aad34be27b5aab1e21129ca5eed32faed072e20f30c98ec2a03f5'
 raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
 text=raw.decode()
 if digest==PRISTINE:
@@ -35,10 +38,19 @@ if digest==CONSUMER:
     for old in (old_main,old_consumer,old_mask):
         assert text.count(old)==1,'HID ringer variant: anchor not unique: '+old
     text=text.replace(old_main,new_main).replace(old_consumer,new_consumer).replace(old_mask,new_mask)
-    FINAL=hashlib.sha256(text.encode()).hexdigest()
-    assert FINAL==FINAL_RECORDED,'HID ringer variant result differs from the recorded source'
-    path.write_text(text)
+    digest=hashlib.sha256(text.encode()).hexdigest()
+    assert digest==RINGER,'HID ringer variant result differs from the recorded source'
     print('GuampHid: ring/silent switch (Telephony 0x0B/0x2E) added as report 2 bit 4; collections unchanged')
+if digest==RINGER:
+    old_touch='        unsigned touch=0;\n        touchEnabled=PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch)) && touch==1;'
+    new_touch=('        unsigned touch=1;   // default on (guamp 28/10): sheng-touch-hid=0 turns the touch collection off\n'
+               '        PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch));touchEnabled=touch==1;')
+    assert text.count(old_touch)==1,'HID touch default: anchor not unique'
+    text=text.replace(old_touch,new_touch)
+    FINAL=hashlib.sha256(text.encode()).hexdigest()
+    assert FINAL==FINAL_RECORDED,'HID touch default result differs from the recorded source: '+FINAL
+    path.write_text(text)
+    print('GuampHid: sheng-touch-hid default 1 (=0 off)')
 elif digest==FINAL_RECORDED:
     print('GuampHid: pinned Consumer-only opt-in and ring/silent switch already prepared')
 else:

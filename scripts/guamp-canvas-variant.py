@@ -12,12 +12,13 @@ scales it to the panel, as the display pipe of an iPhone in Display Zoom (or an 
 - guamp-canvas-mode=2: the canvas is reported as the display dimensions (installBootDimensions).
 - guamp-canvas-filter: 1 (default) bilinear, 0 nearest.
 Swaps whose larger rectangle is the canvas are scaled into the GOP frame buffer (which the USB mirror keeps reading at 720 x 1600).
-Without the two arguments nothing changes.
+Without the two arguments the canvas is off. Section 11: the guamp display arguments (offline-legacy-*) and guamp-copy-gpu-wait=500
+are code defaults since 28/10; an explicit key still wins.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '74bf7811ea4360cc7bef2a392a6fe82f2505920a4498d88674d01442ad59c389'
+PATCHED_SHA256 = '56ffaee74bbb5276a5fbd2b01c181a01229611c33816525b6fe2c0a68affc918'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -276,7 +277,7 @@ EDITS.append((r'''            installBootDimensions((uint32_t)video.v_width,(uin
 #    reused, [10] async skipped: option off, [11] skipped: GPU bypass after a failure, [12] skipped: no thread call, [13] skipped:
 #    a copy still in flight, [14] options read (bit0 fast, bit1 flush, bit2 map cache, bits3-4 async mode, bit5 read, bit6 GPU wait), [15] snapshot
 #    ticks (copy into the internal buffer).
-#    guamp-copy-gpu-wait=<ms> (default 0, off; at most 1000): the copy is deferred to the thread call (guamp-async-copy is taken as
+#    guamp-copy-gpu-wait=<ms> (default 500 since 28/10, 0 off; at most 1000): the copy is deferred to the thread call (guamp-async-copy is taken as
 #                             1, no snapshot) and first waits, at most <ms>, until the GPU has retired every submission handed out
 #                             by then (drivers/GuampAdreno guamp_adreno_wait_submitted: the CP timestamp of the fence page against
 #                             the ring's newest fence), because the render server swaps after waitUntilScheduled, before its Metal
@@ -301,7 +302,7 @@ EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint
               'volatile uint64_t guamp_copy_latest[10];}'))
 EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
-    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=0;
+    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=500;   // guamp-copy-gpu-wait default 500 (verified 28/10)
     bool latestWanted=false,gpuScaled=true;unsigned trailMs=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
@@ -663,6 +664,21 @@ EDITS.append(('''            if(!native_legacy_prepare_scanout()) {native_legacy
                 latestRetire(request,frame);return;
             }
             if(!native_legacy_fill_pixels('''))
+# 11. Defaults (owner 28/10, ARGOMENTI-PREDEFINITI-20261028): the display arguments of the guamp boot line are code defaults;
+#     an explicit key still wins (offline-legacy-*=0 turns one off).
+for _key, _value in (('offline-legacy-pm', 1), ('offline-legacy-register', 1), ('offline-legacy-transfer', 1),
+                     ('offline-legacy-validate', 1)):
+    EDITS.append(('unsigned enabled=0;PE_parse_boot_argn("%s",&enabled,sizeof(enabled));' % _key,
+                  'unsigned enabled=%u;PE_parse_boot_argn("%s",&enabled,sizeof(enabled));   // default %u (guamp 28/10)' % (_value, _key, _value)))
+EDITS.append(('''        unsigned enabled=0;
+        PE_parse_boot_argn("offline-legacy-gop",&enabled,sizeof(enabled));''', '''        unsigned enabled=1;   // default 1 (guamp 28/10)
+        PE_parse_boot_argn("offline-legacy-gop",&enabled,sizeof(enabled));'''))
+EDITS.append(('''        unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+        if(enabled!=1 || phase!=4''', '''        unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));   // default 4 (guamp 28/10)
+        if(enabled!=1 || phase!=4'''))
+EDITS.append(('''        unsigned retire=0,cpuPresent=0;
+        PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));''', '''        unsigned retire=0,cpuPresent=1;   // offline-legacy-cpu-present default 1 (guamp 28/10)
+        PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
@@ -677,4 +693,4 @@ def apply(data):
 if __name__ == '__main__':
     path = Path(sys.argv[1]) if len(sys.argv)>1 else Path(__file__).resolve().parents[1]/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp'
     path.write_bytes(apply(path.read_bytes()))
-    print('NativeLegacyDisplay: verified guamp canvas variant (guamp-canvas-width/-height), default unchanged')
+    print('NativeLegacyDisplay: verified guamp canvas variant (guamp-canvas-width/-height; guamp defaults of 28/10)')

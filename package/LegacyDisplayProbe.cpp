@@ -413,10 +413,10 @@ __attribute__((noinline)) bool native_legacy_gop_mapping_observed(IOService *obj
         }
     }
     native_legacy_gop_mapping_checkpoint();
-    unsigned enabled=0;PE_parse_boot_argn("offline-legacy-unit-scale",&enabled,sizeof(enabled));
+    unsigned enabled=2;PE_parse_boot_argn("offline-legacy-unit-scale",&enabled,sizeof(enabled));   // default 2 (verified 28/10)
     if(!enabled)return true;
     native_legacy_unit_scale_calls=native_legacy_unit_scale_calls+1;native_legacy_unit_scale_status=1;
-    unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+    unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));   // default 4 (verified 28/10)
     PE_Video video={};
     // The value is the UI scale: logical points = actual scanout pixels / scale (1..3). It changes
     // only the published display-scale; the scanout copy still moves one actual pixel per pixel.
@@ -470,7 +470,7 @@ void native_legacy_display_probe(void) {
     native_legacy_object_size=display->getMetaClass()->getClassSize();
     native_legacy_parent_match=(display->metaCast("IOMobileFramebufferLegacy") && display->metaCast("IOMobileFramebuffer") && display->metaCast("IOService"));
     native_legacy_stage=3;native_legacy_init_result=display->init();
-    unsigned phase=1;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+    unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));   // default 4 (verified 28/10)
     if(native_legacy_init_result && (phase==2 || phase==3 || phase==4)) {
         // IOSurface matches the real IOBSD resource, published by bsd_autoconf.
         // Retain this actual object until that normal lifecycle boundary.
@@ -509,7 +509,7 @@ void native_legacy_display_late_probe(void) {
             ranges->setObject(memory);nub->setDeviceMemory(ranges);nub->setName("NativeGOPFramebuffer");
             nubAttached=nub->attach(parent);if(nubAttached)nubStarted=nub->start(parent);
             if(nubStarted) {
-                unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
+                unsigned phase=4;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));   // default 4 (verified 28/10)
                 if(phase==4) {
                     // This is the actually implemented GOP display subsystem,
                     // attached to its real IOPlatformDevice memory resource.
@@ -536,7 +536,7 @@ void native_legacy_display_late_probe(void) {
                         activeLegacyDisplay=display;activeGOPNub=nub;native_legacy_stage=10;
                         {
                             unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);
-                            {unsigned g=0;if(PE_parse_boot_argn("guamp-gop-presenter",&g,sizeof g) && g==1)gpu=1;}   // guamp alias
+                            {unsigned g=1;PE_parse_boot_argn("guamp-gop-presenter",&g,sizeof g);if(g==1)gpu=1;}   // guamp alias, default on (28/10)
                             if(gpu==1) {
                                 IOService *handoff=native_gop_presenter_create();
                                 // Not a child of the display subsystem's node: the original display code enumerates that node's children (int-075/077:

@@ -27,27 +27,30 @@ static volatile int32_t aks_rc[96];
 bool native_aks_state_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        unsigned value = 0;
-        cached = PE_parse_boot_argn("sheng-aks", &value, sizeof(value)) && value == 1;
+        unsigned value = 1;   // default on (verified 28/10): sheng-aks=0 disables
+        PE_parse_boot_argn("sheng-aks", &value, sizeof(value));
+        cached = value == 1;
     }
     return cached == 1;
 }
-// guamp-aks-wrap=1: the owned AppleKeyStore also answers aks_wrap_key/aks_unwrap_key (selectors 10/11) so securityd can store
+// guamp-aks-wrap (default 1 since 28/10, =0 off): the owned AppleKeyStore also answers aks_wrap_key/aks_unwrap_key (selectors 10/11) so securityd can store
 // keychain items, for instance the LE root keys of bluetoothd (scripts/guamp-aks-variant.py). The blob is not encrypted.
 bool native_aks_wrap_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        unsigned value = 0;
-        cached = PE_parse_boot_argn("guamp-aks-wrap", &value, sizeof(value)) && value == 1;
+        unsigned value = 1;   // default on (verified 28/10, bluetoothd root keys); guamp-aks-wrap=0 disables
+        PE_parse_boot_argn("guamp-aks-wrap", &value, sizeof(value));
+        cached = value == 1;
     }
     return cached == 1;
 }
-// sheng-aks-sls=<n> overrides the reported lock state (default 0 = unlocked; 3 = MobileKeyBag's "no passcode").
+// sheng-aks-sls=<n> overrides the reported lock state (default 3 since 28/10 = MobileKeyBag's "no passcode"; 0 = unlocked).
 uint32_t native_aks_lock_state(void) {
     static int cached = -1;
     if (cached < 0) {
-        unsigned value = 0;
-        if (!PE_parse_boot_argn("sheng-aks-sls", &value, sizeof(value)) || value > 7) value = 0;
+        unsigned value = 3;
+        PE_parse_boot_argn("sheng-aks-sls", &value, sizeof(value));
+        if (value > 7) value = 0;
         cached = (int)value;
     }
     return (uint32_t)cached;
@@ -84,9 +87,9 @@ void native_aks_call(uint32_t selector, int32_t result) {
     aks_publish();
 }
 static void native_keyevents_probe(void) {
-    unsigned enabled = 0, original = 0;
-    if (!PE_parse_boot_argn("offline-key-events", &enabled, sizeof(enabled)) || enabled != 1 ||
-        native_keyevents_stage) return;
+    unsigned enabled = 1, original = 0;   // offline-key-events: default on (verified 28/10), =0 off
+    PE_parse_boot_argn("offline-key-events", &enabled, sizeof(enabled));
+    if (enabled != 1 || native_keyevents_stage) return;
     native_keyevents_stage = 1;
     PE_parse_boot_argn("offline-keystore", &original, sizeof(original));
     native_keyevents_status = kIOReturnNotPermitted;

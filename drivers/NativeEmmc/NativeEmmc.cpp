@@ -1111,9 +1111,11 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   if (native_emmc_stage) { IOLog("NativeEmmc: init failed at stage %u\n", native_emmc_stage); return; }
   if (!card.findPartitions()) { native_emmc_stage = 11; IOLog("NativeEmmc: GPT, kpan or userdata not found\n"); return; }
   // Boot argument guamp-emmc-div=N: faster SD clock (base / 2N, N < 8) kept only if the GPT header and a CMD18 run
-  // of the partition entries read back identical to the proven clock; otherwise back to N = 8
-  uint32_t wanted = 8;
-  if (PE_parse_boot_argn("guamp-emmc-div", &wanted, sizeof(wanted)) && wanted >= 1 && wanted < 8) {
+  // of the partition entries read back identical to the proven clock; otherwise back to N = 8.
+  // Default 2 (verified 28/10); guamp-emmc-div=8 (or 0) keeps the proven clock.
+  uint32_t wanted = 2;
+  PE_parse_boot_argn("guamp-emmc-div", &wanted, sizeof(wanted));
+  if (wanted >= 1 && wanted < 8) {
     uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
     bool ok = reference && check && card.readBlocks(1, 33, reference) && card.host.setClock(wanted);
     for (unsigned pass = 0; ok && pass < 4; pass++) {
@@ -1129,9 +1131,11 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     if (check) IOFree(check, 33 * kBlock);
   }
   // Boot argument guamp-emmc-ddr=1: DDR52, kept only if the GPT header and entries read back identical to SDR (single
-  // blocks and a CMD18 run, four passes); otherwise back to SDR with the card and host lines recovered
-  uint32_t ddr = 0;
-  if (PE_parse_boot_argn("guamp-emmc-ddr", &ddr, sizeof(ddr)) && ddr) {
+  // blocks and a CMD18 run, four passes); otherwise back to SDR with the card and host lines recovered. Default 1
+  // (verified 28/10); guamp-emmc-ddr=0 stays SDR.
+  uint32_t ddr = 1;
+  PE_parse_boot_argn("guamp-emmc-ddr", &ddr, sizeof(ddr));
+  if (ddr) {
     uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
     bool ok = reference && check && card.readBlocks(1, 33, reference) && card.host.setDdr(true);
     for (unsigned pass = 0; ok && pass < 4; pass++) {
@@ -1149,11 +1153,13 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     if (reference) IOFree(reference, 33 * kBlock);
     if (check) IOFree(check, 33 * kBlock);
   }
-  // Boot argument guamp-emmc-dma=1: ADMA2 reads, kept only if three DMA reads of the GPT header and entries match PIO
-  uint32_t dma = 0;
-  if (PE_parse_boot_argn("guamp-emmc-dma", &dma, sizeof(dma)) && dma) {
+  // Boot argument guamp-emmc-dma=1: ADMA2 reads, kept only if three DMA reads of the GPT header and entries match PIO.
+  // Default 1, cached buffer (guamp-emmc-cached) and DMA writes (guamp-emmc-dmaw) too (verified 28/10); =0 turns each off.
+  uint32_t dma = 1;
+  PE_parse_boot_argn("guamp-emmc-dma", &dma, sizeof(dma));
+  if (dma) {
     uint8_t *reference = static_cast<uint8_t *>(IOMallocZero(33 * kBlock)), *check = static_cast<uint8_t *>(IOMallocZero(33 * kBlock));
-    bool ok = reference && check && card.host.setupDma([] { uint32_t c = 0; return PE_parse_boot_argn("guamp-emmc-cached", &c, sizeof(c)) && c; }()) && card.readBlocks(1, 33, reference);
+    bool ok = reference && check && card.host.setupDma([] { uint32_t c = 1; PE_parse_boot_argn("guamp-emmc-cached", &c, sizeof(c)); return c != 0; }()) && card.readBlocks(1, 33, reference);
     for (unsigned pass = 0; ok && pass < 3; pass++) {
       memset(check, 0, 33 * kBlock);
       ok = card.host.readDma(1, 33, check) && !memcmp(reference, check, 33 * kBlock);
@@ -1163,8 +1169,9 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     IOLog("NativeEmmc: ADMA2 reads %s (%s buffer)\n", ok ? "verified, in use" : "refused, PIO", card.host.dmaCached ? "cached" : "uncached");
     // Boot argument guamp-emmc-dmaw=1: CMD25 + ADMA2 writes, kept only if a write of 64 blocks to a free kpan area
     // (between the framebuffer copy and the panic copy) reads back identical through PIO, three times with different data
-    uint32_t dmaw = 0;
-    if (ok && PE_parse_boot_argn("guamp-emmc-dmaw", &dmaw, sizeof(dmaw)) && dmaw && card.logBlocks >= kDmaWriteTestBlock + 64) {
+    uint32_t dmaw = 1;
+    PE_parse_boot_argn("guamp-emmc-dmaw", &dmaw, sizeof(dmaw));
+    if (ok && dmaw && card.logBlocks >= kDmaWriteTestBlock + 64) {
       uint8_t *pattern = static_cast<uint8_t *>(IOMallocZero(64 * kBlock)), *back = static_cast<uint8_t *>(IOMallocZero(64 * kBlock));
       bool good = pattern && back;
       for (unsigned pass = 0; good && pass < 3; pass++) {
@@ -1189,9 +1196,10 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   card.fbShadow = static_cast<uint8_t *>(IOMallocZero(kFbBytes + kBlock));
   if (card.fbShadow) memset(card.fbShadow, 0xA5, kFbBytes + kBlock);
   card.seen = static_cast<uint8_t *>(IOMallocZero((card.capacity + 63) / 64));
-  { unsigned direct = 0;
-    card.directRead = PE_parse_boot_argn("guamp-emmc-direct-read", &direct, sizeof(direct)) && direct == 1;
-    IOLog("NativeEmmc: direct cached read buffer %s (opt-in, writes unchanged)\n", card.directRead ? "enabled" : "disabled");
+  { unsigned direct = 1;   // default on (verified 28/10): guamp-emmc-direct-read=0 disables
+    PE_parse_boot_argn("guamp-emmc-direct-read", &direct, sizeof(direct));
+    card.directRead = direct == 1;
+    IOLog("NativeEmmc: direct cached read buffer %s (default on, writes unchanged)\n", card.directRead ? "enabled" : "disabled");
   }
   card.online = true;
   if (!guamp_panic_base) {
@@ -1219,6 +1227,8 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   publish(0, card.capacity, "user area");
   publishWindows();
   wifiprep::start();   // guamp-wifi-prep=1: read-only SMEM and modem firmware checks, own thread
+  // prepara-boot-smp-fix.py --short-base looks for this marker: the kernel has the verified boot arguments as code defaults.
+  IOLog("NativeEmmc: guamp-defaults-1028: verified boot arguments are code defaults (=0 turns one off)\n");
   usbProbe();
   usbMirrorStart();
   dispext::start();

@@ -29,6 +29,7 @@
 // client slot (gOpen). Controller bytes reach the socket through pumpCtl (ctl_getenqueuespace, then ctl_enqueuedata),
 // again on ctl_rcvd once the client has read.
 #include "GuampBtShim.h"
+#include "GuampBtDefaults.h"   // guamp-bt=2: verified sub-option defaults
 #ifndef GUAMP_BT_SERIAL_HOST_CHECK
 #include <sys/conf.h>
 #include <sys/uio.h>
@@ -449,15 +450,16 @@ void registerCtls() {
 }
 
 void start() {
-  unsigned on = 0;
+  unsigned on = guamp_bt_default(1);
   PE_parse_boot_argn("guamp-bt-shim", &on, sizeof(on));
   if (on != 1) return;
   gLock = IOLockAlloc();
   gShim = static_cast<bts_shim *>(IOMallocZero(sizeof(bts_shim)));
   if (!gLock || !gShim) { IOLog("GuampBtShim: allocation failed\n"); return; }
   bts_shim_init(gShim, nullptr, nullptr);
-  unsigned bd = 0;
-  if (PE_parse_boot_argn("guamp-bt-shim-bdaddr", &bd, sizeof(bd))) gShim->id.translateBdaddr = bd == 1;
+  unsigned bd = guamp_bt_default(1);
+  PE_parse_boot_argn("guamp-bt-shim-bdaddr", &bd, sizeof(bd));
+  gShim->id.translateBdaddr = bd == 1;
   bts_tty_init(&gTty);
   gMajor = cdevsw_add(-1, &kSw);
   gCtlMajor = cdevsw_add(-1, &kCtlSw);
@@ -469,7 +471,7 @@ void start() {
   for (int m = 0; m < 3; m = m + 1)
     nodes += devfs_make_node(makedev(gCtlMajor, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", kCtlNames[m]) ? 1 : 0;
   gNodes = nodes;
-  unsigned ctl = 0;
+  unsigned ctl = guamp_bt_default(1);
   PE_parse_boot_argn("guamp-bt-ctl", &ctl, sizeof(ctl));
   if (ctl == 1) registerCtls();
   gEnabled = nodes != 0 || gKctlRegs != 0;

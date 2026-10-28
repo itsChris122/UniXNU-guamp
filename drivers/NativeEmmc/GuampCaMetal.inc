@@ -139,7 +139,7 @@ static void thread(void *, wait_result_t) {
 
 // Runs from the kext start, before the patch has parsed the mode (launchd's exec): read the boot arg here, the thread checks the gate.
 void start() {
-  unsigned mode = 0;
+  unsigned mode = 2;   // default 2 (verified 28/10), as zzzzzzzzz-guamp-default-args.patch; guamp-ca-metal=0 keeps software
   PE_parse_boot_argn("guamp-ca-metal", &mode, sizeof(mode));
   if (mode != 2) return;
   IOLog("GuampCaMetal: watchdog on, waiting for the Metal device\n");

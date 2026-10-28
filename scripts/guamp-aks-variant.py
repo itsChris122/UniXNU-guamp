@@ -8,8 +8,8 @@ both with kIOReturnUnsupported-like 0xe00002c7, so every keychain write fails; b
 (_BTKCSetData, kSecUseSystemKeychain) and stops with "LeSecurityManager hit a keychain problem." (stackshot 288, 0xbd15dead).
 
 With guamp-aks-wrap=1 the two selectors answer: the blob is an 8-byte tag followed by the key (the size of an RFC 3394 wrap). It
-is NOT encryption and protects nothing, like the rest of this stand-in (the Data volume has no data protection either). Without
-the boot argument the selectors fail exactly as before.
+is NOT encryption and protects nothing, like the rest of this stand-in (the Data volume has no data protection either). Default on
+since 28/10 (package/KeyStoreProbe.cpp); with guamp-aks-wrap=0 the selectors fail exactly as before.
 """
 from pathlib import Path
 import hashlib

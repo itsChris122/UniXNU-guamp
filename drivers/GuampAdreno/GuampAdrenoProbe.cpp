@@ -435,7 +435,7 @@ bool naSecureMode(Session &s, const char *when) {
 // when the CP did not retire CP_SET_SECURE_MODE. A refused zap start leaves the GPU secure, exactly as without the option.
 bool naZap(Session &s, const GuampAdrenoStart *in, bool *failed) {
   *failed = false;
-  const unsigned mode = bootArg("guamp-adreno-zap", 0);
+  const unsigned mode = bootArg("guamp-adreno-zap", 1);   // default 1 (verified 28/10); =0 old SECVID path
   if (mode != 1 && mode != 2) return false;
   if (!in->zap) {
     IOLog("GuampAdreno: zap mode %u: no zap loader from the caller; GPU left secure, secvid not touched\n", mode);
@@ -716,7 +716,7 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   IOLog("GuampAdreno: start level %u: rbbm status %08x, sqe %u bytes\n", in->level, gr(s, 0x210), in->sqeBytes);
   int result = GuampAdrenoOk;
   bool tested = false;
-  gRecEnabled = bootArg("guamp-gpu-recover", 0) == 1;   // before the ring: its write index is followed from attach on
+  gRecEnabled = bootArg("guamp-gpu-recover", 1) == 1;   // default on (verified 28/10); before the ring: its write index is followed from attach on
   do {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}
@@ -733,10 +733,10 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     if (zap) {naGfsr(s, "after self test"); gfsrArm();}
     recoverArm(s);   // guamp-gpu-recover=1 only (GuampAdrenoRecover.inc)
     // The staged AGXAccelerator (IOAcceleratorES) makes every Metal client of the system (CoreImage in Settings > Screen Time,
-    // QuartzCore...) load the plugin; until the plugin is proven on guamp it is registered only with guamp-adreno-accel=1. The
+    // QuartzCore...) load the plugin; proven on guamp (28/10), so registered by default; guamp-adreno-accel=0 leaves it out. The
     // user clients of level 1 (NativeAdrenoGpuPublished, used by adrenoprobed and the self test) stay published either way.
-    if (in->level >= 2 && bootArg("guamp-adreno-accel", 0) == 1) result = naAccelerator();
-    else if (in->level >= 2) IOLog("GuampAdreno: accelerator not registered (guamp-adreno-accel=1 to register IOAcceleratorES)\n");
+    if (in->level >= 2 && bootArg("guamp-adreno-accel", 1) == 1) result = naAccelerator();
+    else if (in->level >= 2) IOLog("GuampAdreno: accelerator not registered (guamp-adreno-accel=0)\n");
   } while (false);
   IOLog("GuampAdreno: RESULT %d (level %u, context step %u, irqs %u, idle sleeps %llu spins %llu)\n", result, in->level,
         gContextStep, gIrqCount, native_gpu_idle_sleeps, native_gpu_idle_spins);

@@ -35,9 +35,11 @@ fi
 # Remove them first so earlier independent patches retain their idempotent checks.
 # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
 # inside the systemos patch, the audio plug-in mount and the staged apps install trigger (zzzzzzz), which edits the setup skip,
-# and the Wi-Fi mode 2 network-ready hook (zzzzzzzz), which edits bsd_init.c after the boot progress patch.
+# the Wi-Fi mode 2 network-ready hook (zzzzzzzz), which edits bsd_init.c after the boot progress patch, and the verified
+# boot-argument defaults (zzzzzzzzz, 28/10), which edit lines of the ca-metal, iphone-res/zbt-tool, ram-nc, smp-snapshot and
+# component-load patches.
 # Reverse newest first; the loop below re-applies them in name order.
-for LATE_PATCH in "$ROOT/patches/xnu/zzzzzzzz-guamp-wifi-network-ready.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-install-staged-apps.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-audio-plugin.patch" "$ROOT/patches/xnu/zzzzzz-guamp-ca-metal.patch" "$ROOT/patches/xnu/zzzz-guamp-ram-fb-wc.patch" "$ROOT/patches/xnu/zzzz-guamp-stuck-cpu.patch" "$ROOT/patches/xnu/zzzz-guamp-zbt-tool.patch" "$ROOT/patches/xnu/zzzz-guamp-setup-skip.patch" "$ROOT/patches/xnu/zzzz-guamp-iphone-res.patch" "$ROOT/patches/xnu/zzzz-guamp-exit-trace.patch" "$ROOT/patches/xnu/zzzz-guamp-cs-sealed.patch" "$ROOT/patches/xnu/zzzz-guamp-data-skeleton.patch" "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
+for LATE_PATCH in "$ROOT/patches/xnu/zzzzzzzzz-guamp-default-args.patch" "$ROOT/patches/xnu/zzzzzzzz-guamp-wifi-network-ready.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-install-staged-apps.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-audio-plugin.patch" "$ROOT/patches/xnu/zzzzzz-guamp-ca-metal.patch" "$ROOT/patches/xnu/zzzz-guamp-ram-fb-wc.patch" "$ROOT/patches/xnu/zzzz-guamp-stuck-cpu.patch" "$ROOT/patches/xnu/zzzz-guamp-zbt-tool.patch" "$ROOT/patches/xnu/zzzz-guamp-setup-skip.patch" "$ROOT/patches/xnu/zzzz-guamp-iphone-res.patch" "$ROOT/patches/xnu/zzzz-guamp-exit-trace.patch" "$ROOT/patches/xnu/zzzz-guamp-cs-sealed.patch" "$ROOT/patches/xnu/zzzz-guamp-data-skeleton.patch" "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
     "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
   if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
     git -C .cache/xnu-work apply --reverse "$LATE_PATCH"

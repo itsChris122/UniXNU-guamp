@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp Adreno 610 milestone M1, included by NativeEmmc.cpp after the other services (mapPhysical, the boot log). A
-// one-shot diagnostic on its own kernel thread, opt-in with boot argument guamp-gpu-m1=1 (default off):
+// kernel thread, boot argument guamp-gpu-m1 (default 1 since 28/10, with guamp-adreno=2; =0 off):
 //   power   the Linux order (GuampGpuM1.h): gcc cfg_ahb + GPLL0 vote, CX GDSC, the kgsl_smmu clocks (gcc memnoc,
 //           gcc snoc_dvm, gpu_cc_ahb, smmu vote), GX GDSC (BLK_ARES pulse, CLAMP_IO off), gx_gfx3d_clk_src on XO
 //           19.2 MHz, gmu_clk_src 200 MHz from GPLL0 / 3, the kgsl clocks (cx_gmu, iref, cxo, bimc_gpu_axi, gx/cx gfx3d)
@@ -13,7 +13,7 @@
 // RBBM_SW_RESET, no PLL programming. Writes stay limited to the GCC/GPUCC registers listed in kGmRegs. M2 (below,
 // guamp-gpu-m2) adds the SQE firmware, GPU register writes and the CP start; still no SCM/SMC and no zap shader.
 // Other boot arguments: guamp-gpu-delay=<s> (start later, so the USB mirror sees the lines), guamp-gpu-off=1 (undo
-// the power-up at the end; default: the GPU stays powered). guamp-gpu-rpm=1: before the GCC GPU branches, the RPM
+// the power-up at the end; default: the GPU stays powered). guamp-gpu-rpm=1 (default since 28/10): before the GCC GPU branches, the RPM
 // votes Linux holds for kgsl on bengal (GuampRpm.inc, kRpmGpuVotes): qdss Enab 1 (active + sleep), bimc / snoc / cnoc
 // KHz (active) at guamp-gpu-rpm-khz (default RPM_KHZ_MAX: the RPM clamps to its top level, as rpmcc's probe vote for
 // bimc; a low value would slow the DDR / eMMC path of the whole system), " rpm <state>" appended to RESULT.
@@ -422,7 +422,7 @@ const char *rpmVotes() {
 
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-gpu-m1");
-  unsigned delay = 0, off = 0, rpmOn = 0, relaxed = 0, m2 = 0, smmuMode = GM2_SM_BYPASS, smmuCb = 0xff;
+  unsigned delay = 0, off = 0, rpmOn = 1, relaxed = 0, m2 = 0, smmuMode = GM2_SM_BYPASS, smmuCb = 0xff;
   PE_parse_boot_argn("guamp-gpu-m2", &m2, sizeof(m2));
   if (m2 > 3) m2 = 0;
   PE_parse_boot_argn("guamp-gpu-smmu", &smmuMode, sizeof(smmuMode));
@@ -456,7 +456,7 @@ void thread(void *, wait_result_t) {
   }
   // guamp-adreno=1|2: NativeAdreno (xVanTuring/Adreno610 A6XX backend, drivers/GuampAdreno) takes the GPU after M1
   // instead of M2/M3: SMMU context, A610 init, ring, CP_ME_INIT, IRQ, publish (2: AGXAccelerator for the Metal plugin).
-  unsigned adreno = 0;
+  unsigned adreno = 2;   // default 2 (verified 28/10, Metal); guamp-adreno=0 leaves the GPU to M2/M3
   PE_parse_boot_argn("guamp-adreno", &adreno, sizeof(adreno));
   if (adreno && st.gpuRead && st.aonOk) {
     uint8_t *sqe = static_cast<uint8_t *>(IOMallocZero(gpum2::kSqeCap));
@@ -501,8 +501,9 @@ void thread(void *, wait_result_t) {
 }
 
 void start() {
-  unsigned on = 0;
-  if (!PE_parse_boot_argn("guamp-gpu-m1", &on, sizeof(on)) || on != 1) return;
+  unsigned on = 1;   // default on (verified 28/10): guamp-gpu-m1=0 leaves the GPU alone
+  PE_parse_boot_argn("guamp-gpu-m1", &on, sizeof(on));
+  if (on != 1) return;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

@@ -8,7 +8,7 @@
 // bind WinUSB by itself (DeviceInterfaceGUID below). Polled from a kernel thread: no interrupts, DMA through physical
 // addresses below 4 GiB (the SMMU stream is in bypass, as for the SDHC ADMA).
 //
-// Boot argument guamp-usb-mirror=1. The controller is touched only when its GDSC and clocks are on (an unclocked access
+// Boot argument guamp-usb-mirror (default 1 since 28/10; =0 off). The controller is touched only when its GDSC and clocks are on (an unclocked access
 // can hang the bus); the GCC state is logged either way. Counters: native_usb_stage (last step reached), _events, _frames.
 //
 // Message format (see specchio-ios.py): "GMIR", u32 type, u32 body length, u32 argument, then the body.
@@ -490,8 +490,9 @@ void thread(void *, wait_result_t)
 
 static void usbMirrorStart()
 {
-  uint32_t enabled = 0;
-  if (!PE_parse_boot_argn("guamp-usb-mirror", &enabled, sizeof(enabled)) || !enabled) return;
+  uint32_t enabled = 1;   // default on (verified 28/10): guamp-usb-mirror=0 disables
+  PE_parse_boot_argn("guamp-usb-mirror", &enabled, sizeof(enabled));
+  if (!enabled) return;
   if (!usbm::gMirror.start()) return;
   thread_t thread = nullptr;
   if (kernel_thread_start(usbm::thread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);

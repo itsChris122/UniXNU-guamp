@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// guamp-gpu-recover=1 (default 0, off: the hooks below only test gRecEnabled/gRecArmed and nothing else changes): hang detection and
+// guamp-gpu-recover=1 (default 1 since 28/10; =0 off: the hooks below only test gRecEnabled/gRecArmed and nothing else changes): hang detection and
 // recovery of the published Adreno 610, included by GuampAdrenoProbe.cpp inside its namespace. Decisions in GuampGpuRecoverCore.h.
 // NativeAdreno (the pinned xVanTuring/Adreno610 submodule) has no reset path and is not changed: everything runs from the board
 // callbacks it already calls.
@@ -175,7 +175,7 @@ void recover(Session &s, grc_reason why, uint32_t stalled, uint32_t fsr) {
     // guamp-adreno-zap: the soft reset may put the CP back in secure mode; the zap shader TrustZone loaded stays in its region, so
     // CP_SET_SECURE_MODE 0 is sent again (no PAS call, no SECVID write). Without the option, as before.
     if (gZapUp) (void)naSecureMode(s, "recover");
-    else if (bootArg("guamp-adreno-zap", 0) == 0 && bootArg("guamp-adreno-secvid", 0) == 1) naSecureFallback(s);
+    else if (bootArg("guamp-adreno-zap", 1) == 0 && bootArg("guamp-adreno-secvid", 0) == 1) naSecureFallback(s);
     (void)grc_done(&gRec.core, true);
     guamp_gpu_recover[1] = guamp_gpu_recover[1] + 1;
     IOLog("GuampAdreno: recover: GPU restarted (%u of %u in this minute): drain acks %x, %u fences signalled (dropped), rbbm status "

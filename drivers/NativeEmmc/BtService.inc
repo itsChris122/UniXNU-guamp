@@ -42,6 +42,7 @@
 #include "GeniUartCpp.inc"
 #include "GuampRpmCore.h"
 #include "BtQcaFw.h"
+#include "GuampBtDefaults.h"   // guamp-bt=2: verified sub-option defaults
 #include "GuampExt4.inc"
 
 #ifndef GUAMP_BT_HOST_CHECK
@@ -160,7 +161,7 @@ const char *railsRpm(bool spmi) {
 // Returns a short word for the RESULT line.
 const char *rails() {
   gStep = 1;
-  unsigned ldo = 0;
+  unsigned ldo = guamp_bt_default(3);
   PE_parse_boot_argn("guamp-bt-ldo", &ldo, sizeof(ldo));
   for (unsigned i = 0; i < 300 && !pmic::gArbReady; ++i) IOSleep(10);
   if (!pmic::gArbReady) {
@@ -710,7 +711,7 @@ bool m1() {
   // with it the patched controller came back from HCI_Reset sending 7-bit characters and ignored every later command.
   bt_tlv_nvm probe = {};
   bt_tlv_nvm_fix_ex(cfg.data, cfg.size, code, 0u, 0, &probe);   // reads the tags; only the idempotent deep-sleep edit
-  unsigned fields = bt_tlv_nvm_baud_fields_auto(probe.hci_before, newLayout);
+  unsigned fields = guamp_bt_default(1) ? 1u : bt_tlv_nvm_baud_fields_auto(probe.hci_before, newLayout);
   if (PE_parse_boot_argn("guamp-bt-nvm-baud", &fields, sizeof(fields)) && fields > 3) fields = 0;
   unsigned ibs = family == 3950 ? 0u : 1u;
   PE_parse_boot_argn("guamp-bt-nvm-ibs", &ibs, sizeof(ibs));

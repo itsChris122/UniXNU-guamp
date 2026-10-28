@@ -12,12 +12,12 @@
 extern "C" {
 #endif
 
-// guamp-adreno=<level> (default 0, off):
+// guamp-adreno=<level> (default 2 since 28/10, NativeEmmc GpuService.inc; 0 off):
 //   1  NativeAdreno's GPU context on the GPU SMMU (context bank 0, SIDs 0 and 1), the A610 hw_init, ring 0, CP_ME_INIT, a
 //      CP_MEM_WRITE check, RBBM_SECVID_TRUST_CNTL = 0 written directly (no zap shader), the GPU interrupt (SPI 177), then the
 //      device published for user clients
 //   2  1, then the staged AGXAccelerator (IOAcceleratorES) with the Metal plugin keys, when the staged class is linked
-// guamp-adreno-zap=<mode> (default 0: unchanged): after CP_ME_INIT, as mainline a6xx_hw_init (a6xx_zap_shader_init), the
+// guamp-adreno-zap=<mode> (default 1 since 28/10; 0: the old SECVID path): after CP_ME_INIT, as mainline a6xx_hw_init (a6xx_zap_shader_init), the
 // ORIGINAL signed zap shader (a610_zap, PAS id 13) is started through TrustZone PAS by the caller's zap callback, then
 // CP_SET_SECURE_MODE 0 goes on ring 0. 1 authenticated start; 2 SCM/PAS queries, integrity and placement only (nothing written,
 // no CP_SET_SECURE_MODE). With the option set RBBM_SECVID_TRUST_CNTL is never written (TrustZone-owned on guamp: no fallback).

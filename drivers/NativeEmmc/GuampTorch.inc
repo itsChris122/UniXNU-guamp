@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp camera flash LED as a torch. Included by PmicService.inc inside namespace pmic (uses read8/write8 and the PMIC
-// thread). Opt-in: guamp-torch=1 (default off); guamp-torch-ma = current at level 1.0 (default 100, 25..200),
+// thread). Default on since 28/10: guamp-torch=0 turns it off; guamp-torch-ma = current at level 1.0 (default 100, 25..200),
 // guamp-torch-sec = auto-off (default 600, max 1800). No button drives it: requests come through guamp_torch_request()
 // (level in permille, 0 = off) from any thread and are applied by the PMIC thread within one 25 ms poll.
 // IOKit endpoint: service GuampTorch (class GuampTorchService, child of the platform expert). A root process sets
@@ -241,9 +241,9 @@ void publish() {
 // PMIC thread, once after the arbiter is up: boot arguments, identification, one readback line; switches off a torch
 // found on. Returns whether the service runs.
 bool init() {
-  unsigned enabled = 0, ma = guamp_torch::kDefaultMa, sec = guamp_torch::kDefaultTimeoutS;
+  unsigned enabled = 1, ma = guamp_torch::kDefaultMa, sec = guamp_torch::kDefaultTimeoutS;   // default on (verified 28/10)
   PE_parse_boot_argn("guamp-torch", &enabled, sizeof(enabled));
-  if (enabled != 1) { IOLog("GuampTorch: disabled (guamp-torch=1 enables it)\n"); return false; }
+  if (enabled != 1) { IOLog("GuampTorch: disabled (guamp-torch=0)\n"); return false; }
   PE_parse_boot_argn("guamp-torch-ma", &ma, sizeof(ma));
   PE_parse_boot_argn("guamp-torch-sec", &sec, sizeof(sec));
   gMaxMa = guamp_torch::maForCode(guamp_torch::codeForMa(ma));
