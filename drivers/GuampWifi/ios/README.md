@@ -13,7 +13,7 @@ active only with the boot argument `guamp-wifi-start=2`.
 
 HakiOS: <https://github.com/oosexgang/hackios-xnu-kernel>, commit 8851317. Those kernel files are a derivative work of
 Apple's XNU under the **Apple Public Source License 2.0** (HakiOS `LICENSE`, `LICENSE.APSL`); the copies here keep that
-license and say at the top what was changed: built outside the XNU tree at the public KPI level (lock groups made at
+license and say at the top what was changed: built outside the XNU tree without the BSD-private layer (IOMallocData, lock groups made at
 run time, no startup-section macros), no virtio link, Guamp log prefixes (`GuampWiFi: net:`, `GuampWiFi: sta:`,
 `GuampWiFi: apple80211:`, `GuampWLAN:`) and boot arguments (`guamp-net-trace=N`, `guamp-net-names=1`).
 

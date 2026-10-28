@@ -46,7 +46,7 @@ extern void guamp_wlan_publish(const char *interface, const uint8_t *address);  
 extern void guamp_sm6115_wifi_network_ready(void);  /* drivers/GuampWifi/integration/guamp_xnu_sm6115_runtime.cpp */
 
 static lck_grp_t *net_lck_grp;          /* guamp_wifi_bsd_network_ready() */
-/* (XNU keeps its etherbroadcastaddr for BSD_KERNEL_PRIVATE code; this file is built with the public KPI) */
+/* (XNU keeps its etherbroadcastaddr for BSD_KERNEL_PRIVATE code; this file is built without BSD_KERNEL_PRIVATE) */
 static const uint8_t net_broadcast[ETHER_ADDR_LEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 /* One interface: enN on its link. */

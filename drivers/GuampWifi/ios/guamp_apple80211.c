@@ -38,7 +38,7 @@
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
-#include <kern/kalloc.h>
+#include <IOKit/IOLib.h>                /* IOMallocData: plain functions, no kalloc startup sites */
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
@@ -256,7 +256,7 @@ give(const struct apple80211req *request, const void *data, size_t length)
 static int
 give_network(const struct apple80211req *request, const struct hakios_sta_bss *bss)
 {
-	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
+	struct apple80211_scan_result *result = IOMallocZeroData(sizeof(*result));
 	unsigned room = sizeof(result->elements);
 	int error;
 
@@ -291,7 +291,7 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 		}
 	}
 	error = give(request, result, sizeof(*result));
-	kfree_data(result, sizeof(*result));
+	IOFreeData(result, sizeof(*result));
 	return error;
 }
 
@@ -342,7 +342,7 @@ get(struct apple80211req *request)
 		struct hakios_sta_channel channels[96];
 		unsigned count = hakios_sta_channels(channels, 96);
 
-		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
+		if (count == 0 || (answer = IOMallocZeroData(sizeof(*answer))) == NULL) {
 			return count == 0 ? ENXIO : ENOMEM;
 		}
 		answer->version = 1;
@@ -351,7 +351,7 @@ get(struct apple80211req *request)
 			channel_fill(&answer->channels[i], channels[i].frequency, channels[i].flags);
 		}
 		error = give(request, answer, sizeof(*answer));
-		kfree_data(answer, sizeof(*answer));
+		IOFreeData(answer, sizeof(*answer));
 		return error;
 	}
 	case 207: {                             /* ... and more of each */
@@ -359,7 +359,7 @@ get(struct apple80211req *request)
 		struct hakios_sta_channel channels[96];
 		unsigned count = hakios_sta_channels(channels, 96);
 
-		if (count == 0 || (answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO)) == NULL) {
+		if (count == 0 || (answer = IOMallocZeroData(sizeof(*answer))) == NULL) {
 			return count == 0 ? ENXIO : ENOMEM;
 		}
 		answer->count = (uint16_t)count;
@@ -373,7 +373,7 @@ get(struct apple80211req *request)
 			answer->flags[i] = channel.flags;
 		}
 		error = give(request, answer, sizeof(*answer));
-		kfree_data(answer, sizeof(*answer));
+		IOFreeData(answer, sizeof(*answer));
 		return error;
 	}
 	case 21:                                /* how the last join went (0: not over yet) */
@@ -382,7 +382,7 @@ get(struct apple80211req *request)
 		lck_mtx_unlock(&apple80211_lock);
 		return 0;
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
-		struct hakios_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
+		struct hakios_sta_bss *bss = IOMallocData(sizeof(*bss));
 		unsigned index;
 		bool there;
 
@@ -394,7 +394,7 @@ get(struct apple80211req *request)
 		lck_mtx_unlock(&apple80211_lock);
 		there = hakios_sta_heard(index, bss);
 		error = there ? give_network(request, bss) : EIO;
-		kfree_data(bss, sizeof(*bss));
+		IOFreeData(bss, sizeof(*bss));
 		return error;
 	}
 	default:
@@ -402,7 +402,7 @@ get(struct apple80211req *request)
 	}
 
 	/* the rest is about the network joined, and there is none unless the station says so */
-	if ((state = kalloc_data(sizeof(*state), Z_WAITOK)) == NULL) {
+	if ((state = IOMallocData(sizeof(*state))) == NULL) {
 		return ENOMEM;
 	}
 	hakios_sta_state(state);
@@ -460,7 +460,7 @@ get(struct apple80211req *request)
 		error = EOPNOTSUPP;
 		break;
 	}
-	kfree_data(state, sizeof(*state));
+	IOFreeData(state, sizeof(*state));
 	return error;
 }
 
@@ -480,8 +480,8 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	if (!hakios_sta_present()) {
 		return EBUSY;                   /* (the radio is still being brought up: the framework tries again) */
 	}
-	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
-	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+	asked = IOMallocData(sizeof(*asked));
+	what = IOMallocZeroData(sizeof(*what));
 	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, sizeof(*asked))) != 0) {
 		error = asked == NULL || what == NULL ? ENOMEM : error;
 		goto out;
@@ -515,10 +515,10 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	}
 out:
 	if (asked != NULL) {
-		kfree_data(asked, sizeof(*asked));
+		IOFreeData(asked, sizeof(*asked));
 	}
 	if (what != NULL) {
-		kfree_data(what, sizeof(*what));
+		IOFreeData(what, sizeof(*what));
 	}
 	return error;
 }
@@ -533,8 +533,8 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
 		return EINVAL;
 	}
-	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
-	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+	asked = IOMallocZeroData(sizeof(*asked));
+	what = IOMallocZeroData(sizeof(*what));
 	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
 		error = asked == NULL || what == NULL ? ENOMEM : error;
 		goto out;
@@ -570,11 +570,11 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 out:
 	if (asked != NULL) {
 		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
-		kfree_data(asked, sizeof(*asked));
+		IOFreeData(asked, sizeof(*asked));
 	}
 	if (what != NULL) {
 		memset_s(what, sizeof(*what), 0, sizeof(*what));
-		kfree_data(what, sizeof(*what));
+		IOFreeData(what, sizeof(*what));
 	}
 	return error;
 }
@@ -655,12 +655,12 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 	case HAKIOS_STA_LINK: {
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
 			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
-		struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+		struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
 
 		if (state != NULL) {
 			hakios_sta_state(state);
 			link.rssi = status == 1 ? state->bss.rssi : 0;
-			kfree_data(state, sizeof(*state));
+			IOFreeData(state, sizeof(*state));
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);

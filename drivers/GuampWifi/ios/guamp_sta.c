@@ -23,7 +23,7 @@
  * another network -- as iOS itself rejoins the networks it knows. If that other network cannot
  * be joined (a wrong passphrase), the standing one is joined again.
  */
-#include <kern/kalloc.h>
+#include <IOKit/IOLib.h>                /* IOMallocData: plain functions, no kalloc startup sites */
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
@@ -108,13 +108,13 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 		lck_mtx_unlock(&sta_lock);
 
 		if (power) {
-			struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+			struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
 			bool was_joined = false;
 
 			if (state != NULL) {
 				ops->state(state);
 				was_joined = state->phase == HAKIOS_STA_JOINED;
-				kfree_data(state, sizeof(*state));
+				IOFreeData(state, sizeof(*state));
 			}
 			error = ops->power(power_on);
 			if (!power_on && was_joined) {
@@ -187,7 +187,7 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 		return;
 	}
 	if (heard == NULL) {
-		heard = kalloc_data(HEARD_MOST * sizeof(*heard), Z_WAITOK | Z_ZERO);
+		heard = IOMallocZeroData(HEARD_MOST * sizeof(*heard));
 	}
 	if (heard == NULL) {
 		printf("GuampWiFi: sta: no memory for what a scan hears: nobody can ask the radio for a network\n");

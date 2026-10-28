@@ -162,9 +162,10 @@ if args.wifi_runtime:
 if args.wifi_redwood:
     # Mode 2, C side: the station bridge (drivers/GuampWifi/integration/guamp_xnu_station.c) and the en0 / station /
     # Apple80211 layer it is written against (drivers/GuampWifi/ios, from HakiOS, APSL). XNU code: the bsd_init recipe
-    # with its own include paths, defines and -include, but at the public KPI level (the XNU/BSD private defines are
-    # undone, so kalloc and the lock groups are the exported functions and nothing lands in XNU's startup sections), with
-    # -std=gnu11 and the NativeEmmc warning set under -Werror; LTO, dependency and warning flags of the recipe dropped.
+    # with its own include paths, defines and -include; the BSD/driver/Mach private layers are undone. The sources
+    # allocate with IOMallocData and make their lock groups at run time, so nothing lands in XNU's startup sections
+    # (audited below). -std=gnu11 and the NativeEmmc warning set under -Werror; LTO, dependency and warning flags of the
+    # recipe dropped.
     xnu_c, index = [], 0
     while index < len(c_arguments):
         value = c_arguments[index]
@@ -179,7 +180,9 @@ if args.wifi_redwood:
         else:
             xnu_c.append(value)
         index += 1
-    xnu_c += ['-std=gnu11', '-UXNU_KERNEL_PRIVATE', '-UBSD_KERNEL_PRIVATE', '-UDRIVER_PRIVATE', '-UMACH_KERNEL_PRIVATE',
+    # XNU_KERNEL_PRIVATE stays, as for every kernel source: without it the exported headers (kern/debug.h, ...) include
+    # the SDK's TargetConditionals.h, which the kernel build does not have (CI run 40745822077).
+    xnu_c += ['-std=gnu11', '-UBSD_KERNEL_PRIVATE', '-UDRIVER_PRIVATE', '-UMACH_KERNEL_PRIVATE',
               '-Wall', '-Wextra', '-Werror', '-Wno-error=unknown-warning-option', '-Wno-unused-parameter',
               '-I', str(wifi / 'ios'), '-I', str(wifi / 'integration')]
     for path in [wifi / 'integration/guamp_xnu_station.c'] + [wifi / 'ios' / (name + '.c') for name in (
