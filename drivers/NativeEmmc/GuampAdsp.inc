@@ -7,7 +7,7 @@
 //                  then the ready signal over SMP2P; PAS SHUTDOWN and cleanup on any failure
 //   guamp-adsp-delay=<s>  start later (0..600 s, default 0), so the USB mirror (connected ~4 s after boot) sees every
 //                  GuampAdsp line (as guamp-gpu-delay / guamp-wifi-delay); the thread logs the delay it honoured
-//   guamp-adsp-ipc=1|2|3|4  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 443 before
+//   guamp-adsp-ipc=1|2|3|4  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 429 before
 //                  the start + inbound negotiation; 2 + GLINK SMEM edge after err-ready and channel apr_audio_svc;
 //                  3 + APR q6core state / framework version queries ("ADSP APR OK"); 4 + the first tone (q6afe DTMF on
 //                  PRIMARY_MI2S_RX 0x1000, GuampAfe.inc, "ADSP TONE OK|FAILED"). Default 0 = phase 1 only.
@@ -27,14 +27,15 @@
 //     "rwlc" 0) and vdd_lpi_mx ("rwlm" 0) at level 384, proxy clock xo (RPM clk0 0 via cxo_pil_lpass voter),
 //     qcom,proxy-timeout-ms 10000; interrupts: wdog GIC SPI 282, err-fatal / err-ready / proxy-unvote / stop-ack =
 //     bits 0 / 1 / 2 / 3 of the ADSP's SMP2P "slave-kernel" entry; qcom,force-stop = bit 0 of apps "master-kernel".
-//   qcom,smp2p-adsp: qcom,smem = <443 429> (443 apps -> adsp, allocated by the apps side; 429 adsp -> apps,
+//   qcom,smp2p-adsp: qcom,smem = <443 429> = {inbound, outbound} (smp2p.c SMP2P_INBOUND 0 / SMP2P_OUTBOUND 1):
+//     (429 apps -> adsp, allocated by the apps side; 443 adsp -> apps,
 //     allocated by the ADSP), local pid 0, remote pid 2, IPC: APCS 0x0f111008 bit 10, GIC SPI 279.
 //   GLINK edge "lpass": remote pid 2, APCS bit 8, GIC SPI 277; SMEM 478 descriptor and 479 TX FIFO allocated by apps,
 //     480 RX FIFO allocated by the ADSP (qcom_glink_smem.c): 480 appearing = the ADSP's GLINK is up.
 //   adsp-loader (guamp dtbo): nvmem "adsp_variant" = qfprom 0x1b40000 + 0x6011 bit 3; value 1 selects "adsp2".
 //   Firmware: modem_<slot> partition (ext4), /image/adsp.mdt + adsp.b00..b35 (the Android /vendor/firmware_mnt).
-// Without guamp-adsp-ipc read-only towards SMEM: nothing allocated there (no 443, no GLINK items), only the ADSP's own
-// 429 entry is observed. The cleanup path uses PAS SHUTDOWN directly (no graceful force-stop through 443).
+// Without guamp-adsp-ipc read-only towards SMEM: nothing allocated there (no 429, no GLINK items), only the ADSP's own
+// 443 entry is observed. The cleanup path uses PAS SHUTDOWN directly (no graceful force-stop through 429).
 
 #include "GuampScm.inc"
 #include "GuampScmArm64.inc"
@@ -47,7 +48,7 @@ namespace adsp {
 constexpr uint64_t kBase = 0x52200000, kBytes = 0x1c00000;
 constexpr unsigned kPasId = 1;
 constexpr uint16_t kHost = 2;                                     // SMEM/SMP2P/GLINK remote pid of the ADSP
-constexpr uint32_t kSmp2pIn = 429, kSmp2pOut = 443, kReason = 423, kGlinkDesc = 478, kGlinkTx = 479, kGlinkRx = 480;
+constexpr uint32_t kSmp2pIn = 443, kSmp2pOut = 429, kReason = 423, kGlinkDesc = 478, kGlinkTx = 479, kGlinkRx = 480;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2, kStopAck = 1u << 3;
 constexpr uint64_t kQfpromPage = 0x1b46000;                       // qfprom 0x1b40000 + 0x6000
 constexpr uint32_t kVariantWord = 0x10, kVariantBit = 8 + 3;      // byte 0x6011 bit 3 inside the word at 0x6010
@@ -114,7 +115,7 @@ bool stopped(void *) {
   s.parse();
   uint32_t at = 0, bytes = 0;
   const bool present = s.find(kSmp2pIn, &at, &bytes);
-  IOLog("GuampAdsp: SMEM v%u initialized %u %s, adsp smp2p 429 %s\n", s.info->version, s.info->initialized,
+  IOLog("GuampAdsp: SMEM v%u initialized %u %s, adsp smp2p 443 %s\n", s.info->version, s.info->initialized,
         s.info->error ? "PARSE ERROR" : "ok", present ? "PRESENT (peer ran before)" : "absent");
   return !s.info->error && s.info->initialized && !present;
 }
@@ -126,16 +127,17 @@ int levelVote(uint32_t type, uint32_t swen, uint32_t level) {
   return rc;
 }
 
-// pil_proxy_vote: vdd_lpi_cx and vdd_lpi_mx enabled at level 384, XO on. XO is voted in the active set only and never
-// removed: that is the vote Linux keeps permanently (bi_tcxo_ao at rpmcc probe), so the unvote cannot drop a vote of
-// another apps user. The rails are not voted by anything else on the apps side.
+// pil_proxy_vote: vdd_lpi_cx and vdd_lpi_mx enabled at level 384, XO on. The DT proxy clock is CXO_SMD_PIL_LPASS_CLK
+// = bi_tcxo_pil_lpass_clk, a branch voter of bi_tcxo (not _ao): active AND sleep set, as the modem's cxo_pil_mss.
+// XO is never removed (the unvote cannot drop a vote of another apps user). The rails have no other apps voter.
 bool vote(void *, bool on) {
   if (!on) {
     const int mx = levelVote(kRwlm, 0, 0), cx = levelVote(kRwlc, 0, 0);
     IOLog("GuampAdsp: proxy unvote: lpi_mx %s, lpi_cx %s\n", rpm_err_name(mx), rpm_err_name(cx));
     return !mx && !cx;
   }
-  const int xo = rpm::set(RPM_RES_CLK0, RPM_CLK0_XO, RPM_KEY_ENAB, 1, RPM_SET_ACTIVE, 500);
+  int xo = rpm::set(RPM_RES_CLK0, RPM_CLK0_XO, RPM_KEY_ENAB, 1, RPM_SET_ACTIVE, 500);
+  if (!xo) xo = rpm::set(RPM_RES_CLK0, RPM_CLK0_XO, RPM_KEY_ENAB, 1, RPM_SET_SLEEP, 500);
   const int cx = xo ? xo : levelVote(kRwlc, 1, kLevel);
   const int mx = cx ? cx : levelVote(kRwlm, 1, kLevel);
   IOLog("GuampAdsp: proxy vote: xo %s, lpi_cx %s, lpi_mx %s (level %u)\n", rpm_err_name(xo), xo ? "-" : rpm_err_name(cx),
@@ -165,7 +167,7 @@ int awaitReady(void *) {
   for (; elapsed <= kReadyMs + kProxyMs; elapsed += kPollMs) {
     s.parse();
     if (slaveKernel(s, state, &value)) {
-      if (!seen) IOLog("GuampAdsp: smp2p 429 appeared after %u ms (pids %u->%u, %u/%u entries)\n", elapsed,
+      if (!seen) IOLog("GuampAdsp: smp2p 443 appeared after %u ms (pids %u->%u, %u/%u entries)\n", elapsed,
                        state->localPid, state->remotePid, state->validEntries, state->total);
       seen = true;
       if (value != last) {
@@ -190,7 +192,7 @@ int awaitReady(void *) {
     IOLog("GuampAdsp: ready at %u ms, proxy votes released at %u ms (%s)\n", readyAt, elapsed,
           value & kHandover ? "handover" : "proxy timeout");
   else if (result == pas::kNotReady)
-    IOLog("GuampAdsp: no err-ready within %u ms (smp2p 429 %s)\n", kReadyMs, seen ? "present" : "never allocated");
+    IOLog("GuampAdsp: no err-ready within %u ms (smp2p 443 %s)\n", kReadyMs, seen ? "present" : "never allocated");
   IOFree(state, sizeof(smem::Smp2p));
   return result;
 }

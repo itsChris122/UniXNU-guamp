@@ -63,9 +63,9 @@ struct WifiControl {
       e=qrtr.addLocalService(Rmtfs::Service,Rmtfs::ServiceInstance,Rmtfs::Port,this,rmtfsRx);if(e)return fail(e);
     }
     smemSummary();
-    // qcom_smp2p probe (before the modem boots): outbound 435 in the APPS-MPSS partition, kick bit 14.
-    gate="smem 435 smp2p out"; e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
-    itemTrace(435);
+    // qcom_smp2p probe (before the modem boots): outbound 428 in the APPS-MPSS partition, kick bit 14.
+    gate="smem 428 smp2p out"; e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
+    itemTrace(428);
     // glink_smem items. Linux (glink_probe SUBSYS_AFTER_POWERUP / remoteproc glink subdev start) allocates them only
     // once the modem is up; they live in SMEM (found already present on guamp), so allocating them here only makes a
     // size/partition problem fail before PAS writes RAM. Descriptor words and the first IRQ are written by
@@ -79,7 +79,7 @@ struct WifiControl {
   }
   int modemStarted(uint64_t millis) {
     if(stage!=Prepared) return NotReady;
-    now=started=beat=millis; deadline=now+ReadyMs; gate="smp2p 428 slave-kernel ready (bit 1)";
+    now=started=beat=millis; deadline=now+ReadyMs; gate="smp2p 435 slave-kernel ready (bit 1)";
     transition(AwaitModem); return Ok;
   }
   // The board/ath10k owner supplies the exact CE, service-pipe and shadow
@@ -105,7 +105,7 @@ struct WifiControl {
     if(now>=beat+BeatMs) { beat=now; heartbeat(); }
     int e=smp.poll();
     if(smp.inPresent&&!sawInbound) {
-      sawInbound=true; trace("smp2p 428 inbound present: size/valid/features",0,smp.inSize,smp.inValid,smp.inFeatures);
+      sawInbound=true; trace("smp2p 435 inbound present: size/valid/features",0,smp.inSize,smp.inValid,smp.inFeatures);
     }
     if(e!=Ok&&e!=Again) return fail(e);
     if(stage==AwaitModem) {
@@ -163,7 +163,7 @@ private:
   // One line with the state of every layer (also printed on failure): enough to tell which gate stalled.
   void heartbeat() {
     trace(gate,error,stage,uint32_t(now-started),0);
-    trace(" smp2p 428 present/valid/slave",0,smp.inPresent,smp.inValid,smp.slave);
+    trace(" smp2p 435 present/valid/slave",0,smp.inPresent,smp.inValid,smp.slave);
     trace(" smp2p wlan/flags/entries",0,smp.wlan,smp.inFlags,smp.inEntries);
     trace(" glink running/negotiated/rx",0,glink.running,glink.negotiated,glink.rxPackets);
     trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);

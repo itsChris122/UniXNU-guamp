@@ -66,17 +66,17 @@ struct Fixture {
 static void smemTest() {
   for(bool partitioned:{false,true}) {
     Fixture f; f.init(partitioned); auto a=f.arena(); uint32_t off=0,size=0; bool created=false;
-    CHECK(a.allocate(1,435,340,&off,&created)==Ok&&created);
-    CHECK(a.find(1,435,&off,&size)==Ok&&size==(partitioned?340u:344u));
-    uint32_t saved=off; CHECK(a.allocate(1,435,340,&off,&created)==Ok&&!created&&off==saved);
-    CHECK(a.allocate(1,435,349,&off)==Range);
+    CHECK(a.allocate(1,428,340,&off,&created)==Ok&&created);
+    CHECK(a.find(1,428,&off,&size)==Ok&&size==(partitioned?340u:344u));
+    uint32_t saved=off; CHECK(a.allocate(1,428,340,&off,&created)==Ok&&!created&&off==saved);
+    CHECK(a.allocate(1,428,349,&off)==Range);
     // Wi-Fi R1 -102: an existing item is reused when large enough (Linux -EEXIST + qcom_smem_get), with its own size
     static std::vector<SmemArena::Note> seen; seen.clear();
     a.note=[](void *,const SmemArena::Note &n) { seen.push_back(n); };
-    uint32_t actual=0; CHECK(a.allocate(1,435,300,&off,&created,&actual)==Ok&&!created&&off==saved&&actual==(partitioned?340u:344u));
-    CHECK(seen.size()==1&&seen[0].item==435&&seen[0].wanted==300&&seen[0].found==actual&&seen[0].result==Ok);
-    CHECK(a.allocate(1,435,349,&off,&created,&actual)==Range&&seen.size()==2&&seen[1].result==Range&&seen[1].wanted==349);
-    CHECK(a.allocate(1,435,340,&off)==Ok&&seen.size()==2);   // same size (v11: padded 344): no note
+    uint32_t actual=0; CHECK(a.allocate(1,428,300,&off,&created,&actual)==Ok&&!created&&off==saved&&actual==(partitioned?340u:344u));
+    CHECK(seen.size()==1&&seen[0].item==428&&seen[0].wanted==300&&seen[0].found==actual&&seen[0].result==Ok);
+    CHECK(a.allocate(1,428,349,&off,&created,&actual)==Range&&seen.size()==2&&seen[1].result==Range&&seen[1].wanted==349);
+    CHECK(a.allocate(1,428,340,&off)==Ok&&seen.size()==2);   // same size (v11: padded 344): no note
     a.note=nullptr;
     uint32_t before=f.locks; CHECK(a.allocate(1,7,16,&off)==Invalid&&f.locks==before);
     f.deny=true; auto bytes=f.bytes; CHECK(a.allocate(1,478,32,&off)==Timeout&&f.bytes==bytes); f.deny=false;
@@ -93,7 +93,7 @@ static void smpTest() {
   Fixture f; f.init(true); auto a=f.arena(); Smp2pEdge e;
   CHECK(e.start(&a,Fixture::kick,&f)==Ok);
   CHECK(e.poll()==Again&&!e.ready());
-  uint32_t in=0; CHECK(a.allocate(1,428,340,&in)==Ok);
+  uint32_t in=0; CHECK(a.allocate(1,435,340,&in)==Ok);
   f.w(in,0x504d5324); f.w(in+4,0x101); f.w(in+8,1); f.w(in+12,16u|(2u<<16));
   memcpy(f.bytes.data()+in+20,"slave-kernel",13); f.w(in+36,2);
   memcpy(f.bytes.data()+in+40,"wlan",5); f.w(in+56,0);
@@ -575,7 +575,7 @@ static void controlTest() {
     smem::Info i={}; CHECK(r.a.parse(&i)==Ok&&i.infoPresent&&i.numItems==512);
     CHECK(r.prepare()==Ok&&r.c->stage==WifiControl::Prepared);
     uint32_t at=0,n=0;
-    CHECK(r.a.find(1,435,&at,&n)==Ok&&n==340&&r.a.find(1,478,&at,&n)==Ok&&n==32&&r.a.find(1,479,&at,&n)==Ok&&n==16384);
+    CHECK(r.a.find(1,428,&at,&n)==Ok&&n==340&&r.a.find(1,478,&at,&n)==Ok&&n==32&&r.a.find(1,479,&at,&n)==Ok&&n==16384);
     // outbound "master-kernel" + "ipa" (bengal.dtsi order), version published
     const uint8_t *o=r.f.bytes.data()+r.c->smp.outbound;
     CHECK(le32(o+4)==0x101&&le32(o+12)==(16u|(2u<<16))&&!strcmp((const char *)o+20,"master-kernel")&&!strcmp((const char *)o+40,"ipa"));
@@ -584,8 +584,8 @@ static void controlTest() {
     CHECK(r.c->step(5)==NotReady);
     CHECK(r.c->modemStarted(1000)==Ok&&r.c->step(1001)==Ok&&r.c->stage==WifiControl::AwaitModem);
     // inbound allocated but not published yet: keep waiting (it used to be a fatal Protocol)
-    uint32_t in=0; CHECK(r.a.allocate(1,428,340,&in)==Ok);
-    CHECK(r.c->step(1002)==Ok&&r.c->stage==WifiControl::AwaitModem&&r.saw("smp2p 428 inbound present"));
+    uint32_t in=0; CHECK(r.a.allocate(1,435,340,&in)==Ok);
+    CHECK(r.c->step(1002)==Ok&&r.c->stage==WifiControl::AwaitModem&&r.saw("smp2p 435 inbound present"));
     r.f.w(in,0x504d5324); r.f.w(in+8,1); r.f.w(in+12,16u|(1u<<16));
     memcpy(r.f.bytes.data()+in+20,"slave-kernel",13); r.f.w(in+36,2); r.f.w(in+4,0x101);
     CHECK(r.c->step(1003)==Ok&&r.c->stage==WifiControl::AwaitFifo&&r.saw("smp2p modem ready"));
@@ -615,10 +615,10 @@ static void controlTest() {
     CHECK(r.c->release(true)==Ok);
   }
   { ControlRig r(400);   // Linux semantics: item ids >= num_items are refused
-    CHECK(r.prepare()==Range&&!strcmp(r.c->where(),"smem 435 smp2p out")&&r.saw("FAILED"));
+    CHECK(r.prepare()==Range&&!strcmp(r.c->where(),"smem 428 smp2p out")&&r.saw("FAILED"));
   }
   { ControlRig r(512); CHECK(r.prepare()==Ok&&r.c->modemStarted(0)==Ok);
-    CHECK(r.c->step(WifiControl::ReadyMs)==Timeout&&!strcmp(r.c->where(),"smp2p 428 slave-kernel ready (bit 1)"));
+    CHECK(r.c->step(WifiControl::ReadyMs)==Timeout&&!strcmp(r.c->where(),"smp2p 435 slave-kernel ready (bit 1)"));
   }
 }
 int main() {

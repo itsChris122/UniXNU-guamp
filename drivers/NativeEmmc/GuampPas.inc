@@ -28,7 +28,7 @@ struct Hooks {
   // Owner hand-off (the modem's ModemBootHooks, GuampModem.inc): prepare runs after placement, the stopped-peer check
   // and the carveout mapping, before any vote or RAM write (nonzero = refuse, nothing written); cleanup runs after the
   // PAS SHUTDOWN of a failed start that INIT_IMAGE had accepted, with the SHUTDOWN result. ADSP sets only prepare, with
-  // guamp-adsp-ipc>=1 (GuampAdspIpc.inc: apps SMP2P item 443 the ADSP reads at boot).
+  // guamp-adsp-ipc>=1 (GuampAdspIpc.inc: apps SMP2P item 429 the ADSP reads at boot).
   int (*prepare)(void *)=nullptr;
   void (*cleanup)(void *,bool stopped)=nullptr;
 };

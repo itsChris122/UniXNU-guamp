@@ -4,7 +4,7 @@
 // (GuampPasCore.inc / GuampPas.inc: placement, original metadata, INIT_IMAGE, MEM_SETUP, segments, AUTH_AND_RESET,
 // SHUTDOWN + cleanup) and the ONE SCM transport (GuampScm.inc: interrupted calls resumed with the returned x0-x6,
 // discovery as is_scm_armv8). What stays modem-specific: the carveout and PAS id, the stopped-peer and ready checks
-// over SMP2P 428, and ModemBootHooks, the hand-off that feeds the Wi-Fi bootstrap (prepare before any RAM write,
+// over SMP2P 435, and ModemBootHooks, the hand-off that feeds the Wi-Fi bootstrap (prepare before any RAM write,
 // started after AUTH_AND_RESET instead of the plain ready observation, shutdown with the actual PAS SHUTDOWN result).
 // Disk remains read-only. Only the reserved modem RAM is written. TrustZone authenticates the original signed image.
 namespace modem {
@@ -44,7 +44,7 @@ static int modemHookReady(void *) {
   return modemAwaitReady()?pas::kReady:pas::kNotReady;
 }
 static void modemHookCleanup(void *,bool stopped) {gModemHooks->shutdown(gModemHooks->ctx,stopped);}
-// log_failure_reason of subsys-pil-tz: SMP2P 428 bits and SMEM item 421 (qcom,smem-id of qcom,mss), before SHUTDOWN.
+// log_failure_reason of subsys-pil-tz: SMP2P 435 bits and SMEM item 421 (qcom,smem-id of qcom,mss), before SHUTDOWN.
 static void modemHookFailure(void *) {
   modemFailureReport();
 #if defined(GUAMP_MODEM_INIT)
@@ -78,7 +78,7 @@ static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
   if(startForWifi)enabled=1; // caller has already checked its explicit Wi-Fi opt-in
   else if(!PE_parse_boot_argn("guamp-modem-start",&enabled,sizeof(enabled)) || (enabled!=1 && enabled!=2))return false;
   const pas::Peripheral peripheral={"GuampModem",modem::kPas,modem::kBase,modem::kBytes,"/image","modem"};
-  IOLog("GuampModem: start mode %u%s, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in 428 out 435, "
+  IOLog("GuampModem: start mode %u%s, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in 435 out 428, "
         "reason 421, proxy votes by %s\n",enabled,startForWifi?" (Wi-Fi owner)":"",modem::kPas,modem::kBase,modem::kBytes,
         guamp_phys_base,guamp_phys_size,hooks?"the Wi-Fi owner":"this loader");
   fw::Image *image=static_cast<fw::Image *>(IOMallocZero(sizeof(fw::Image)));

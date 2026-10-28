@@ -3,8 +3,8 @@
 // the later Wi-Fi steps, all opt-in with the boot argument guamp-wifi-prep=1, run once by one kernel thread after the
 // eMMC devices are published:
 //   SMEM       0x46000000 (2 MiB, bengal.dtsi smem_region, not XNU RAM) mapped uncached and read-only for the duration
-//              of the check: version, partitions, the items of the apps partitions, items 421/428/435/478-480 and
-//              the modem SMP2P inbound state (GuampSmem.inc). Expected before any modem boot: no 428, no GLINK items.
+//              of the check: version, partitions, the items of the apps partitions, items 421/435/428/478-480 and
+//              the modem SMP2P inbound state (GuampSmem.inc). Expected before any modem boot: no 435, no GLINK items.
 //   firmware   the modem_<slot> partition (slot from the boot_a/boot_b GPT active bit, boot argument
 //              guamp-wifi-slot=a|b overrides) read as ext4 (GuampExt4.inc); /image/modem.mdt parsed and every
 //              /image/modem.bNN checked against its SHA-384 (GuampFirmware.inc); presence of wlanmdsp.mbn and bdwlan.*
@@ -247,14 +247,14 @@ static bool modemStopped() {
     smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
     smem::parse(reader,info);uint32_t at=0,bytes=0;
     const smem::Partition *peer=smem::partitionFor(*info,smem::kHostModem);
-    const bool in428=!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes);
+    const bool in428=!info->error && smem::find(reader,*info,smem::kHostModem,435,&at,&bytes);
     uint32_t a=0,n=0;
     const bool r421=!info->error && smem::find(reader,*info,smem::kHostModem,421,&a,&n);
     const bool g480=!info->error && smem::find(reader,*info,smem::kHostModem,480,&a,&n);
     stopped=!info->error && info->initialized && (!peer || !peer->status) && !in428;
-    // Cold-boot check the Wi-Fi contract asks for in the first log: no modem SMP2P (428) and no modem-side GLINK RX
+    // Cold-boot check the Wi-Fi contract asks for in the first log: no modem SMP2P (435) and no modem-side GLINK RX
     // FIFO (480) means MPSS, hence the WLAN firmware inside it, has not run since SMEM was initialised by the boot chain.
-    IOLog("GuampModem: cold-boot check: SMEM v%u initialized %u %s, modem partition %s, smp2p 428 %s, glink rx 480 %s, "
+    IOLog("GuampModem: cold-boot check: SMEM v%u initialized %u %s, modem partition %s, smp2p 435 %s, glink rx 480 %s, "
           "reason 421 %s -> %s\n",info->version,info->initialized,info->error?"PARSE ERROR":"ok",
           !peer?"absent":peer->status?"WALK ERROR":"ok",in428?"PRESENT":"absent",g480?"PRESENT":"absent",
           r421?"present":"absent",stopped?"cold boot, modem and WLAN never started":"NOT a cold boot: modem not started");
@@ -262,7 +262,7 @@ static bool modemStopped() {
       smem::Smp2p *state=static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
       if(state) {
         smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
-        IOLog("GuampModem: stale smp2p 428 slave-kernel %x (fatal %u ready %u handover %u stop-ack %u)\n",state->value,
+        IOLog("GuampModem: stale smp2p 435 slave-kernel %x (fatal %u ready %u handover %u stop-ack %u)\n",state->value,
               state->value&1,state->value>>1&1,state->value>>2&1,state->value>>3&1);
         IOFree(state,sizeof(*state));
       }
@@ -285,12 +285,12 @@ static void modemFailureReport() {
     smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
     __asm__ volatile("dmb sy" ::: "memory");
     smem::parse(reader,info);uint32_t at=0,bytes=0;
-    if(!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes)) {
+    if(!info->error && smem::find(reader,*info,smem::kHostModem,435,&at,&bytes)) {
       smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
       const uint32_t v=state->value;
-      IOLog("GuampModem: failure: smp2p 428 %s slave-kernel %x (fatal %u ready %u handover %u stop-ack %u shutdown-ack %u)\n",
+      IOLog("GuampModem: failure: smp2p 435 %s slave-kernel %x (fatal %u ready %u handover %u stop-ack %u shutdown-ack %u)\n",
             state->valid?"valid":"INVALID",v,v&1,v>>1&1,v>>2&1,v>>3&1,v>>7&1);
-    } else IOLog("GuampModem: failure: smp2p 428 never allocated (modem did not reach its SMP2P init)\n");
+    } else IOLog("GuampModem: failure: smp2p 435 never allocated (modem did not reach its SMP2P init)\n");
     if(!info->error && smem::find(reader,*info,smem::kHostModem,421,&at,&bytes) && bytes) {
       char text[129];uint32_t n=0;
       for(;n<bytes && n+1<sizeof(text);n++) {
@@ -319,7 +319,7 @@ static bool modemAwaitReady() {
     for(unsigned attempt=0;attempt<100;++attempt) {
       __asm__ volatile("dmb sy" ::: "memory");
       smem::parse(reader,info);uint32_t at=0,bytes=0;
-      if(!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes)) {
+      if(!info->error && smem::find(reader,*info,smem::kHostModem,435,&at,&bytes)) {
         smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
         if(state->valid && state->hasEntry && state->localPid==1 && state->remotePid==0) {
           uint32_t flags=state->value;
@@ -375,20 +375,20 @@ void smemReport() {
             p.offset, p.size, p.cacheline, !p.read ? "not apps, not read," : p.status ? "WALK ERROR," : "",
             p.items, p.items ? ":" : "", ids);
     }
-    static const uint32_t wanted[] = {421, 428, 435, 478, 479, 480};
+    static const uint32_t wanted[] = {421, 435, 428, 478, 479, 480};
     uint32_t at[6] = {}, size[6] = {};
     bool found[6] = {};
     for (unsigned k = 0; k < 6 && !info->error; k++) found[k] = smem::find(r, *info, smem::kHostModem, wanted[k], &at[k], &size[k]);
-    IOLog("GuampSmem: items crash-reason 421 %s %u, smp2p in 428 %s %u, smp2p out 435 %s %u, glink 478/479/480 %s/%s/%s\n",
+    IOLog("GuampSmem: items crash-reason 421 %s %u, smp2p in 435 %s %u, smp2p out 428 %s %u, glink 478/479/480 %s/%s/%s\n",
           found[0] ? "present" : "absent", size[0], found[1] ? "present" : "absent", size[1],
           found[2] ? "present" : "absent", size[2], found[3] ? "present" : "absent", found[4] ? "present" : "absent",
           found[5] ? "present" : "absent");
     if (!found[1]) {
-      IOLog("GuampSmem: modem SMP2P 428 absent: modem not running (expected)\n");
+      IOLog("GuampSmem: modem SMP2P 435 absent: modem not running (expected)\n");
     } else {
       smem::readSmp2p(r, at[1], size[1], "slave-kernel", sp);
       uint32_t v = sp->value;
-      IOLog("GuampSmem: modem SMP2P 428 %s, pids %u->%u, %u/%u entries, slave-kernel %s %x (fatal %u ready %u handover %u stop-ack %u shutdown-ack %u)\n",
+      IOLog("GuampSmem: modem SMP2P 435 %s, pids %u->%u, %u/%u entries, slave-kernel %s %x (fatal %u ready %u handover %u stop-ack %u shutdown-ack %u)\n",
             sp->valid ? "valid" : "INVALID", sp->localPid, sp->remotePid, sp->validEntries, sp->total,
             sp->hasEntry ? "=" : "missing", v, v & 1, v >> 1 & 1, v >> 2 & 1, v >> 3 & 1, v >> 7 & 1);
     }

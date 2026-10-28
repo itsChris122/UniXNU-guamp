@@ -2,7 +2,7 @@
 // GuampSmemLock.inc (the one SMEM lock, local + TCSR mutex), GuampSmp2pEdge.inc, GuampGlinkEdge.inc,
 // GuampApr.inc and the kernel glue GuampAdspIpc.inc itself (prepare / onReady / service / run), against a simulated
 // 2 MiB SMEM (v12 partitions, as XBL leaves it) and a simulated ADSP written independently from the Linux sources:
-// it allocates its SMP2P item 429 (ready, restart-done) and, once the apps GLINK descriptor 478 exists, its RX FIFO
+// it allocates its SMP2P item 443 (ready, restart-done) and, once the apps GLINK descriptor 478 exists, its RX FIFO
 // 480 (small, to force wrap-around), speaks GLINK (own VERSION, OPEN of IPCRTR and apr_audio_svc, intents, SIGNALS,
 // fragmented DATA, RX_INTENT_REQ for a reply bigger than the apps intents) and answers APR q6core like the AVS
 // firmware (state 0 twice, then 1; framework version with 40 services = 520 bytes), then q6afe for the level-4 tone
@@ -186,8 +186,8 @@ struct Peer {
   void smp2p() {
     if (!in429 && nowMs() >= 100) {   // the ADSP allocates and publishes its inbound item early in its boot
       uint32_t at = 0, bytes = 0;
-      CHECK(remoteGet(m, kPartAdsp, 443, &at, &bytes) && bytes == 340);   // apps item exists before the remote runs
-      in429 = remoteAlloc(m, kPartAdsp, 429, 340);
+      CHECK(remoteGet(m, kPartAdsp, 429, &at, &bytes) && bytes == 340);   // apps item exists before the remote runs
+      in429 = remoteAlloc(m, kPartAdsp, 443, 340);
       wr(m, in429, 0x504d5324);
       wr(m, in429 + 8, 2);              // local 2, remote 0
       wr(m, in429 + 12, 16 | (1u << 16));
@@ -444,13 +444,13 @@ static void endToEnd() {
   adspipc::gLevel = 4;
   CHECK(adspipc::prepare(nullptr) == qipc::Ok);   // pas::Hooks::prepare: 0 = go on
   uint32_t at = 0, bytes = 0;
-  CHECK(remoteGet(smemImage, kPartAdsp, 443, &at, &bytes) && bytes == 340);
+  CHECK(remoteGet(smemImage, kPartAdsp, 429, &at, &bytes) && bytes == 340);
   CHECK(rd(smemImage, at) == 0x504d5324 && rd(smemImage, at + 4) == (1u | (1u << 8)) && rd(smemImage, at + 8) == (2u << 16));
   CHECK(rd(smemImage, at + 12) == (16u | (3u << 16)));
   CHECK(!strcmp(reinterpret_cast<const char *>(&smemImage[at + 20]), "master-kernel"));
   CHECK(!strcmp(reinterpret_cast<const char *>(&smemImage[at + 40]), "rdbg"));
   CHECK(!strcmp(reinterpret_cast<const char *>(&smemImage[at + 60]), "sleepstate") && rd(smemImage, at + 76) == 0x1000);
-  CHECK(rd(smemImage, at - 16) == (0xa5a5u | (443u << 16)) && rd(smemImage, at - 12) == 344 && rd(smemImage, at - 8) == 4);
+  CHECK(rd(smemImage, at - 16) == (0xa5a5u | (429u << 16)) && rd(smemImage, at - 12) == 344 && rd(smemImage, at - 8) == 4);
   CHECK(rd(apcsPage, 8) == 1u << 10 && rd(mutexPage, 0) == 0);
   CHECK(!remoteGet(smemImage, kPartAdsp, 478, &at, &bytes));   // GLINK only after err-ready
   // the awaitReady loop of GuampAdsp.inc
@@ -485,7 +485,7 @@ static void endToEnd() {
   for (const auto &li : c->intent) local += li.data ? 1 : 0;
   CHECK(local == 20 && c->rxPackets == 13 && c->txPackets == 13 && c->remote == Peer::kRcidApr);
   CHECK(adspipc::gGlink->ignoredOpens == 1 && adspipc::gGlink->rx.length == 1024);
-  printf("end to end: SMP2P 443 + negotiation + SSR ack, GLINK version/open/intents/signals, APR state x3 + fwk "
+  printf("end to end: SMP2P 429 + negotiation + SSR ack, GLINK version/open/intents/signals, APR state x3 + fwk "
          "(520-byte reply via RX_INTENT_REQ, fragmented, RX FIFO wrapped), ADSP APR OK, AFE tone sequence with every "
          "packet checked, ADSP TONE OK, err-fatal exit\n");
   gPeer = nullptr;
@@ -569,13 +569,13 @@ static void smp2pUnit() {
   const char *names[2] = {"master-kernel", "sleepstate"};
   const uint32_t values[2] = {0, 0x1000};
   const char *bad[1] = {"a-name-too-long-for-smp2p"};
-  CHECK(e.start(&a, 0, 2, 443, 429, bad, values, 1, uKick, nullptr) == qipc::Invalid);
-  CHECK(e.start(&a, 0, 2, 443, 429, names, values, 2, uKick, nullptr) == qipc::Ok && unitKicks == 1);
+  CHECK(e.start(&a, 0, 2, 429, 443, bad, values, 1, uKick, nullptr) == qipc::Invalid);
+  CHECK(e.start(&a, 0, 2, 429, 443, names, values, 2, uKick, nullptr) == qipc::Ok && unitKicks == 1);
   smem::Smp2p s = {};
   bool has = true;
   uint32_t v = 7;
   CHECK(e.poll(&s, "slave-kernel", &v, &has) == qipc::Again && !has && !v);
-  const uint32_t in = remoteAlloc(unitImage, kPartAdsp, 429, 340);
+  const uint32_t in = remoteAlloc(unitImage, kPartAdsp, 443, 340);
   wr(unitImage, in, 0x504d5324);
   wr(unitImage, in + 8, 2);
   wr(unitImage, in + 12, 16 | (1u << 16));

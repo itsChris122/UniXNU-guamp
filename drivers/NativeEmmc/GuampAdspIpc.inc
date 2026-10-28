@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp ADSP transports, audio phase 2: kernel glue of GuampSmemWrite.inc (the one SMEM allocator, shared with Wi-Fi R1,
 // under the one SMEM lock of GuampSmemLock.inc: local IOLock + TCSR mutex),
-// GuampSmp2pEdge.inc (apps SMP2P item 443), GuampGlinkEdge.inc (GLINK over SMEM 478/479/480) and GuampApr.inc (APR,
+// GuampSmp2pEdge.inc (apps SMP2P item 429), GuampGlinkEdge.inc (GLINK over SMEM 478/479/480) and GuampApr.inc (APR,
 // q6core). Included by GuampAdsp.inc, driven from its guamp-adsp thread (single thread; SMEM allocations take the
 // shared lock, so they are serialised with the Wi-Fi provider's). Opt-in with guamp-adsp=1 and
-//   guamp-adsp-ipc=1  before the PAS start: apps SMP2P item 443 (as smp2p.c probes it at boot: "master-kernel" 0,
-//                     "rdbg" 0, "sleepstate" bit 12 = apps awake), APCS IPC bit 10 kicks, inbound 429 negotiation and
+//   guamp-adsp-ipc=1  before the PAS start: apps SMP2P item 429 (as smp2p.c probes it at boot: "master-kernel" 0,
+//                     "rdbg" 0, "sleepstate" bit 12 = apps awake), APCS IPC bit 10 kicks, inbound 443 negotiation and
 //                     SSR-ack handshake while waiting for err-ready and afterwards
 //   guamp-adsp-ipc=2  + after err-ready (SUBSYS_AFTER_POWERUP, when glink_probe.c registers the SMEM edge): GLINK
 //                     descriptor 478 + TX FIFO 479 (16 KiB), version 1 / INTENT_REUSE, RX FIFO 480 of the ADSP,
@@ -54,7 +54,7 @@ inline void service(uint32_t, int (*)(void *, const uint8_t *, uint32_t)) {}
 namespace adspipc {
 
 constexpr uint16_t kHost = 2;
-constexpr uint32_t kSmp2pOut = 443, kSmp2pIn = 429, kGlinkDesc = 478, kGlinkTx = 479, kGlinkRx = 480;
+constexpr uint32_t kSmp2pOut = 429, kSmp2pIn = 443, kGlinkDesc = 478, kGlinkTx = 479, kGlinkRx = 480;
 constexpr uint32_t kDescBytes = 32, kTxBytes = 0x4000;
 constexpr uint64_t kApcsPhys = 0x0f111000;
 constexpr uint32_t kApcsIpc = 8, kBitSmp2p = 10, kBitGlink = 8, kAwake = 1u << 12, kFatal = 1u << 0;
@@ -185,7 +185,7 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   else gCore.receive(p, n, nowMs());
 }
 
-// pas::Hooks::prepare (after the stopped-peer check, before any vote or RAM write): mappings + SMP2P 443.
+// pas::Hooks::prepare (after the stopped-peer check, before any vote or RAM write): mappings + SMP2P 429.
 // Nonzero = PAS does not start (kErrPrepare, no RAM written).
 int prepare(void *) {
   gEpoch = mach_absolute_time();
@@ -255,7 +255,7 @@ void service() {
   const int e = gSmp2p.poll(gScratch, "slave-kernel", &value, &has);
   if (!e && !gNegotiatedLogged) {
     gNegotiatedLogged = true;
-    IOLog("GuampAdsp: ipc smp2p 429 open at %u ms: in features %x flags %x, out features %x, ssr-ack %s\n", nowMs(),
+    IOLog("GuampAdsp: ipc smp2p 443 open at %u ms: in features %x flags %x, out features %x, ssr-ack %s\n", nowMs(),
           gSmp2p.inFeatures, gSmp2p.inFlags, gSmp2p.outFeatures, gSmp2p.ssrEnabled ? "on" : "off");
   }
   if (!e && gSmp2p.acks) {
@@ -263,7 +263,7 @@ void service() {
     if (logged != gSmp2p.acks) IOLog("GuampAdsp: ipc smp2p restart-done %x acked (%u)\n", gSmp2p.inFlags & 1, gSmp2p.acks);
     logged = gSmp2p.acks;
   }
-  if (e && e != qipc::Again) IOLog("GuampAdsp: ipc smp2p 429 %s\n", qipc::errorName(e));
+  if (e && e != qipc::Again) IOLog("GuampAdsp: ipc smp2p 443 %s\n", qipc::errorName(e));
   if (!e) gSlave = value;
   if (!gGlink || !gGlink->running) return;
   if (!gGlink->rx.attached()) {

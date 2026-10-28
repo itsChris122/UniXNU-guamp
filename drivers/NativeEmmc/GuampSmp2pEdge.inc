@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Apps side of one SMP2P edge (outbound item allocated and owned by apps, inbound item allocated by the remote), audio
-// phase 2. Generalises the Wi-Fi line's modem-only Smp2pEdge (Codex GuampSmp2p.inc: 435/428, pid 1) to any remote:
+// phase 2. Generalises the Wi-Fi line's modem-only Smp2pEdge (GuampSmp2p.inc: out 428 / in 435, pid 1) to any remote:
 // pids, items and the outbound entry list are parameters. Host-tested by tests/adsp_ipc_host.cpp.
 // Protocol studied in the guamp kernel drivers/soc/qcom/smp2p.c and smp2p_sleepstate.c (no code copied):
 //   item (340 bytes): magic "$SMP", version:8 + features:24, local_pid:16, remote_pid:16, total_entries:16 (16),
@@ -11,7 +11,9 @@
 //   out.features = in.features & out.features (negotiation, no kick) and ssr-ack is enabled if bit 0 survives; while
 //   open, in.flags bit 0 != the last ack -> flip out.flags bit 1 and kick (qcom_smp2p_do_ssr_ack).
 //   update_bits(entry, mask, value): read-modify-write of the entry value, kick if changed.
-// guamp ADSP edge (qcom,smp2p-adsp): smem <443 429>, local pid 0, remote pid 2, APCS IPC bit 10, GIC SPI 279 (polled
+// guamp ADSP edge (qcom,smp2p-adsp): smem <443 429> = {SMP2P_INBOUND, SMP2P_OUTBOUND} of smp2p.c, i.e. apps
+// allocates 429 and reads the ADSP's 443 (until 20261029 the port had them swapped: both remotes found their own
+// outbound slot taken by an apps-format item and never published err-ready where we looked), local pid 0, remote pid 2, APCS IPC bit 10, GIC SPI 279 (polled
 // here); outbound entries in DT order: "master-kernel" (bit 0 = force-stop), "rdbg", "sleepstate" (bit 12 = apps
 // awake, set at smp2p-sleepstate probe and cleared only around system suspend).
 #ifndef GUAMP_SMP2P_EDGE_INC

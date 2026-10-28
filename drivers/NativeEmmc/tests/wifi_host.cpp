@@ -494,7 +494,7 @@ static void buildSmem(Region &r, bool with428, bool corruptGlobal) {
   g.cached(470, 24);
   PartBuilder m(r, 0x28000, 0x20000, 0, 1, 64);
   if (with428) {
-    uint32_t at = m.uncached(428, 20 + 20 * 16);
+    uint32_t at = m.uncached(435, 20 + 20 * 16);
     buildSmp2p(r, at, 0x2);
   }
   m.uncached(478, 32);
@@ -525,18 +525,18 @@ static void testSmem() {
     CHECK(f479 && size == 16384, "479 cached");
     bool f470 = smem::find(r, info, smem::kHostModem, 470, &at, &size);
     CHECK(pass == 2 ? !f470 : (f470 && size == 24), "470 cached global");
-    CHECK(!smem::find(r, info, smem::kHostModem, 435, &at, &size), "435 absent");
+    CHECK(!smem::find(r, info, smem::kHostModem, 428, &at, &size), "428 absent");
     CHECK(!smem::find(r, info, smem::kHostModem, 600, &at, &size), "600 out of range");
-    bool f428 = smem::find(r, info, smem::kHostModem, 428, &at, &size);
-    CHECK(f428 == (pass != 1), "428 presence");
+    bool f428 = smem::find(r, info, smem::kHostModem, 435, &at, &size);
+    CHECK(f428 == (pass != 1), "435 presence");
     if (f428) {
       smem::Smp2p s;
       smem::readSmp2p(r, at, size, "slave-kernel", &s);
       CHECK(s.valid && s.hasEntry && s.value == 0x2 && s.localPid == 1 && s.remotePid == 0 && s.validEntries == 3, "smp2p");
-      printf("smem pass %d: SMP2P 428 valid %d pids %u->%u entries %u/%u slave-kernel %x (ready %u)\n", pass, s.valid,
+      printf("smem pass %d: SMP2P 435 valid %d pids %u->%u entries %u/%u slave-kernel %x (ready %u)\n", pass, s.valid,
              s.localPid, s.remotePid, s.validEntries, s.total, s.value, s.value >> 1 & 1);
     } else {
-      printf("smem pass %d: SMP2P 428 absent (modem not running)\n", pass);
+      printf("smem pass %d: SMP2P 435 absent (modem not running)\n", pass);
     }
     CHECK(reg.violations == 0 && reg.misaligned == 0, "reads outside apps partitions %u, misaligned %u", reg.violations, reg.misaligned);
   }
