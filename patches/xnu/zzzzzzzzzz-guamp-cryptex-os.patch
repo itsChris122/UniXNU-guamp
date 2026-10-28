@@ -1,0 +1,350 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7901,6 +7901,336 @@
+ 	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
+ 	    point, native_guamp_audio_plugin_stage, native_guamp_audio_plugin_status);
+ }
++/* guamp: the SystemOS cryptex at /private/preboot/Cryptexes/OS (29/10). Here the cryptex is union-mounted on "/" (owner
++ * composition, XNU_OWNER_UNION_SYSTEMOS), not at /private/preboot/Cryptexes/OS as on a real device, so the 30 sealed-root symlinks
++ * into it (/System/Cryptexes/OS -> ../../private/preboot/Cryptexes/OS: WebKit.framework, MobileSafari*.framework,
++ * SafariShared.framework, ExtensionKit/Extensions/{WebContent,Networking,GPU,WebContentCaptivePortal}Extension.appex, ...) dangle.
++ * LaunchServices records cryptex bundles by their /System/Cryptexes/OS path and never registered the WebKit extensions: Safari's
++ * WebKit logs "Error launching process" for every WebContent/Networking/GPU process and no such process ever starts.
++ * Two read-only views fix the path: a union of Data's /private/var/ngpu/preboot (only Cryptexes/OS, empty) over the empty sealed
++ * /private/preboot, then a bindfs of the cryptex root (rootvnode, the union's top) on /private/preboot/Cryptexes/OS. bindfs looks
++ * names up with VNOP_LOOKUP on the cryptex vnodes, so below the view only cryptex content is visible (no fall-through to the
++ * sealed root and its symlinks, no loop). Checked after mounting: the WebKit extension's Info.plist is there and
++ * MobileSafari.framework is a directory (not the sealed symlink); otherwise the bind is unmounted again. guamp-cryptex-os=0 skips
++ * it. Never panics. */
++volatile int native_guamp_cryptex_os_stage = 0;
++volatile int native_guamp_cryptex_os_status = -1;
++volatile int native_guamp_cryptex_os_view_stage = 0;
++volatile int native_guamp_cryptex_os_view_status = -1;
++static int
++native_guamp_mkdir(proc_t p, user_addr_t scratch, const char *path)
++{
++	struct mkdir_args request = {.path = scratch + 0xc00, .mode = 0755};
++	int32_t result = 0;
++	int error = copyout(path, request.path, strlen(path) + 1);
++	if (!error) {
++		error = mkdir(p, &request, &result);
++	}
++	return error == EEXIST ? 0 : error;
++}
++static void
++native_guamp_cryptex_os(proc_t p, user_addr_t scratch)
++{
++	uint32_t enabled = 1;	/* default on: guamp-cryptex-os=0 disables */
++	PE_parse_boot_argn("guamp-cryptex-os", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++	vfs_context_t ctx = vfs_context_current();
++	int error = 0;
++	native_guamp_cryptex_os_stage = 1;
++	/* Only with the owner union: the root vnode must be the SystemOS cryptex mount. */
++	mount_t top = rootvnode ? vnode_mount(rootvnode) : NULL;
++	vnode_t device_vnode = top ? vfs_devvp(top) : NULLVP;
++	dev_t top_device = device_vnode ? vnode_specrdev(device_vnode) : NODEV;
++	if (device_vnode) {
++		vnode_put(device_vnode);
++	}
++	if (!native_owner_cache_native_union || top_device == NODEV || top_device != native_owner_cache_mounted_device) {
++		error = ENOTSUP;
++		goto done;
++	}
++	native_guamp_cryptex_os_stage = 2;
++	static const char *const dirs[] = {"/private/var/ngpu", "/private/var/ngpu/preboot", "/private/var/ngpu/preboot/Cryptexes",
++		                           "/private/var/ngpu/preboot/Cryptexes/OS"};
++	for (size_t i = 0; !error && i < sizeof(dirs) / sizeof(dirs[0]); i++) {
++		error = native_guamp_mkdir(p, scratch, dirs[i]);
++	}
++	if (error) {
++		goto done;
++	}
++	native_guamp_cryptex_os_stage = 3;
++	static const char view_source[] = "/private/var/ngpu/preboot", view_point[] = "/private/preboot";
++	native_gpu_addon_mount(p, scratch, 0x400, view_source, sizeof(view_source), view_point, sizeof(view_point),
++	    "/private/preboot/Cryptexes", "/private/preboot/Cryptexes/OS", &native_guamp_cryptex_os_view_stage,
++	    &native_guamp_cryptex_os_view_status);
++	if (native_guamp_cryptex_os_view_stage != 5) {
++		error = native_guamp_cryptex_os_view_status ? native_guamp_cryptex_os_view_status : EIO;
++		goto done;
++	}
++	native_guamp_cryptex_os_stage = 4;
++	static const char bind_source[] = "/", bind_point[] = "/private/preboot/Cryptexes/OS";
++	struct mount_args request = {.type = scratch + 0x400, .path = scratch + 0x420, .flags = MNT_RDONLY,
++		                     .data = scratch + 0x500};
++	int32_t result = 0;
++	if ((error = copyout("bindfs", request.type, 7)) || (error = copyout(bind_point, request.path, sizeof(bind_point))) ||
++	    (error = copyout(bind_source, request.data, sizeof(bind_source)))) {
++		goto done;
++	}
++	native_bindfs_boot_mount = 1;
++	error = mount(p, &request, &result);
++	native_bindfs_boot_mount = 0;
++	if (error) {
++		goto done;
++	}
++	native_guamp_cryptex_os_stage = 5;
++	vnode_t vp = NULLVP;
++	error = vnode_lookup("/private/preboot/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist",
++	    0, &vp, ctx);
++	if (!error) {
++		vnode_put(vp);
++		vp = NULLVP;
++		native_guamp_cryptex_os_stage = 6;
++		error = vnode_lookup("/private/preboot/Cryptexes/OS/System/Library/PrivateFrameworks/MobileSafari.framework",
++		    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++		if (!error) {
++			if (vnode_vtype(vp) != VDIR) {
++				error = ENOTDIR;
++			}
++			vnode_put(vp);
++			vp = NULLVP;
++		}
++	}
++	if (error) {
++		/* Not the bare cryptex below the view: take the bind away again. */
++		struct unmount_args undo = {.path = scratch + 0x420, .flags = 0};
++		int undo_error = unmount(p, &undo, &result);
++		printf("guamp-cryptex-os: check failed (%d), unmount status %d\n", error, undo_error);
++		goto done;
++	}
++	native_guamp_cryptex_os_stage = 7;
++	/* The path the sealed symlinks take, end to end. */
++	error = vnode_lookup("/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/WebContentExtension.appex/Info.plist", 0,
++	    &vp, ctx);
++	if (!error) {
++		vnode_put(vp);
++		native_guamp_cryptex_os_stage = 8;
++	}
++done:
++	native_guamp_cryptex_os_status = error;
++	printf("guamp-cryptex-os: stage %d status %d (view stage %d status %d)\n", native_guamp_cryptex_os_stage, error,
++	    native_guamp_cryptex_os_view_stage, native_guamp_cryptex_os_view_status);
++}
++/* guamp-ls-rebuild=N (N > 0): one-shot removal of the LaunchServices databases (lsd's InternalDaemon container,
++ * Library/Caches/{,SystemDataOnly-}com.apple.LaunchServices-*.csstore) so lsd rebuilds them at its next start and registers the
++ * cryptex bundles it could not reach before (guamp-cryptex-os). /private/var/db/guamp-ls-rebuild-N.done marks cycle N as done.
++ * Runs before launchd, so lsd is not running yet. Regular files with that name pattern only. */
++#define NATIVE_GUAMP_LS_MAX 64
++uint32_t native_guamp_ls_rebuild_cycle, native_guamp_ls_rebuild_deleted;
++int native_guamp_ls_rebuild_error;
++static int
++native_guamp_dir_names(const char *path, uint8_t type, char (*names)[64], uint32_t max, uint32_t *found)
++{
++	vfs_context_t ctx = vfs_context_current();
++	const uint32_t entries_size = 16384;
++	uint8_t *entries = kalloc_data(entries_size, Z_WAITOK);
++	vnode_t dir = NULLVP;
++	int error = entries ? 0 : ENOMEM, opened = 0;
++	*found = 0;
++	if (!error) {
++		error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &dir, ctx);
++	}
++	if (!error && vnode_vtype(dir) != VDIR) {
++		error = ENOTDIR;
++	}
++	if (!error) {
++		error = VNOP_OPEN(dir, FREAD, ctx);
++		opened = !error;
++	}
++	off_t offset = 0;
++	for (int eof = 0; !error && !eof;) {
++		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
++		if (!uio) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(entries), entries_size);
++		int count = 0;
++		error = vnode_readdir64(dir, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx);
++		uint32_t filled = entries_size - (uint32_t)uio_resid(uio);
++		offset = uio_offset(uio);
++		uio_free(uio);
++		if (error || !filled) {
++			break;
++		}
++		for (uint32_t at = 0; at + offsetof(struct direntry, d_name) < filled;) {
++			struct direntry *entry = (struct direntry *)(entries + at);
++			if (!entry->d_reclen || at + entry->d_reclen > filled) {
++				error = EINVAL;
++				break;
++			}
++			at += entry->d_reclen;
++			if (!entry->d_ino || entry->d_type != type || entry->d_name[0] == '.' || strlen(entry->d_name) >= 64) {
++				continue;
++			}
++			if (*found < max) {
++				strlcpy(names[*found], entry->d_name, sizeof(names[*found]));
++				*found = *found + 1;
++			}
++		}
++	}
++	if (opened) {
++		VNOP_CLOSE(dir, FREAD, ctx);
++	}
++	if (dir != NULLVP) {
++		vnode_put(dir);
++	}
++	if (entries) {
++		kfree_data(entries, entries_size);
++	}
++	return error;
++}
++static int
++native_guamp_ls_store_match(const char *name)
++{
++	static const char p1[] = "com.apple.LaunchServices-", p2[] = "SystemDataOnly-com.apple.LaunchServices-", suffix[] = ".csstore";
++	size_t length = strlen(name), s_length = sizeof(suffix) - 1;
++	return length > s_length && !strcmp(name + length - s_length, suffix) &&
++	       (!strncmp(name, p1, sizeof(p1) - 1) || !strncmp(name, p2, sizeof(p2) - 1));
++}
++static void
++native_guamp_ls_rebuild(proc_t p, user_addr_t scratch)
++{
++	uint32_t cycle = 0;
++	if (!PE_parse_boot_argn("guamp-ls-rebuild", &cycle, sizeof(cycle)) || !cycle) {
++		return;
++	}
++	native_guamp_ls_rebuild_cycle = cycle;
++	vfs_context_t ctx = vfs_context_current();
++	char marker[96];
++	snprintf(marker, sizeof(marker), "/private/var/db/guamp-ls-rebuild-%u.done", cycle);
++	vnode_t vp = NULLVP;
++	if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		printf("guamp-ls-rebuild: cycle %u already done\n", cycle);
++		return;
++	}
++	static const char base[] = "/private/var/mobile/Containers/Data/InternalDaemon";
++	char (*containers)[64] = kalloc_data(NATIVE_GUAMP_LS_MAX * 64, Z_WAITOK | Z_ZERO);
++	char (*files)[64] = kalloc_data(NATIVE_GUAMP_LS_MAX * 64, Z_WAITOK | Z_ZERO);
++	char *path = kalloc_data(256, Z_WAITOK | Z_ZERO);
++	uint32_t n_containers = 0;
++	int error = containers && files && path ? 0 : ENOMEM;
++	if (!error) {
++		error = native_guamp_dir_names(base, DT_DIR, containers, NATIVE_GUAMP_LS_MAX, &n_containers);
++	}
++	for (uint32_t c = 0; !error && c < n_containers; c++) {
++		uint32_t n_files = 0;
++		snprintf(path, 256, "%s/%s/Library/Caches", base, containers[c]);
++		int list_error = native_guamp_dir_names(path, DT_REG, files, NATIVE_GUAMP_LS_MAX, &n_files);
++		if (list_error) {
++			continue;	/* a container without Library/Caches */
++		}
++		for (uint32_t f = 0; f < n_files; f++) {
++			if (!native_guamp_ls_store_match(files[f])) {
++				continue;
++			}
++			snprintf(path, 256, "%s/%s/Library/Caches/%s", base, containers[c], files[f]);
++			struct unlink_args request = {.path = scratch + 0xa00};
++			int32_t result = 0;
++			int unlink_error = copyout(path, request.path, strlen(path) + 1);
++			if (!unlink_error) {
++				unlink_error = unlink(p, &request, &result);
++			}
++			if (!unlink_error) {
++				native_guamp_ls_rebuild_deleted = native_guamp_ls_rebuild_deleted + 1;
++			} else if (unlink_error != ENOENT) {
++				error = unlink_error;
++			}
++			printf("guamp-ls-rebuild: %s status %d\n", path, unlink_error);
++		}
++	}
++	if (!error) {
++		(void)native_guamp_mkdir(p, scratch, "/private/var/db");
++		vp = NULLVP;
++		error = vnode_open(marker, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx);
++		if (!error) {
++			error = vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	if (containers) {
++		kfree_data(containers, NATIVE_GUAMP_LS_MAX * 64);
++	}
++	if (files) {
++		kfree_data(files, NATIVE_GUAMP_LS_MAX * 64);
++	}
++	if (path) {
++		kfree_data(path, 256);
++	}
++	native_guamp_ls_rebuild_error = error;
++	printf("guamp-ls-rebuild: cycle %u: %u containers, %u deleted, status %d\n", cycle, n_containers,
++	    native_guamp_ls_rebuild_deleted, error);
++}
++/* guamp-home-reset=N (N > 0, owner request 29/10): one-shot Home Screen layout reset, like Settings > General > Transfer or
++ * Reset > Reset Home Screen Layout. Deletes only SpringBoard's icon layout files (the Data backup of 29/10 holds just
++ * IconState.plist; the other names are older/iPad layouts). SpringBoard then rebuilds its default layout at first start.
++ * Widgets (TodayViewArchive.plist), app switcher (RecentAppLayouts), wallpapers (PosterBoard) and preferences are left alone.
++ * Runs before launchd, so SpringBoard is not running. /private/var/db/guamp-home-reset-N.done marks cycle N as done.
++ * (zzzz-guamp-setup-skip's receipt-gated reset reads the same argument and changes nothing without its ADT receipt.) */
++uint32_t native_guamp_home_layout_cycle, native_guamp_home_layout_deleted;
++int native_guamp_home_layout_error;
++static void
++native_guamp_home_layout_reset(proc_t p, user_addr_t scratch)
++{
++	static const char *const files[] = {
++		"/private/var/mobile/Library/SpringBoard/IconState.plist",
++		"/private/var/mobile/Library/SpringBoard/IconState~ipad.plist",
++		"/private/var/mobile/Library/SpringBoard/DesiredIconState.plist",
++		"/private/var/mobile/Library/SpringBoard/IconSupportState.plist",
++	};
++	uint32_t cycle = 0;
++	if (!PE_parse_boot_argn("guamp-home-reset", &cycle, sizeof(cycle)) || !cycle) {
++		return;
++	}
++	native_guamp_home_layout_cycle = cycle;
++	vfs_context_t ctx = vfs_context_current();
++	char marker[96];
++	snprintf(marker, sizeof(marker), "/private/var/db/guamp-home-reset-%u.done", cycle);
++	vnode_t vp = NULLVP;
++	if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		printf("guamp-home-reset: cycle %u already done\n", cycle);
++		return;
++	}
++	int error = 0;
++	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		struct unlink_args request = {.path = scratch + 0xa00};
++		int32_t result = 0;
++		int unlink_error = copyout(files[i], request.path, strlen(files[i]) + 1);
++		if (!unlink_error) {
++			unlink_error = unlink(p, &request, &result);
++		}
++		if (unlink_error == ENOENT) {
++			continue;
++		}
++		if (!unlink_error) {
++			native_guamp_home_layout_deleted = native_guamp_home_layout_deleted + 1;
++		} else {
++			error = unlink_error;
++		}
++		printf("guamp-home-reset: %s status %d\n", files[i], unlink_error);
++	}
++	if (!error) {
++		(void)native_guamp_mkdir(p, scratch, "/private/var/db");
++		vp = NULLVP;
++		error = vnode_open(marker, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx);
++		if (!error) {
++			error = vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	native_guamp_home_layout_error = error;
++	printf("guamp-home-reset: cycle %u: %u deleted, status %d\n", cycle, native_guamp_home_layout_deleted, error);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -7921,6 +8251,9 @@
+ 		native_guamp_iphone_res_mount(p, scratch);
+ 	}
+ 	native_guamp_bt_tool(p, scratch);	/* guamp-bt-tool=1 with sheng-gpu-addon=1 or guamp-iphone-res=1 */
++	native_guamp_cryptex_os(p, scratch);	/* cryptex at /private/preboot/Cryptexes/OS, guamp-cryptex-os=0 skips */
++	native_guamp_ls_rebuild(p, scratch);	/* guamp-ls-rebuild=N, one shot */
++	native_guamp_home_layout_reset(p, scratch);	/* guamp-home-reset=N, one shot */
+ 	if (audio_plugin) {
+ 		native_guamp_audio_plugin_mount(p, scratch);
+ 	}
