@@ -159,6 +159,38 @@ struct Sdam {
   unsigned learnedMah() const { unsigned v = u16(0x68); return v >= 0x8000 ? 0 : v; }
 };
 
+// Battery health as iOS 17 reads it. powerd computes "Maximum Capacity Percent" = ceil(NominalChargeCapacity * 100 /
+// DesignCapacity) (accepted 1..150) and Settings > Battery > Battery Health shows that number. Design capacity: the
+// profile FCC at 25 C (kDesignMah, the gauge's 100 % reference for a new JK50-SWD cell, rated 4850 / typical 5000 mAh).
+// Nominal capacity: the capacity the Linux QG learned (QG SDAM 0x68, written by Linux capacity learning), capped at the
+// design value so a cell measured above the profile reads 100 %, never more. A value outside 50..110 % of the design
+// is not a learning result (SDAM never written or corrupted): the capacity is unknown and the design value is reported,
+// i.e. 100 % (owner request 28/10), flagged as not learned in the log and in the GuampCapacityLearned property.
+struct Health {
+  unsigned nominalMah = kDesignMah, percent = 100;
+  bool learned = false;
+};
+inline bool plausibleLearned(unsigned mah) { return mah >= kDesignMah / 2 && mah <= kDesignMah * 11 / 10; }
+inline Health health(unsigned learnedMah) {
+  Health h;
+  if (plausibleLearned(learnedMah)) {
+    h.learned = true;
+    h.nominalMah = learnedMah > kDesignMah ? kDesignMah : learnedMah;
+  }
+  h.percent = (h.nominalMah * 100 + kDesignMah - 1) / kDesignMah;     // powerd rounds up (fcvtps)
+  return h;
+}
+// "Serial" for powerd: iOS 17 powerd keeps its battery health record per battery serial and sets the record to
+// "unknown" (service state -1, Settings spins forever) when the power source has no Serial. The JK50 pack has no
+// readable serial number (only the batt-id resistor that selects the profile), so this is a fixed model identifier,
+// not a unit serial: 17 characters like Apple's (powerd accepts 16..18), no digits where Apple keeps the
+// year/week of manufacture (characters 3..5), so no manufacture date is derived from it.
+static const char kBatterySerial[] = "GUAMP-JK50SWD-QG1";
+// "WeightedRa" (BatteryData) is compared by powerd/thermalmonitord with the age-aware P0 threshold (default 500). The QG
+// keeps no resistance table; the value is the battery + connector resistance measured on this phone (kRbattMohm,
+// TWRP voltage_now/voltage_ocv at 483 mA), the same constant the gauge uses for its OCV estimate.
+constexpr unsigned kWeightedRa = static_cast<unsigned>(kRbattMohm);
+
 enum PonSource { kShutdownSoc, kS7Pon, kS3Last, kSdamPon, kLoadedVoltage };
 inline const char *ponName(PonSource s) {
   return s == kShutdownSoc ? "SHUTDOWN_SOC" : s == kS7Pon ? "S7_PON_SOC" : s == kS3Last ? "S3_LAST_SOC"
