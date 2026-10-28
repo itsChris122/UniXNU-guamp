@@ -53,7 +53,8 @@ static int writeState(unsigned attempts) {
   vfs_context_t ctx = vfs_context_create(nullptr);
   if (!ctx) return ENOMEM;
   vnode_t vp = NULLVP;
-  int e = vnode_open(kState, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644, 0, &vp, ctx);
+  // vnode_open takes FREAD/FWRITE (O_WRONLY is 1 = FREAD): opened read-only, the FWRITE close drove writecount to -1 (panic 28/10)
+  int e = vnode_open(kState, FWRITE | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644, 0, &vp, ctx);
   if (!e) {
     e = vn_rdwr(UIO_WRITE, vp, text, len, 0, UIO_SYSSPACE, IO_SYNC | IO_NOAUTH, vfs_context_ucred(ctx), nullptr,
                 vfs_context_proc(ctx));
