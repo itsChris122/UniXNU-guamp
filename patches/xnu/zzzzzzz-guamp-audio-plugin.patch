@@ -1,0 +1,65 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f8e3f0e..a22b734 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7842,6 +7842,35 @@ native_guamp_ca_metal_decide(proc_t p, user_addr_t scratch)
+ 	printf("guamp-ca-metal: mode %u attempts %d -> %s (state status %d, marker %d, backboardd prefs %d/%d)\n",
+ 	    guamp_ca_metal_mode, guamp_ca_metal_attempts, enable ? "Metal" : "software", error, marker, prefs[0], prefs[1]);
+ }
++/* guamp: GuampAudio.driver (package/GuampAudio of the device repository: the AudioServerPlugIn that presents the Speaker,
++ * Hawking and Codec devices VirtualAudio expects and writes PCM to /dev/guamp-audio) shown inside /System/Library/Audio/Plug-Ins/HAL,
++ * the sealed root-volume directory (not in the SystemOS cryptex) that the HAL inside audiomxd scans, through the same read-only
++ * union bindfs view as the GPU addon. Only with boot-arg guamp-audio-plugin=1 (default off). The files come from the boot
++ * payload's addon (scripts/make-guamp-gpu-addon.py --audio, names audio/HAL/GuampAudio.driver/...) and are written into Data's
++ * /private/var/ngpu by native_gpu_addon_install, which this switch also enables. The upper directory holds only GuampAudio.driver:
++ * the Apple plug-ins stay visible below it, and directory enumeration (getdirentries, getattrlistbulk) continues into the covered
++ * directory at the end of the upper one. The bundle still has to pass AMFI through the loaded owner trust cache. Never panics:
++ * a missing directory or a refused mount only records its status (stage 5 = mounted, an Apple plug-in and ours both visible). */
++volatile int native_guamp_audio_plugin_stage = 0;
++volatile int native_guamp_audio_plugin_status = -1;
++static int
++native_guamp_audio_plugin_enabled(void)
++{
++	uint32_t enabled = 0;
++	return PE_parse_boot_argn("guamp-audio-plugin", &enabled, sizeof(enabled)) && enabled == 1;
++}
++static void
++native_guamp_audio_plugin_mount(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/ngpu/audio/HAL", point[] = "/System/Library/Audio/Plug-Ins/HAL";
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point),
++	    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver/Info.plist",
++	    "/System/Library/Audio/Plug-Ins/HAL/GuampAudio.driver/Info.plist", &native_guamp_audio_plugin_stage,
++	    &native_guamp_audio_plugin_status);
++	printf("guamp-audio-plugin: addon files %d, written %d, same %d, failed %d (last error %d); %s stage %d status %d\n",
++	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
++	    point, native_guamp_audio_plugin_stage, native_guamp_audio_plugin_status);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -7851,10 +7880,12 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	}
+ 	/* guamp-iphone-res=1 installs the payload addon too (it carries the iPhone resources) and mounts their views right after it. */
+ 	int iphone_res = native_guamp_iphone_res_enabled();
+-	if (enabled != 1 && !iphone_res) {
++	/* guamp-audio-plugin=1 likewise installs the addon (it carries GuampAudio.driver) and mounts the HAL view after it. */
++	int audio_plugin = native_guamp_audio_plugin_enabled();
++	if (enabled != 1 && !iphone_res && !audio_plugin) {
+ 		return;
+ 	}
+-	if (iphone_res) {
++	if (iphone_res || audio_plugin) {
+ 		native_guamp_iphone_res_ngpu(p, scratch);
+ 	}
+ 	native_gpu_addon_install(p, scratch);
+@@ -7862,6 +7893,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 		native_guamp_iphone_res_mount(p, scratch);
+ 	}
+ 	native_guamp_bt_tool(p, scratch);	/* guamp-bt-tool=1 with sheng-gpu-addon=1 or guamp-iphone-res=1 */
++	if (audio_plugin) {
++		native_guamp_audio_plugin_mount(p, scratch);
++	}
+ 	if (enabled != 1) {
+ 		return;
+ 	}

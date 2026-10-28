@@ -1,76 +1,68 @@
-# GuampAudio.driver — iOS side, step "null audio device"
+# GuampAudio.driver — iOS side of guamp audio
 
 Route (c) of `analisi/audio/IOS-AUDIO-LATO-UTENTE-20261028.md`: an AudioServerPlugIn in userland that presents the built-in
 devices with the UIDs VirtualAudio expects, instead of an `IOAudio2Device` in the kernel (undocumented ABI) or nubs for
 Apple's MCA/SIO/codec kexts (would drive Apple hardware). Proven on iOS 16 by hackios (D22); here the host is
 **audiomxd** (iPadOS 17.7.11, 21H461, `CoreAudioServices/audiomxd` feature flag).
 
-Status: source skeleton only. Nothing is built, packaged or booted yet.
+Status: complete source, PC-checked (host test + arm64-apple-ios17 syntax), CI workflow and kernel mount prepared. Not built
+on a Mac yet, not booted.
 
 ## Pieces
 
-| Piece | Where | State |
-|---|---|---|
-| Plug-in (CFPlugIn `443ABAB8-…`, factory `GuampAudio_Create`) | `GuampAudio.c`, `GuampAudioServerPlugIn.h`, `Info.plist` | written, host syntax check only |
-| Build + CDHash | `build-guamp-audio-plugin.sh` (macOS runner, iPhoneOS SDK, ad hoc signature) | written, not run |
-| ADT facts | `scripts/make-guamp-audio-adt.py` → `Codex/cpu-config-8-audio/kernel.macho.adt` | generated (base `cpu-config-8-gpu-pub`) |
-| Placement | NGPUADD2 addon entry `audio/HAL/GuampAudio.driver/*` + kernel bindfs union over `/System/Library/Audio/Plug-Ins/HAL` | design below, kernel patch not written |
-| Trust | CDHash in the owner trust cache (`make-owner-trust-bundle.py`), as the Adreno Metal plugin | design below |
-| Kernel bridge `/dev/guamp-audio` | step 4 | not started |
+| Piece | Where |
+|---|---|
+| Plug-in (CFPlugIn `443ABAB8-…`, factory `GuampAudio_Create`) | `GuampAudio.c`, `GuampAudioServerPlugIn.h`, `Info.plist` |
+| Clock / volume law / s16 conversion / staging FIFO (no OS calls) | `GuampAudioCore.h`, host test `tests/guamp_audio_core_test.c` |
+| Kernel interface `/dev/guamp-audio` (shared with the kernel side) | `guamp_audio_dev.h` |
+| PC checks | `tests/check-guamp-audio.sh` (stand-in headers in `tests/stubs`, `tests/darwin-libc`) |
+| Build + 4 KiB ad hoc signature + CDHash | `build-guamp-audio-plugin.sh`; CI: `guamp-kernel-build/.github/workflows/audio-plugin.yml` |
+| Addon entry `audio/HAL/GuampAudio.driver/*` | `scripts/make-guamp-gpu-addon.py --audio DIR [--no-gpu]` |
+| Addon + owner trust bundle on the PC | `scripts/compose-guamp-audio-addon.py` (recomputes the CDHash from the signature) |
+| Mount over `/System/Library/Audio/Plug-Ins/HAL` | `patches/xnu/zzzzzzz-guamp-audio-plugin.patch`, boot-arg `guamp-audio-plugin=1` (default off) |
+| ADT facts | `scripts/make-guamp-audio-adt.py` → `Codex/cpu-config-8-audio/kernel.macho.adt` |
 
-## Devices (null I/O)
+## Devices
 
 | UID | Streams | Controls | Why |
 |---|---|---|---|
-| `Speaker` | out 2 ch (`spkr`), in 2 ch silent | volume `vlme`, −48…0 dB (16 × 3 dB) | VirtualAudio's built-in speaker port; the silent input stands for the amplifier sense |
-| `Hawking` | in 1 ch silent | — | VirtualAudio's `vhaw` companion VAD (hackios: without it every route stays on the null port); J120 has `audio-hawking-device` |
-| `Codec` | in 1 ch silent (`micr`) | data source selector, one item `imic` "Microphone" | built-in microphone port; VirtualAudio asks DataSources on the codec input |
+| `Speaker` | out 2 ch (`spkr`), in 2 ch silent | volume `vlme` −48…0 dB, mute `mute` | VirtualAudio's built-in speaker port |
+| `Hawking` | in 1 ch silent | — | VirtualAudio's `vhaw` companion VAD (hackios: without it every route stays on the null port) |
+| `Codec` | in 1 ch silent (`micr`) | data source `imic` "Microphone" | built-in microphone port |
 
-Format: Float32 interleaved, 48 kHz, one format per stream (sample-rate and format changes to anything else are refused).
-Clock: `mach_absolute_time()`, zero time stamp every 16384 frames (NullAudio model), clock domain 0, latency/safety 0.
-WriteMix is dropped, ReadInput is zeros. Every property the plug-in does not know is logged once per selector
-(`os_log` subsystem `com.guamp.audio`): that list, plus audiomxd's own log, answers plan step 3 (which UIDs and
-properties VirtualAudio of J120 really needs). `Actuator`/`Digital Mic` are left out until the log asks for them.
+Format to the HAL: Float32 interleaved 48 kHz (other rates/formats refused). Clock: `mach_absolute_time()`, zero time stamp
+every 16384 frames, one period per call (NullAudio model), seed bumped on each restart. Unknown properties are logged once
+(`os_log` subsystem `com.guamp.audio`) to learn what VirtualAudio of J120 asks.
 
-Expected effect when it works: the volume HUD and the Control Center slider move, `AVAudioSession.currentRoute` shows
-Speaker, apps "play" silently; no change for Bluetooth (BTAudioHALPlugin untouched).
+## Output path
 
-## Placement: addon + bindfs union (design, kernel patch to write)
+- Speaker's first StartIO opens `/dev/guamp-audio` (`O_WRONLY|O_NONBLOCK`), checks `GET_INFO` (abi 1, 48 kHz, 2 ch, 16 bit),
+  `SET_ROUTE speaker`, `SET_VOLUME`, `START`. Last StopIO: `STOP`, close, counters to the log.
+- WriteMix: Float32 → s16 (rounded, saturated, NaN → 0), 512-frame chunks into a 4096-frame FIFO, flushed with non-blocking
+  write(); a short write/EAGAIN leaves the rest for the next cycle; a full FIFO drops the oldest frames (bounded latency).
+- Volume/mute: Q16 gain to the kernel by ioctl; if the ioctl fails (ENOTTY, sandbox EPERM) the plug-in scales the samples.
+- No device, wrong ABI or open refused: null output (logged once per errno), everything else unchanged.
 
-`/System/Library/Audio/Plug-Ins/HAL` is on the sealed system volume. The mechanism is the one of the iPhone resources and
-of the Metal plugin (`patches/xnu/zzy-native-gpu-addon-mount.patch`, `zzzz-guamp-iphone-res.patch`):
+## Placement
 
-1. the payload addon (`kernel.macho.gpuaddon`, NGPUADD2) carries `audio/HAL/GuampAudio.driver/Info.plist` and
-   `…/GuampAudio` (mode 0755); `native_gpu_addon_install` writes them below Data's `/private/var/ngpu`;
-2. new boot arg `guamp-audio-plugin=1`: after the Data mount and before launchd, `native_gpu_addon_mount(…,
-   "/private/var/ngpu/audio/HAL", "/System/Library/Audio/Plug-Ins/HAL", visible = ".../HAL/BTAudioHALPlugin.driver",
-   own = ".../HAL/GuampAudio.driver", …)` — read-only `MNT_UNION` bindfs, original plug-ins still visible (stage 4),
-   ours visible (stage 5); never panics, status logged;
-3. to check first: the HAL directory is in the System volume and not in the SystemOS cryptex (iphone-res had the same
-   question for its frameworks); if it is in the cryptex the union goes over the cryptex path.
+`/System/Library/Audio/Plug-Ins/HAL` is on the sealed **root system volume** (verified on 21H461: `044-76040` holds it with
+BuiltinAudioPlugin, BTAudioHALPlugin…; the SystemOS cryptex `044-76034` has no Audio directory). The HAL (dyld cache .17)
+scans `/System/Library/Audio/Plug-Ins/HAL`, `/Library/Audio/Plug-Ins/HAL` and `/Library/Apple/Audio/Plug-Ins/HAL` (the
+last does not exist on the volume, so no mount point). With `guamp-audio-plugin=1` the kernel installs the payload addon into
+Data's `/private/var/ngpu` (also without `sheng-gpu-addon`/`guamp-iphone-res`) and mounts `/private/var/ngpu/audio/HAL`
+read-only, `MNT_UNION`, over the HAL directory; stage 5 = BuiltinAudioPlugin and GuampAudio both visible. Enumeration falls
+through to the Apple plug-ins (`native-union-getattrlistbulk.patch`, getdirentries union code).
 
-Without `guamp-audio-plugin=1` nothing changes (default off), like `sheng-gpu-addon`.
+## Signing, trust, sandbox
 
-## Signing and trust
-
-- Ad hoc signature (`codesign -s -`), no entitlements: the HAL loads the bundle into audiomxd, so audiomxd's
-  entitlements and sandbox apply; the plug-in itself needs only to pass AMFI library validation.
-- AMFI accepts it because its CDHash is in the **owner trust cache** loaded by the payload
-  (`kernel.macho.trustcache` built with `UniXNU/scripts/make-owner-trust-bundle.py`: the base trust cache modules byte for
-  byte + one owner module with our CDHashes), exactly as `cpu-config-8-gpu-pub` does for NativeAdrenoMetal
-  (`gpu-userspace.json` `own_cdhashes`). The RAM test passes it with `prepara-boot-smp-fix.py --trustcache`.
-- Trust-cache code counts as platform code, which is what audiomxd's library validation requires (hackios: same on iOS 16
-  in mediaserverd). Open point: whether audiomxd on 17.x adds a plug-in allow-list or a bundle-ID check; the first boot
-  will tell (audiomxd log: "HALS_PlugInManager" lines, our `GuampAudio: initialized`).
-- Sandbox: the null device opens nothing. Step 4 opens `/dev/guamp-audio`; audiomxd's profile may deny it (hackios saw no
-  block, unverified on 17): alternatives are an IOKit user client of NativeEmmc or a shared memory ring mapped by the
-  kernel.
-
-## Next steps
-
-1. Build on the runner (`build-guamp-audio-plugin.sh`), add the addon entry + owner trust bundle, write the
-   `guamp-audio-plugin=1` mount patch; RAM test with ADT `cpu-config-8-audio`.
-2. Read audiomxd/VirtualAudio logs (unified log reader of `analisi/bt/log-unificato/`), add or rename UIDs until the
-   Speaker route appears.
-3. Kernel bridge `/dev/guamp-audio` (s16 48 kHz ring, volume ioctl), then the ADSP sink (q6asm/AFE → PRI MI2S 0x1000 →
-   aw882xx) once `GuampAdsp: ADSP APR OK` is seen.
+- Ad hoc, `--pagesize 4096`, identifier `com.guamp.audio.GuampAudio`, no entitlements (it runs inside audiomxd). Apple's own
+  HAL plug-ins and audiomxd are 4 KiB-page signed and in the static trust cache; ours goes into the owner trust module.
+- audiomxd: `platform-application`, `com.apple.private.audio.driver-host`, sandbox `com.apple.private.sandbox.profile:embedded`
+  = `temporary-sandbox`, runs as `mobile`. File exceptions: read `/Library/Audio/Plug-Ins/HAL/`, `/Library/Audio/Tunings/`,
+  read-write only `/dev/exfiltration-audio_capture`. Whether its profile lets it open `/dev/guamp-audio` is open: the
+  plug-in then logs `unavailable (errno 1)` and stays silent. Fallback without touching the sandbox: an IOKit user client
+  published with `NativeSandboxGrantProcess = audiomxd` (`zzw-native-adreno-sandbox-grant.patch` mechanism).
+- Node permissions: root:mobile 0660 (`guamp_audio_dev.h`).
+- No plug-in allow-list strings found in the HAL (`HALS_PlugInManager::LoadPlugIns: loading plug-in from: %s`); optional
+  Info.plist keys seen: `AudioServerPlugIn_LoadingConditions`, `AudioServerPlugIn_MachServices`,
+  `AudioServerPlugIn_IOKitUserClients` (not needed).
