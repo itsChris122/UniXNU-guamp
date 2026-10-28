@@ -282,9 +282,13 @@ static void powerPlanTest() {
   auto r=std::make_unique<Rpm>(); r->channel=1; r->glink.running=true;
   r->glink.channels[0].local=1; r->glink.channels[0].announced=true;
   WifiPower power; CHECK(power.begin(r.get(),true)==NotReady);
-  CHECK(power.begin(r.get(),false)==Ok&&power.count==4&&power.busy&&!power.proxyHeld);
+  CHECK(power.begin(r.get(),false)==Ok&&power.count==8&&power.busy&&!power.proxyHeld);
   CHECK(power.plan[0].type==0x306b6c63&&power.plan[0].key==0x62616e45&&power.plan[0].value==1);
   CHECK(power.plan[2].type==0x78637772&&power.plan[2].key==0x6c766c76&&power.plan[2].value==384);
+  // rpm-smd-regulator with the pil proxy load: "ma" 100 (HPM) and "swen" 1, active and sleep
+  CHECK(power.plan[4].type==0x78637772&&power.plan[4].key==0x616d&&power.plan[4].value==100);
+  CHECK(power.plan[6].type==0x78637772&&power.plan[6].key==0x6e657773&&power.plan[6].value==1);
+  CHECK(power.plan[5].state==1&&power.plan[7].state==1);
   CHECK(power.plan[0].state==0&&power.plan[1].state==1);
   power.busy=false; power.proxyHeld=true;
   CHECK(power.begin(r.get(),true)==Ok&&power.count==16&&!power.wlanHeld);

@@ -29,6 +29,10 @@
 #if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
 #include "guamp_xnu_sm6115_runtime.h"
 #endif
+// The kernel's one SMEM allocation lock (GuampSmemLock.inc, defined in this translation unit by GuampAdspIpc.inc):
+// GuampModemInit.inc allocates SMEM item 134 under it.
+extern "C" bool guamp_smem_hwlock_acquire(void);
+extern "C" void guamp_smem_hwlock_release(void);
 
 extern "C" {
 extern unsigned long guamp_phys_base __asm__("_gPhysBase");   // XNU-managed RAM (osfmk/arm64/arm_vm_init.c),
@@ -209,6 +213,11 @@ char activeSlot() {
 static bool modemStopped();
 static bool modemAwaitReady();
 static void modemFailureReport();
+// Modem init prerequisites + diagnostics (GuampModemInit.inc, defined below after the SMEM readers)
+#define GUAMP_MODEM_INIT 1
+static void modemInitPrepare();
+static void modemWatchStart();
+static void modemInitReport();
 #include "GuampModem.inc"
 
 static unsigned radioMode() {
@@ -329,6 +338,8 @@ static bool modemAwaitReady() {
   }
   if(info)IOFree(info,sizeof(*info));if(state)IOFree(state,sizeof(*state));map->release();return ready;
 }
+
+#include "GuampModemInit.inc"
 
 void smemReport() {
   if (kSmemPhys + kSmemBytes > guamp_phys_base && kSmemPhys < guamp_phys_base + guamp_phys_size) {
