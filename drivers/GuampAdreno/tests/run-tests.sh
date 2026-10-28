@@ -3,7 +3,8 @@
 # (the Adreno 610 fork) and authored kernel stand-ins (kernel_shim.h), on arm64-apple-ios. Usage:
 #   run-tests.sh [NativeAdreno dir] [ArmSmmu4K dir] [AdrenoPM4 dir]
 # (defaults: the device repository's drivers/NativeAdreno and kits/ArmSmmu4K, kits/AdrenoPM4 of the build tree or ~/moto/riferimenti).
-# The guamp-gpu-recover host test (recover_host.cpp) runs after the syntax check.
+# The guamp-gpu-recover host test (recover_host.cpp) runs after the syntax check; then patches/native-adreno/*.patch are applied to a
+# copy of the pinned sources and dropViews' map loop runs, pinned and patched, over the XNU reference model (view_unmap_host.cpp).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -30,5 +31,31 @@ echo "== guamp-gpu-recover decisions and ring layout (GuampGpuRecoverCore.h): cl
 FLAGS="-std=gnu++20 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -fno-exceptions -fno-rtti"
 clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined "$HERE/recover_host.cpp" -o "$WORK/recover_host" && "$WORK/recover_host" || rc=1
 g++ $FLAGS -Wvolatile "$HERE/recover_host.cpp" -o "$WORK/recover_host_gcc" && "$WORK/recover_host_gcc" >/dev/null || rc=1
+echo "== patches/native-adreno apply to the pinned NativeAdreno; dropViews releases the maps it takes (view_unmap_host.cpp)"
+mkdir -p "$WORK/na"
+cp "$NA"/*.cpp "$NA"/*.h "$WORK/na/"
+for p in "$REPO"/patches/native-adreno/*.patch; do
+  [ -e "$p" ] || continue
+  patch -s -p1 -N -t -d "$WORK/na" -i "$p" || { echo "$(basename "$p"): does not apply"; rc=1; }
+done
+extract() {   # source output: the statements of dropViews between "if(!view)return;" and "view->release();"
+  python3 -I - "$1" "$2" <<'PY' || return 1
+import sys
+s = open(sys.argv[1]).read()
+f = s.index('void AGXDeviceUserClient::dropViews(')
+a = s.index('if(!view)return;', f) + len('if(!view)return;')
+b = s.index('view->release();', a)
+open(sys.argv[2], 'w').write(s[a:b] + '\n')
+PY
+}
+for v in pinned:1:"$NA" patched:0:"$WORK/na"; do
+  name=${v%%:*}; rest=${v#*:}; leak=${rest%%:*}; dir=${rest#*:}
+  extract "$dir/NativeAdrenoPublish.cpp" "$WORK/loop-$name.inc" || { echo "$name: dropViews not found"; rc=1; continue; }
+  echo "-- $name loop (expect leak=$leak)"
+  clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -DEXPECT_LEAK=$leak "-DVIEW_DROP_LOOP=\"$WORK/loop-$name.inc\"" \
+    "$HERE/view_unmap_host.cpp" -o "$WORK/view_$name" && "$WORK/view_$name" || rc=1
+  g++ $FLAGS -Wvolatile -DEXPECT_LEAK=$leak "-DVIEW_DROP_LOOP=\"$WORK/loop-$name.inc\"" \
+    "$HERE/view_unmap_host.cpp" -o "$WORK/view_${name}_gcc" && "$WORK/view_${name}_gcc" >/dev/null || rc=1
+done
 echo "== result: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc

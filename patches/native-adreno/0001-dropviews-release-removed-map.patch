@@ -1,0 +1,21 @@
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index fe15901..9ccca98 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -283,8 +283,14 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
+         else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+         IOLockUnlock(g.lock);
+         if(!view)return;
+-        /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
+-        while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        /* removeMappingForDescriptor hands back the map RETAINED (IOUserClient.cpp: map->retain() before mappings->removeObject): that
++         * reference is the last one outside the descriptor's own list, and only releasing it frees the map, which unmaps the user range.
++         * Dropping the pointer leaked the map with its user PTEs, and the BO's pages went back to the VM still mapped: guamp kernel-gpu12,
++         * Preferences exiting with BO views mapped, pmap_assert_free "User CPU mapping" from vm_page_free_list under clientClose/releaseAll. */
++        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
++            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++            map->release();
++        }
+         view->release();
+     }
+ }

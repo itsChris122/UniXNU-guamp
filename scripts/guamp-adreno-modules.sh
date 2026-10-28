@@ -7,6 +7,8 @@
 #                         moved that include to ../AdrenoMetal.
 #   kits/ArmSmmu4K        xVanTuring/ArmSmmu4K b464afc: UniXNU/ArmSmmu4K main merged into tb128fu, the kit Adreno610 is built
 #                         with (the base pins 4d0d659, three commits older, without ArmSmmu4KLiveMapContextBatchExclusive).
+#                         guamp's fixes to it stay out of the submodule: patches/native-adreno/*.patch, applied by build-guamp-adreno.py to
+#                         a copy under build/ (0001: dropViews released no map it took back, kernel-gpu12 pmap_assert_free).
 # kits/AdrenoPM4 stays the base's (445f8fe; upstream main only adds documentation).
 # Run once from the repository root, review "git status", then commit .gitmodules and the two gitlinks.
 set -euo pipefail

@@ -7,17 +7,31 @@ see scripts/guamp-adreno-modules.sh): the pinned UniXNU NativeAdreno has no A6XX
 the GMU and its platform nodes, the HFI firmware path, NativeAdrenoService.cpp and its board glue. The staged accelerator class
 (build-native-adreno-accelerator.py, run next when wanted) adds itself to this archive. No firmware is embedded: the probe takes
 a630_sqe.fw from the caller, which reads it from vendor at boot."""
-import json, re, subprocess, sys
+import json, re, shutil, subprocess, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 c_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o.json').read_text().strip().rstrip(','))
 cxx_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
 out = ROOT / 'build/native-adreno'
 out.mkdir(parents=True, exist_ok=True)
-driver = ROOT / 'drivers/NativeAdreno'
+pinned = ROOT / 'drivers/NativeAdreno'
 probe = ROOT / 'drivers/GuampAdreno'
-if not (driver / 'NativeAdrenoIrq.h').read_text().count('maskA6xx'):
+if not (pinned / 'NativeAdrenoIrq.h').read_text().count('maskA6xx'):
     sys.exit('drivers/NativeAdreno has no A6XX generation: check out the Adreno 610 fork (scripts/guamp-adreno-modules.sh)')
+# The submodule stays pinned (81a0b01): guamp's fixes to it are patches/native-adreno/*.patch (paths a/<file> relative to the submodule),
+# applied in order to a copy of its top-level sources under build/, which is what gets compiled. A patch that does not apply stops the build.
+driver = out / 'src'
+shutil.rmtree(driver, ignore_errors=True)
+driver.mkdir()
+for f in pinned.iterdir():
+    if f.is_file() and f.suffix in ('.cpp', '.h', '.inc'):
+        shutil.copy2(f, driver / f.name)
+for patch in sorted((ROOT / 'patches/native-adreno').glob('*.patch')):
+    result = subprocess.run(['patch', '-p1', '-N', '-t', '-d', str(driver), '-i', str(patch)],
+                            capture_output=True, text=True)
+    if result.returncode:
+        sys.exit('patches/native-adreno/%s does not apply to drivers/NativeAdreno:\n%s%s' % (patch.name, result.stdout, result.stderr))
+    print('applied patches/native-adreno/' + patch.name)
 sources = sorted((ROOT / 'kits/ArmSmmu4K').glob('ArmSmmu4K*.c')) + [ROOT / 'kits/AdrenoPM4/AdrenoPM4.c']
 sources += [driver / (name + '.cpp') for name in (
     'NativeAdrenoGpuContext', 'NativeAdrenoSmmuContext', 'NativeAdrenoSmmuMemory',
