@@ -4,8 +4,11 @@
 // and feeds every received message to receive(); time is passed in (ms) so tests/adsp_ipc_host.cpp can drive it.
 // Protocol studied in the guamp kernel techpack/audio (no code copied): include/ipc/apr.h, ipc/apr.c apr_send_pkt,
 // ipc/apr_tal_rpmsg.c, dsp/q6core.c, include/dsp/q6core.h, include/dsp/apr_audio-v2.h:
-//   header (32 bytes, little endian): hdr_field = msg_type << 8 | hdr_len_words << 4 | version (SEQ_CMD 2, 8 words,
-//   v0 = 0x0280), pkt_size, src_svc, src_domain, src_port, dest_svc, dest_domain, dest_port, token, opcode.
+//   header (struct apr_hdr, 20 bytes, little endian): hdr_field = msg_type << 8 | hdr_len_words << 4 | version
+//   (APR_HDR_FIELD(SEQ_CMD 2, APR_HDR_LEN(APR_HDR_SIZE) = 5 words, v0) = 0x0250), pkt_size (header included),
+//   src_svc, src_domain, src_port, dest_svc, dest_domain, dest_port, token, opcode. apr_cb_func accepts a header of
+//   5 words or more and version 0 or 1, so parse() does the same. (Phase 2 sent 8 words / 0x0280 with 12 undefined
+//   bytes and refused the ADSP's 20-byte headers: fixed 28/10, checked against sizeof(struct apr_hdr) = 20.)
 //   apr_send_pkt fills src_domain APPS (5), src_svc = dest_svc = the client's service (q6core: ADSP_CORE 3),
 //   dest_domain ADSP (4); q6core uses ports 0. Responses come back with src/dest swapped.
 //   q6core_is_adsp_ready: AVCS_CMD_ADSP_EVENT_GET_STATE 0x1290c (no payload) -> AVCS_CMDRSP_ADSP_EVENT_GET_STATE
@@ -18,8 +21,8 @@
 #define GUAMP_APR_INC
 namespace apr {
 
-constexpr uint16_t kHdrField = (2u << 8) | (8u << 4);   // SEQ_CMD, 32-byte header, version 0
-constexpr uint32_t kHdrBytes = 32, kMaxPacket = 512;     // APR_MAX_BUF of apr_tal_rpmsg.c
+constexpr uint16_t kHdrField = (2u << 8) | (5u << 4);   // SEQ_CMD, 20-byte header, version 0
+constexpr uint32_t kHdrBytes = 20, kMaxPacket = 512;     // sizeof(struct apr_hdr); APR_MAX_BUF of apr_tal_rpmsg.c
 constexpr uint8_t kDomainAdsp = 4, kDomainApps = 5, kSvcCore = 3, kSvcAfe = 4, kSvcAsm = 7, kSvcAdm = 8;
 constexpr uint32_t kBasicResult = 0x000110e8, kGetState = 0x0001290c, kGetStateRsp = 0x0001290d;
 constexpr uint32_t kGetFwk = 0x0001292c, kGetFwkRsp = 0x0001292d;
@@ -38,7 +41,8 @@ inline uint32_t rd32(const uint8_t *p) { return rd16(p) | (static_cast<uint32_t>
 inline void wr16(uint8_t *p, uint16_t v) { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
 inline void wr32(uint8_t *p, uint32_t v) { wr16(p, static_cast<uint16_t>(v)); wr16(p + 2, static_cast<uint16_t>(v >> 16)); }
 
-// A command from apps to an ADSP service (apr_send_pkt); returns the packet size, 0 if it does not fit
+// A command from apps to an ADSP service (apr_send_pkt); returns the packet size, 0 if it does not fit. The port is
+// both src_port and dest_port (q6core/q6afe 0, q6asm session << 8 | stream, q6adm the AFE port id).
 inline uint32_t build(uint8_t *out, uint32_t cap, uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode,
                       const uint8_t *payload, uint32_t n) {
   if (cap < kHdrBytes || n > cap - kHdrBytes || n > kMaxPacket - kHdrBytes || (n & 3)) return 0;
@@ -56,7 +60,7 @@ inline uint32_t build(uint8_t *out, uint32_t cap, uint8_t svc, uint16_t port, ui
   return kHdrBytes + n;
 }
 
-// apr_cb_func checks: header length >= 8 words and inside the packet, pkt_size inside the message, version 0
+// apr_cb_func checks: header length >= 5 words and inside the packet, pkt_size inside the message, version <= 1
 inline bool parse(const uint8_t *p, uint32_t n, Header *h, const uint8_t **payload, uint32_t *payloadBytes) {
   if (n < kHdrBytes) return false;
   h->hdrField = rd16(p);
@@ -70,7 +74,7 @@ inline bool parse(const uint8_t *p, uint32_t n, Header *h, const uint8_t **paylo
   h->token = rd32(p + 12);
   h->opcode = rd32(p + 16);
   const uint32_t hdrLen = ((h->hdrField >> 4) & 0xf) * 4;
-  if ((h->hdrField & 0xf) || hdrLen < kHdrBytes || h->pktSize < hdrLen || h->pktSize > n) return false;
+  if ((h->hdrField & 0xf) > 1 || hdrLen < kHdrBytes || h->pktSize < hdrLen || h->pktSize > n) return false;
   *payload = p + hdrLen;
   *payloadBytes = h->pktSize - hdrLen;
   return true;

@@ -7,9 +7,12 @@
 //                  then the ready signal over SMP2P; PAS SHUTDOWN and cleanup on any failure
 //   guamp-adsp-delay=<s>  start later (0..600 s, default 0), so the USB mirror (connected ~4 s after boot) sees every
 //                  GuampAdsp line (as guamp-gpu-delay / guamp-wifi-delay); the thread logs the delay it honoured
-//   guamp-adsp-ipc=1|2|3  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 443 before the
-//                  start + inbound negotiation; 2 + GLINK SMEM edge after err-ready and channel apr_audio_svc;
-//                  3 + APR q6core state / framework version queries ("ADSP APR OK"). Default 0 = phase 1 only.
+//   guamp-adsp-ipc=1|2|3|4  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 443 before
+//                  the start + inbound negotiation; 2 + GLINK SMEM edge after err-ready and channel apr_audio_svc;
+//                  3 + APR q6core state / framework version queries ("ADSP APR OK"); 4 + the first tone (q6afe DTMF on
+//                  PRIMARY_MI2S_RX 0x1000, GuampAfe.inc, "ADSP TONE OK|FAILED"). Default 0 = phase 1 only.
+//   guamp-adsp-tone=<ms>  with ipc 4: tone length 100..20000 ms (default 3000)
+//   guamp-adsp-tone-gain=<n>  with ipc 4: AFE DTMF gain 1..0xffff (default 0x800)
 // Default: nothing runs. The original signed firmware is loaded unchanged; TrustZone authenticates it.
 // Facts (guamp device tree: decompiled ~/moto/guamp.dts = bengal.dtsi + guamp dtbo, guamp kernel sources):
 //   qcom,lpass@ab00000 (qcom,pil-tz-generic): qcom,pas-id 1, qcom,firmware-name "adsp", memory-region
@@ -313,7 +316,12 @@ void start() {
   started = true;
   gMode = mode;
   unsigned ipc = 0;
-  if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 3) adspipc::gLevel = ipc;
+  if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 4) adspipc::gLevel = ipc;
+  unsigned toneMs = 0, toneGain = 0;
+  if (PE_parse_boot_argn("guamp-adsp-tone", &toneMs, sizeof(toneMs)) && toneMs >= 100 && toneMs <= 20000)
+    adspipc::gToneMs = toneMs;
+  if (PE_parse_boot_argn("guamp-adsp-tone-gain", &toneGain, sizeof(toneGain)) && toneGain && toneGain <= 0xffff)
+    adspipc::gToneGain = toneGain;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

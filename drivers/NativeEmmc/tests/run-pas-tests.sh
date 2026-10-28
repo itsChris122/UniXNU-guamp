@@ -15,7 +15,7 @@ echo "== kernel glue: arm64-apple-ios, -Werror, integer registers only, smc pres
 clang++ $KFLAGS -S "$HERE/adsp_glue_check.cpp" -o "$WORK/adsp_glue.s" && grep -q 'smc' "$WORK/adsp_glue.s" \
   && echo "adsp_glue_check: compiled, smc emitted" || rc=1
 echo "== no raw newline inside a string literal of the new kernel sources"
-(cd "$HERE/.." && python3 -I tests/check_literals.py GuampAdsp.inc GuampAdspIpc.inc GuampGpuZap.inc GuampSmemWrite.inc GuampSmemLock.inc GuampWifiWire.inc GuampSmp2pEdge.inc GuampGlinkEdge.inc GuampApr.inc GuampPas.inc GuampPasCore.inc GuampScm.inc GuampScmArm64.inc NativeEmmc.cpp) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GuampAdsp.inc GuampAdspIpc.inc GuampGpuZap.inc GuampSmemWrite.inc GuampSmemLock.inc GuampWifiWire.inc GuampSmp2pEdge.inc GuampGlinkEdge.inc GuampApr.inc GuampAfe.inc GuampAudioHwWeak.inc GuampAudioHw.h GuampPas.inc GuampPasCore.inc GuampScm.inc GuampScmArm64.inc NativeEmmc.cpp) || rc=1
 echo "== SCM transport (clang, gcc)"
 clang++ $FLAGS "$HERE/scm_host.cpp" -o "$WORK/scm" && "$WORK/scm" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/scm_host.cpp" -o "$WORK/scm_gcc" && "$WORK/scm_gcc" >/dev/null || rc=1
