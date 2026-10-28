@@ -194,7 +194,7 @@ enum bts_bcm_action {
     BTS_BCM_VERBOSE,      // ACK with bts_identity::verbose
     BTS_BCM_FEATURES,     // ACK with bts_identity::features
     BTS_BCM_USB_PRODUCT,  // ACK with bts_identity::usbProduct
-    BTS_BCM_SUBOP_ACK,    // ACK with the sub-opcode (first parameter byte) echoed back
+    BTS_BCM_ZERO8,        // ACK followed by 8 zero bytes (Apple 0xfce2 sub-commands, see the table)
 };
 struct bts_bcm_cmd { uint16_t opcode; enum bts_bcm_action action; const char *name; };
 // Linux drivers/bluetooth btbcm.c / hci_bcm.c opcodes. Entries marked (?) are less certain; an unlisted vendor command
@@ -213,10 +213,15 @@ static const struct bts_bcm_cmd kBtsBcmCmds[] = {
     {0xfc6d, BTS_BCM_ACK, "i2spcm_param"},             // I2S/PCM interface parameters (?)
     {0xfc6e, BTS_BCM_FEATURES, "read_features"},       // btbcm_read_controller_features (?)
     {0xfc79, BTS_BCM_VERBOSE, "read_verbose_config"},  // btbcm_read_verbose_config (?)
-    // Apple's multiplexed VSC (bluetoothd 21H461, Stack/vsc/bcm/bcm_vsc.c: 48 _BCM_Olympic* senders call the VSC
-    // sender 0x100050818 with OCF 0xe2, sub-opcode first). Those completing through the generic status-only callback
-    // 0x10004eec4 need status 0; RAM test 8 stopped on status 0x01 for it. (?) for sub-commands that read data.
-    {0xfce2, BTS_BCM_SUBOP_ACK, "apple_olympic"},
+    // Apple's multiplexed VSC (bluetoothd 21H461, Stack/vsc/bcm/bcm_vsc.c): 48 _BCM_Olympic* senders call the VSC
+    // sender 0x100050818 with OCF 0xe2 and a le32 sub-command (WriteNumOfCompletedPackets 0, ReadWBSSupport 5,
+    // ReadLESettings 0x0a, ReadProfilingStats 0x0d, CountryCodeSel 0x13, SetExtendedScanLimits 0x2c,
+    // GetExtendedAdvNumDropped 0x2d, SetExtendedAdvLimits 0x2e, ...). Reply parsers: status only (0x10004eec4), one
+    // byte (_BCM_U8EventParser 0x100195180: 5, 0x0a), the raw stream to the caller (_BCM_ByteStreamEventParser
+    // 0x100075f94, which asserts on an empty stream), le32 (0x100075e88: 0x2d), 4 x le16 (0x100195518: 0x0d). Status 0
+    // with 8 zero bytes satisfies every parser: values 0 (no WBS, default LE settings, nothing dropped) and a 0 first
+    // byte where a stream consumer reads a status. RAM test 9 (sub-opcode echoed) still stopped right after it.
+    {0xfce2, BTS_BCM_ZERO8, "apple_olympic"},
 };
 static inline const struct bts_bcm_cmd *bts_bcm_find(uint16_t opcode) {
     for (size_t i = 0; i < sizeof kBtsBcmCmds / sizeof kBtsBcmCmds[0]; i = i + 1)
@@ -243,7 +248,7 @@ struct bts_stats {
     uint32_t writeRamCmds, launches, minidriver;
     uint64_t writeRamBytes, rxBytes;
 };
-#define BTS_UNKNOWN_RING 8
+#define BTS_VENDOR_RING 12
 struct bts_shim {
     struct bts_h4 host, ctrl;
     struct bts_fifo rx;
@@ -258,7 +263,8 @@ struct bts_shim {
     uint16_t lastCmd;           // last HCI command the client wrote
     uint16_t lastReply;         // opcode of the last Command Complete / Command Status queued for the client
     uint8_t lastReplyStatus;    // its status (lastCmd == lastReply and status 0: the client's last command succeeded)
-    uint32_t unknownRing[BTS_UNKNOWN_RING];   // last unknown vendor commands: opcode << 8 | first parameter byte
+    uint32_t vendorRing[BTS_VENDOR_RING];   // last vendor commands: opcode << 16 | first parameter byte << 8 | status
+    uint32_t vendorCount;
     uint8_t scratch[BTS_PKT_MAX];
 };
 
@@ -283,19 +289,25 @@ static inline void bts_shim_queue(struct bts_shim *s, const uint8_t *pkt, size_t
     }
 }
 
+static inline void bts_vendor_note(struct bts_shim *s, uint16_t opcode, const uint8_t *p, size_t plen, uint8_t status) {
+    s->vendorRing[s->vendorCount % BTS_VENDOR_RING] = (uint32_t)opcode << 16 | (uint32_t)(plen ? p[0] : 0u) << 8 | status;
+    s->vendorCount = s->vendorCount + 1;
+}
+
 static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const uint8_t *p, size_t plen) {
     const struct bts_bcm_cmd *c = bts_bcm_find(opcode);
     s->lastVendorOpcode = opcode;
     uint8_t *o = s->scratch;
     size_t n = 0;
     if (!c) {
-        s->unknownRing[s->st.unknownVendor % BTS_UNKNOWN_RING] = (uint32_t)opcode << 8 | (plen ? p[0] : 0u);
+        bts_vendor_note(s, opcode, p, plen, s->id.unknownVendorStatus);
         s->st.unknownVendor = s->st.unknownVendor + 1;
         n = bts_cmd_complete(o, sizeof s->scratch, opcode, s->id.unknownVendorStatus, nullptr, 0);
         bts_shim_queue(s, o, n);
         return;
     }
     s->st.emulated = s->st.emulated + 1;
+    bts_vendor_note(s, opcode, p, plen, 0);
     switch (c->action) {
     case BTS_BCM_BAUD:   // hci_bcm: le16 reserved(0), le32 baud
         if (plen >= 6) s->baud = (uint32_t)p[2] | (uint32_t)p[3] << 8 | (uint32_t)p[4] << 16 | (uint32_t)p[5] << 24;
@@ -325,7 +337,8 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
     if (c->action == BTS_BCM_VERBOSE) {ret = s->id.verbose; rn = sizeof s->id.verbose;}
     if (c->action == BTS_BCM_FEATURES) {ret = s->id.features; rn = sizeof s->id.features;}
     if (c->action == BTS_BCM_USB_PRODUCT) {ret = s->id.usbProduct; rn = sizeof s->id.usbProduct;}
-    if (c->action == BTS_BCM_SUBOP_ACK && plen >= 1) {ret = p; rn = 1;}
+    static const uint8_t zero8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (c->action == BTS_BCM_ZERO8) {ret = zero8; rn = sizeof zero8;}
     n = bts_cmd_complete(o, sizeof s->scratch, opcode, 0, ret, rn);
     bts_shim_queue(s, o, n);
 }
