@@ -117,7 +117,7 @@ static void backendOpen(Float32 db, UInt32 mute) {
       gBackend.eagain = gBackend.errors = 0;
       gBackend.fifo.dropped = gBackend.fifo.written = 0;
       guamp_fifo_reset(&gBackend.fifo);
-      UInt32 route = GUAMP_AUDIO_ROUTE_SPEAKER;
+      UInt32 route = GUAMP_AUDIO_DEV_ROUTE_SPEAKER;
       const int routeErr = ioctl(fd, GUAMP_AUDIO_SET_ROUTE, &route) ? errno : 0;
       backendVolume(db, mute);
       const int startErr = ioctl(fd, GUAMP_AUDIO_START) ? errno : 0;

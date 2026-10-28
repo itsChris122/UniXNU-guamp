@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// /dev/guamp-audio (guamp-audio-dev=1): the PCM output node the userland AudioServerPlugIn writes to; ABI in
-// guamp_audio_dev.h (48 kHz, s16le stereo, ioctls INFO/START/STOP/VOLUME/ROUTE/POSITION/DRAIN). Ring and clock in
-// GuampAudioRing.inc. Sink today: GUAMP_AUDIO_SINK_NULL (frames dropped at the 48 kHz pace of the host clock), so the
-// plug-in can be brought up before the ADSP PCM path (GuampAsm.inc) exists; the ADSP sink will pull() the same ring.
-// A plain cdevsw like GuampBtSerial.inc (no IOSerialFamily/IOAudioFamily in this kernel). One opener (audiomxd).
-// Own thread "guamp-audio-dev": devfs may not be up at platform start, so the node is retried once a second (30 s).
+// /dev/guamp-audio (guamp-audio-dev=1): the PCM output node the userland AudioServerPlugIn writes to; ABI v2 in
+// package/GuampAudio/guamp_audio_dev.h (the one header shared with the plug-in: 48 kHz, s16le stereo, ioctls
+// GET_INFO/START/STOP/SET_VOLUME/SET_ROUTE/GET_ROUTE/GET_POSITION/DRAIN). Ring and clock in GuampAudioRing.inc.
+// Sinks: null (frames dropped at the 48 kHz pace of the host clock) until the ADSP chain streams; with
+// guamp-adsp-ipc=6 apr::Playback (GuampAsm.inc, glue GuampAudioPlay.inc) attaches and pulls the ring period by period.
+// A plain cdevsw like GuampBtSerial.inc (no IOSerialFamily/IOAudioFamily in this kernel). One opener (audiomxd, user
+// mobile): node root:mobile 0660. Own thread "guamp-audio-dev": devfs may not be up at platform start, so the node is
+// retried once a second (30 s). guamp-audio-cdc=1 also accepts the earpiece/headphone routes (codec DMA 0xB030).
 #ifndef GUAMP_AUDIO_DEV_INC
 #define GUAMP_AUDIO_DEV_INC
 #include "GuampAudioRing.inc"
@@ -52,8 +54,9 @@ int adOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   gOpens = gOpens + 1;
   gStream.reset();
   gWrittenFrames = 0;
+  const bool adsp = gStream.adspEnabled;
   IOLockUnlock(gLock);
-  IOLog("GuampAudioDev: open (%u), sink %s\n", gOpens, gStream.sink == GUAMP_AUDIO_SINK_NULL ? "null" : "adsp");
+  IOLog("GuampAudioDev: open (%u), sink %s, ABI %u\n", gOpens, adsp ? "adsp (on START)" : "null", GUAMP_AUDIO_ABI_VERSION);
   return 0;
 }
 
@@ -61,20 +64,20 @@ int adClose(dev_t dev, int flags, int devtype, struct proc *p) {
   IOLockLock(gLock);
   gStream.consume(mach_absolute_time());
   const uint64_t written = gWrittenFrames, played = gStream.framesPlayed();
-  const uint32_t underruns = gStream.underruns;
+  const uint32_t underruns = gStream.underruns, routeChanges = gStream.routeChanges, volumes = gStream.volumeChanges;
   gStream.reset();
   gOpen = false;
   IOLockUnlock(gLock);
-  IOLog("GuampAudioDev: close; %llu frames written, %llu played, %u underruns, %u writes (%u blocked), %u ioctls\n",
-        static_cast<unsigned long long>(written), static_cast<unsigned long long>(played), underruns, gWrites, gBlocked,
-        gIoctls);
+  IOLog("GuampAudioDev: close; %llu frames written, %llu played, %u underruns, %u writes (%u blocked), %u ioctls, "
+        "%u route / %u volume changes\n", static_cast<unsigned long long>(written), static_cast<unsigned long long>(played),
+        underruns, gWrites, gBlocked, gIoctls, routeChanges, volumes);
   return 0;
 }
 
 int adRead(dev_t dev, struct uio *uio, int ioflag) { return ENODEV; }
 
 int adWrite(dev_t dev, struct uio *uio, int ioflag) {
-  if (uio_resid(uio) % GUAMP_AUDIO_FRAME_BYTES) return EINVAL;
+  if (uio_resid(uio) % GUAMP_AUDIO_BYTES_PER_FRAME) return EINVAL;
   gWrites = gWrites + 1;
   uint8_t buf[1024];
   bool took = false;
@@ -96,7 +99,7 @@ int adWrite(dev_t dev, struct uio *uio, int ioflag) {
     if (e) return e;
     IOLockLock(gLock);
     const uint32_t pushed = gStream.push(buf, n, mach_absolute_time());   // single writer: all of it fits
-    gWrittenFrames = gWrittenFrames + pushed / GUAMP_AUDIO_FRAME_BYTES;
+    gWrittenFrames = gWrittenFrames + pushed / GUAMP_AUDIO_BYTES_PER_FRAME;
     IOLockUnlock(gLock);
     took = true;
   }
@@ -105,7 +108,7 @@ int adWrite(dev_t dev, struct uio *uio, int ioflag) {
 
 int adIoctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p) {
   gIoctls = gIoctls + 1;
-  if (cmd == GUAMP_AUDIO_IOC_DRAIN) {
+  if (cmd == GUAMP_AUDIO_DRAIN) {
     for (unsigned i = 0; i < 400; i = i + 1) {   // at most 2 s (the ring holds ~341 ms)
       IOLockLock(gLock);
       gStream.consume(mach_absolute_time());
@@ -117,8 +120,14 @@ int adIoctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p) {
     return ETIMEDOUT;
   }
   IOLockLock(gLock);
+  const uint32_t route = gStream.route, gain = gStream.gainQ16;
   const int e = gStream.ioctl(static_cast<uint32_t>(cmd), data, mach_absolute_time(), gWrittenFrames);
+  const uint32_t newRoute = gStream.route, newGain = gStream.gainQ16;
   IOLockUnlock(gLock);
+  if (cmd == GUAMP_AUDIO_START || cmd == GUAMP_AUDIO_STOP || e || route != newRoute)
+    IOLog("GuampAudioDev: ioctl %x -> %d (route %u, gain %x)\n", static_cast<unsigned>(cmd), e, newRoute, newGain);
+  else if (gain != newGain && gIoctls < 64)
+    IOLog("GuampAudioDev: volume gain %x\n", newGain);
   return e;
 }
 
@@ -135,26 +144,32 @@ int adSelect(dev_t dev, int which, void *wql, struct proc *p) {
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-audio-dev");
   for (unsigned i = 0; i < 30 && !gNode; i = i + 1) {
-    gNode = devfs_make_node(makedev(gMajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "guamp-audio");
+    gNode = devfs_make_node(makedev(gMajor, 0), DEVFS_CHAR, GUAMP_AUDIO_DEV_UID, GUAMP_AUDIO_DEV_GID, GUAMP_AUDIO_DEV_MODE,
+                            GUAMP_AUDIO_DEV_NAME);
     if (!gNode) IOSleep(1000);
   }
-  IOLog("GuampAudioDev: /dev/guamp-audio %s (major %d, ring %u bytes, %llu host ticks/s, ABI %u)\n",
-        gNode ? "created" : "NOT created after 30 s", gMajor, gStream.bytes,
-        static_cast<unsigned long long>(gStream.ticksPerSec), GUAMP_AUDIO_ABI);
+  IOLog("GuampAudioDev: %s %s (major %d, ring %u bytes, %llu host ticks/s, ABI %u, root:%u %o, routes %x, sink %s %u bit)\n",
+        GUAMP_AUDIO_DEV_PATH, gNode ? "created" : "NOT created after 30 s", gMajor, gStream.bytes,
+        static_cast<unsigned long long>(gStream.ticksPerSec), GUAMP_AUDIO_ABI_VERSION, GUAMP_AUDIO_DEV_GID,
+        GUAMP_AUDIO_DEV_MODE, gStream.routes, gStream.adspEnabled ? "adsp" : "null", gStream.dspBits);
 }
 
-// Once, from the platform start path: boot argument guamp-audio-dev=1
+// Once, from the platform start path (after adsp::start): boot argument guamp-audio-dev=1
 void start() {
-  unsigned on = 0;
+  unsigned on = 0, cdc = 0;
   PE_parse_boot_argn("guamp-audio-dev", &on, sizeof(on));
   if (on != 1 || gLock) return;
   gLock = IOLockAlloc();
-  gStream.buf = static_cast<uint8_t *>(IOMallocZero(GUAMP_AUDIO_RING_BYTES));
+  gStream.buf = static_cast<uint8_t *>(IOMallocZero(guampaudio::kRingBytes));
   if (!gLock || !gStream.buf) {
     IOLog("GuampAudioDev: allocation failed\n");
     return;
   }
-  gStream.bytes = GUAMP_AUDIO_RING_BYTES;
+  gStream.bytes = guampaudio::kRingBytes;
+  gStream.adspEnabled = adspipc::gLevel == 6;
+  gStream.dspBits = adspipc::gPcmBits;
+  if (PE_parse_boot_argn("guamp-audio-cdc", &cdc, sizeof(cdc)) && cdc == 1)
+    gStream.routes |= (1u << GUAMP_AUDIO_DEV_ROUTE_EARPIECE) | (1u << GUAMP_AUDIO_DEV_ROUTE_HEADPHONE);
   uint64_t second = 0;
   nanoseconds_to_absolutetime(1000000000ull, &second);
   gStream.ticksPerSec = second;
