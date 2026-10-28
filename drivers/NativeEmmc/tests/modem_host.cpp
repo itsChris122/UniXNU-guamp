@@ -86,6 +86,8 @@ namespace wifiprep {
 constexpr uint32_t kChunkBytes=65536;
 static bool modemStopped(){return stopped;}
 static bool modemAwaitReady(){++readyCalls;return ready;}
+static unsigned failureReports=0;
+static void modemFailureReport(){++failureReports;}
 #include "../GuampModem.inc"
 }
 struct HookFixture {

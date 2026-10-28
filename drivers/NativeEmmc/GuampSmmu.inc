@@ -16,6 +16,8 @@ struct WlanSmmu {
   uint32_t oldSmr=0,oldS2cr=0,oldCbar=0,oldCba2r=0;
   uint32_t oldCb[16]={}; // selected control/TTBR/MAIR words only
   bool active=false,owned=false;
+  bool preexisting=false;        // an SMR for SID 0x1a0 was already valid (WLAN set up before XNU: not a cold boot)
+  uint32_t groupsSeen=0,banksSeen=0,s2cbSeen=0;   // ID0.NUMSMRG, ID1.NUMCB, ID1.NUMS2CB, for the diagnostic log
   void *ctx=nullptr; void (*delayUs)(void *,uint32_t)=nullptr;
   static constexpr uint32_t SavedOffsets[16]={0,4,0x10,0x20,0x24,0x28,0x2c,0x30,
     0x34,0x38,0x3c,0x58,0x60,0x64,0x68,0x6c};
@@ -36,6 +38,7 @@ struct WlanSmmu {
     if(id0==0xffffffffu||!(id0&(1u<<30))||!(id0&(1u<<27))||(id1&(1u<<31))||!(id2&(1u<<12))) return Unsupported;
     uint32_t groups=id0&255u,banks=id1&255u;
     if(!groups||groups>128||!banks||banks>128) return Unsupported;
+    groupsSeen=groups;banksSeen=banks;s2cbSeen=(id1>>16)&255u;
     // The OEM arm-smmu driver maps context banks at base + resource_size/2
     // (arm-smmu.c: smmu->cb_base), not immediately after ID1.NUMPAGENDXB.
     // Guamp's DT window is 0x80000, so this places CB0 at offset 0x40000.
@@ -57,6 +60,7 @@ struct WlanSmmu {
         uint32_t c=s2cr&255u; if(c>=banks) return Protocol; used[c]=true;
       }
     }
+    preexisting=match!=0xffffffffu;
     slot=match!=0xffffffffu?match:firstFree; if(slot==0xffffffffu) return NoMemory;
     oldSmr=registers.r32(0x800+4*slot); oldS2cr=registers.r32(0xc00+4*slot);
     uint32_t chosen=0xffffffffu;
@@ -82,7 +86,11 @@ struct WlanSmmu {
     // define how subsequent TTBR fields are interpreted. Keep that order even
     // while the context bank is disabled.
     registers.w32(bank+0x10,encoding|(7u<<15)); // PASIZE, sign-extension upstream
-    registers.w32(bank+0x30,32u|(1u<<8)|(1u<<10)|(3u<<12)|(1u<<23)); // 32-bit VA, WB walks, EPD1
+    // 32-bit VA, EPD1, walks Non-cacheable + Outer Shareable: the OEM io-pgtable-arm.c TCR for a domain without
+    // IO_PGTABLE_QUIRK_NO_DMA (apps-smmu@c600000 has no dma-coherent, so no coherent table walk; icnss no LLC hints).
+    // The tables are CPU-mapped Normal-NC: a cacheable walk would not match them. Same encoding as the working
+    // kgsl SMMU (GuampGpuSmmu: outer NC walk, SH0 2).
+    registers.w32(bank+0x30,32u|(2u<<12)|(1u<<23));
     uint64_t ttbr=tablePhysical|(uint64_t(asid)<<48);
     registers.w32(bank+0x24,uint32_t(ttbr>>32)); registers.w32(bank+0x20,uint32_t(ttbr));
     // 0x28/0x2c are the low/high halves of TTBR1. TTBR1 is disabled through

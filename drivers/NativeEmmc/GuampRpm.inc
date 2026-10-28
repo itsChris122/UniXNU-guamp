@@ -17,6 +17,7 @@
 //   guamp-rpm-log=0    no per-request log line (default 1).
 
 #include "GuampRpmCore.h"
+#define GUAMP_RPM_CLIENT_INC 1   // rpm::set/request available to later includes (GuampModem.inc proxy vote)
 
 namespace rpm {
 volatile uint8_t *gRam, *gApcs;
