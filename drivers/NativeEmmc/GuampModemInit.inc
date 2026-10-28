@@ -2,6 +2,7 @@
 // Modem (MPSS) init: Linux-side prerequisites and diagnostics (29/10/2026). Included by GuampWifiPrep.inc inside
 // namespace wifiprep after modemAwaitReady; hooked by GuampModem.inc (GUAMP_MODEM_INIT).
 // Context: first authenticated start (wifi3, kernel 58540b0): AUTH_AND_RESET status 0, then no SMP2P 428 within 10 s
+// (428 is the APPS outbound item: the port had in/out swapped, fixed 20261029; the modem's own item is 435)
 // and item 421 = "SFR Init: wdog or kernel error suspected.", the placeholder the modem writes at its err init: the
 // modem died (watchdog bite or QuRT kernel error) or hung after err init and before its SMP2P init.
 // prepare (after the cold-boot check, before any modem RAM write):
@@ -18,7 +19,7 @@
 //   baseline   SMEM items of the global and apps-modem partitions and the MSS watchdog interrupt state.
 // watch (thread from AUTH_AND_RESET, 15 s): every 10 ms GIC SPI 307 (qcom,wdog of qcom,mss = INTID 339, rising edge:
 //   the distributor latches the pending bit even while the line is disabled); every 50 ms SMEM: new items, item 421
-//   text, item 428 slave-kernel bits. One line per change with ms since AUTH_AND_RESET, then a summary.
+//   text, item 435 slave-kernel bits. One line per change with ms since AUTH_AND_RESET, then a summary.
 // report (failure path, before PAS SHUTDOWN): item 421 dump (text + hex of the used bytes), wdog latch, TCSR mutex 3,
 //   RPM rail floors.
 // Read-only except item 134 (allocated under the shared SMEM lock, GuampSmemLock.inc) and the optional MX vote.
@@ -245,14 +246,14 @@ static void modemWatchThread(void *, wait_result_t) {
             IOLog("GuampModem: watch +%u ms: item 421 (%u bytes): \"%s\"\n", t, bytes, sfr);
           }
           uint32_t at = 0, n = 0;
-          if (smem::find(reader, *info, smem::kHostModem, 428, &at, &n)) {
+          if (smem::find(reader, *info, smem::kHostModem, 435, &at, &n)) {
             if (g428At == ~0u) g428At = t;
             smem::Smp2p *st = static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
             if (st) {
               smem::readSmp2p(reader, at, n, "slave-kernel", st);
               if (st->value != gLast428) {
                 gLast428 = st->value;
-                IOLog("GuampModem: watch +%u ms: smp2p 428 slave-kernel %x (fatal %u ready %u handover %u)\n", t, st->value,
+                IOLog("GuampModem: watch +%u ms: smp2p 435 slave-kernel %x (fatal %u ready %u handover %u)\n", t, st->value,
                       st->value & 1, st->value >> 1 & 1, st->value >> 2 & 1);
               }
               IOFree(st, sizeof(*st));
@@ -262,7 +263,7 @@ static void modemWatchThread(void *, wait_result_t) {
       }
       IOSleep(10);
     }
-    IOLog("GuampModem: watch summary %u ms: wdog %s%u ms, item 421 at %d ms, smp2p 428 at %d ms, %u new SMEM items, "
+    IOLog("GuampModem: watch summary %u ms: wdog %s%u ms, item 421 at %d ms, smp2p 435 at %d ms, %u new SMEM items, "
           "last 421 \"%s\"\n", kWatchMs, gWdogAt == ~0u ? (gWdogBase ? "pending BEFORE start, " : "never latched, ") : "bite at ",
           gWdogAt == ~0u ? 0u : gWdogAt, g421At == ~0u ? -1 : static_cast<int>(g421At),
           g428At == ~0u ? -1 : static_cast<int>(g428At), gNew, gSfr);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Modem SMP2P APPS edge, including feature negotiation and restart ACK.
+// Modem SMP2P APPS edge, including feature negotiation and restart ACK. bengal qcom,smp2p-modem qcom,smem = <435 428>:
+// smp2p.c reads it as {SMP2P_INBOUND, SMP2P_OUTBOUND}, so apps ALLOCATES 428 (outbound) and READS 435 (the modem's).
 #ifndef GUAMP_SMP2P_INC
 #define GUAMP_SMP2P_INC
 #include "GuampSmemWrite.inc"
@@ -10,12 +11,12 @@ struct Smp2pEdge {
   void (*kick)(void *)=nullptr;
   uint32_t outbound=0;
   uint32_t slave=0,wlan=0;
-  uint32_t inSize=0,inFeatures=0,inFlags=0,inEntries=0;   // last inbound 428 seen (diagnostics only)
+  uint32_t inSize=0,inFeatures=0,inFlags=0,inEntries=0;   // last inbound 435 seen (diagnostics only)
   bool negotiated=false,ssr=false,ack=false,seenReady=false,inPresent=false,inValid=false;
   int start(SmemArena *a,void (*notify)(void *),void *ctx) {
     if(!a||!notify) return Invalid;
     arena=a; kick=notify; kickCtx=ctx;
-    int e=arena->allocate(1,435,340,&outbound); if(e) return e;
+    int e=arena->allocate(1,428,340,&outbound); if(e) return e;
     // Caller must establish that PAS modem is stopped before resetting APPS state.
     arena->mem.zero(outbound,340);
     arena->mem.w32(outbound,smem::kSmp2pMagic);
@@ -35,7 +36,7 @@ struct Smp2pEdge {
   }
   int poll() {
     if(!arena||!outbound) return NotReady;
-    uint32_t at=0,size=0; int e=arena->find(1,428,&at,&size); if(e) return e==NotFound?Again:e;
+    uint32_t at=0,size=0; int e=arena->find(1,435,&at,&size); if(e) return e==NotFound?Again:e;
     smem::Smp2p in={}; arena->mem.fence();
     smem::readSmp2p(arena->view(),at,size,"slave-kernel",&in);
     inPresent=true; inSize=size; inValid=in.valid; inFeatures=in.features; inFlags=in.flags; inEntries=in.validEntries;

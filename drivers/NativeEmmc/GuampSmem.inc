@@ -15,8 +15,9 @@
 // Only partitions that include the application processor (host 0) or the global one (0xfffe/0xfffe) are read:
 // the others are firewalled for the apps CPU and a read could fault.
 // SMP2P item (smp2p.c): magic "$SMP", version 1, features:24, local_pid, remote_pid, total_entries, valid_entries,
-// flags, then 16 entries of {name[16], value}. guamp modem pair (bengal.dtsi qcom,smp2p-modem): 435 apps -> modem
-// (outbound, allocated by the apps side), 428 modem -> apps (inbound "slave-kernel": bit 0 err-fatal, 1 err-ready,
+// flags, then 16 entries of {name[16], value}. guamp modem pair (bengal.dtsi qcom,smp2p-modem qcom,smem = <435 428>,
+// smp2p.c order {SMP2P_INBOUND 0, SMP2P_OUTBOUND 1}): 428 apps -> modem (outbound, allocated by the apps side),
+// 435 modem -> apps (inbound, allocated by the modem: "slave-kernel": bit 0 err-fatal, 1 err-ready,
 // 2 proxy-unvote/handover, 3 stop-ack, 7 shutdown-ack); crash reason item 421 (qcom,smem-id of the modem PIL);
 // GLINK items 478 (descriptor), 479 and 480 (FIFOs) in the apps-modem partition.
 
