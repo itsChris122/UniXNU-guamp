@@ -22,6 +22,9 @@
 // guamp: eMMC driver (drivers/NativeEmmc), started without a personality once the platform is configured
 extern "C" void guamp_emmc_start (IOService *platform);
 extern "C" void guamp_emmc_flush (unsigned type);
+// guamp: wall clock from the PM6125 RTC + saved offset (drivers/NativeEmmc/GuampRtc.inc); 0 = not available
+extern "C" int guamp_rtc_get (clock_sec_t *secs, clock_nsec_t *nsecs);
+extern "C" int guamp_rtc_set (clock_sec_t secs, clock_nsec_t nsecs);
 
 // Observation counters describe actual published nubs, not started drivers.
 extern "C" {
@@ -41,12 +44,30 @@ public:
   const char *deleteList (void) override;
   const char *excludeList (void) override;
   int haltRestart (unsigned int type) override;
+  void getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs) override;
+  void setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
 };
 
 OSDefineMetaClassAndStructors (ArmDTPlatform, IODTPlatformExpert)
+
+// The platform clock of PEGetUTCTimeOfDay (clock_initialize_calendar) and PESetUTCTimeOfDay (settimeofday), as
+// Apple's RTC drivers provide it; without the guamp RTC the IOPlatformExpert defaults stay (0 / ignored).
+void ArmDTPlatform::getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs)
+{
+  if (!guamp_rtc_get (secs, nsecs)) {
+    IODTPlatformExpert::getUTCTimeOfDay (secs, nsecs);
+  }
+}
+
+void ArmDTPlatform::setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs)
+{
+  if (!guamp_rtc_set (secs, nsecs)) {
+    IODTPlatformExpert::setUTCTimeOfDay (secs, nsecs);
+  }
+}
 
 // Serialized empty name lists: XNU's processTopLevel() treats a null pointer
 // as "every entry" (remove every child), not as "nothing". An empty list

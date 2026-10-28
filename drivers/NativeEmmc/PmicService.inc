@@ -71,6 +71,20 @@ int init() {
   }
   return SPMI_OK;
 }
+// Maps the arbiter and reads the APID table once: rtc::boot (startLater, before pmic::start) or the PMIC thread
+int ensureArb() {
+  if (gArbReady) return SPMI_OK;
+  if (!gCore) gCore = mapPhysical(GP_SPMI_CORE, GP_SPMI_CORE_SIZE);
+  if (!gCnfg) gCnfg = mapPhysical(GP_SPMI_CNFG, 0x26000);
+  if (!gObs) gObs = mapPhysical(GP_SPMI_OBSRVR, GP_SPMI_OBSRVR_SIZE);
+  if (!gChn) gChn = mapPhysical(GP_SPMI_CHNLS, GP_SPMI_CHNLS_SIZE);
+  if (!gCore || !gCnfg || !gObs || !gChn) return SPMI_ERR_NODEV;
+  int r = init();
+  if (r) return r;
+  __asm__ volatile("dmb ish" ::: "memory");
+  gArbReady = 1;
+  return SPMI_OK;
+}
 int waitDone(unsigned region, uint32_t chan) {
   for (unsigned n = 0; n < SPMI_TIMEOUT_POLLS; ++n) {
     uint32_t st = ioRd(nullptr, region, chan + 0x08);
@@ -275,16 +289,10 @@ void sinkFromHid(void (*sink)(void *, uint32_t), void *context) {
 
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-pmic");
-  gCore = mapPhysical(GP_SPMI_CORE, GP_SPMI_CORE_SIZE);
-  gCnfg = mapPhysical(GP_SPMI_CNFG, 0x26000);
-  gObs = mapPhysical(GP_SPMI_OBSRVR, GP_SPMI_OBSRVR_SIZE);
-  gChn = mapPhysical(GP_SPMI_CHNLS, GP_SPMI_CHNLS_SIZE);
-  if (!gCore || !gCnfg || !gObs || !gChn) { IOLog("GuampPmic: mapping failed\n"); return; }
-  int r = init();
+  int r = ensureArb();   // usually done already by rtc::boot
+  if (r == SPMI_ERR_NODEV && !gChn) { IOLog("GuampPmic: mapping failed\n"); return; }
   IOLog("GuampPmic: SPMI arbiter version %08x, %u APIDs, init %d\n", gArb.version, gArb.apids, r);
   if (r) return;
-  __asm__ volatile("dmb ish" ::: "memory");
-  gArbReady = 1;
   unsigned battery = 1;   // default on (verified 28/10): guamp-battery=0 disables
   PE_parse_boot_argn("guamp-battery", &battery, sizeof(battery));
   gBatteryEnabled = battery == 1;
