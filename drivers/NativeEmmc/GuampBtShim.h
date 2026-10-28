@@ -248,6 +248,9 @@ struct bts_shim {
     bool bdaddrSet, downloading;
     uint16_t lastVendorOpcode;
     uint16_t internalOpcode;    // a command the shim itself sent: its Command Complete / Status is not for bluetoothd
+    uint16_t lastCmd;           // last HCI command the client wrote
+    uint16_t lastReply;         // opcode of the last Command Complete / Command Status queued for the client
+    uint8_t lastReplyStatus;    // its status (lastCmd == lastReply and status 0: the client's last command succeeded)
     uint8_t scratch[BTS_PKT_MAX];
 };
 
@@ -265,6 +268,11 @@ static inline size_t bts_shim_read(struct bts_shim *s, uint8_t *out, size_t cap)
 static inline void bts_shim_queue(struct bts_shim *s, const uint8_t *pkt, size_t len) {
     if (bts_fifo_put(&s->rx, pkt, len)) s->st.rxBytes += len;
     else s->st.rxDropped = s->st.rxDropped + 1;
+    if (len >= 6 && pkt[0] == BTS_H4_EVT && pkt[1] == BTS_EVT_CMD_COMPLETE) {
+        s->lastReply = bts_le16(pkt + 4); s->lastReplyStatus = len >= 7 ? pkt[6] : 0;
+    } else if (len >= 7 && pkt[0] == BTS_H4_EVT && pkt[1] == BTS_EVT_CMD_STATUS) {
+        s->lastReply = bts_le16(pkt + 5); s->lastReplyStatus = pkt[3];
+    }
 }
 
 static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const uint8_t *p, size_t plen) {
@@ -318,6 +326,7 @@ static inline void bts_shim_host_pkt(void *ctx, const uint8_t *pkt, size_t len) 
     if (pkt[0] == BTS_H4_CMD) {
         s->st.hostCmds = s->st.hostCmds + 1;
         const uint16_t opcode = bts_le16(pkt + 1);
+        s->lastCmd = opcode;
         if ((opcode >> 10) == BTS_OGF_VENDOR) {bts_shim_vendor(s, opcode, pkt + 4, len - 4); return;}
         if (!s->link.tx || s->link.tx(s->link.ctx, pkt, len)) {
             s->st.txErrors = s->st.txErrors + 1;
@@ -545,6 +554,15 @@ static inline enum bts_ctl_opt_result bts_ctl_sockopt(struct bts_tty *t, uint32_
         *len = need;
     }
     return r == BTS_IOCTL_FLUSH ? BTS_CTL_OPT_FLUSH : BTS_CTL_OPT_OK;
+}
+// Who gets the one client slot. which/holder: 0 = com.apple.uart.bluetooth (BlueTool), 1 = com.apple.uart.sk.bluetooth
+// (bluetoothd). BlueTool's boot script ends with "device -D -S", which reopens the control, and BlueTool stays alive
+// holding it while bluetoothd connects the sk control (RAM test 6): bluetoothd takes the slot over (BlueTool's later
+// writes get ENOTCONN). Anything else while the slot is taken (the tty, BlueTool against bluetoothd) is refused.
+enum bts_ctl_admit_result { BTS_CTL_REFUSE = 0, BTS_CTL_ACCEPT = 1, BTS_CTL_PREEMPT = 2 };
+static inline enum bts_ctl_admit_result bts_ctl_admit(bool open, bool viaKctl, unsigned holder, unsigned which) {
+    if (!open) return BTS_CTL_ACCEPT;
+    return viaKctl && holder == 0 && which == 1 ? BTS_CTL_PREEMPT : BTS_CTL_REFUSE;
 }
 // Bytes for the socket: no more than the receive buffer has room for (space, from ctl_getenqueuespace) nor cap.
 // Packets may be split across enqueues (stream socket; the client reassembles by H4 header).

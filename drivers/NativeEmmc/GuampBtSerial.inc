@@ -62,7 +62,7 @@ bool gViaKctl = false;
 kern_ctl_ref gKctlRef = nullptr;
 uint32_t gKctlUnit = 0, gKctlWhich = 0;
 uint32_t gKctlRegs = 0, gKctlConnects = 0, gKctlBusy = 0, gKctlSends = 0, gKctlOpts = 0, gKctlOptErrs = 0;
-uint32_t gKctlFull = 0, gKctlEnqErrs = 0;
+uint32_t gKctlFull = 0, gKctlEnqErrs = 0, gKctlPreempts = 0;
 uint64_t gKctlTxBytes = 0, gKctlRxBytes = 0;
 
 int bsOpen(dev_t dev, int flags, int devtype, struct proc *p);
@@ -293,13 +293,25 @@ errno_t kctlConnect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
   const uint32_t which = ref == gKctlRefs[1] ? 1 : 0;
   *unitinfo = nullptr;
   IOLockLock(gLock);
-  if (gOpen) {   // one client: the tty or one control (BlueTool, then bluetoothd)
+  // One client: the tty or one control; bluetoothd's sk control takes the slot over from BlueTool (bts_ctl_admit).
+  const bts_ctl_admit_result admit = bts_ctl_admit(gOpen, gViaKctl, gKctlWhich, which);
+  if (admit == BTS_CTL_REFUSE) {
     gKctlBusy = gKctlBusy + 1;
     const bool tty = !gViaKctl;
     IOLockUnlock(gLock);
     IOLog("GuampBtShim: connect %s unit %u refused: %s already open\n", kKctlNames[which], sac->sc_unit,
           tty ? "the tty" : kKctlNames[gKctlWhich]);
     return EBUSY;
+  }
+  if (admit == BTS_CTL_PREEMPT) {
+    const uint32_t oldUnit = gKctlUnit, oldWhich = gKctlWhich;
+    const uint16_t cmd = gShim->lastCmd, reply = gShim->lastReply;
+    const uint8_t status = gShim->lastReplyStatus;
+    const size_t pending = bts_shim_readable(gShim);
+    gKctlPreempts = gKctlPreempts + 1;
+    IOLog("GuampBtShim: %s unit %u takes over from %s unit %u (still open; last cmd %04x, last reply %04x status %02x, "
+          "%u bytes unread dropped)\n", kKctlNames[which], sac->sc_unit, kKctlNames[oldWhich], oldUnit, cmd, reply,
+          status, static_cast<unsigned>(pending));
   }
   gOpen = true;
   gViaKctl = true;
@@ -324,13 +336,19 @@ errno_t kctlDisconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo) {
   const bts_stats st = gShim->st;
   const uint32_t baud = gShim->baud;
   const uint64_t speed = gTty.speed;
+  const uint16_t cmd = gShim->lastCmd, reply = gShim->lastReply;
+  const uint8_t status = gShim->lastReplyStatus;
   IOLockUnlock(gLock);
   if (mine)
     IOLog("GuampBtShim: disconnect %s unit %u; host %u pkts (%u cmds, %u forwarded, %u emulated, %u tx errors), "
-          "controller %u pkts; socket %llu bytes in %llu out, %u full %u lost; baud %u, termios speed %llu\n",
-          kKctlNames[gKctlWhich], unit, st.hostPkts, st.hostCmds, st.forwarded, st.emulated, st.txErrors, st.ctrlPkts,
-          static_cast<unsigned long long>(gKctlTxBytes), static_cast<unsigned long long>(gKctlRxBytes), gKctlFull,
-          gKctlEnqErrs, baud, static_cast<unsigned long long>(speed));
+          "controller %u pkts; socket %llu bytes in %llu out, %u full %u lost; baud %u, termios speed %llu; last cmd "
+          "%04x, last reply %04x status %02x\n", kKctlNames[gKctlWhich], unit, st.hostPkts, st.hostCmds, st.forwarded,
+          st.emulated, st.txErrors, st.ctrlPkts, static_cast<unsigned long long>(gKctlTxBytes),
+          static_cast<unsigned long long>(gKctlRxBytes), gKctlFull, gKctlEnqErrs, baud,
+          static_cast<unsigned long long>(speed), cmd, reply, status);
+  else
+    IOLog("GuampBtShim: disconnect %s unit %u (refused or taken over)\n", kKctlNames[ref == gKctlRefs[1] ? 1 : 0],
+          unit);
   return 0;
 }
 
