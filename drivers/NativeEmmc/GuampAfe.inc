@@ -127,6 +127,9 @@ struct AfeTone {
   I2sConfig port;
   uint32_t toneMs = 3000, clockHz = 1536000;
   uint16_t high = 1209, low = 697, gain = 0x0800;
+  // PCM path (GuampAsm.inc): useDtmf false + holdPort true = bring the port up and keep it at Play (portRunning())
+  // until release(); then the same undo steps.
+  bool useDtmf = true, holdPort = false;
   int step = Vote;
   bool waiting = false, voted = false, clockOn = false, started = false, ampOn = false, dtmfOn = false, setupFailed = false;
   bool played = false;
@@ -139,6 +142,8 @@ struct AfeTone {
     deadline = now;
   }
   bool finished() const { return step == Done; }
+  bool portRunning() const { return step == Play && started; }
+  void release() { holdPort = false; }
   bool ok() const { return finished() && played && !setupFailed; }
   static const char *stepName(int s) {
     static const char *const n[] = {"lpass vote", "codec prepare", "mi2s clock on", "port config", "port start",
@@ -156,7 +161,7 @@ struct AfeTone {
         continue;
       }
       if (step == Play) {
-        if (now < playUntil) return;
+        if (holdPort || now < playUntil) return;
         played = true;
         step = DtmfOff;
         continue;
@@ -238,7 +243,14 @@ private:
         step = DtmfOn;
         return true;
       }
-      case DtmfOn: n = afeDtmf(pkt, sizeof(pkt), t, -1, high, low, gain, port.port); break;
+      case DtmfOn:
+        if (!useDtmf) {
+          step = Play;
+          playUntil = now;
+          return true;
+        }
+        n = afeDtmf(pkt, sizeof(pkt), t, -1, high, low, gain, port.port);
+        break;
       case DtmfOff:
         if (!dtmfOn) { step = AmpOff; return true; }
         n = afeDtmf(pkt, sizeof(pkt), t, 0, high, low, gain, port.port);

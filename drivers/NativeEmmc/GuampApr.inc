@@ -43,21 +43,26 @@ inline void wr32(uint8_t *p, uint32_t v) { wr16(p, static_cast<uint16_t>(v)); wr
 
 // A command from apps to an ADSP service (apr_send_pkt); returns the packet size, 0 if it does not fit. The port is
 // both src_port and dest_port (q6core/q6afe 0, q6asm session << 8 | stream, q6adm the AFE port id).
-inline uint32_t build(uint8_t *out, uint32_t cap, uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode,
-                      const uint8_t *payload, uint32_t n) {
+// buildPorts: different src/dest ports (adm_close: src = AFE port, dest = copp id).
+inline uint32_t buildPorts(uint8_t *out, uint32_t cap, uint8_t svc, uint16_t srcPort, uint16_t destPort, uint32_t token,
+                           uint32_t opcode, const uint8_t *payload, uint32_t n) {
   if (cap < kHdrBytes || n > cap - kHdrBytes || n > kMaxPacket - kHdrBytes || (n & 3)) return 0;
   wr16(out, kHdrField);
   wr16(out + 2, static_cast<uint16_t>(kHdrBytes + n));
   out[4] = svc;
   out[5] = kDomainApps;
-  wr16(out + 6, port);
+  wr16(out + 6, srcPort);
   out[8] = svc;
   out[9] = kDomainAdsp;
-  wr16(out + 10, port);
+  wr16(out + 10, destPort);
   wr32(out + 12, token);
   wr32(out + 16, opcode);
   for (uint32_t i = 0; i < n; i++) out[kHdrBytes + i] = payload[i];
   return kHdrBytes + n;
+}
+inline uint32_t build(uint8_t *out, uint32_t cap, uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode,
+                      const uint8_t *payload, uint32_t n) {
+  return buildPorts(out, cap, svc, port, port, token, opcode, payload, n);
 }
 
 // apr_cb_func checks: header length >= 5 words and inside the packet, pkt_size inside the message, version <= 1
