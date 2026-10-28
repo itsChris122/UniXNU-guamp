@@ -16,20 +16,65 @@
 // deliberately not AppleBluetoothModule / AppleBTMgmt (bluetoothd would take its PCIe path).
 
 namespace btnub {
+// The boot-time lines come before the USB log mirror attaches: a thread call repeats the outcome every 60 s (15 times,
+// then every 10 min), looked up the way bluetoothd does it (service name match, then local-mac-address through the
+// IODeviceTree plane, recursive), so the line tells what bluetoothd itself would find at that moment.
+static const char *gPublish = "not run";
+static thread_call_t gStatusCall;
+static unsigned gStatusRound;
+static const char *macState(IOService *s) {
+  if (!s) return "-";
+  OSObject *o = s->copyProperty("local-mac-address", gIODTPlane, kIORegistryIterateRecursively);
+  OSData *d = OSDynamicCast(OSData, o);
+  const uint8_t *b = d && d->getLength() >= 6 ? static_cast<const uint8_t *>(d->getBytesNoCopy()) : nullptr;
+  const char *r = !b ? "missing" : (b[0] | b[1] | b[2] | b[3] | b[4] | b[5]) ? "set" : "all zero";
+  if (o) o->release();
+  return r;
+}
+static IOService *byName(const char *name) {
+  OSDictionary *m = IOService::nameMatching(name);
+  IOService *s = m ? IOService::copyMatchingService(m) : nullptr;
+  if (m) m->release();
+  return s;
+}
+static void status(thread_call_param_t, thread_call_param_t) {
+  IOService *marconi = byName("marconi-bt"), *bt = marconi ? nullptr : byName("bluetooth");
+  IOService *s = marconi ? marconi : bt;
+  gStatusRound = gStatusRound + 1;
+  IOLog("GuampBtNub: status %u: publish %s; name match %s -> %s, local-mac-address %s\n", gStatusRound, gPublish,
+        marconi ? "marconi-bt" : "bluetooth", s ? s->getMetaClass()->getClassName() : "none (bluetoothd: no bluetooth)",
+        macState(s));
+  if (s) s->release();
+  uint64_t deadline = 0;
+  clock_interval_to_deadline(gStatusRound < 15 ? 60 : 600, kSecondScale, &deadline);
+  thread_call_enter_delayed(gStatusCall, deadline);
+}
+static void publish();
 void start() {
   unsigned enabled = 0;
   PE_parse_boot_argn("guamp-bt-nub", &enabled, sizeof(enabled));
   if (enabled != 1) return;
+  publish();
+  gStatusCall = thread_call_allocate(status, nullptr);
+  if (gStatusCall) {
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(30, kSecondScale, &deadline);
+    thread_call_enter_delayed(gStatusCall, deadline);
+  }
+}
+static void publish() {
   IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/uart1/bluetooth", gIODTPlane);
   IORegistryEntry *parentEntry = IORegistryEntry::fromPath("/arm-io/uart1", gIODTPlane);
   IOService *parent = OSDynamicCast(IOService, parentEntry);
   if (!node || !parent) {
+    gPublish = !node ? "no (no /arm-io/uart1/bluetooth node)" : "no (no uart1 nub)";
     IOLog("GuampBtNub: %s missing, not published\n", !node ? "/arm-io/uart1/bluetooth" : "uart1 nub");
     if (node) node->release();
     if (parentEntry) parentEntry->release();
     return;
   }
   if (OSDynamicCast(IOService, node)) {   // already a service (another publisher): only report it
+    gPublish = "already a service";
     IOLog("GuampBtNub: bluetooth node is already a %s, left as is\n", node->getMetaClass()->getClassName());
     node->release();
     parentEntry->release();
@@ -45,6 +90,7 @@ void start() {
     ok = nub->attach(parent);
   }
   if (ok) nub->registerService();
+  gPublish = ok ? "yes" : "no (init/attach failed)";
   IOLog("GuampBtNub: /arm-io/uart1/bluetooth %s (local-mac-address %s)\n", ok ? "published below uart1" : "not published",
         !b ? "missing" : zero ? "all zero: bluetoothd will still exit" : "set");
   if (nub) nub->release();
