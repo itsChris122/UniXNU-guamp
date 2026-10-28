@@ -197,6 +197,11 @@ def main():
         # -[_UIBlurEffectVariableImpl _updateEffectDescriptor:forEnvironment:usage:]); ...arm64.03,3495cfc (16 bytes) and
         # ...,3495d0c (4 bytes) turn the failure block into the normal cleanup without the variable-blur filter.
         # ADT Codex/cpu-config-8-full2-power-nome-ram-ci, see analisi/gpu-ci/SAFARI-SMS-20261029.md.
+        # The CoreUI graphic-variant fallback (.11,34a279c.., CG instead of CoreImage) drew the symbol untinted: the white
+        # comes from the content-effect stack (CoreImage), so Settings glyphs came out black (29/10). ADT
+        # Codex/cpu-config-8-full2-power-nome-ram-ci2 replaces those 14 entries with 23 (368 bytes): without
+        # disableColorFill the symbol goes through a transparency layer, SourceIn fill with
+        # options.monochromeForegroundColor or white; analisi/gpu-ci/prepara-fixup-glifi-cg.py.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
