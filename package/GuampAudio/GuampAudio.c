@@ -1,26 +1,34 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// GuampAudio.driver: the "null audio device" step of the guamp iOS audio plan (analisi/audio/IOS-AUDIO-LATO-UTENTE-20261028.md,
-// route (c)). An AudioServerPlugIn loaded by the HAL inside audiomxd (iPadOS 17.7.11, 21H461) from
-// /System/Library/Audio/Plug-Ins/HAL. It presents the built-in devices VirtualAudio knows by UID, so that it builds the
-// Built-In Speaker / Microphone ports instead of leaving everything on Null_Device:
-//   "Speaker"  stereo output (+ a silent stereo input, the amplifier sense of an iPhone/iPad), volume control 'vlme'
+// GuampAudio.driver: the iOS half of guamp audio (analisi/audio/IOS-AUDIO-LATO-UTENTE-20261028.md, route (c)). An
+// AudioServerPlugIn loaded by the HAL inside audiomxd (iPadOS 17.7.11, 21H461) from /System/Library/Audio/Plug-Ins/HAL. It
+// presents the built-in devices VirtualAudio knows by UID, so that it builds the Built-In Speaker / Microphone ports instead
+// of leaving everything on Null_Device:
+//   "Speaker"  stereo output (+ a silent stereo input, the amplifier sense of an iPhone/iPad), volume 'vlme' and mute 'mute'
 //   "Hawking"  one silent input (VirtualAudio's 'vhaw' companion device; J120 has an audio-hawking-device node)
 //   "Codec"    one silent input with a data source selector (VirtualAudio asks for DataSources on the codec input)
-// This step plays into nowhere and records silence: WriteMix is dropped, ReadInput returns zeros. Step 4 replaces the two
-// marked places with the kernel bridge (/dev/guamp-audio ring, s16 48 kHz, see DESIGN.md); nothing else changes then.
-// Clock: exactly kRate frames per second of mach_absolute_time(), zero time stamp every kRingFrames frames.
+// Output: when the kernel's /dev/guamp-audio exists (guamp_audio_dev.h), the Speaker mix is converted to s16 48 kHz stereo and
+// written to it (non-blocking, through a small staging FIFO); volume/mute go to the kernel by ioctl, or are applied here when
+// the ioctl is refused. Without the device the output is dropped (null device). Input is always silence (microphone: later).
+// Clock: kRate frames per second of mach_absolute_time(), zero time stamp every kRingFrames frames (GuampAudioCore.h).
 // No Apple code: written from the public macOS AudioServerPlugIn documentation (declarations in GuampAudioServerPlugIn.h).
-// Diagnostics: os_log subsystem "com.guamp.audio" (Initialize, devices, StartIO/StopIO, every property it does not know,
-// once per selector: the list that tells which properties VirtualAudio of J120 really needs, plan step 3).
+// Diagnostics: os_log subsystem "com.guamp.audio" (Initialize, devices, StartIO/StopIO, backend open/close and counters, every
+// property it does not know, once per selector: the list that tells which properties VirtualAudio of J120 really needs).
 #include "GuampAudioServerPlugIn.h"
+#include "GuampAudioCore.h"
+#include "guamp_audio_dev.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <mach/mach_time.h>
 #include <os/log.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 enum {
   kPlugIn = kAudioObjectPlugInObject,
-  kSpeaker = 2, kSpeakerOut, kSpeakerIn, kSpeakerVolume,
+  kSpeaker = 2, kSpeakerOut, kSpeakerIn, kSpeakerVolume, kSpeakerMute,
   kHawking, kHawkingIn,
   kCodec, kCodecIn, kCodecSource,
   kObjectCount
@@ -29,37 +37,138 @@ static const Float64 kRate = 48000.0;
 static const UInt32 kRingFrames = 16384, kSafetyFrames = 0, kLatencyFrames = 0;
 static const Float32 kMinDb = -48.0f, kMaxDb = 0.0f;   // 16 iOS volume steps of 3 dB
 static const UInt32 kSourceInternalMic = 'imic';       // to confirm against VirtualAudio's queries (step 3)
+_Static_assert(GUAMP_AUDIO_RATE == 48000 && GUAMP_AUDIO_CHANNELS == GUAMP_FIFO_CHANNELS, "device format");
 
 typedef struct {
-  AudioObjectID object, out, in, volume, source;
+  AudioObjectID object, out, in, volume, mute, source;
   UInt32 outChannels, inChannels;
   CFStringRef uid, name;
-  UInt32 running;        // StartIO count
-  UInt64 anchor, cycles;  // zero time stamp state while running
+  UInt32 running;   // StartIO count
+  GuampClock clock;
 } Device;
 
 static Device gDevices[] = {
-  {kSpeaker, kSpeakerOut, kSpeakerIn, kSpeakerVolume, 0, 2, 2, CFSTR("Speaker"), CFSTR("Speaker"), 0, 0, 0},
-  {kHawking, 0, kHawkingIn, 0, 0, 0, 1, CFSTR("Hawking"), CFSTR("Hawking"), 0, 0, 0},
-  {kCodec, 0, kCodecIn, 0, kCodecSource, 0, 1, CFSTR("Codec"), CFSTR("Codec"), 0, 0, 0},
+  {kSpeaker, kSpeakerOut, kSpeakerIn, kSpeakerVolume, kSpeakerMute, 0, 2, 2, CFSTR("Speaker"), CFSTR("Speaker"), 0, {0, 0, 0, 0, 0}},
+  {kHawking, 0, kHawkingIn, 0, 0, 0, 0, 1, CFSTR("Hawking"), CFSTR("Hawking"), 0, {0, 0, 0, 0, 0}},
+  {kCodec, 0, kCodecIn, 0, 0, kCodecSource, 0, 1, CFSTR("Codec"), CFSTR("Codec"), 0, {0, 0, 0, 0, 0}},
 };
 static const UInt32 kDeviceCount = sizeof(gDevices) / sizeof(gDevices[0]);
 
-static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;   // object model, clocks, controls
 static AudioServerPlugInHostRef gHost;
-static Float64 gTicksPerFrame;
 static Float32 gVolumeDb = kMaxDb;
+static UInt32 gMute;
 static UInt32 gSourceItem = kSourceInternalMic;
 static UInt32 gRefs = 1;
 static os_log_t gLog;
 static UInt32 gUnknownSeen[64];   // selectors already reported as unknown (diagnostics only)
 
-// ---- object model -------------------------------------------------------------------------------------------------------
+// ---- kernel backend (/dev/guamp-audio) ----------------------------------------------------------------------------------------
+// Opened by the Speaker's first StartIO, closed by its last StopIO. gIOLock serialises the IO thread (WriteMix) against
+// open/close and the volume ioctl; it is never taken while gLock is held.
+static pthread_mutex_t gIOLock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+  int fd;                      // -1: null device
+  int lastOpenErrno;           // logged once per distinct value
+  Boolean hwVolume;            // the kernel accepted SET_VOLUME: samples leave here at unity
+  _Atomic UInt32 softGainQ16;  // gain applied while converting (unity when hwVolume)
+  GuampFifo fifo;
+  UInt64 eagain, errors;
+} gBackend = {.fd = -1, .softGainQ16 = GUAMP_AUDIO_GAIN_UNITY};
+
+static long sinkWrite(void *ctx, const void *bytes, size_t length) {
+  const ssize_t n = write(*(const int *)ctx, bytes, length);
+  if (n >= 0) return (long)(n - n % GUAMP_AUDIO_BYTES_PER_FRAME);
+  if (errno == EAGAIN) gBackend.eagain++;
+  else gBackend.errors++;
+  return -1;
+}
+
+// Called with gIOLock held. Sends the current volume to the kernel, or keeps it for the conversion.
+static void backendVolume(Float32 db, UInt32 mute) {
+  const UInt32 gain = guamp_gain_q16(db, kMinDb, kMaxDb, (int)mute);
+  if (gBackend.fd >= 0) {
+    struct guamp_audio_volume v = {gain, (int32_t)lrintf(db * 100.0f), mute ? 1u : 0u, 0};
+    gBackend.hwVolume = ioctl(gBackend.fd, GUAMP_AUDIO_SET_VOLUME, &v) == 0;
+  }
+  atomic_store(&gBackend.softGainQ16, gBackend.hwVolume ? GUAMP_AUDIO_GAIN_UNITY : gain);
+}
+
+static void backendOpen(Float32 db, UInt32 mute) {
+  pthread_mutex_lock(&gIOLock);
+  if (gBackend.fd < 0) {
+    const int fd = open(GUAMP_AUDIO_DEV_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    struct guamp_audio_info info;
+    memset(&info, 0, sizeof(info));
+    int why = fd < 0 ? errno : 0;
+    if (fd >= 0 && ioctl(fd, GUAMP_AUDIO_GET_INFO, &info)) why = errno;
+    else if (fd >= 0 && (info.abi != GUAMP_AUDIO_ABI_VERSION || info.rate != GUAMP_AUDIO_RATE ||
+                         info.channels != GUAMP_AUDIO_CHANNELS || info.bits != GUAMP_AUDIO_BITS))
+      why = EPROTO;
+    if (why) {
+      if (fd >= 0) close(fd);
+      if (why != gBackend.lastOpenErrno)
+        os_log(gLog, "GuampAudio: %{public}s unavailable (errno %d, abi %u): null output", GUAMP_AUDIO_DEV_PATH, why, info.abi);
+      gBackend.lastOpenErrno = why;
+    } else {
+      gBackend.fd = fd;
+      gBackend.lastOpenErrno = 0;
+      gBackend.hwVolume = false;
+      gBackend.eagain = gBackend.errors = 0;
+      gBackend.fifo.dropped = gBackend.fifo.written = 0;
+      guamp_fifo_reset(&gBackend.fifo);
+      UInt32 route = GUAMP_AUDIO_ROUTE_SPEAKER;
+      const int routeErr = ioctl(fd, GUAMP_AUDIO_SET_ROUTE, &route) ? errno : 0;
+      backendVolume(db, mute);
+      const int startErr = ioctl(fd, GUAMP_AUDIO_START) ? errno : 0;
+      os_log(gLog, "GuampAudio: %{public}s open: ring %u, period %u, flags 0x%x, route err %d, hw volume %d, start err %d",
+             GUAMP_AUDIO_DEV_PATH, info.ring_frames, info.period_frames, info.flags, routeErr, gBackend.hwVolume, startErr);
+    }
+  }
+  pthread_mutex_unlock(&gIOLock);
+}
+
+static void backendClose(void) {
+  pthread_mutex_lock(&gIOLock);
+  if (gBackend.fd >= 0) {
+    struct guamp_audio_info info;
+    memset(&info, 0, sizeof(info));
+    (void)ioctl(gBackend.fd, GUAMP_AUDIO_GET_INFO, &info);
+    (void)ioctl(gBackend.fd, GUAMP_AUDIO_STOP);
+    close(gBackend.fd);
+    gBackend.fd = -1;
+    os_log(gLog, "GuampAudio: %{public}s closed: written %llu, played %llu, underruns %llu; plug-in sent %llu, dropped %llu, "
+           "full %llu, errors %llu", GUAMP_AUDIO_DEV_PATH, (unsigned long long)info.frames_written,
+           (unsigned long long)info.frames_played, (unsigned long long)info.underruns, (unsigned long long)gBackend.fifo.written,
+           (unsigned long long)gBackend.fifo.dropped, (unsigned long long)gBackend.eagain, (unsigned long long)gBackend.errors);
+  }
+  pthread_mutex_unlock(&gIOLock);
+}
+
+// IO thread: one WriteMix buffer (Float32 interleaved stereo) into the device.
+static void backendWrite(const Float32 *mix, UInt32 frames) {
+  pthread_mutex_lock(&gIOLock);
+  if (gBackend.fd >= 0) {
+    const UInt32 gain = atomic_load(&gBackend.softGainQ16);
+    int16_t chunk[512 * GUAMP_FIFO_CHANNELS];
+    for (UInt32 done = 0; done < frames;) {
+      const UInt32 n = frames - done < 512 ? frames - done : 512;
+      guamp_f32_to_s16(mix + (size_t)done * GUAMP_FIFO_CHANNELS, chunk, (size_t)n * GUAMP_FIFO_CHANNELS, gain);
+      (void)guamp_fifo_push(&gBackend.fifo, chunk, n);
+      done += n;
+      (void)guamp_fifo_flush(&gBackend.fifo, sinkWrite, &gBackend.fd);
+    }
+  }
+  pthread_mutex_unlock(&gIOLock);
+}
+
+// ---- object model -------------------------------------------------------------------------------------------------------------
 
 static Device *deviceOwning(AudioObjectID object) {
   for (UInt32 i = 0; i < kDeviceCount; i++) {
     Device *d = &gDevices[i];
-    if (object == d->object || (object && (object == d->out || object == d->in || object == d->volume || object == d->source)))
+    if (object == d->object ||
+        (object && (object == d->out || object == d->in || object == d->volume || object == d->mute || object == d->source)))
       return d;
   }
   return NULL;
@@ -80,7 +189,7 @@ static AudioStreamBasicDescription format(UInt32 channels) {
   return f;
 }
 
-// ---- replies: out == NULL means "size only" ---------------------------------------------------------------------------
+// ---- replies: out == NULL means "size only" -----------------------------------------------------------------------------------
 
 typedef struct {
   void *out;
@@ -124,7 +233,7 @@ static UInt32 deviceStreams(const Device *d, AudioObjectPropertyScope scope, Aud
 }
 
 // One table for HasProperty, GetPropertyDataSize and GetPropertyData. Returns kAudioHardwareUnknownPropertyError when
-// the object does not have the property.
+// the object does not have the property. Called with gLock held.
 static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress *a, UInt32 qualSize, const void *qual,
                          Reply *r) {
   r->status = kAudioHardwareNoError;
@@ -155,7 +264,7 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
   Device *d = deviceOwning(object);
   if (!d) return kAudioHardwareBadObjectError;
   if (object == d->object) {
-    AudioObjectID ids[4];
+    AudioObjectID ids[5];
     UInt32 n;
     switch (sel) {
       case kAudioObjectPropertyBaseClass: putU32(r, kAudioObjectClassID); break;
@@ -194,12 +303,14 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
       case kAudioObjectPropertyControlList:
         n = 0;
         if (d->volume) ids[n++] = d->volume;
+        if (d->mute) ids[n++] = d->mute;
         if (d->source) ids[n++] = d->source;
         putObjects(r, ids, n);
         break;
       case kAudioObjectPropertyOwnedObjects:
         n = deviceStreams(d, a->mScope, ids);
         if (d->volume && a->mScope != kAudioObjectPropertyScopeInput) ids[n++] = d->volume;
+        if (d->mute && a->mScope != kAudioObjectPropertyScopeInput) ids[n++] = d->mute;
         if (d->source && a->mScope != kAudioObjectPropertyScopeOutput) ids[n++] = d->source;
         putObjects(r, ids, n);
         break;
@@ -246,7 +357,7 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
       case kAudioObjectPropertyOwner: putU32(r, d->object); break;
       case kAudioControlPropertyScope: putU32(r, kAudioObjectPropertyScopeOutput); break;
       case kAudioControlPropertyElement: putU32(r, kAudioObjectPropertyElementMain); break;
-      case kAudioLevelControlPropertyScalarValue: putF32(r, (gVolumeDb - kMinDb) / (kMaxDb - kMinDb)); break;
+      case kAudioLevelControlPropertyScalarValue: putF32(r, guamp_db_to_scalar(gVolumeDb, kMinDb, kMaxDb)); break;
       case kAudioLevelControlPropertyDecibelValue: putF32(r, gVolumeDb); break;
       case kAudioLevelControlPropertyDecibelRange: {
         AudioValueRange range = {kMinDb, kMaxDb};
@@ -256,18 +367,23 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
       case kAudioLevelControlPropertyConvertScalarToDecibels:
       case kAudioLevelControlPropertyConvertDecibelsToScalar: {
         // In-out property: the caller's value arrives in the output buffer (as on macOS)
-        Float32 v = r->out && r->cap >= sizeof(Float32) ? *(Float32 *)r->out : 0;
-        if (v != v) v = 0;   // NaN
-        if (sel == kAudioLevelControlPropertyConvertScalarToDecibels) {
-          v = v < 0 ? 0 : v > 1 ? 1 : v;
-          v = kMinDb + v * (kMaxDb - kMinDb);
-        } else {
-          v = v < kMinDb ? kMinDb : v > kMaxDb ? kMaxDb : v;
-          v = (v - kMinDb) / (kMaxDb - kMinDb);
-        }
-        putF32(r, v);
+        const Float32 v = r->out && r->cap >= sizeof(Float32) ? *(Float32 *)r->out : 0;
+        putF32(r, sel == kAudioLevelControlPropertyConvertScalarToDecibels ? guamp_scalar_to_db(v, kMinDb, kMaxDb)
+                                                                           : guamp_db_to_scalar(v, kMinDb, kMaxDb));
         break;
       }
+      default: return kAudioHardwareUnknownPropertyError;
+    }
+    return r->status;
+  }
+  if (object == d->mute) {
+    switch (sel) {
+      case kAudioObjectPropertyBaseClass: putU32(r, kAudioBooleanControlClassID); break;
+      case kAudioObjectPropertyClass: putU32(r, kAudioMuteControlClassID); break;
+      case kAudioObjectPropertyOwner: putU32(r, d->object); break;
+      case kAudioControlPropertyScope: putU32(r, kAudioObjectPropertyScopeOutput); break;
+      case kAudioControlPropertyElement: putU32(r, kAudioObjectPropertyElementMain); break;
+      case kAudioBooleanControlPropertyValue: putU32(r, gMute); break;
       default: return kAudioHardwareUnknownPropertyError;
     }
     return r->status;
@@ -290,7 +406,7 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
   return r->status;
 }
 
-// ---- COM entry points ---------------------------------------------------------------------------------------------------
+// ---- COM entry points ---------------------------------------------------------------------------------------------------------
 
 static AudioServerPlugInDriverInterface gInterface;
 static AudioServerPlugInDriverInterface *gInterfacePtr = &gInterface;
@@ -327,9 +443,11 @@ static OSStatus initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
   gHost = host;
   mach_timebase_info_data_t tb;
   mach_timebase_info(&tb);
-  gTicksPerFrame = (1.0e9 / kRate) * (Float64)tb.denom / (Float64)tb.numer;
-  os_log(gLog, "GuampAudio: initialized, %u devices (Speaker, Hawking, Codec), %.0f Hz, ring %u frames, null I/O",
-         kDeviceCount, kRate, kRingFrames);
+  const double ticksPerFrame = guamp_ticks_per_frame(tb.numer, tb.denom, kRate);
+  for (UInt32 i = 0; i < kDeviceCount; i++) guamp_clock_init(&gDevices[i].clock, ticksPerFrame, kRingFrames);
+  const Boolean present = access(GUAMP_AUDIO_DEV_PATH, F_OK) == 0;
+  os_log(gLog, "GuampAudio: initialized, %u devices (Speaker, Hawking, Codec), %.0f Hz, ring %u frames, %{public}s %{public}s",
+         kDeviceCount, kRate, kRingFrames, GUAMP_AUDIO_DEV_PATH, present ? "present" : "absent (null output)");
   return kAudioHardwareNoError;
 }
 static OSStatus createDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc, const AudioServerPlugInClientInfo *c,
@@ -370,6 +488,7 @@ static OSStatus isSettable(AudioServerPlugInDriverRef d, AudioObjectID object, p
   const UInt32 s = a->mSelector;
   *out = (object == kSpeaker || object == kHawking || object == kCodec) ? s == kAudioDevicePropertyNominalSampleRate
        : object == kSpeakerVolume ? s == kAudioLevelControlPropertyScalarValue || s == kAudioLevelControlPropertyDecibelValue
+       : object == kSpeakerMute   ? s == kAudioBooleanControlPropertyValue
        : object == kCodecSource   ? s == kAudioSelectorControlPropertyCurrentItem
        : s == kAudioStreamPropertyVirtualFormat || s == kAudioStreamPropertyPhysicalFormat;
   return kAudioHardwareNoError;
@@ -381,8 +500,8 @@ static OSStatus getSize(AudioServerPlugInDriverRef d, AudioObjectID object, pid_
   Reply r = {NULL, 0, 0, 0};
   pthread_mutex_lock(&gLock);
   const OSStatus s = property(object, a, qualSize, qual, &r);
-  pthread_mutex_unlock(&gLock);
   if (s == kAudioHardwareUnknownPropertyError) unknown(object, a);
+  pthread_mutex_unlock(&gLock);
   if (s == kAudioHardwareIllegalOperationError) { *out = sizeof(CFStringRef); return kAudioHardwareNoError; }
   *out = r.used;
   return s;
@@ -394,8 +513,8 @@ static OSStatus getData(AudioServerPlugInDriverRef d, AudioObjectID object, pid_
   Reply r = {out, inSize, 0, 0};
   pthread_mutex_lock(&gLock);
   const OSStatus s = property(object, a, qualSize, qual, &r);
-  pthread_mutex_unlock(&gLock);
   if (s == kAudioHardwareUnknownPropertyError) unknown(object, a);
+  pthread_mutex_unlock(&gLock);
   *outSize = r.used;
   return s;
 }
@@ -427,16 +546,34 @@ static OSStatus setData(AudioServerPlugInDriverRef d, AudioObjectID object, pid_
     if (inSize != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
     Float32 v = *(const Float32 *)in;
     if (v != v) return kAudioHardwareIllegalOperationError;
-    if (sel == kAudioLevelControlPropertyScalarValue) v = kMinDb + (v < 0 ? 0 : v > 1 ? 1 : v) * (kMaxDb - kMinDb);
-    v = v < kMinDb ? kMinDb : v > kMaxDb ? kMaxDb : v;
+    v = sel == kAudioLevelControlPropertyScalarValue ? guamp_scalar_to_db(v, kMinDb, kMaxDb) : guamp_clampf(v, kMinDb, kMaxDb);
     pthread_mutex_lock(&gLock);
     const Boolean differs = v != gVolumeDb;
     gVolumeDb = v;
+    const UInt32 mute = gMute;
     pthread_mutex_unlock(&gLock);
     if (differs) {
-      // step 4: the kernel bridge gets the level here (ioctl), as hackios' HAKIOS_AUDIO_SET_VOLUME
+      pthread_mutex_lock(&gIOLock);
+      backendVolume(v, mute);
+      pthread_mutex_unlock(&gIOLock);
       changed(object, kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal);
       changed(object, kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal);
+    }
+    return kAudioHardwareNoError;
+  }
+  if (object == kSpeakerMute && sel == kAudioBooleanControlPropertyValue) {
+    if (inSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+    const UInt32 mute = *(const UInt32 *)in ? 1 : 0;
+    pthread_mutex_lock(&gLock);
+    const Boolean differs = mute != gMute;
+    gMute = mute;
+    const Float32 db = gVolumeDb;
+    pthread_mutex_unlock(&gLock);
+    if (differs) {
+      pthread_mutex_lock(&gIOLock);
+      backendVolume(db, mute);
+      pthread_mutex_unlock(&gIOLock);
+      changed(object, kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal);
     }
     return kAudioHardwareNoError;
   }
@@ -454,12 +591,14 @@ static OSStatus startIO(AudioServerPlugInDriverRef d, AudioObjectID device, UInt
   Device *dev = deviceOwning(device);
   if (!dev || dev->object != device) return kAudioHardwareBadObjectError;
   pthread_mutex_lock(&gLock);
-  if (!dev->running++) {
-    dev->anchor = mach_absolute_time();
-    dev->cycles = 0;
-  }
+  const Boolean first = dev->running == 0;
+  dev->running++;
+  if (first) guamp_clock_start(&dev->clock, mach_absolute_time());
   const UInt32 n = dev->running;
+  const Float32 db = gVolumeDb;
+  const UInt32 mute = gMute;
   pthread_mutex_unlock(&gLock);
+  if (first && dev->out) backendOpen(db, mute);
   os_log(gLog, "GuampAudio: StartIO %{public}@ (%u clients)", dev->uid, n);
   return kAudioHardwareNoError;
 }
@@ -472,23 +611,23 @@ static OSStatus stopIO(AudioServerPlugInDriverRef d, AudioObjectID device, UInt3
   if (dev->running) dev->running--;
   const UInt32 n = dev->running;
   pthread_mutex_unlock(&gLock);
+  if (!s && !n && dev->out) backendClose();
   os_log(gLog, "GuampAudio: StopIO %{public}@ (%u clients)", dev->uid, n);
   return s;
 }
-// Zero time stamps exactly kRingFrames frames apart on the host clock (the NullAudio sample driver's model)
 static OSStatus zeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID device, UInt32 client, Float64 *sampleTime,
                               UInt64 *hostTime, UInt64 *seed) {
   (void)d; (void)client;
   Device *dev = deviceOwning(device);
   if (!dev || dev->object != device || !sampleTime || !hostTime || !seed) return kAudioHardwareBadObjectError;
+  double t = 0;
+  uint64_t h = 0, s = 0;
   pthread_mutex_lock(&gLock);
-  const Float64 ticksPerRing = gTicksPerFrame * kRingFrames;
-  const UInt64 now = mach_absolute_time();
-  if ((Float64)dev->anchor + ticksPerRing * (Float64)(dev->cycles + 1) <= (Float64)now) dev->cycles++;
-  *sampleTime = (Float64)dev->cycles * kRingFrames;
-  *hostTime = dev->anchor + (UInt64)(ticksPerRing * (Float64)dev->cycles);
-  *seed = 1;
+  guamp_clock_zero(&dev->clock, mach_absolute_time(), &t, &h, &s);
   pthread_mutex_unlock(&gLock);
+  *sampleTime = t;
+  *hostTime = h;
+  *seed = s;
   return kAudioHardwareNoError;
 }
 static OSStatus willDo(AudioServerPlugInDriverRef d, AudioObjectID device, UInt32 client, UInt32 op, Boolean *will,
@@ -510,11 +649,10 @@ static OSStatus doIO(AudioServerPlugInDriverRef d, AudioObjectID device, AudioOb
   Device *dev = deviceOwning(device);
   if (!dev || !isStream(dev, stream) || !main) return kAudioHardwareBadObjectError;
   if (op == kAudioServerPlugInIOOperationReadInput) {
-    // step 6: microphone samples from the kernel (/dev/guamp-mic); null device: silence
+    // microphone samples from the kernel later (/dev/guamp-mic); now: silence
     memset(main, 0, (size_t)frames * streamChannels(dev, stream) * sizeof(Float32));
-  } else if (op == kAudioServerPlugInIOOperationWriteMix) {
-    // step 4: Float32 -> s16 and a non-blocking write to /dev/guamp-audio (kernel ring -> q6asm/AFE -> aw882xx);
-    // null device: dropped
+  } else if (op == kAudioServerPlugInIOOperationWriteMix && stream == kSpeakerOut) {
+    backendWrite(main, frames);   // no-op while /dev/guamp-audio is not open (null device)
   }
   return kAudioHardwareNoError;
 }

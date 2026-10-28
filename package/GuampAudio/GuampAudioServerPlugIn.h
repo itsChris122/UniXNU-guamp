@@ -102,7 +102,7 @@ enum {
   kAudioObjectPropertyElementMain = 0,
   kAudioObjectClassID = 'aobj', kAudioPlugInClassID = 'aplg', kAudioDeviceClassID = 'adev', kAudioStreamClassID = 'astr',
   kAudioLevelControlClassID = 'levl', kAudioVolumeControlClassID = 'vlme', kAudioSelectorControlClassID = 'slct',
-  kAudioDataSourceControlClassID = 'dsrc',
+  kAudioDataSourceControlClassID = 'dsrc', kAudioBooleanControlClassID = 'togl', kAudioMuteControlClassID = 'mute',
   kAudioObjectPropertyBaseClass = 'bcls', kAudioObjectPropertyClass = 'clas', kAudioObjectPropertyOwner = 'stdv',
   kAudioObjectPropertyName = 'lnam', kAudioObjectPropertyManufacturer = 'lmak', kAudioObjectPropertyOwnedObjects = 'ownd',
   kAudioObjectPropertyControlList = 'ctrl',
@@ -127,7 +127,7 @@ enum {
   kAudioLevelControlPropertyDecibelRange = 'lcdr', kAudioLevelControlPropertyConvertScalarToDecibels = 'lcsd',
   kAudioLevelControlPropertyConvertDecibelsToScalar = 'lcds',
   kAudioSelectorControlPropertyCurrentItem = 'scci', kAudioSelectorControlPropertyAvailableItems = 'scai',
-  kAudioSelectorControlPropertyItemName = 'scin',
+  kAudioSelectorControlPropertyItemName = 'scin', kAudioBooleanControlPropertyValue = 'bcvl',
   kAudioServerPlugInIOOperationReadInput = 'read', kAudioServerPlugInIOOperationWriteMix = 'rite',
 };
 

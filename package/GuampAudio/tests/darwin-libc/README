@@ -1,0 +1,3 @@
+Minimal Darwin libc declarations (values as in the iOS SDK) so that check-guamp-audio.sh can run clang -fsyntax-only
+-target arm64-apple-ios17 on a Linux host without an Apple SDK. Only what GuampAudio.c and guamp_audio_dev.h use.
+The real build (build-guamp-audio-plugin.sh, macOS runner) uses the iPhoneOS SDK and never sees these files.

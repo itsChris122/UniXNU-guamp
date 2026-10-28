@@ -13,6 +13,11 @@ Nothing here is enabled by default: the plugin files only matter with the kernel
 accelerator (guamp-adreno=1), and the code only runs when its CDHashes (DIR/trust.json) are in the payload trust cache. Without
 --publish the plugin runs its self-tests only and backboardd keeps the software renderer.
 
+--audio DIR adds GuampAudio.driver (DIR = the OUTDIR of package/GuampAudio/build-guamp-audio-plugin.sh: GuampAudio.driver/ and
+trust.json) as audio/HAL/GuampAudio.driver/*; the kernel shows that directory over /System/Library/Audio/Plug-Ins/HAL only with
+guamp-audio-plugin=1 (patches/xnu/zzzzz-guamp-audio-plugin.patch), and audiomxd loads it only with its CDHash in the trust cache.
+--no-gpu leaves the GPU files out (audio-only addon on top of BASE).
+
 Layout (UniXNU make-gpu-addon.py), little endian: "NGPUADD2", u32 count, u32 0, u64 total bytes; per file u32 path bytes (with NUL,
 at most 160), u32 mode, u64 size, u64 compressed size, the path padded to 8 bytes, the zlib stream padded to 8 bytes."""
 import argparse
@@ -78,6 +83,19 @@ def plugin_files(plugin, publish, clients, prime_list):
     return files
 
 
+def audio_files(directory):
+    bundle = directory / 'GuampAudio.driver'
+    if not (bundle / 'GuampAudio').is_file() or not (bundle / 'Info.plist').is_file():
+        sys.exit(f'{directory}: build it first (package/GuampAudio/build-guamp-audio-plugin.sh {directory})')
+    if not (bundle / '_CodeSignature' / 'CodeResources').is_file() or not (directory / 'trust.json').is_file():
+        sys.exit(f'{directory}: unsigned bundle or trust.json missing (the CDHash the payload trust cache must carry)')
+    files = []
+    for path in sorted(p for p in bundle.rglob('*') if p.is_file()):
+        mode = 0o755 if path.name == 'GuampAudio' else 0o644
+        files.append(('audio/HAL/GuampAudio.driver/' + path.relative_to(bundle).as_posix(), mode, path.read_bytes()))
+    return files
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--base', type=Path, required=True, help='the existing guamp addon (iphone-res)')
@@ -85,6 +103,8 @@ def main():
     parser.add_argument('--publish', action='store_true', help='backboardd gets the native Metal device (GPU compositing)')
     parser.add_argument('--clients', help='other processes with their own Metal device, comma separated ("*" = all)')
     parser.add_argument('--prime-list', type=Path, help='absolute .metallib paths the render server compiles ahead')
+    parser.add_argument('--audio', type=Path, help='OUTDIR of build-guamp-audio-plugin.sh (GuampAudio.driver + trust.json)')
+    parser.add_argument('--no-gpu', action='store_true', help='leave the GPU plugin files out (with --audio: audio-only addon)')
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
     clients = [name for name in (args.clients or '').split(',') if name]
@@ -93,7 +113,13 @@ def main():
     if args.output.exists():
         sys.exit(f'Refuse to overwrite {args.output}')
     base = read_addon(args.base)
-    added = plugin_files(args.plugin, args.publish, clients, args.prime_list)
+    if args.no_gpu and (args.publish or clients or args.prime_list):
+        sys.exit('--no-gpu excludes --publish, --clients and --prime-list')
+    added = [] if args.no_gpu else plugin_files(args.plugin, args.publish, clients, args.prime_list)
+    if args.audio:
+        added += audio_files(args.audio)
+    if not added:
+        sys.exit('nothing to add (--no-gpu without --audio)')
     names = {name for name, _, _ in base}
     clash = sorted(name for name, _, _ in added if name in names)
     if clash:
@@ -109,7 +135,7 @@ def main():
     args.output.write_bytes(blob)
     for name, mode, data in added:
         print(f'{mode:o} {len(data):>10} {name}')
-    print(f'{args.output}: {len(base)} base + {len(added)} GPU files, {len(blob)} bytes')
+    print(f'{args.output}: {len(base)} base + {len(added)} added files, {len(blob)} bytes')
 
 
 if __name__ == '__main__':
