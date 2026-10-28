@@ -695,6 +695,18 @@ extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited
   }
 }
 
+extern "C" int guamp_adreno_ring_marks(uint32_t *submitted, uint32_t *retired) {
+  if (submitted) *submitted = 0;
+  if (retired) *retired = 0;
+  NativeAdrenoRing *ring = gRing;
+  const volatile uint8_t *page = gSession.ncpu[2];
+  if (!ring || !page || gSession.nb[2].bytes < 8 || ring->poisoned() || gGpuParked) return -1;
+  if (submitted) *submitted = ring->lastSubmitted();
+  __asm__ volatile("dsb sy" ::: "memory");
+  if (retired) *retired = *reinterpret_cast<const volatile uint32_t *>(page + 4);
+  return 0;
+}
+
 extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   static bool started = false;
   if (!in || !in->gpu || in->gpuBytes < 0x90000 || !in->sqe || !in->level || started) return GuampAdrenoBadArgs;

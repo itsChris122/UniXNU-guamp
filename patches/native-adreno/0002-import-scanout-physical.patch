@@ -1,0 +1,80 @@
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -174,6 +174,67 @@
+     if(range)native_adreno_import_persistent[1]=native_adreno_import_persistent[1]+1;
+     return range;
+ }
++/* guamp (patches/native-adreno/0002-import-scanout-physical.patch): the display hand-off's scanout (memory type 0x5343, the firmware
++ * frame buffer, device memory outside the VM's pages) reaches the GPU as the presenter's user mapping of it, imported like any range
++ * (withAddressRange + prepare + getPhysicalSegment). For device memory that chain was never verified here (guamp P1: the GPU copied
++ * into the scanout and the panel did not change). When the range is the task's mapping of the scanout (or its PTEs map the scanout
++ * linearly), the spans are rebuilt from the kernel's own descriptor of it (its physical segments); every import records IOKit's first
++ * address against the PTE's.
++ * native_adreno_import_pa: [0] imports checked, [1] scanout imports (spans from the scanout descriptor), [2] of those whose IOKit spans
++ * differed (first address or span count), [3] imports whose first PTE address differed from IOKit's, [4] last scanout import: IOKit's
++ * first address, [5] its IOKit span count, [6] the first address used, [7] last import: IOKit's first address, [8] its span count,
++ * [9] its PTE address. */
++extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void);
++extern "C" uint64_t native_adreno_task_pa(void *pmap,uint64_t va) __asm__("_pmap_find_pa");
++extern "C" void *native_adreno_task_pmap(void *task) __asm__("_get_task_pmap");
++extern "C" {volatile uint64_t native_adreno_import_pa[10];}
++static uint64_t importPte(void *task,uint64_t address)
++{
++    void *pmap=task?native_adreno_task_pmap(task):nullptr;
++    return pmap?native_adreno_task_pa(pmap,address):0;
++}
++static IOReturn importScanout(void *task,uint64_t address,size_t bytes,uint64_t limit,NativeAdrenoPhysicalSpan *spans,size_t capacity,
++    size_t *count)
++{
++    if(!spans || !*count || !bytes)return kIOReturnSuccess;
++    const uint64_t first=importPte(task,address),last=importPte(task,address+bytes-4096);
++    const uint64_t iokitFirst=spans[0].physical;const size_t iokitCount=*count;
++    native_adreno_import_pa[0]=native_adreno_import_pa[0]+1;
++    native_adreno_import_pa[7]=iokitFirst;native_adreno_import_pa[8]=iokitCount;native_adreno_import_pa[9]=first;
++    if(first && first!=iokitFirst)native_adreno_import_pa[3]=native_adreno_import_pa[3]+1;
++    IOMemoryDescriptor *scanout=native_gop_handoff_memory();   /* retained for the caller; the weak stand-in answers none */
++    if(!scanout)return kIOReturnSuccess;
++    IOReturn status=kIOReturnSuccess;
++    IOByteCount run=0;
++    const uint64_t base=scanout->getPhysicalSegment(0,&run,kIOMemoryMapperNone),length=scanout->getLength();
++    /* Where the range starts in the scanout: the task's own mapping of the scanout descriptor at this address (kIOMapReference finds an
++     * existing mapping only, never makes one; device memory may not be faulted in yet), else the PTEs, when they map it linearly. */
++    uint64_t at=UINT64_MAX;
++    if(IOMemoryMap *map=scanout->createMappingInTask(static_cast<task_t>(task),address,kIOMapReference,0,0)) {
++        if(map->getAddress()==address)at=0;
++        map->release();
++    }
++    if(at==UINT64_MAX && first && base && !(first&4095) && first>=base && first-base<length && last==first+bytes-4096)at=first-base;
++    if(base && at!=UINT64_MAX && at<length && bytes<=length-at) {
++        size_t n=0;
++        for(size_t offset=0;offset<bytes;offset+=4096) {
++            IOByteCount segment=0;
++            const uint64_t physical=scanout->getPhysicalSegment(at+offset,&segment,kIOMemoryMapperNone);
++            if(!physical || (physical&4095) || segment<4096 || physical>=limit || 4096>limit-physical) {status=kIOReturnUnsupported;break;}
++            if(n && physical==spans[n-1].physical+spans[n-1].bytes)spans[n-1].bytes+=4096;
++            else if(n<capacity)spans[n++]={offset,physical,4096};
++            else {status=kIOReturnUnsupported;break;}
++        }
++        if(status==kIOReturnSuccess) {
++            *count=n;
++            native_adreno_import_pa[1]=native_adreno_import_pa[1]+1;
++            if(iokitFirst!=spans[0].physical || iokitCount!=n)native_adreno_import_pa[2]=native_adreno_import_pa[2]+1;
++            native_adreno_import_pa[4]=iokitFirst;native_adreno_import_pa[5]=iokitCount;native_adreno_import_pa[6]=spans[0].physical;
++        }
++    }
++    scanout->release();
++    return status;
++}
+ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
+ {
+     native_adreno_import_stage=10;
+@@ -220,6 +281,9 @@
+             spans_[span_count_-1].bytes+=4096;
+         else spans_[span_count_++]={offset,physical,4096};
+     }
++    /* guamp: a range over the scanout takes its spans from the scanout's own descriptor (importScanout above). */
++    status=importScanout(task,address,bytes,limit,spans_,span_capacity_,&span_count_);
++    if(status!=kIOReturnSuccess) {native_adreno_import_stage=18;goto failed;}
+     native_adreno_import_stage=19;
+     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)span_count_;
+     return kIOReturnSuccess;

@@ -54,6 +54,9 @@ extern "C" volatile uint64_t guamp_copy_split[16];
 // The same variant's guamp-copy-gpu-wait counters ([0] reached, [1] timed out, [2] no ring, [3] us waited, [4] longest us,
 // [5] reached at once, [6] the bound in ms; 0 = off).
 extern "C" volatile uint64_t guamp_copy_gpu_wait[8];
+// Section 10 of the variant, latest-frame-wins: [0] frames started, [1] coalesced, [2] stale-skipped, [3] GPU frames, [4] CPU frames,
+// [5] in-thread refreshes, [6] trailing re-shows, [7] GPU failures, [8] CPU copy failures, [9] on.
+extern "C" volatile uint64_t guamp_copy_latest[10];
 // drivers/NativeAdreno/NativeAdrenoPublish.cpp: the Metal plugin's connections and tunnel calls (only the leading counters of its
 // NativeAdrenoMetalDiag, declared first there) and its telemetry rows, which otherwise reach only the boot page (hidden under Metal).
 struct GuampMetalDiagHead {
@@ -63,9 +66,27 @@ struct GuampMetalDiagHead {
 extern "C" GuampMetalDiagHead native_adreno_metal_diag;
 extern "C" char native_adreno_metal_rows[48][96];
 extern "C" volatile uint32_t native_adreno_metal_rows_seq;
+// patches/native-adreno/0002-import-scanout-physical.patch: [0] imports checked, [1] scanout imports (spans from the kernel's scanout
+// descriptor), [2] of those whose IOKit spans differed, [3] imports whose first PTE address differed from IOKit's, [4] last scanout
+// import's IOKit first address, [5] its IOKit span count, [6] its address used, [7] last import's IOKit first address, [8] its span
+// count, [9] its PTE address.
+extern "C" volatile uint64_t native_adreno_import_pa[10];
+
+static void importLog()
+{
+  static uint64_t lastChecked = 0;
+  const uint64_t checked = native_adreno_import_pa[0];
+  if (checked == lastChecked) return;
+  IOLog("GuampMetal: imports %llu (+%llu), pte!=iokit %llu; scanout imports %llu, iokit differed %llu, last: iokit pa %llx spans %llu "
+        "-> pa %llx; last import: iokit pa %llx spans %llu pte %llx\n", checked, checked - lastChecked, native_adreno_import_pa[3],
+        native_adreno_import_pa[1], native_adreno_import_pa[2], native_adreno_import_pa[4], native_adreno_import_pa[5],
+        native_adreno_import_pa[6], native_adreno_import_pa[7], native_adreno_import_pa[8], native_adreno_import_pa[9]);
+  lastChecked = checked;
+}
 
 static void metalLog()
 {
+  importLog();
   static uint32_t lastCalls = 0, lastTunnel = 0, lastSeq = 0;
   const GuampMetalDiagHead &d = native_adreno_metal_diag;
   const uint32_t seq = native_adreno_metal_rows_seq;
@@ -99,19 +120,32 @@ static void copyLog()
   const uint64_t waits = guamp_copy_gpu_wait[0], timeouts = guamp_copy_gpu_wait[1], noRing = guamp_copy_gpu_wait[2];
   const uint64_t waitUs = guamp_copy_gpu_wait[3], ready = guamp_copy_gpu_wait[5];
   const uint64_t waited = (waits - lastWaits) + (timeouts - lastTimeouts);
+  // Latest-frame-wins (variant section 10), since the previous report: frames started, coalesced (replaced before they started),
+  // stale-skipped (a newer frame queued during the GPU wait), shown by the GPU / the CPU, refreshes, trailing re-shows, failures.
+  char latest[200] = "";
+  {
+    static uint64_t last[9] = {};
+    uint64_t now[9];
+    for (unsigned i = 0; i < 9; i++) now[i] = guamp_copy_latest[i];
+    if (guamp_copy_latest[9])
+      snprintf(latest, sizeof(latest), "; latest: frames +%llu coalesced +%llu stale-skipped +%llu gpu +%llu cpu +%llu refresh +%llu "
+               "trail +%llu fail gpu +%llu cpu +%llu", now[0] - last[0], now[1] - last[1], now[2] - last[2], now[3] - last[3],
+               now[4] - last[4], now[5] - last[5], now[6] - last[6], now[7] - last[7], now[8] - last[8]);
+    for (unsigned i = 0; i < 9; i++) last[i] = now[i];
+  }
   if (guamp_copy_gpu_wait[6])
     IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
           "swaps accepted +%u rejected +%u, scanout %s; gpu wait %llu ms: waits +%llu (ready +%llu) timeouts +%llu no ring +%llu, "
-          "mean %llu ms max %llu ms\n", frames, n, meanUs, max * 1000000 / f,
+          "mean %llu ms max %llu ms%s\n", frames, n, meanUs, max * 1000000 / f,
           max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
           guamp_fb_wc_enabled == 1 ? "write-combining" : "device", guamp_copy_gpu_wait[6], waits - lastWaits, ready - lastReady,
           timeouts - lastTimeouts, noRing - lastNoRing, waited ? (waitUs - lastWaitUs) / waited / 1000 : 0,
-          guamp_copy_gpu_wait[4] / 1000);
+          guamp_copy_gpu_wait[4] / 1000, latest);
   else
     IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
-          "swaps accepted +%u rejected +%u, scanout %s\n", frames, n, meanUs, max * 1000000 / f,
+          "swaps accepted +%u rejected +%u, scanout %s%s\n", frames, n, meanUs, max * 1000000 / f,
           max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
-          guamp_fb_wc_enabled == 1 ? "write-combining" : "device");
+          guamp_fb_wc_enabled == 1 ? "write-combining" : "device", latest);
   lastWaits = waits; lastTimeouts = timeouts; lastNoRing = noRing; lastWaitUs = waitUs; lastReady = ready;
   {
     // Mapping (and, with guamp-fast-copy=1, cache maintenance) per frame and the read-only probe of guamp-copy-probe=N.
