@@ -7,6 +7,7 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
+#include <pexpert/pexpert.h>
 #include "guamp_xnu_sm6115_runtime.h"
 #include "guamp_xnu_sm6115_provider.h"
 #include "GuampScm.inc"
@@ -118,19 +119,29 @@ struct Sm6115Runtime {
   int startWlanResources() {
     // A newly booted PAS owner is mandatory; an already-running WLAN service
     // cannot be remapped underneath its DMA engines.
-    if(!remoteMayRun||control.wlan.alreadyRunning)return Busy;
+    if(!remoteMayRun||control.wlan.alreadyRunning) {
+      IOLog("GuampWiFi: WLAN power refused: remote %s, WLAN %s\n",remoteMayRun?"started":"not started by this boot",
+            control.wlan.alreadyRunning?"ALREADY RUNNING (not a cold boot)":"not running");
+      return Busy;
+    }
     if(!smmu.active) {
-      if(!pageTables.retainForDevice())return NoMemory;
+      if(!pageTables.retainForDevice()) {IOLog("GuampWiFi: SMMU page tables not retained\n");return NoMemory;}
       int e=smmu.start(owner.smmuRegisters,pageTables.memory,pageTables.physical,
         owner.xnuBase,owner.xnuBytes,true,this,delayUs);
+      IOLog("GuampWiFi: SMMU c600000 SID %x mask %x: %d groups, %d banks (%u S2), SMR slot %u%s, context bank %u, "
+            "tables %llx, result %d\n",WlanSmmu::Stream,WlanSmmu::StreamMask,int(smmu.groupsSeen),int(smmu.banksSeen),
+            smmu.s2cbSeen,smmu.slot,smmu.preexisting?" (SMR ALREADY VALID: WLAN set up before XNU)":" (free)",smmu.cb,
+            pageTables.physical,e);
       if(e)return e;
     }
     if(!dmaStarted) {
       extern GuampXnuDma gGuampXnuDma;
-      if(!gGuampXnuDma.init(&smmu,owner.xnuBase,owner.xnuBytes))return NoMemory;
+      if(!gGuampXnuDma.init(&smmu,owner.xnuBase,owner.xnuBytes)) {IOLog("GuampWiFi: DMA window init failed\n");return NoMemory;}
       dmaStarted=true;
     }
-    return applyVotes(true);
+    int e=applyVotes(true);
+    IOLog("GuampWiFi: WLAN rails L8/L16/L17/L23 votes %s (%d)\n",e?"FAILED":"acked",e);
+    return e;
   }
 
   bool physicalReady() const {
@@ -260,13 +271,34 @@ struct Sm6115Runtime {
   static void glinkKick(void *p) { static_cast<Sm6115Runtime *>(p)->owner.kickModemGlink(); }
   static int assignMsa(void *p,const Wlfw::Region *regions,uint32_t count) {
     auto &r=*static_cast<Sm6115Runtime *>(p);
-    if(!regions||!count||count>2||!r.msaPayload.retainForDevice())return Invalid;
+    if(!regions||!count||count>2) {IOLog("GuampWiFi: MSA info refused: %u regions\n",count);return Invalid;}
     // Validate the complete list before the first irreversible assignment.
-    for(uint32_t i=0;i<count;i++)if(!regions[i].size||(regions[i].address&4095)||
-      (regions[i].size&4095)||regions[i].address<Wlfw::MsaBase||
-      regions[i].address-Wlfw::MsaBase>=Wlfw::MsaBytes||
-      regions[i].size>Wlfw::MsaBytes-(regions[i].address-Wlfw::MsaBase))return Range;
-    for(uint32_t i=0;i<count;i++) {int e=r.msa.assign(regions[i].address,regions[i].size,regions[i].secure);if(e)return e;}
+    for(uint32_t i=0;i<count;i++) {
+      IOLog("GuampWiFi: MSA region %u: %llx + %llx %s\n",i,uint64_t(regions[i].address),uint64_t(regions[i].size),
+            regions[i].secure?"secure":"non-secure");
+      if(!regions[i].size||(regions[i].address&4095)||
+        (regions[i].size&4095)||regions[i].address<Wlfw::MsaBase||
+        regions[i].address-Wlfw::MsaBase>=Wlfw::MsaBytes||
+        regions[i].size>Wlfw::MsaBytes-(regions[i].address-Wlfw::MsaBase)) {
+        IOLog("GuampWiFi: MSA region %u outside wlan_msa_region 51900000 + 100000\n",i);return Range;
+      }
+    }
+    // icnss.c assigns MSA permissions only when its DT node has "qcom,hyp_enabled" (icnss_assign_msa_perm returns 0
+    // otherwise). The guamp qcom,icnss@C800000 node does not have it: Linux never sends MEM_PROT_ASSIGN for the MSA on
+    // this phone, the fixed wlan_msa_region keeps the ownership the boot chain gave it. Same here by default;
+    // guamp-wifi-msa-assign=1 sends the documented hyp_assign (HLOS -> MSS_MSA/WLAN[/WLAN_CE] RW) as an experiment.
+    unsigned assign=0;
+    PE_parse_boot_argn("guamp-wifi-msa-assign",&assign,sizeof(assign));
+    if(assign!=1) {
+      IOLog("GuampWiFi: MSA permissions left as set by the boot chain (DT icnss without qcom,hyp_enabled, as Linux)\n");
+      return Ok;
+    }
+    if(!r.msaPayload.retainForDevice()) {IOLog("GuampWiFi: MSA SCM payload not retained\n");return Invalid;}
+    for(uint32_t i=0;i<count;i++) {
+      int e=r.msa.assign(regions[i].address,regions[i].size,regions[i].secure);
+      IOLog("GuampWiFi: MSA hyp_assign region %u -> VMID 15/24%s: %d\n",i,regions[i].secure?"":"/25",e);
+      if(e)return e;
+    }
     return Ok;
   }
   static int wlanPower(void *p,bool on) { return on?static_cast<Sm6115Runtime *>(p)->startWlanResources():Busy; }

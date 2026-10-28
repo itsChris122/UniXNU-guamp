@@ -208,6 +208,7 @@ char activeSlot() {
 
 static bool modemStopped();
 static bool modemAwaitReady();
+static void modemFailureReport();
 #include "GuampModem.inc"
 
 static unsigned radioMode() {
@@ -237,11 +238,62 @@ static bool modemStopped() {
     smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
     smem::parse(reader,info);uint32_t at=0,bytes=0;
     const smem::Partition *peer=smem::partitionFor(*info,smem::kHostModem);
-    stopped=!info->error && info->initialized && (!peer || !peer->status) &&
-      !smem::find(reader,*info,smem::kHostModem,428,&at,&bytes);
+    const bool in428=!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes);
+    uint32_t a=0,n=0;
+    const bool r421=!info->error && smem::find(reader,*info,smem::kHostModem,421,&a,&n);
+    const bool g480=!info->error && smem::find(reader,*info,smem::kHostModem,480,&a,&n);
+    stopped=!info->error && info->initialized && (!peer || !peer->status) && !in428;
+    // Cold-boot check the Wi-Fi contract asks for in the first log: no modem SMP2P (428) and no modem-side GLINK RX
+    // FIFO (480) means MPSS, hence the WLAN firmware inside it, has not run since SMEM was initialised by the boot chain.
+    IOLog("GuampModem: cold-boot check: SMEM v%u initialized %u %s, modem partition %s, smp2p 428 %s, glink rx 480 %s, "
+          "reason 421 %s -> %s\n",info->version,info->initialized,info->error?"PARSE ERROR":"ok",
+          !peer?"absent":peer->status?"WALK ERROR":"ok",in428?"PRESENT":"absent",g480?"PRESENT":"absent",
+          r421?"present":"absent",stopped?"cold boot, modem and WLAN never started":"NOT a cold boot: modem not started");
+    if(in428) {
+      smem::Smp2p *state=static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
+      if(state) {
+        smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
+        IOLog("GuampModem: stale smp2p 428 slave-kernel %x (fatal %u ready %u handover %u stop-ack %u)\n",state->value,
+              state->value&1,state->value>>1&1,state->value>>2&1,state->value>>3&1);
+        IOFree(state,sizeof(*state));
+      }
+    }
     IOFree(info,sizeof(*info));
-  }
+  } else IOLog("GuampModem: cold-boot check: out of memory\n");
   map->release();return stopped;
+}
+
+// Failure report (subsys-pil-tz log_failure_reason + the err-fatal/ready bits): read-only SMEM, called by the PAS
+// loader before PAS SHUTDOWN of a start that did not reach ready (also from the Wi-Fi owner's timeouts).
+static void modemFailureReport() {
+  if(pas::overlap(kSmemPhys,kSmemBytes,guamp_phys_base,guamp_phys_size))return;
+  IOMemoryDescriptor *d=IOMemoryDescriptor::withPhysicalAddress(kSmemPhys,kSmemBytes,kIODirectionIn);
+  IOMemoryMap *map=d?d->map(kIOMapInhibitCache|kIOMapReadOnly):nullptr;if(d)d->release();
+  if(!map){IOLog("GuampModem: failure report: SMEM not mapped\n");return;}
+  smem::Info *info=static_cast<smem::Info *>(IOMallocZero(sizeof(smem::Info)));
+  smem::Smp2p *state=static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
+  if(info && state) {
+    smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
+    __asm__ volatile("dmb sy" ::: "memory");
+    smem::parse(reader,info);uint32_t at=0,bytes=0;
+    if(!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes)) {
+      smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
+      const uint32_t v=state->value;
+      IOLog("GuampModem: failure: smp2p 428 %s slave-kernel %x (fatal %u ready %u handover %u stop-ack %u shutdown-ack %u)\n",
+            state->valid?"valid":"INVALID",v,v&1,v>>1&1,v>>2&1,v>>3&1,v>>7&1);
+    } else IOLog("GuampModem: failure: smp2p 428 never allocated (modem did not reach its SMP2P init)\n");
+    if(!info->error && smem::find(reader,*info,smem::kHostModem,421,&at,&bytes) && bytes) {
+      char text[129];uint32_t n=0;
+      for(;n<bytes && n+1<sizeof(text);n++) {
+        const uint8_t c=reader.r8(at+n);
+        if(!c)break;
+        text[n]=c>=32&&c<127?static_cast<char>(c):'?';
+      }
+      text[n]=0;
+      IOLog("GuampModem: failure reason (item 421, %u bytes): %s\n",bytes,n?text:"(empty)");
+    } else IOLog("GuampModem: failure reason: item 421 absent\n");
+  }
+  if(info)IOFree(info,sizeof(*info));if(state)IOFree(state,sizeof(*state));map->release();
 }
 
 static bool modemAwaitReady() {
@@ -262,7 +314,11 @@ static bool modemAwaitReady() {
         smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
         if(state->valid && state->hasEntry && state->localPid==1 && state->remotePid==0) {
           uint32_t flags=state->value;
-          if(flags!=last) {IOLog("GuampModem: SMP2P slave-kernel %x (ready %u fatal %u)\n",flags,flags>>1&1,flags&1);last=flags;}
+          if(flags!=last) {
+            IOLog("GuampModem: SMP2P slave-kernel %x at %u ms (ready %u fatal %u handover %u)\n",flags,attempt*100,
+                  flags>>1&1,flags&1,flags>>2&1);
+            last=flags;
+          }
           if(flags&1)break;
           if(flags&2) {ready=true;break;}
         }
