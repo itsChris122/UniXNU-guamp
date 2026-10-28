@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>GuampAudio</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.guamp.audio.GuampAudio</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>GuampAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>17.0</string>
+	<!-- CFPlugIn: factory UUID (ours, random) -> GuampAudio_Create; type = kAudioServerPlugInTypeUUID -->
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>6B1F4E52-3A1D-4C77-9E0B-5C2A7D9F1A64</key>
+		<string>GuampAudio_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>6B1F4E52-3A1D-4C77-9E0B-5C2A7D9F1A64</string>
+		</array>
+	</dict>
+</dict>
+</plist>
