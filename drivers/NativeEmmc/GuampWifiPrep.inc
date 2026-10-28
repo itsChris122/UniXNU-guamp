@@ -12,6 +12,8 @@
 // mode1 can load/authenticate reserved modem RAM (GuampModem.inc over the shared PAS loader).
 // guamp-wifi-start=1 (implies the prep) starts the modem through ModemBootHooks into the
 // Wi-Fi runtime (drivers/GuampWifi, compiled only with GUAMP_WIFI_RUNTIME=1): diagnostic scan.
+// guamp-wifi-start=2 does the same into the iOS station (GUAMP_WIFI_REDWOOD=1, build-arm-driver.py --wifi-redwood):
+// after bsd_init has called guamp_wifi_bsd_network_ready() the runtime attaches en0 (drivers/GuampWifi/ios, GuampWlanNub.inc).
 // eMMC stays read-only, through Card::readBlocks under the card gate.
 
 #include "GuampExt4.inc"

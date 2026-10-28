@@ -1088,6 +1088,9 @@ static void usbProbe()
 #include "BtService.inc"
 #include "GuampBtNub.inc"
 #include "GuampWifiPrep.inc"
+#if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
+#include "GuampWlanNub.inc"     // Wi-Fi mode 2: IO80211Controller/IONetworkInterface for en0 (guamp-wifi-start=2)
+#endif
 #include "GpuService.inc"
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"

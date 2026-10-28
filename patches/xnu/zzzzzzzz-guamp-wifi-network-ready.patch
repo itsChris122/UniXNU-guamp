@@ -1,0 +1,32 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 94243c9..dd54140 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -323,6 +323,17 @@ extern int customnbuf;
+ kern_return_t bsd_autoconf(void);
+ void bsd_utaskbootstrap(void);
+ 
++/*
++ * guamp: the BSD networking stack is up (after net_init_run). The Wi-Fi mode 2 layer of NativeEmmc
++ * (drivers/GuampWifi/ios/guamp_net.c in libNativeEmmc.a, built with --wifi-redwood) defines it; this weak
++ * no-op stands in for a kernel without it. A weak definition, not a weak import: the static link resolves it.
++ */
++void guamp_wifi_bsd_network_ready(void);
++__attribute__((weak)) void
++guamp_wifi_bsd_network_ready(void)
++{
++}
++
+ #if CONFIG_DEV_KMEM
+ extern void dev_kmem_init(void);
+ #endif
+@@ -998,6 +1009,9 @@ bsd_init(void)
+ 	 */
+ 	bsd_init_kprintf("calling net_init_run\n");
+ 	net_init_run();
++
++	/* guamp Wi-Fi mode 2 (guamp-wifi-start=2): en0 may be attached from now on */
++	guamp_wifi_bsd_network_ready();
+ #endif /* NETWORKING */
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
