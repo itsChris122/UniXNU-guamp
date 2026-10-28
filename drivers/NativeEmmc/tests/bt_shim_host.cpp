@@ -457,6 +457,19 @@ static void testCtl() {
     unsigned events = 0;
     while (p + 3 <= sock.size() && sock[p] == BTS_H4_EVT) { p += 3 + sock[p + 2]; events++; }
     CHECK(p == sock.size() && events == 3);
+    // Last command and last reply: "bcm -A" (0xfc01) was the last command, the last reply is the controller's 0x0c03.
+    CHECK(s.lastCmd == 0xfc01 && s.lastReply == 0x0c03 && s.lastReplyStatus == 0);
+    Bytes st = {BTS_H4_EVT, BTS_EVT_CMD_STATUS, 4, 0x0c, 1, 0x05, 0x04};   // Command Status 0x0c for Create Connection
+    bts_shim_ctrl_input(&s, st.data(), st.size());
+    CHECK(s.lastReply == 0x0405 && s.lastReplyStatus == 0x0c);
+
+    // Slot: bluetoothd's sk control takes over from BlueTool's control (RAM test 6), nothing else does.
+    CHECK(bts_ctl_admit(false, false, 0, 0) == BTS_CTL_ACCEPT);
+    CHECK(bts_ctl_admit(true, true, 0, 1) == BTS_CTL_PREEMPT);
+    CHECK(bts_ctl_admit(true, true, 1, 0) == BTS_CTL_REFUSE);
+    CHECK(bts_ctl_admit(true, true, 1, 1) == BTS_CTL_REFUSE);
+    CHECK(bts_ctl_admit(true, true, 0, 0) == BTS_CTL_REFUSE);
+    CHECK(bts_ctl_admit(true, false, 0, 1) == BTS_CTL_REFUSE);   // the tty holds it
 }
 
 int main() {
