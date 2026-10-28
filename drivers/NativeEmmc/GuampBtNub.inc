@@ -9,11 +9,11 @@
 // UART driver publishes its bluetooth child; here ArmDTPlatform publishes nubs for the direct /arm-io children only
 // (uart1 gets one, its bluetooth child none), so the ADT node alone is not found.
 //
-// This publishes /arm-io/uart1/bluetooth as a plain IOService that takes the device-tree entry's place in the IODeviceTree
-// plane (IORegistryEntry::init(from, plane), as IOPlatformExpert::createNub does): it shares the node's property table
-// (name "bluetooth", local-mac-address, transport-speed ...; guamp-bt-addr updates stay visible) and is attached in the
-// IOService plane below the uart1 nub, then registered. No driver matches it and nothing else changes; the class is
-// deliberately not AppleBluetoothModule / AppleBTMgmt (bluetoothd would take its PCIe path).
+// This attaches the /arm-io/uart1/bluetooth entry itself (an IOService outside the IOService plane, like every
+// device-tree entry) below the uart1 nub in the IOService plane and registers it, so the name match finds it and the
+// IODeviceTree search reads its own local-mac-address (guamp-bt-addr updates stay visible). No driver matches it and
+// nothing else changes; the class is deliberately not AppleBluetoothModule / AppleBTMgmt (bluetoothd would take its
+// PCIe path).
 
 namespace btnub {
 // The boot-time lines come before the USB log mirror attaches: a thread call repeats the outcome every 60 s (15 times,
@@ -73,27 +73,34 @@ static void publish() {
     if (parentEntry) parentEntry->release();
     return;
   }
-  if (OSDynamicCast(IOService, node)) {   // already a service (another publisher): only report it
-    gPublish = "already a service";
-    IOLog("GuampBtNub: bluetooth node is already a %s, left as is\n", node->getMetaClass()->getClassName());
-    node->release();
-    parentEntry->release();
-    return;
-  }
   OSData *mac = OSDynamicCast(OSData, node->getProperty("local-mac-address"));
   const uint8_t *b = mac && mac->getLength() == 6 ? static_cast<const uint8_t *>(mac->getBytesNoCopy()) : nullptr;
   const bool zero = !b || !(b[0] | b[1] | b[2] | b[3] | b[4] | b[5]);
-  IOService *nub = OSTypeAlloc(IOService);
-  bool ok = nub && nub->init(node, gIODTPlane);
-  if (ok) {
-    nub->setName("bluetooth");
-    ok = nub->attach(parent);
+  // Device-tree entries are IOService objects already (IODeviceTreeSupport MakeReferenceTable: new IOService, named
+  // from the node's "name"), just not in the IOService plane: such an entry is attached below the uart1 nub and
+  // registered as it is. Only an entry that is not a service gets a separate nub taking its place.
+  IOService *service = OSDynamicCast(IOService, node);
+  bool ok = false;
+  if (service && service->inPlane(gIOServicePlane)) {
+    gPublish = "already registered";
+    ok = true;
+  } else if (service) {
+    ok = service->attach(parent);
+    if (ok) service->registerService();
+    gPublish = ok ? "yes (device-tree entry below uart1)" : "no (attach failed)";
+  } else {
+    IOService *nub = OSTypeAlloc(IOService);
+    ok = nub && nub->init(node, gIODTPlane);
+    if (ok) {
+      nub->setName("bluetooth");
+      ok = nub->attach(parent);
+    }
+    if (ok) nub->registerService();
+    gPublish = ok ? "yes (new nub below uart1)" : "no (init/attach failed)";
+    if (nub) nub->release();
   }
-  if (ok) nub->registerService();
-  gPublish = ok ? "yes" : "no (init/attach failed)";
-  IOLog("GuampBtNub: /arm-io/uart1/bluetooth %s (local-mac-address %s)\n", ok ? "published below uart1" : "not published",
+  IOLog("GuampBtNub: /arm-io/uart1/bluetooth %s (local-mac-address %s)\n", gPublish,
         !b ? "missing" : zero ? "all zero: bluetoothd will still exit" : "set");
-  if (nub) nub->release();
   node->release();
   parentEntry->release();
 }

@@ -50,7 +50,7 @@ static void start()
 // Every report: frames copied since the previous one and the CPU copy cost (mean / maximum since the previous report,
 // microseconds per frame), with the scanout mapping mode (guamp-fb-wc=1: write-combining).
 // scripts/guamp-canvas-variant.py (always applied to the legacy display): source mapping and read-probe counters.
-extern "C" volatile uint64_t guamp_copy_split[10];
+extern "C" volatile uint64_t guamp_copy_split[16];
 
 static void copyLog()
 {
@@ -78,10 +78,12 @@ static void copyLog()
     const uint64_t probes = guamp_copy_split[2], probeTicks = guamp_copy_split[3];
     if (maps != lastMaps || probes != lastProbes)
       IOLog("GuampDisplay: source map %llu us/frame (%llu frames), cache mode %llu, cacheable %llu, refused %llu; "
-            "async copies %llu, cached maps reused %llu; read probe %llu us/frame over %llu KiB (%llu frames)\n",
+            "async copies %llu (skipped: off %llu, bypass %llu, no call %llu, busy %llu; options %llx, snapshot %llu us total), "
+            "cached maps reused %llu; read probe %llu us/frame over %llu KiB (%llu frames)\n",
             maps > lastMaps ? (mapTicks - lastMapTicks) / (maps - lastMaps) * 1000000 / f : 0, maps - lastMaps,
             guamp_copy_split[4], guamp_copy_split[5], guamp_copy_split[7],
-            guamp_copy_split[8], guamp_copy_split[9],
+            guamp_copy_split[8], guamp_copy_split[10], guamp_copy_split[11], guamp_copy_split[12], guamp_copy_split[13],
+            guamp_copy_split[14], guamp_copy_split[15] * 1000000 / f, guamp_copy_split[9],
             probes > lastProbes ? (probeTicks - lastProbeTicks) / (probes - lastProbes) * 1000000 / f : 0,
             guamp_copy_split[6] >> 10, probes - lastProbes);
     lastMaps = maps; lastMapTicks = mapTicks; lastProbes = probes; lastProbeTicks = probeTicks;

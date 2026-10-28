@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
-index 760c339..58b3c78 100644
+index 11a8212..5c6121b 100644
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1882,6 +1882,114 @@ proc_handle_critical_exit(proc_t p, int rv)
+@@ -1876,6 +1876,151 @@ proc_handle_critical_exit(proc_t p, int rv)
  	}
  }
  
@@ -112,12 +112,49 @@ index 760c339..58b3c78 100644
 +	}
 +	return parsed == 1 && strncmp(p->p_comm, name, MAXCOMLEN) == 0;
 +}
++/* With guamp-exit-trace: the C strings the exiting thread's x19 and x20 point to, when they are readable user strings.
++ * A process that ends through its own fatal-error helper usually still holds the message there: bluetoothd's
++ * fatal path (0x100107b90) keeps the reason's c_str() in x19 up to its _exit(1). Non-printable bytes become '.'. */
++static void
++guamp_exit_trace_strings(proc_t p)
++{
++	arm_thread_state64_t ts;
++	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
++	if (p != current_proc() ||
++	    thread_getstatus(current_thread(), ARM_THREAD_STATE64, (thread_state_t)&ts, &count) != KERN_SUCCESS) {
++		return;
++	}
++	for (int r = 19; r <= 20; r++) {
++		char text[161];
++		size_t copied = 0;
++		uint64_t address = ts.x[r];
++		if (address < 4096 || address >= (1ULL << 48)) {
++			continue;
++		}
++		int error = copyinstr((user_addr_t)address, text, sizeof(text), &copied);
++		if (error && error != ENAMETOOLONG) {
++			continue;
++		}
++		text[sizeof(text) - 1] = 0;
++		size_t length = strlen(text);
++		if (length < 4) {
++			continue;
++		}
++		for (size_t i = 0; i < length; i++) {
++			if (text[i] < 0x20 || text[i] > 0x7e) {
++				text[i] = '.';
++			}
++		}
++		printf("guamp exit: %s[%d] x%d %llx \"%s\"%s\n", p->p_comm, proc_getpid(p), r, address, text,
++		    error == ENAMETOOLONG ? " (cut)" : "");
++	}
++}
 +#endif /* __arm64__ */
 +
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -2037,6 +2145,13 @@ skipcheck:
+@@ -2027,6 +2172,14 @@ skipcheck:
  
  
  	/* stash the usage into corpse data if making_corpse == true */
@@ -126,6 +163,7 @@ index 760c339..58b3c78 100644
 +		guamp_exit_trace(p, rv, code, subcode);
 +	} else if (guamp_exit_trace_named(p)) {
 +		guamp_exit_trace(p, rv, 0, 0);
++		guamp_exit_trace_strings(p);
 +	}
 +#endif
  	if (create_corpse == TRUE) {

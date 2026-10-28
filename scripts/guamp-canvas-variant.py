@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '142f2fcd96cb821eea216d0e53b5ff52d81804a7bb461be879a432094f299595'
+PATCHED_SHA256 = '842725ba8d271d0d4662464d017b6b9020ec177336ba810f6acc0c24ff81e75e'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -259,26 +259,31 @@ EDITS.append((r'''            installBootDimensions((uint32_t)video.v_width,(uin
 #    guamp-async-copy=1       the swap retires at once and a kernel thread call copies it, as the GPU offer path does (early retire,
 #                             transferred held until the copy ends, gpuComplete on the work loop); a failed copy falls back to the
 #                             synchronous copy for the next frame (gpuBypass);
+#    guamp-async-copy=2       snapshot: the surface is first copied (cacheable, fast) into an internal buffer, the swap retires and
+#                             the thread call scales from the buffer, so a surface the render server reuses is never read late;
 #    guamp-copy-probe=N       the first N synchronous frames also time a read-only pass over the surface.
 #    guamp_copy_split: [0] frames mapped, [1] map + cache maintenance ticks, [2] probed frames, [3] probe ticks, [4] mapping cache
 #    mode, [5] last mapping cacheable, [6] probe bytes, [7] cacheable mappings refused, [8] asynchronous copies, [9] cached mappings
-#    reused.
+#    reused, [10] async skipped: option off, [11] skipped: GPU bypass after a failure, [12] skipped: no thread call, [13] skipped:
+#    a copy still in flight, [14] options read (bit0 fast, bit1 flush, bit2 map cache, bits3-4 async mode, bit5 read), [15] snapshot
+#    ticks (copy into the internal buffer).
 EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}',
               'extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint64_t guamp_canvas_frames,guamp_canvas_tables;}\n'
               '#include <kern/thread_call.h>\n'
-              'extern "C" {volatile uint64_t guamp_copy_split[10];volatile uint64_t guamp_copy_probe_sink;}\n'
+              'extern "C" {volatile uint64_t guamp_copy_split[16];volatile uint64_t guamp_copy_probe_sink;}\n'
               'extern "C" void flush_dcache64(addr64_t,unsigned,int);'))
 EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
-    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false,asyncCopyOn=false;unsigned probeBudget=0;
+    int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=0;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;
         v=1;PE_parse_boot_argn("guamp-fast-copy-flush",&v,sizeof v);fastFlush=v!=0;
         v=0;PE_parse_boot_argn("guamp-map-cache",&v,sizeof v);mapCache=v==1;
-        v=0;PE_parse_boot_argn("guamp-async-copy",&v,sizeof v);asyncCopyOn=v==1;
+        v=0;PE_parse_boot_argn("guamp-async-copy",&v,sizeof v);asyncMode=v<=2?v:0;
         PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;
         copyOptions=1;
+        guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32;
     }
     struct GuampMapSlot {IOMemoryDescriptor *memory;IOMemoryMap *map;uint64_t used;bool cacheable;};
     GuampMapSlot mapSlots[4]={};uint64_t mapUse=0;
@@ -320,44 +325,74 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp-async-copy=1: one copy in flight; its parameters are taken under the work loop before the thread call runs.
     thread_call_t asyncCall=nullptr;IOMemoryDescriptor *asyncMemory=nullptr;
     uint64_t asyncStride=0,asyncAllocation=0,asyncLength=0,asyncRowBytes=0;uint32_t asyncWidth=0,asyncHeight=0;bool asyncScaled=false;
+    bool asyncBusy=false,asyncSnapshot=false;void *snapshot=nullptr;vm_size_t snapshotSize=0;uint64_t snapshotBytes=0;
     static void asyncCopyEntry(thread_call_param_t owner,thread_call_param_t) {static_cast<NativeLegacyDisplay *>(owner)->asyncCopy();}
     void asyncCopy() {
         IOMemoryDescriptor *memory=asyncMemory;asyncMemory=nullptr;
         int status=-1;
         IOMemoryMap *source=memory?guampSourceMap(memory,asyncAllocation):nullptr;
-        if(source && source->getVirtualAddress() && source->getLength()>=asyncAllocation && bootMapping) {
+        const uintptr_t from=asyncSnapshot?(uintptr_t)snapshot:(source?(uintptr_t)source->getVirtualAddress():0);
+        const uint64_t fromBytes=asyncSnapshot?snapshotBytes:(source?source->getLength():0);
+        if(from && fromBytes>=asyncAllocation && bootMapping) {
             uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
             const int ok=asyncScaled
                 ?guampScalePixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),asyncRowBytes,
-                    reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),asyncStride,scaler)
+                    reinterpret_cast<const void *>(from),fromBytes,asyncStride,scaler)
                 :native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
-                    asyncRowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),asyncStride,asyncWidth,asyncHeight);
+                    asyncRowBytes,reinterpret_cast<const void *>(from),fromBytes,asyncStride,asyncWidth,asyncHeight);
             __asm__ volatile("dsb sy" ::: "memory");
             uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
             if(ok){native_legacy_copy_timing_observed(copyEnd-copyStart,asyncLength);if(asyncScaled)guamp_canvas_frames=guamp_canvas_frames+1;status=0;}
         }
-        OSSafeReleaseNULL(source);OSSafeReleaseNULL(memory);
+        OSSafeReleaseNULL(source);OSSafeReleaseNULL(memory);asyncBusy=false;
         gpuComplete(status);
     }
     void freeAsync() {
         if(asyncCall){thread_call_cancel_wait(asyncCall);thread_call_free(asyncCall);asyncCall=nullptr;}
         OSSafeReleaseNULL(asyncMemory);freeMapSlots();
+        if(snapshot){IOFreeAligned(snapshot,snapshotSize);snapshot=nullptr;snapshotSize=0;}
     }
 '''))
 EDITS.append(('    void free() override {freeScaler();stopVsync();', '    void free() override {freeAsync();freeScaler();stopVsync();'))
 EDITS.append(('        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);\n',
 r'''        readCopyOptions();
-        if(asyncCopyOn && !gpuBypass) {
+        if(!asyncMode)guamp_copy_split[10]=guamp_copy_split[10]+1;
+        else if(gpuBypass)guamp_copy_split[11]=guamp_copy_split[11]+1;
+        else {
             if(!asyncCall)asyncCall=thread_call_allocate_with_options(asyncCopyEntry,this,THREAD_CALL_PRIORITY_KERNEL_HIGH,0);
-            if(asyncCall && !asyncMemory) {
-                memory->retain();asyncMemory=memory;asyncStride=sourceStride;asyncAllocation=allocation;asyncLength=length;
-                asyncRowBytes=video.v_rowBytes;asyncWidth=width;asyncHeight=height;asyncScaled=scaled;
-                native_legacy_swap_stage(1);
-                shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
-                if(retireSwap(request,true)){gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;}
-                guamp_copy_split[8]=guamp_copy_split[8]+1;
-                thread_call_enter(asyncCall);
-                return;
+            if(!asyncCall)guamp_copy_split[12]=guamp_copy_split[12]+1;
+            else if(asyncBusy || asyncMemory)guamp_copy_split[13]=guamp_copy_split[13]+1;
+            else {
+                bool ready=true;asyncSnapshot=false;
+                if(asyncMode==2) {
+                    // Snapshot: the surface into the internal buffer now, so retiring the swap cannot race the render server.
+                    if(!snapshot || snapshotSize<allocation) {
+                        if(snapshot)IOFreeAligned(snapshot,snapshotSize);
+                        snapshotSize=(vm_size_t)((allocation+16383)&~16383ull);snapshot=IOMallocAligned(snapshotSize,16384);
+                        if(!snapshot)snapshotSize=0;
+                    }
+                    IOMemoryMap *copyFrom=snapshot?guampSourceMap(memory,allocation):nullptr;
+                    ready=copyFrom && copyFrom->getVirtualAddress() && copyFrom->getLength()>=allocation;
+                    if(ready) {
+                        uint64_t snapStart,snapEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(snapStart));
+                        memcpy(snapshot,reinterpret_cast<const void *>(copyFrom->getVirtualAddress()),(size_t)allocation);
+                        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(snapEnd));
+                        guamp_copy_split[15]=guamp_copy_split[15]+(snapEnd-snapStart);
+                        snapshotBytes=allocation;asyncSnapshot=true;
+                    }
+                    OSSafeReleaseNULL(copyFrom);
+                }
+                if(ready) {
+                    if(!asyncSnapshot){memory->retain();asyncMemory=memory;}
+                    asyncStride=sourceStride;asyncAllocation=allocation;asyncLength=length;
+                    asyncRowBytes=video.v_rowBytes;asyncWidth=width;asyncHeight=height;asyncScaled=scaled;asyncBusy=true;
+                    native_legacy_swap_stage(1);
+                    shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+                    if(retireSwap(request,true)){gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;}
+                    guamp_copy_split[8]=guamp_copy_split[8]+1;
+                    thread_call_enter(asyncCall);
+                    return;
+                }
             }
         }
         IOMemoryMap *source=guampSourceMap(memory,allocation);
