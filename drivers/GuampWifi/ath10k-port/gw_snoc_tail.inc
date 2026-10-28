@@ -44,6 +44,11 @@ static int gw_poll_hif_start(struct ath10k *ar) {
   ath10k_core_napi_enable(ar);
   ath10k_snoc_rx_post(ar);
   clear_bit(ATH10K_SNOC_FLAG_RECOVERY, &s->flags);
+  { char line[160]; int n=0; unsigned total=0;
+    for(unsigned i=0;i<12;i++) { struct ath10k_ce_ring *r=s->ce.ce_states[i].dest_ring; if(!r) continue;
+      unsigned posted=(r->write_index-r->sw_index)&r->nentries_mask; total+=posted;
+      if(n<(int)sizeof(line)-12) n+=snprintf(line+n,sizeof(line)-n," ce%u=%u",i,posted); }
+    lx_log(6,"ath10k: phase HIF start (CE polling, no CE IRQ): %u RX buffers posted:%s",total,line); }
   return 0;
 }
 static void gw_poll_hif_stop(struct ath10k *ar) {
@@ -59,16 +64,23 @@ int ath10k_qmi_wlan_enable(struct ath10k *ar,struct ath10k_qmi_wlan_enable_cfg *
   _Static_assert(sizeof(struct gw_ce_pipe)==sizeof(struct ath10k_tgt_pipe_cfg),"pipe ABI");
   _Static_assert(sizeof(struct gw_ce_service)==sizeof(struct ath10k_svc_pipe_cfg),"service ABI");
   _Static_assert(sizeof(struct gw_ce_shadow)==sizeof(struct ath10k_shadow_reg_cfg),"shadow ABI");
-  return gw_board.wlan_enable(gw_board.ctx,(const struct gw_ce_pipe *)cfg->ce_tgt_cfg,cfg->num_ce_tgt_cfg,
+  lx_log(6,"ath10k: phase WLFW wlan_enable: %u CE target pipes, %u service maps, %u shadow regs",
+    cfg->num_ce_tgt_cfg,cfg->num_ce_svc_pipe_cfg,cfg->num_shadow_reg_cfg);
+  int e=gw_board.wlan_enable(gw_board.ctx,(const struct gw_ce_pipe *)cfg->ce_tgt_cfg,cfg->num_ce_tgt_cfg,
     (const struct gw_ce_service *)cfg->ce_svc_cfg,cfg->num_ce_svc_pipe_cfg,
     (const struct gw_ce_shadow *)cfg->shadow_reg_cfg,cfg->num_shadow_reg_cfg);
+  lx_log(e?3:6,"ath10k: phase WLFW wlan_enable (cfg 0x23 + mode 0x22 mission) result %d",e);
+  return e;
 }
 static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
   if(!gw_board.ready(gw_board.ctx)) return -ENODEV;
   int e=gw_board.power(gw_board.ctx,1); if(e) return e;
   e=ath10k_snoc_wlan_enable(ar,mode); if(e) return e;
   ath10k_ce_alloc_rri(ar);
-  e=ath10k_snoc_init_pipes(ar); if(e) { ath10k_ce_free_rri(ar); return e; }
+  e=ath10k_snoc_init_pipes(ar); if(e) { lx_log(3,"ath10k: CE init failed %d",e); ath10k_ce_free_rri(ar); return e; }
+  { struct ath10k_ce *ce=ath10k_ce_priv(ar);
+    lx_log(6,"ath10k: phase CE init: 12 pipes at PA 0x%llx+0x240000, RRI bus 0x%llx",
+      (unsigned long long)ath10k_snoc_priv(ar)->mem_pa,(unsigned long long)ce->paddr_rri); }
   return 0;
 }
 static void gw_hif_power_down(struct ath10k *ar) {
@@ -77,10 +89,15 @@ static void gw_hif_power_down(struct ath10k *ar) {
   ath10k_ce_free_rri(ar);
   e=gw_board.power(gw_board.ctx,0); if(e) gw_boot_error=e;
 }
+static int gw_map_service_to_pipe(struct ath10k *ar,u16 service,u8 *ul,u8 *dl) {
+  int e=ath10k_snoc_hif_map_service_to_pipe(ar,service,ul,dl);
+  lx_log(e?3:6,"ath10k: phase HTC service connect 0x%04x -> UL pipe %u DL pipe %u (%d)",service,e?0:*ul,e?0:*dl,e);
+  return e;
+}
 static const struct ath10k_hif_ops gw_hif={
   .read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32,
   .start=gw_poll_hif_start,.stop=gw_poll_hif_stop,
-  .map_service_to_pipe=ath10k_snoc_hif_map_service_to_pipe,.get_default_pipe=ath10k_snoc_hif_get_default_pipe,
+  .map_service_to_pipe=gw_map_service_to_pipe,.get_default_pipe=ath10k_snoc_hif_get_default_pipe,
   .power_up=gw_hif_power_up,.power_down=gw_hif_power_down,
   .tx_sg=ath10k_snoc_hif_tx_sg,.send_complete_check=ath10k_snoc_hif_send_complete_check,
   .get_free_queue_number=ath10k_snoc_hif_get_free_queue_number,.get_target_info=ath10k_snoc_hif_get_target_info,
@@ -93,12 +110,23 @@ static int gw_napi_poll(struct napi_struct *n,int budget) {
   if(done<budget) napi_complete_done(n,done); return done;
 }
 static void gw_on_rx(struct ieee80211_hw *hw,struct sk_buff *s) { (void)hw; nw_sta_rx(s); }
-static void gw_on_scan(struct ieee80211_hw *hw,bool aborted) { (void)hw; nw_sta_scan_done(aborted); }
+static void gw_on_scan(struct ieee80211_hw *hw,bool aborted) {
+  (void)hw; lx_log(6,"ath10k: phase WMI scan completion event%s, %u beacons/probe responses received",aborted?" (aborted)":"",nw_wifi_stats.beacons);
+  nw_sta_scan_done(aborted); }
 static void gw_on_lost(void) { nw_sta_link_lost(); }
 static void gw_on_status(u64 replay, u32 cookie, bool ack) { nw_sta_eapol_status(replay,cookie,ack); }
 static void gw_on_registered(struct ieee80211_hw *hw) {
   hw->wiphy->interface_modes=BIT(NL80211_IFTYPE_STATION);
   hw->wiphy->flags&=~WIPHY_FLAG_SUPPORTS_TDLS;
+  if(gw_ar) {
+    struct ath_regulatory *rd=&gw_ar->ath_common.regulatory; unsigned c2=0,c5=0;
+    if(hw->wiphy->bands[NL80211_BAND_2GHZ]) for(int i=0;i<hw->wiphy->bands[NL80211_BAND_2GHZ]->n_channels;i++)
+      c2+=!(hw->wiphy->bands[NL80211_BAND_2GHZ]->channels[i].flags&IEEE80211_CHAN_DISABLED);
+    if(hw->wiphy->bands[NL80211_BAND_5GHZ]) for(int i=0;i<hw->wiphy->bands[NL80211_BAND_5GHZ]->n_channels;i++)
+      c5+=!(hw->wiphy->bands[NL80211_BAND_5GHZ]->channels[i].flags&IEEE80211_CHAN_DISABLED);
+    lx_log(6,"ath10k: phase WMI ready + wmi_init done, mac registered: fw %s, EEPROM regdomain 0x%x alpha2 %c%c, channels 2.4 GHz %u 5 GHz %u",
+      gw_ar->hw->wiphy->fw_version,rd->current_rd,rd->alpha2[0]?rd->alpha2[0]:'?',rd->alpha2[1]?rd->alpha2[1]:'?',c2,c5);
+  }
   nw_sta_ready(hw); // this calls .start and creates a station only after core registration
   if(nw_wifi_stats.stage!=4||nw_wifi_stats.last_err) {
     gw_boot_error=nw_wifi_stats.last_err?nw_wifi_stats.last_err:-EIO;
@@ -141,6 +169,8 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
   }
   struct ath10k_bus_params params={.dev_type=ATH10K_DEV_TYPE_LL,.chip_id=board->firmware_chip_id};
   e=ath10k_core_register(gw_ar,&params);
+  lx_log(e?3:6,"ath10k: phase probe queued: WCN3990 regs PA 0x0c800000 len 0x%x, chip id 0x%x, 12 CE pipes allocated (%d)",
+    (unsigned)board->register_bytes,board->firmware_chip_id,e);
   if(e) { for(unsigned i=0;i<12;i++) ath10k_ce_free_pipe(gw_ar,i); ath10k_core_destroy(gw_ar); gw_ar=0; return e; }
   return 0; // enqueued probe, NOT associated/connected
 }
