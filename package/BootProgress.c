@@ -25,6 +25,28 @@ extern int proc_selfpid(void);
 #include "BootProgressDisplay.h"
 #include "BootProgressPulse.h"
 #include "BootProgressLifecycle.h"
+#include "BootLogo.h"
+// Boot logo (29/10, analisi/kernel-build/LOGO-AVVIO-20261029.md). boot-progress=3, and the default when boot-progress is absent:
+// the monitor threads run exactly as with boot-progress=2 (log writer, cpufreq poll, process/UI probes, console capture),
+// but the screen shows only the white Apple logo on black, like an iPhone boot: no page, no bar, no banners, no pulse.
+// The diagnostic page stays opt-in (boot-progress=1/2); guamp-logo=0 keeps the monitors and leaves the screen untouched;
+// boot-progress=0 switches everything off. Logs are unaffected (msgbuf, USB mirror, kpan).
+__attribute__((used)) static const char logo_marker[]="guamp-logo-1029";
+static unsigned logo_mode, logo_enabled, logo_painted;
+static uintptr_t logo_base;
+static void logo_paint(uintptr_t base,unsigned w,unsigned h,unsigned rb) {
+  if (w < BOOT_LOGO_WIDTH || h < BOOT_LOGO_HEIGHT) return;
+  unsigned x0=(w-BOOT_LOGO_WIDTH)/2, y0=(h-BOOT_LOGO_HEIGHT)/2;
+  for (unsigned y=0;y<h;++y) {
+    volatile uint32_t *row=(volatile uint32_t *)(base+(uintptr_t)y*rb);
+    const unsigned char *a=(y>=y0 && y<y0+BOOT_LOGO_HEIGHT) ? &boot_logo_alpha[(y-y0)*BOOT_LOGO_WIDTH] : NULL;
+    for (unsigned x=0;x<w;++x) {
+      unsigned v=(a && x>=x0 && x<x0+BOOT_LOGO_WIDTH) ? a[x-x0] : 0;
+      row[x]=v*0x010101u;
+    }
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+}
 static struct bp_exits exit_records,exit_snapshot;
 static unsigned exit_lock,exit_dropped;
 
@@ -486,7 +508,7 @@ static void refresh(unsigned now) {
 
 int boot_progress_active(void) { return enabled != 0; }
 int boot_progress_pulse_anchor(uintptr_t base,uint64_t bytes,unsigned w,unsigned h,unsigned rb) {
-  int accepted=enabled && bp_pulse_register(&pulse,base,bytes,w,h,rb);
+  int accepted=enabled && !logo_mode && bp_pulse_register(&pulse,base,bytes,w,h,rb);   // logo mode: no pulse line on the OS frame
   if(accepted)bp_panic_bind(&boot_progress_panic_vinfo,base,w,h,rb);
   return accepted;
 }
@@ -495,6 +517,11 @@ int boot_progress_pulse_anchor(uintptr_t base,uint64_t bytes,unsigned w,unsigned
 // console fallback cannot start drawing over the system frame.
 int boot_progress_prepare_scanout(void) {
   if (!enabled) return 1;
+  if (logo_mode) {   // nothing of ours is on screen to retire: just stop any later logo repaint
+    __atomic_store_n(&boot_progress_display_owned,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&last_scanout_at,seconds(),__ATOMIC_RELAXED);
+    return 1;
+  }
   __atomic_store_n(&display.yield_requested,1,__ATOMIC_RELEASE);
   if (__atomic_exchange_n(&render_busy,1,__ATOMIC_ACQUIRE)) return 0;
   if(!bp_pulse_enter(&pulse)) {
@@ -517,8 +544,13 @@ void boot_progress_cancel_scanout(void) {
   __atomic_store_n(&display.yield_requested,0,__ATOMIC_RELEASE);
 }
 void boot_progress_init(void) {
-  unsigned opt=0;
-  if (!PE_parse_boot_argn("boot-progress",&opt,sizeof(opt)) || (opt != 1 && opt != 2)) return;
+  unsigned opt=3;   // default: logo screen + monitors (marker guamp-logo-1029)
+  PE_parse_boot_argn("boot-progress",&opt,sizeof(opt));
+  if (opt == 3) {
+    logo_mode=1;logo_enabled=1;PE_parse_boot_argn("guamp-logo",&logo_enabled,sizeof(logo_enabled));
+    opt=2;   // same monitors and deadlines as boot-progress=2, only the screen differs
+  }
+  if (opt != 1 && opt != 2) return;
   __asm__ volatile("mrs %0,cntfrq_el0" : "=r"(boot_progress_frequency));
   if (!boot_progress_frequency) return;
   boot_progress_epoch=ticks(); state.limit=120; state.stall=30;
@@ -528,6 +560,21 @@ void boot_progress_init(void) {
   boot_progress_stage("PE initialized; early native mappings");
 }
 void boot_progress_bind(uintptr_t base,unsigned w,unsigned h,unsigned rb,unsigned depth) {
+  if (logo_mode) {
+    // The page is never bound (display.bound/frame stay 0, so page, overlays, banners and resume draw nothing).
+    // Paint the logo once per mapping, never after the OS owns the panel; keep the panic screen bound.
+    if (!enabled || boot_progress_display_owned || !take()) return;
+    ++bind_count;bind_base=base;bind_depth=depth;bind_result=1;
+    if (base >= 0xffff000000000000ULL && depth == 32 && w >= 720 && w <= 4096 &&
+        h >= 560 && h <= 4096 && rb >= w*4 && rb <= 65536 &&
+        base <= UINTPTR_MAX-(uint64_t)h*rb) {
+      bp_panic_bind(&boot_progress_panic_vinfo,base,w,h,rb);
+      if (logo_enabled && (!logo_painted || logo_base != base)) { logo_paint(base,w,h,rb); logo_painted=1; logo_base=base; }
+      bind_result=0;
+    }
+    release();
+    return;
+  }
   if (!enabled || !take()) return;
   ++bind_count;bind_base=base;bind_depth=depth;bind_result=1;
   if (boot_progress_display_owned) { bind_result=2;release(); return; }
