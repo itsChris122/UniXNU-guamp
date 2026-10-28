@@ -510,6 +510,11 @@ static void testCtl() {
     bts_shim_host_write(&s, other.data(), other.size());
     CHECK(drain(&s) == cc(0xfd1b, {BTS_STATUS_UNKNOWN_COMMAND}));
     s.id.unknownVendorStatus = 0;
+    // RAM test 11: LE meta 0xfce9 answers status 0, the sub-command echoed, then zeros.
+    Bytes meta = pktCmd(0xfce9, {0x01, 0xff, 0, 0, 0});   // LEMetaEnableFeatures(0xff)
+    bts_shim_host_write(&s, meta.data(), meta.size());
+    Bytes mr(1 + BTS_VENDOR_ZEROS, 0); mr[1] = 0x01;
+    CHECK(drain(&s) == cc(0xfce9, mr) && l.sent.size() == sentBefore);
 }
 
 int main() {

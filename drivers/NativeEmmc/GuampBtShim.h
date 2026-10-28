@@ -195,6 +195,7 @@ enum bts_bcm_action {
     BTS_BCM_FEATURES,     // ACK with bts_identity::features
     BTS_BCM_USB_PRODUCT,  // ACK with bts_identity::usbProduct
     BTS_BCM_ZEROS,        // ACK followed by BTS_VENDOR_ZEROS zero bytes (Apple 0xfce2 sub-commands, see the table)
+    BTS_BCM_SUBCMD,       // ACK, the sub-command (first parameter byte) echoed, then zero bytes (LE meta 0xfce9)
 };
 struct bts_bcm_cmd { uint16_t opcode; enum bts_bcm_action action; const char *name; };
 // Linux drivers/bluetooth btbcm.c / hci_bcm.c opcodes. Entries marked (?) are less certain; an unlisted vendor command
@@ -230,6 +231,11 @@ static const struct bts_bcm_cmd kBtsBcmCmds[] = {
     // with BTS_VENDOR_ZEROS (64) zero bytes satisfies every parser: values 0 (no WBS, default LE settings, nothing dropped) and a 0 first
     // byte where a stream consumer reads a status. RAM test 9 (sub-opcode echoed) still stopped right after it.
     {0xfce2, BTS_BCM_ZEROS, "apple_olympic"},
+    // Broadcom LE meta VSC (bluetoothd 21H461 _BCM_LEMeta*: OCF 0xe9, sub-command byte first, e.g. EnableFeatures 1 +
+    // le32). Its Command Complete carries status then the sub-command; with zeros there (RAM test 11, dump
+    // 20261028-212637) bluetoothd never matched the reply: "BD_VSC_LE_META_ENA_FEATURES timedout waiting for
+    // controller", reason 3602, restart. So the sub-command is echoed after the status, the rest stays zero.
+    {0xfce9, BTS_BCM_SUBCMD, "le_meta"},
 };
 static inline const struct bts_bcm_cmd *bts_bcm_find(uint16_t opcode) {
     for (size_t i = 0; i < sizeof kBtsBcmCmds / sizeof kBtsBcmCmds[0]; i = i + 1)
@@ -350,6 +356,12 @@ static inline void bts_shim_vendor(struct bts_shim *s, uint16_t opcode, const ui
     if (c->action == BTS_BCM_FEATURES) {ret = s->id.features; rn = sizeof s->id.features;}
     if (c->action == BTS_BCM_USB_PRODUCT) {ret = s->id.usbProduct; rn = sizeof s->id.usbProduct;}
     if (c->action == BTS_BCM_ZEROS) {ret = kBtsVendorZeros; rn = BTS_VENDOR_ZEROS;}
+    uint8_t sub[BTS_VENDOR_ZEROS];
+    if (c->action == BTS_BCM_SUBCMD) {
+        bts_zero(sub, sizeof sub);
+        sub[0] = plen ? p[0] : 0;
+        ret = sub; rn = sizeof sub;
+    }
     n = bts_cmd_complete(o, sizeof s->scratch, opcode, 0, ret, rn);
     bts_shim_queue(s, o, n);
 }
