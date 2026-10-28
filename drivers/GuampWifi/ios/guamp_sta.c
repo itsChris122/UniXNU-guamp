@@ -46,6 +46,7 @@ static bool sta_thread_made;
 static bool sta_calls;                          /* the thread is in a call of the station side's */
 static unsigned sta_reads;                      /* ... and so many others are in its state() */
 static bool sta_on;                             /* the radio's power, as last asked for */
+static int sta_wanted = -1;                     /* power asked for while there was no station (guamp-wifi-ui): 0/1, -1 none */
 
 /* what has been asked for and not begun */
 static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
@@ -174,6 +175,7 @@ void
 hakios_sta_attach(const struct hakios_sta_ops *ops)
 {
 	thread_t thread;
+	bool wanted_off;
 
 	if (ops == NULL) {
 		lck_mtx_lock(&sta_lock);
@@ -206,9 +208,16 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 	lck_mtx_lock(&sta_lock);
 	sta_ops = ops;
 	sta_on = true;
+	wanted_off = sta_wanted == 0;
+	sta_wanted = -1;
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+	if (wanted_off) {
+		/* (the switch was turned off in Settings while the radio was coming up: it stays off) */
+		printf("GuampWiFi: sta: the radio is up; Wi-Fi was switched off before, so it is switched off\n");
+		hakios_sta_ask_power(false);
+	}
 }
 
 void
@@ -247,8 +256,19 @@ hakios_sta_ask_power(bool on)
 {
 	lck_mtx_lock(&sta_lock);
 	if (sta_ops == NULL) {
+		/*
+		 * guamp-wifi-ui: no radio yet (placeholder en0). The wish is kept for when the station attaches, the answer is
+		 * "done" and the power stays off: the event makes wifid read it again, so Settings shows the switch off.
+		 */
+		bool first = sta_wanted == -1;
+
+		sta_wanted = on;
 		lck_mtx_unlock(&sta_lock);
-		return ENXIO;
+		if (first) {
+			printf("GuampWiFi: sta: power %s asked for before the radio is up: kept, the switch stays off\n", on ? "on" : "off");
+		}
+		hakios_apple80211_event(HAKIOS_STA_POWER, 0);
+		return 0;
 	}
 	sta_on = on;
 	asked_power = true;
@@ -367,6 +387,14 @@ hakios_sta_channels(struct hakios_sta_channel *out, unsigned most)
 	lck_mtx_lock(&sta_lock);
 	count = channel_count < most ? channel_count : most;
 	memcpy(out, channels, count * sizeof(*out));
+	if (count == 0 && sta_ops == NULL) {
+		/* (guamp-wifi-ui, no radio yet: 2.4 GHz 1..13, 12 and 13 passive, so a device can be made of en0 at all) */
+		for (unsigned i = 0; i < 13 && i < most; i++) {
+			out[i].frequency = (uint16_t)(2412 + 5 * i);
+			out[i].flags = i >= 11 ? HAKIOS_STA_CHANNEL_PASSIVE : 0;
+			count++;
+		}
+	}
 	lck_mtx_unlock(&sta_lock);
 	return count;
 }

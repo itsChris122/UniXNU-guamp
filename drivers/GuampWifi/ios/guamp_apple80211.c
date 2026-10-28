@@ -326,10 +326,10 @@ get(struct apple80211req *request)
 		}
 		return give(request, bits, sizeof(bits));
 	}
-	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
-		struct {                        /* is being brought up, and iOS asks this once, early */
-			uint32_t version, radios, state[4];
-		} answer = { .version = 1, .radios = 1, .state = { !hakios_sta_present() || hakios_sta_powered() } };
+	case 19: {                              /* the radio's power: one radio. Without the station (only the guamp-wifi-ui */
+		struct {                        /* placeholder en0, or the radio lost) it is off: the station's attach posts */
+			uint32_t version, radios, state[4];     /* POWER_CHANGED, and iOS reads it again then */
+		} answer = { .version = 1, .radios = 1, .state = { hakios_sta_powered() } };
 
 		return give(request, &answer, sizeof(answer));
 	}
