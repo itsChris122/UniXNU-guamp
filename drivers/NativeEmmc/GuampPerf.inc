@@ -4,11 +4,15 @@
 #include <mach/host_info.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
+extern "C" {   // these headers declare C functions without C linkage for C++
 #include <kern/timer_call.h>
+}
 #include <kern/sched_prim.h>
 #include <kern/processor.h>
 #include <kern/thread.h>
+extern "C" {   // these headers declare C functions without C linkage for C++
 #include <vm/vm_shared_region.h>
+}
 extern "C" kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" kern_return_t host_info(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8], armcpu_smp_step[8], armcpu_smp_fail[8];
