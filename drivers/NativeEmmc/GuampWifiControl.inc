@@ -26,7 +26,7 @@ struct WifiControl {
   Smp2pEdge smp={}; Glink glink={}; Qrtr qrtr={}; QftpReadOnly tftp={};
   GuampServreg servreg={}; Wlfw wlan={};
   Stage stage=Off; int error=0;
-  uint32_t descriptor=0,outboundFifo=0; uint16_t channel=0;
+  uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
   uint64_t deadline=0,now=0;
   bool routerStarted=false,wlanStarted=false;
   int prepare(SmemArena *shared,const Allocator &a,const Ops &platform,bool pasStopped) {
@@ -36,7 +36,7 @@ struct WifiControl {
     if(!shared||!a.alloc||!a.free||!platform.smpKick||!platform.glinkKick||
        !platform.wlan.assignMsa||!platform.wlan.power||!platform.wlan.fileSize||!platform.wlan.fileRead) return Invalid;
     arena=shared; allocator=a; ops=platform; error=0; channel=0;
-    routerStarted=wlanStarted=false; descriptor=outboundFifo=0;
+    routerStarted=wlanStarted=false; descriptor=outboundFifo=outboundBytes=0;
     e=tftp.start(this,qftpTx,qftpSize,qftpRead);if(e)return fail(e);
     e=qrtr.addLocalService(QftpReadOnly::Service,QftpReadOnly::ServiceInstance,QftpReadOnly::Port,this,qftpRx);
     if(e)return fail(e);
@@ -45,7 +45,8 @@ struct WifiControl {
     if(e)return fail(e);
     e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
     e=arena->allocate(1,478,32,&descriptor); if(e) return fail(e);
-    e=arena->allocate(1,479,16384,&outboundFifo); if(e) return fail(e);
+    // An existing TX FIFO is reused with its own size (glink_smem: the pipe length is the item size).
+    e=arena->allocate(1,479,16384,&outboundFifo,nullptr,&outboundBytes); if(e) return fail(e);
     // Local TX head / RX tail only. The firmware owns descriptor words 0 and 3.
     arena->mem.w32(descriptor+4,0); arena->mem.w32(descriptor+8,0);
     arena->mem.fence(); ops.glinkKick(ops.ctx); transition(Prepared); return Ok;
@@ -84,7 +85,7 @@ struct WifiControl {
       uint32_t incoming=0,size=0; e=arena->find(1,480,&incoming,&size);
       if(e==NotFound) return now>=deadline?fail(Timeout):Ok;
       if(e) return fail(e);
-      GlinkPipe out={arena->mem,outboundFifo,16384,descriptor+4,descriptor,true};
+      GlinkPipe out={arena->mem,outboundFifo,outboundBytes,descriptor+4,descriptor,true};
       GlinkPipe in={arena->mem,incoming,size,descriptor+12,descriptor+8,false};
       e=glink.start(out,in,allocator,this,kick,channelEvent,glinkRx); if(e) return fail(e);
       deadline=now+30000; transition(Running);

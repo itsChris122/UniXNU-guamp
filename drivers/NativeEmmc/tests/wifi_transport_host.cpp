@@ -67,6 +67,14 @@ static void smemTest() {
     CHECK(a.find(1,435,&off,&size)==Ok&&size==(partitioned?340u:344u));
     uint32_t saved=off; CHECK(a.allocate(1,435,340,&off,&created)==Ok&&!created&&off==saved);
     CHECK(a.allocate(1,435,349,&off)==Range);
+    // Wi-Fi R1 -102: an existing item is reused when large enough (Linux -EEXIST + qcom_smem_get), with its own size
+    static std::vector<SmemArena::Note> seen; seen.clear();
+    a.note=[](void *,const SmemArena::Note &n) { seen.push_back(n); };
+    uint32_t actual=0; CHECK(a.allocate(1,435,300,&off,&created,&actual)==Ok&&!created&&off==saved&&actual==(partitioned?340u:344u));
+    CHECK(seen.size()==1&&seen[0].item==435&&seen[0].wanted==300&&seen[0].found==actual&&seen[0].result==Ok);
+    CHECK(a.allocate(1,435,349,&off,&created,&actual)==Range&&seen.size()==2&&seen[1].result==Range&&seen[1].wanted==349);
+    CHECK(a.allocate(1,435,340,&off)==Ok&&seen.size()==2);   // same size (v11: padded 344): no note
+    a.note=nullptr;
     uint32_t before=f.locks; CHECK(a.allocate(1,7,16,&off)==Invalid&&f.locks==before);
     f.deny=true; auto bytes=f.bytes; CHECK(a.allocate(1,478,32,&off)==Timeout&&f.bytes==bytes); f.deny=false;
     CHECK(a.allocate(1,479,16384,&off)==Ok);

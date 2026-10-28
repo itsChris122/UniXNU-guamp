@@ -7,6 +7,7 @@ void IODelay(unsigned);
 void IOSleep(unsigned);
 }
 IOLock *IOLockAlloc(void);
+void IOLockFree(IOLock *);
 volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
 #include "../GuampRpm.inc"
 #include "../GuampWifiPrep.inc"
