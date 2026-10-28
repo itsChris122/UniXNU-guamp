@@ -338,19 +338,22 @@ errno_t kctlDisconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo) {
   const uint64_t speed = gTty.speed;
   const uint16_t cmd = gShim->lastCmd, reply = gShim->lastReply;
   const uint8_t status = gShim->lastReplyStatus;
-  uint32_t ring[BTS_UNKNOWN_RING];
-  for (unsigned i = 0; i < BTS_UNKNOWN_RING; i = i + 1) ring[i] = gShim->unknownRing[i];
+  uint32_t ring[BTS_VENDOR_RING];
+  for (unsigned i = 0; i < BTS_VENDOR_RING; i = i + 1) ring[i] = gShim->vendorRing[i];
+  const uint32_t vendors = gShim->vendorCount;
   IOLockUnlock(gLock);
-  if (mine && st.unknownVendor) {   // the vendor commands answered 0x01 (Unknown HCI Command): oldest first
-    char line[BTS_UNKNOWN_RING * 9 + 1];
+  if (mine && vendors) {   // the last vendor commands, oldest first: opcode/first parameter byte:status answered
+    char line[BTS_VENDOR_RING * 12 + 1];
     unsigned at = 0;
-    const uint32_t n = st.unknownVendor < BTS_UNKNOWN_RING ? st.unknownVendor : BTS_UNKNOWN_RING;
-    for (uint32_t i = st.unknownVendor - n; i < st.unknownVendor; i = i + 1) {
-      const uint32_t e = ring[i % BTS_UNKNOWN_RING];
-      at += static_cast<unsigned>(snprintf(line + at, sizeof line - at, " %04x/%02x", e >> 8, e & 0xff));
+    const uint32_t n = vendors < BTS_VENDOR_RING ? vendors : BTS_VENDOR_RING;
+    for (uint32_t i = vendors - n; i < vendors; i = i + 1) {
+      const uint32_t e = ring[i % BTS_VENDOR_RING];
+      at += static_cast<unsigned>(snprintf(line + at, sizeof line - at, " %04x/%02x:%02x", e >> 16, (e >> 8) & 0xff,
+                                           e & 0xff));
     }
     line[sizeof line - 1] = 0;
-    IOLog("GuampBtShim: %u unknown vendor commands, last (opcode/first byte):%s\n", st.unknownVendor, line);
+    IOLog("GuampBtShim: %u vendor commands (%u unknown), last (opcode/first byte:status):%s\n", vendors,
+          st.unknownVendor, line);
   }
   if (mine)
     IOLog("GuampBtShim: disconnect %s unit %u; host %u pkts (%u cmds, %u forwarded, %u emulated, %u tx errors), "
