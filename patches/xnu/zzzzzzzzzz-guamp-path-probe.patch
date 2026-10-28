@@ -1,0 +1,169 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -162,8 +162,8 @@
+  *		lookup: ???
+  *		VNOP_READLINK:???
+  */
+-int
+-namei(struct nameidata *ndp)
++static int
++namei_guamp_inner(struct nameidata *ndp)
+ {
+ 	struct vnode *dp;       /* the directory we are searching */
+ 	struct vnode *usedvp = ndp->ni_dvp;  /* store pointer to vp in case we must loop due to
+@@ -2209,3 +2209,87 @@
+ 		kdebug_lookup(vp ? vp : dvp, &ndp->ni_cnd);
+ 	}
+ }
++/* guamp-path-probe=N (29/10, diagnostics, off by default): logs up to N path-based namei/vn_open_auth/getattrlist calls whose
++ * path names MobileSafari.framework, SafariCore.framework, WebContentExtension.appex or a /Cryptexes/ directory, with the result,
++ * the resolved vnode path, its type and its mount (fs type, flags, fsid). Finds where cryptex bundles stop being readable for
++ * NSBundle/lsd/ExtensionKit: a failed lookup, a refusal after the lookup (open/getattrlist error with namei OK) or an unexpected
++ * mount. */
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++static volatile SInt32 guamp_path_probe_limit = -1;
++static volatile SInt32 guamp_path_probe_used = 0;
++int guamp_path_probe_active(void);
++int guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size);
++void guamp_path_probe_log(const char *what, const char *path, int error, vnode_t vp, long extra);
++int
++guamp_path_probe_active(void)
++{
++	SInt32 limit = guamp_path_probe_limit;
++	if (limit < 0) {
++		uint32_t n = 0;
++		if (!PE_parse_boot_argn("guamp-path-probe", &n, sizeof(n))) {
++			n = 0;
++		}
++		limit = n > 100000 ? 100000 : (SInt32)n;
++		guamp_path_probe_limit = limit;
++	}
++	return guamp_path_probe_used < limit;
++}
++int
++guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size)
++{
++	size_t done = 0;
++	buf[0] = '\0';
++	if (path == USER_ADDR_NULL) {
++		return 0;
++	}
++	if (UIO_SEG_IS_USER_SPACE(seg)) {
++		if (copyinstr(path, buf, size, &done)) {
++			buf[0] = '\0';
++			return 0;
++		}
++	} else {
++		strlcpy(buf, CAST_DOWN(const char *, path), size);
++	}
++	return strnstr(buf, "MobileSafari.framework", size) != NULL || strnstr(buf, "SafariCore.framework", size) != NULL ||
++	       strnstr(buf, "/Cryptexes/", size) != NULL || strnstr(buf, "WebContentExtension.appex", size) != NULL;
++}
++void
++guamp_path_probe_log(const char *what, const char *path, int error, vnode_t vp, long extra)
++{
++	if (OSIncrementAtomic(&guamp_path_probe_used) >= guamp_path_probe_limit) {
++		return;
++	}
++	char real[160] = "-";
++	int length = sizeof(real);
++	const char *fs = "-";
++	uint64_t flags = 0;
++	int32_t fsid = 0;
++	int type = -1;
++	if (vp != NULLVP) {
++		if (vn_getpath(vp, real, &length)) {
++			strlcpy(real, "?", sizeof(real));
++		}
++		type = vnode_vtype(vp);
++		mount_t mp = vnode_mount(vp);
++		if (mp) {
++			fs = vfs_statfs(mp)->f_fstypename;
++			flags = vfs_flags(mp);
++			fsid = vfs_statfs(mp)->f_fsid.val[0];
++		}
++	}
++	proc_t p = current_proc();
++	printf("guamp-path: %s[%d] %s %ld err %d %s -> %s type %d fs %s flags 0x%llx fsid 0x%x\n", p ? proc_best_name(p) : "?",
++	    p ? proc_pid(p) : -1, what, extra, error, path, real, type, fs, flags, fsid);
++}
++int
++namei(struct nameidata *ndp)
++{
++	char path[160];
++	if (!guamp_path_probe_active() || !guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path))) {
++		return namei_guamp_inner(ndp);
++	}
++	int error = namei_guamp_inner(ndp);
++	guamp_path_probe_log("namei", path, error, error ? NULLVP : ndp->ni_vp, (long)ndp->ni_cnd.cn_nameiop);
++	return error;
++}
+diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -371,8 +371,8 @@
+  * XXX:		We should enummerate the possible errno values here, and where
+  *		in the code they originated.
+  */
+-int
+-vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
++static int
++vn_open_auth_guamp_inner(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
+ {
+ 	struct vnode *vp;
+ 	struct vnode *dvp;
+@@ -2332,3 +2332,18 @@
+ 
+ 	return error == 0 ? 1 : 0;
+ }
++/* guamp-path-probe (vfs_lookup.c): the open result after the lookup. */
++extern int guamp_path_probe_active(void);
++extern int guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size);
++extern void guamp_path_probe_log(const char *what, const char *path, int error, vnode_t vp, long extra);
++int
++vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
++{
++	char path[160];
++	if (!guamp_path_probe_active() || !guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path))) {
++		return vn_open_auth_guamp_inner(ndp, fmodep, vap, authvp);
++	}
++	int error = vn_open_auth_guamp_inner(ndp, fmodep, vap, authvp);
++	guamp_path_probe_log("open", path, error, error ? NULLVP : ndp->ni_vp, fmodep ? (long)*fmodep : 0);
++	return error;
++}
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -3483,8 +3483,8 @@
+ 	return error;
+ }
+ 
+-int
+-getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
++static int
++getattrlist_guamp_inner(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
+ {
+ 	enum uio_seg segflg;
+ 	struct attrlist al;
+@@ -4942,3 +4942,19 @@
+ 
+ 	return error;
+ }
++/* guamp-path-probe (vfs_lookup.c): the getattrlist result. */
++extern int guamp_path_probe_active(void);
++extern int guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size);
++extern void guamp_path_probe_log(const char *what, const char *path, int error, vnode_t vp, long extra);
++int
++getattrlist(proc_t p, struct getattrlist_args *uap, int32_t *retval)
++{
++	char path[160];
++	if (!guamp_path_probe_active() || !guamp_path_probe_copy(uap->path,
++	    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32, path, sizeof(path))) {
++		return getattrlist_guamp_inner(p, uap, retval);
++	}
++	int error = getattrlist_guamp_inner(p, uap, retval);
++	guamp_path_probe_log("getattrlist", path, error, NULLVP, 0);
++	return error;
++}
