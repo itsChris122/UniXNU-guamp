@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 2962759..a482dc3 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7485,14 +7485,218 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+@@ -7485,14 +7485,224 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
  		at += (packed + 7) & ~7ULL;
  	}
  }
@@ -13,9 +13,11 @@ index 2962759..a482dc3 100644
 + * in its root: the union falls through to the covered directory only for a name the upper directory does not have, so Info.plist,
 + * _CodeSignature and the .lproj directories always come from the sealed volume. Both frameworks live on the root system volume
 + * (not in the SystemOS cryptex). Never panics: a missing directory or a refused mount only records its status (stage 5 = mounted,
-+ * a sealed name and the new name both visible). */
-+volatile int native_guamp_iphone_res_stage[2] = {0, 0};
-+volatile int native_guamp_iphone_res_status[2] = {-1, -1};
++ * a sealed name and the new name both visible). The two /Library/Wallpaper views give WallpaperKit the lookup files named after
++ * MobileGestalt's DeviceName ("iPhone" here): without Collections~iphone.plist -[WKWallpaperRepresentingCollectionsManager
++ * _loadSystemWallpaperCollections] raises and PosterBoard and CollectionsPoster abort in a loop (copies of the ~ipad files). */
++volatile int native_guamp_iphone_res_stage[4] = {0, 0, 0, 0};
++volatile int native_guamp_iphone_res_status[4] = {-1, -1, -1, -1};
 +static const struct {
 +	const char *source;
 +	const char *point;
@@ -28,6 +30,10 @@ index 2962759..a482dc3 100644
 +	{"/private/var/ngpu/iphone-res/ControlCenterUI.framework", "/System/Library/PrivateFrameworks/ControlCenterUI.framework",
 +	 "/System/Library/PrivateFrameworks/ControlCenterUI.framework/DefaultModuleSettings~ipad.plist",
 +	 "/System/Library/PrivateFrameworks/ControlCenterUI.framework/DefaultModuleSettings~iphone.plist"},
++	{"/private/var/ngpu/iphone-res/Wallpaper", "/Library/Wallpaper",
++	 "/Library/Wallpaper/DefaultWallpapers~ipad.plist", "/Library/Wallpaper/DefaultWallpapers~iphone.plist"},
++	{"/private/var/ngpu/iphone-res/WallpaperCollections", "/Library/Wallpaper/Collections",
++	 "/Library/Wallpaper/Collections/Collections~ipad.plist", "/Library/Wallpaper/Collections/Collections~iphone.plist"},
 +};
 +static int
 +native_guamp_iphone_res_enabled(void)
@@ -222,7 +228,7 @@ index 2962759..a482dc3 100644
  	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
  	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
  	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
-@@ -7986,6 +8190,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+@@ -7986,6 +8196,7 @@ native_owner_data_prepare(proc_t p, user_addr_t scratch)
  	if (actual != device || (vfs_flags(data_mount) & MNT_RDONLY) ||
  	    strcmp(vfs_statfs(data_mount)->f_fstypename, "apfs")) error = EINVAL;
  	if (!error) native_owner_data_stage = 4;
