@@ -30,12 +30,25 @@ struct Transport {
   Sleep sleep=nullptr;
   void *context=nullptr;
   bool wide=true;
-  // All PAS commands used here fit the four register arguments. Extended
-  // argument buffers are deliberately unsupported rather than mis-encoded.
+  // Register-only calls (PAS) and explicitly backed extended calls (MSA, from the Codex Wi-Fi transport) are
+  // separate, so an extended descriptor cannot be mistaken for a scalar argument.
   Result call(unsigned service,unsigned command,uint32_t arginfo,
               uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,bool fast=false) const {
+    return callRegisters(service,command,arginfo,a,b,c,d,fast,false);
+  }
+  // Qualcomm passes arguments 3..9 in a shared array when there are more than 4 (x5 = its physical address).
+  // The caller owns that physical backing and must publish/clean it before this call.
+  Result callExtended(unsigned service,unsigned command,uint32_t arginfo,
+                      uint64_t a,uint64_t b,uint64_t c,uint64_t extraPhysical) const {
+    if((arginfo&15)<5||(arginfo&15)>10||(extraPhysical&7)||!extraPhysical) {
+      Result r; r.transport=kInvalid; return r;
+    }
+    return callRegisters(service,command,arginfo,a,b,c,extraPhysical,false,true);
+  }
+  Result callRegisters(unsigned service,unsigned command,uint32_t arginfo,
+                       uint64_t a,uint64_t b,uint64_t c,uint64_t d,bool fast,bool extended) const {
     Result result;
-    if (!invoke || (arginfo&15)>4 || (!wide && ((a|b|c|d)>0xffffffffULL))) {
+    if (!invoke || (arginfo&15)>(extended?10u:4u) || (!wide && ((a|b|c|d)>0xffffffffULL))) {
       result.transport=kInvalid;return result;
     }
     for (uint32_t attempt=0;;++attempt) {

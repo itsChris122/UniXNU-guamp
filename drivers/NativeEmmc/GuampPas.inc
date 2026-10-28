@@ -17,7 +17,7 @@
 #define GUAMP_PAS_INC
 namespace pas {
 enum : int { kUp=0,kQueried=1,kErrScm=-220,kErrPeer=-221,kErrPlace=-222,kErrMap=-223,kErrVote=-224,kErrInit=-225,
-             kErrMemory=-226,kErrLoad=-227,kErrAuth=-228,kErrReady=-229,kErrMemoryAlloc=-230 };
+             kErrMemory=-226,kErrLoad=-227,kErrAuth=-228,kErrReady=-229,kErrMemoryAlloc=-230,kErrPrepare=-231 };
 enum : int { kReady=1,kNotReady=0,kFatal=-1 };   // Hooks::awaitReady
 struct Hooks {
   void *ctx=nullptr;
@@ -25,6 +25,11 @@ struct Hooks {
   bool (*vote)(void *,bool on)=nullptr;     // pil_proxy_vote / pil_remove_proxy_vote (rails, XO)
   int (*awaitReady)(void *)=nullptr;        // after AUTH_AND_RESET; returns once the proxy votes may go
   void (*failure)(void *)=nullptr;          // failure reason (log only)
+  // Owner hand-off (the modem's ModemBootHooks, GuampModem.inc): prepare runs after placement, the stopped-peer check
+  // and the carveout mapping, before any vote or RAM write (nonzero = refuse, nothing written); cleanup runs after the
+  // PAS SHUTDOWN of a failed start that INIT_IMAGE had accepted, with the SHUTDOWN result. ADSP leaves both unset.
+  int (*prepare)(void *)=nullptr;
+  void (*cleanup)(void *,bool stopped)=nullptr;
 };
 
 inline bool scmOkay(const Peripheral &p,const char *stage,const scm::Result &r) {
@@ -121,6 +126,10 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
   Ram ram;
   if(!ram.open(p.base,p.bytes)) {IOLog("%s: carveout mapping failed\n",p.tag);IOFree(plan,sizeof(*plan));return kErrMap;}
   int result=kUp;
+  if(h.prepare) {
+    const int e=h.prepare(h.ctx);
+    if(e) {IOLog("%s: owner prepare failed %d; no RAM written\n",p.tag,e);IOFree(plan,sizeof(*plan));return kErrPrepare;}
+  }
   bool voted=h.vote?h.vote(h.ctx,true):true;
   if(!voted) {IOLog("%s: proxy vote failed; no RAM written\n",p.tag);result=kErrVote;}
   bool initialized=false,okay=voted;
@@ -175,6 +184,7 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
       bool down=scmOkay(p,"cleanup-shutdown",transport.shutdown(p.id));
       if(down) {ram.write(plan->first,nullptr,plan->span,true);ram.synchronize();IOLog("%s: region cleared\n",p.tag);}
       else IOLog("%s: shutdown refused: region left untouched\n",p.tag);
+      if(h.cleanup)h.cleanup(h.ctx,down);
     } else if(voted) {
       ram.write(plan->first,nullptr,meta,true);ram.synchronize();
     }

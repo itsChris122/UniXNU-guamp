@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // SMCCC register preservation, including the Qualcomm x6 resume quirk. Copy of wifi/driver-modem/GuampScmArm64.inc
-// with an include guard, shared by the modem and the ADSP PAS loaders (GuampPas.inc).
+// with an include guard, shared by the modem and the ADSP PAS loaders (GuampPas.inc) and the Wi-Fi runtime object
+// (MSA assignment), which does not use the barrier: hence static inline.
 #ifndef GUAMP_SCM_ARM64_INC
 #define GUAMP_SCM_ARM64_INC
-static void guampModemBarrier() {__asm__ volatile("dsb sy" ::: "memory");}
+static inline void guampModemBarrier() {__asm__ volatile("dsb sy" ::: "memory");}
 static void guampScmInstruction(void *,const scm::Registers &in,scm::Registers &out) {
   register uint64_t x0 __asm__("x0")=in.x[0], x1 __asm__("x1")=in.x[1];
   register uint64_t x2 __asm__("x2")=in.x[2], x3 __asm__("x3")=in.x[3];

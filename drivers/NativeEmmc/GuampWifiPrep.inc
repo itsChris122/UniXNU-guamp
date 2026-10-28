@@ -8,12 +8,25 @@
 //   firmware   the modem_<slot> partition (slot from the boot_a/boot_b GPT active bit, boot argument
 //              guamp-wifi-slot=a|b overrides) read as ext4 (GuampExt4.inc); /image/modem.mdt parsed and every
 //              /image/modem.bNN checked against its SHA-384 (GuampFirmware.inc); presence of wlanmdsp.mbn and bdwlan.*
-// Nothing is written: not the eMMC, not SMEM, not the modem region; no TrustZone call. eMMC reads go through
-// Card::readBlocks under the card gate, at most kBounceBlocks (128) blocks per call, like every other reader.
+// The default prep path only reads. guamp-modem-start=2 adds SCM/PAS queries;
+// mode1 can load/authenticate reserved modem RAM (GuampModem.inc over the shared PAS loader).
+// guamp-wifi-start=1 (implies the prep) starts the modem through ModemBootHooks into the
+// Wi-Fi runtime (drivers/GuampWifi, compiled only with GUAMP_WIFI_RUNTIME=1): diagnostic scan.
+// eMMC stays read-only, through Card::readBlocks under the card gate.
 
 #include "GuampExt4.inc"
+#include "GuampWifiWire.inc"
 #include "GuampFirmware.inc"
+#include "GuampWifiFirmware.inc"
 #include "GuampSmem.inc"
+#include "GuampScm.inc"
+#include "GuampScmArm64.inc"
+#include "GuampPasCore.inc"   // one PAS loader for modem (GuampModem.inc) and ADSP (GuampAdsp.inc)
+#include "GuampPas.inc"
+#include "GuampWifiControl.inc"
+#if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
+#include "guamp_xnu_sm6115_runtime.h"
+#endif
 
 extern "C" {
 extern unsigned long guamp_phys_base __asm__("_gPhysBase");   // XNU-managed RAM (osfmk/arm64/arm_vm_init.c),
@@ -35,6 +48,105 @@ bool readWindow(void *ctx, uint64_t sector, uint32_t count, uint8_t *out) {
   bool ok = card.online && card.readBlocks(w->first + sector, count, out);
   IOLockUnlock(card.gate);
   return ok;
+}
+
+// Persistent, read-only backing for later QRTR/TFTP and WLFW requests. The
+// diagnostic path below used to free its ext4 scratch/window on return, which
+// made an asynchronous firmware callback unsafe even if WifiControl were
+// started later. This owner deliberately survives the prep thread.
+struct FirmwareStore {
+  static constexpr uint32_t Wcn3990BoardBytes=26328;
+  Window window{};
+  ext4::Fs fs{};
+  IOLock *gate=nullptr;
+  uint8_t *scratch=nullptr;
+  uint8_t *ath10kBoard=nullptr;
+  uint32_t ath10kBoardBytes=0;
+  bool ready=false;
+  bool isReady() const { return __atomic_load_n(&ready,__ATOMIC_ACQUIRE); }
+  int mount(uint64_t first,uint64_t blocks) {
+    if(isReady())return guampwifi::Ok;
+    if(!blocks)return guampwifi::Invalid;
+    if(!gate)gate=IOLockAlloc();
+    if(!gate)return guampwifi::NoMemory;
+    IOLockLock(gate);
+    if(isReady()){IOLockUnlock(gate);return guampwifi::Ok;}
+    if(!scratch)scratch=static_cast<uint8_t *>(IOMallocZero(ext4::kScratchBytes));
+    if(!scratch){IOLockUnlock(gate);return guampwifi::NoMemory;}
+    window={first,blocks};
+    int e=fs.mount(readWindow,&window,blocks,scratch);
+    if(e){memset(&fs,0,sizeof(fs));IOLockUnlock(gate);return e==ext4::kErrIo?guampwifi::Io:guampwifi::Unsupported;}
+    __atomic_store_n(&ready,true,__ATOMIC_RELEASE);
+    IOLockUnlock(gate);return guampwifi::Ok;
+  }
+  int sizeLocked(const char *path,uint32_t *bytes) {
+    guampwifi::Ext4FirmwareSource source(&fs);return source.size(path,bytes);
+  }
+  int readLocked(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
+    guampwifi::Ext4FirmwareSource source(&fs);return source.read(path,at,out,bytes);
+  }
+  int size(const char *path,uint32_t *bytes) {
+    if(!isReady())return guampwifi::NotReady;
+    IOLockLock(gate);int e=isReady()?sizeLocked(path,bytes):guampwifi::NotReady;IOLockUnlock(gate);return e;
+  }
+  int read(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
+    if(!isReady())return guampwifi::NotReady;
+    IOLockLock(gate);int e=isReady()?readLocked(path,at,out,bytes):guampwifi::NotReady;IOLockUnlock(gate);return e;
+  }
+  int loadAth10kBoard() {
+    if(!isReady())return guampwifi::NotReady;
+    IOLockLock(gate);
+    if(!isReady()){IOLockUnlock(gate);return guampwifi::NotReady;}
+    if(ath10kBoard&&ath10kBoardBytes){IOLockUnlock(gate);return guampwifi::Ok;}
+    uint32_t n=0;int e=sizeLocked("/image/bdwlan_guamp_ipa.bin",&n);
+    if(e){IOLockUnlock(gate);return e;}
+    if(n!=Wcn3990BoardBytes){IOLockUnlock(gate);return guampwifi::Range;}
+    uint8_t *data=static_cast<uint8_t *>(IOMalloc(n));
+    if(!data){IOLockUnlock(gate);return guampwifi::NoMemory;}
+    for(uint32_t at=0;at<n;) {
+      uint32_t chunk=n-at;if(chunk>6144)chunk=6144;
+      e=readLocked("/image/bdwlan_guamp_ipa.bin",at,data+at,chunk);
+      if(e){IOFree(data,n);IOLockUnlock(gate);return e;}
+      at+=chunk;
+    }
+    ath10kBoard=data;ath10kBoardBytes=n;IOLockUnlock(gate);return guampwifi::Ok;
+  }
+  static int sizeCallback(void *ctx,const char *path,uint32_t *bytes) {
+    return ctx?static_cast<FirmwareStore *>(ctx)->size(path,bytes):guampwifi::Invalid;
+  }
+  static int readCallback(void *ctx,const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
+    return ctx?static_cast<FirmwareStore *>(ctx)->read(path,at,out,bytes):guampwifi::Invalid;
+  }
+};
+static FirmwareStore gFirmwareStore{};
+
+// lx_platform::fw_get has no context. Keep this callback scoped to the one
+// guamp SNOC instance. firmware-5.bin is the 60-byte upstream WCN3990 API5
+// metadata record (not executable firmware); WLAN.HL payload remains the
+// separately loaded wlanmdsp.mbn. The Motorola raw BDF is served through API1.
+int ath10kFirmwareGet(const char *name,const uint8_t **data,size_t *bytes) {
+  if(!name||!data||!bytes)return guampwifi::Invalid;
+  const char *base=name;
+  for(const char *p=name;*p;p++)if(*p=='/'||*p=='\\')base=p+1;
+  if(guampwifi::Ext4FirmwareSource::equals(base,"firmware-5.bin")) {
+    // linux-firmware ath10k/WCN3990/hw1.0/firmware-5.bin, retrieved from
+    // linux-firmware.git. WHENCE marks it redistributable under
+    // LicenseRef-LICENSE.QualcommAtheros_ath10k. It declares NON_BMI,
+    // WMI TLV and HTT v3; it does not carry a WLAN firmware image.
+    static const uint8_t metadata[]={
+      0x51,0x43,0x41,0x2d,0x41,0x54,0x48,0x31,0x30,0x4b,0x00,0x77,
+      0x01,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0xa4,0xe4,0xbe,0x5b,
+      0x02,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x40,0x00,0x0c,0x77,
+      0x05,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x04,0x00,0x00,0x00,
+      0x06,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x03,0x00,0x00,0x00
+    };
+    *data=metadata;*bytes=sizeof(metadata);return guampwifi::Ok;
+  }
+  if(!guampwifi::Ext4FirmwareSource::equals(base,"board-snoc-guamp-wcn-snoc.bin")&&
+     !guampwifi::Ext4FirmwareSource::equals(base,"board.bin"))return guampwifi::NotFound;
+  int e=gFirmwareStore.loadAth10kBoard();if(e)return e;
+  *data=gFirmwareStore.ath10kBoard;*bytes=gFirmwareStore.ath10kBoardBytes;
+  return guampwifi::Ok;
 }
 
 // GPT entry by name (same walk as Card::findPartitions, own buffer, one block per gate hold)
@@ -92,9 +204,72 @@ char activeSlot() {
   return 'a';
 }
 
+static bool modemStopped();
+static bool modemAwaitReady();
+#include "GuampModem.inc"
+
+static unsigned radioMode() {
+  unsigned mode=0;
+  if(!PE_parse_boot_argn("guamp-wifi-start",&mode,sizeof(mode))||mode>2)return 0;
+  return mode;
+}
+#if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
+static int runtimePrepare(void *) { return guamp_sm6115_wifi_prepare(guamp_phys_base,guamp_phys_size); }
+static int runtimeStarted(void *) { return guamp_sm6115_wifi_modem_started(); }
+static void runtimeShutdown(void *,bool stopped) { guamp_sm6115_wifi_shutdown_result(stopped); }
+#endif
+
 // --- SMEM -----------------------------------------------------------------------------------------------------------
 uint32_t smemRead(void *ctx, uint32_t offset) {
   return *reinterpret_cast<const volatile uint32_t *>(static_cast<const volatile uint8_t *>(ctx) + offset);
+}
+
+static bool modemStopped() {
+  if(pas::overlap(kSmemPhys,kSmemBytes,guamp_phys_base,guamp_phys_size))return false;
+  IOMemoryDescriptor *d=IOMemoryDescriptor::withPhysicalAddress(kSmemPhys,kSmemBytes,kIODirectionIn);
+  IOMemoryMap *map=d?d->map(kIOMapInhibitCache|kIOMapReadOnly):nullptr;if(d)d->release();
+  if(!map)return false;
+  smem::Info *info=static_cast<smem::Info *>(IOMallocZero(sizeof(smem::Info)));
+  bool stopped=false;
+  if(info) {
+    smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
+    smem::parse(reader,info);uint32_t at=0,bytes=0;
+    const smem::Partition *peer=smem::partitionFor(*info,smem::kHostModem);
+    stopped=!info->error && info->initialized && (!peer || !peer->status) &&
+      !smem::find(reader,*info,smem::kHostModem,428,&at,&bytes);
+    IOFree(info,sizeof(*info));
+  }
+  map->release();return stopped;
+}
+
+static bool modemAwaitReady() {
+  if(pas::overlap(kSmemPhys,kSmemBytes,guamp_phys_base,guamp_phys_size))return false;
+  IOMemoryDescriptor *d=IOMemoryDescriptor::withPhysicalAddress(kSmemPhys,kSmemBytes,kIODirectionIn);
+  IOMemoryMap *map=d?d->map(kIOMapInhibitCache|kIOMapReadOnly):nullptr;if(d)d->release();
+  if(!map)return false;
+  smem::Info *info=static_cast<smem::Info *>(IOMallocZero(sizeof(smem::Info)));
+  smem::Smp2p *state=static_cast<smem::Smp2p *>(IOMallocZero(sizeof(smem::Smp2p)));
+  bool ready=false;
+  if(info && state) {
+    smem::Reader reader={smemRead,reinterpret_cast<void *>(map->getVirtualAddress()),static_cast<uint32_t>(kSmemBytes)};
+    uint32_t last=~0u;
+    for(unsigned attempt=0;attempt<100;++attempt) {
+      __asm__ volatile("dmb sy" ::: "memory");
+      smem::parse(reader,info);uint32_t at=0,bytes=0;
+      if(!info->error && smem::find(reader,*info,smem::kHostModem,428,&at,&bytes)) {
+        smem::readSmp2p(reader,at,bytes,"slave-kernel",state);
+        if(state->valid && state->hasEntry && state->localPid==1 && state->remotePid==0) {
+          uint32_t flags=state->value;
+          if(flags!=last) {IOLog("GuampModem: SMP2P slave-kernel %x (ready %u fatal %u)\n",flags,flags>>1&1,flags&1);last=flags;}
+          if(flags&1)break;
+          if(flags&2) {ready=true;break;}
+        }
+      }
+      IOSleep(100);
+    }
+    if(!ready)IOLog("GuampModem: ready handshake not complete after bounded observation; apps SMP2P/GLINK prerequisites remain\n");
+  }
+  if(info)IOFree(info,sizeof(*info));if(state)IOFree(state,sizeof(*state));map->release();return ready;
 }
 
 void smemReport() {
@@ -199,6 +374,32 @@ void firmwareReport() {
         });
       IOLog("GuampWifi: wlanmdsp.mbn %s %llu bytes, %u bdwlan.* board files\n", w ? "absent" : "present",
             w ? 0ull : file.size, bdwlan);
+      const bool verified=!res->error&&!res->failed&&res->verified>0;
+      const unsigned mode=radioMode();
+      if(mode) {
+        // Only the radio opt-in keeps a mounted store past this thread (guamp-wifi-prep=1 alone stays as before).
+        int persistent=gFirmwareStore.mount(window.first,window.blocks);
+        IOLog("GuampWifi: persistent read-only firmware source %s; QRTR TFTP remains opt-in to the transport owner\n",
+              persistent?"unavailable":"ready");
+#if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
+#if !defined(GUAMP_WIFI_REDWOOD) || !GUAMP_WIFI_REDWOOD
+        if(mode==2)IOLog("GuampWifi: guamp-wifi-start=2 (iOS station) is not built (GUAMP_WIFI_REDWOOD); modem not started\n");
+        else
+#endif
+        if(persistent||w||!verified)IOLog("GuampWifi: radio start refused: firmware store, WLAN image or verification unavailable\n");
+        else {
+          // The persistent store precedes PAS boot: QFTP may request firmware
+          // while the started hook is negotiating GLINK/QRTR/WLFW.
+          const ModemBootHooks hooks={nullptr,runtimePrepare,runtimeStarted,runtimeShutdown};
+          if(modemBoot(*fs,mdt,chunk,verified,&hooks,true)) {
+            const int e=guamp_sm6115_wifi_start_station(mode);
+            if(e)IOLog("GuampWifi: station worker could not start %d; live modem resources retained\n",e);
+          } else guamp_sm6115_wifi_abort();
+        }
+#else
+        IOLog("GuampWifi: guamp-wifi-start requires the GUAMP_WIFI_RUNTIME component; prep completed only\n");
+#endif
+      } else (void)modemBoot(*fs,mdt,chunk,verified);
     }
   } else {
     IOLog("GuampWifi: out of memory\n");
@@ -214,13 +415,16 @@ void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-wifi-prep");
   smemReport();
   firmwareReport();
+  unsigned modemMode=0;
+  if(PE_parse_boot_argn("guamp-modem-start",&modemMode,sizeof(modemMode)) && modemMode==1)smemReport();
 }
 
-// Once, after publish(): boot argument guamp-wifi-prep=1
+// Once, after publish(): read-only prep or explicit radio-start opt-in.
 void start() {
   static bool started = false;
   unsigned enabled = 0;
-  if (started || !PE_parse_boot_argn("guamp-wifi-prep", &enabled, sizeof(enabled)) || enabled != 1) return;
+  const bool prep=PE_parse_boot_argn("guamp-wifi-prep",&enabled,sizeof(enabled))&&enabled==1;
+  if(started||(!prep&&!radioMode()))return;
   if (!gCard.online || !gCard.gate) return;
   started = true;
   thread_t t = nullptr;
@@ -228,3 +432,24 @@ void start() {
 }
 
 }  // namespace wifiprep
+
+// C ABI consumed by the XNU station glue. Preserve the bounded error codes so
+// the glue can fall back to the caller's firmware provider on NotFound/NotReady.
+extern "C" int guamp_ath10k_firmware_get(const char *name,const uint8_t **data,size_t *bytes) {
+  return wifiprep::ath10kFirmwareGet(name,data,bytes);
+}
+
+// Narrow C ABI for the WLFW QFTP provider callbacks. QFTP itself accepts only
+// these two read-only assets; do not expose an arbitrary ext4 path to callers.
+extern "C" int guamp_wifi_firmware_file_size(const char *path,uint32_t *bytes) {
+  if(!path||!bytes)return guampwifi::Invalid;
+  if(strcmp(path,"/image/wlanmdsp.mbn")&&strcmp(path,"/image/bdwlan_guamp_ipa.bin"))
+    return guampwifi::NotFound;
+  return wifiprep::gFirmwareStore.size(path,bytes);
+}
+extern "C" int guamp_wifi_firmware_file_read(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
+  if(!path||(!out&&bytes)||!bytes)return guampwifi::Invalid;
+  if(strcmp(path,"/image/wlanmdsp.mbn")&&strcmp(path,"/image/bdwlan_guamp_ipa.bin"))
+    return guampwifi::NotFound;
+  return wifiprep::gFirmwareStore.read(path,at,out,bytes);
+}

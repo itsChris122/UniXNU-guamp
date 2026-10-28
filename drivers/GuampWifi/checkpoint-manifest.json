@@ -1,0 +1,1560 @@
+{
+  "saved_at": "2026-10-28T15:14:02+0100",
+  "status": "active WIP; host-tested station, no hardware validation",
+  "linux_commit": "458c6079fc1d41d564c37679c8ace02cd83ee817",
+  "unixnu_wifi_reference": "f6bf561f92cc42761bdd417fce1d53fe1db9477c",
+  "hardware_verified": false,
+  "new_full_kernel_build": false,
+  "files": [
+    {
+      "path": "ath10k-port/gw_bitrate.c",
+      "bytes": 16346,
+      "sha256": "3c496cd67d75e459c926d384a1ff14bed22c0db842ec8d80e18a4e9d71ed1165"
+    },
+    {
+      "path": "ath10k-port/gw_runtime.c",
+      "bytes": 11038,
+      "sha256": "083bbd8c85755838074cd13ab3600e02f105628d560dde9f69c691d0e069aba9"
+    },
+    {
+      "path": "ath10k-port/gw_snoc.c",
+      "bytes": 24771,
+      "sha256": "bfe2c082b42cabea52b6960b9d2621b552397c559a2c09ba084f25850f4678a8"
+    },
+    {
+      "path": "ath10k-port/gw_snoc_abi.h",
+      "bytes": 1631,
+      "sha256": "ef896a9b9d07c2246637ba487fa64bf179dc1b1a10984de7a7e3a59d4992f94d"
+    },
+    {
+      "path": "ath10k-port/gw_snoc_api.c",
+      "bytes": 1112,
+      "sha256": "000005b53510b39bcfaa18c8eee386984a98bde98c44d0abdbed2e51431332d3"
+    },
+    {
+      "path": "ath10k-port/gw_snoc_tail.inc",
+      "bytes": 8887,
+      "sha256": "492965c35afa92488a720b0796e44499ac9ce7969132ea36c1a707f680d320bd"
+    },
+    {
+      "path": "ath10k-port/linux-util-provenance.txt",
+      "bytes": 295,
+      "sha256": "9516f54234df4b715b385fe4f13cf38366aceeb72d2f57fd966547e0ae59d87a"
+    },
+    {
+      "path": "ath10k-port/nw_abi.h",
+      "bytes": 5458,
+      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+    },
+    {
+      "path": "ath10k-port/nw_mac80211.h",
+      "bytes": 1015,
+      "sha256": "cab70325b62c89e277533e4e89cdde1187ba2fa69b1ed5595033741eb3850f74"
+    },
+    {
+      "path": "ath10k-port/nw_sta.c",
+      "bytes": 61839,
+      "sha256": "870184fc12be9574798236534c0eb6c5e04b6f2806cf3472a3eb22add7ff4f4c"
+    },
+    {
+      "path": "ath10k-port/nw_sta.h",
+      "bytes": 358,
+      "sha256": "697029398cbaaa1dfb1836912d57243f8df3a32dbedd5388df119f70e2804075"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/asm/types.h",
+      "bytes": 80,
+      "sha256": "0c2483cb575fe895ee41bb2f4737abef8cd07adb8f3641d843a7d893e6d16d98"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/gw_ath10k_port.h",
+      "bytes": 2935,
+      "sha256": "c20fdca90fee2d6335d50f6f52d75e0d03b68fd38f9f5983da8998c712b81975"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/compiler.h",
+      "bytes": 80,
+      "sha256": "0c2483cb575fe895ee41bb2f4737abef8cd07adb8f3641d843a7d893e6d16d98"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/crc32.h",
+      "bytes": 128,
+      "sha256": "7089cc55565ffda42678675b7ca541c11e5f8367dba66eb1958bebd9115fa687"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/dmapool.h",
+      "bytes": 344,
+      "sha256": "671ba2838501402ffeecf7a4c01179f76650cbf1b7a5060185ac2c37f755d33e"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/kfifo.h",
+      "bytes": 1085,
+      "sha256": "80340e960a007ad2bc9849bcf5ab23b6619b431b3ebf50f5003e89aa01761b0b"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/kstrtox.h",
+      "bytes": 169,
+      "sha256": "682edc07fe484c5f3d4f03ef2c36c7fcefdf0374df9c3e76a8391e232786f3f6"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/leds.h",
+      "bytes": 265,
+      "sha256": "59db3760fbc2a195c3ff49ba609b3c0a11d8647a9762fa7257b31a3b8f4b1bb1"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/log2.h",
+      "bytes": 212,
+      "sha256": "9a8c6661491a568ee1de0553986015bc94901b701e1ea8524a608ff2bbd1d01e"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/notifier.h",
+      "bytes": 84,
+      "sha256": "624db7339b1ee39f144d262b07c460cda3f55352cf0608e579f836ec4389d94b"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/nvmem-consumer.h",
+      "bytes": 332,
+      "sha256": "98feae20c1ef02e7c11286c36246460bc8113a671ca06c7a9dad1b25cc841064"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/pm_qos.h",
+      "bytes": 457,
+      "sha256": "78ba7236db4fc6e364eaf1c2c7ee48294ae814a050286b205b7a07300bea80a1"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/property.h",
+      "bytes": 221,
+      "sha256": "0035e41167d11c47216ce82e822b9d6d7a7ff07f8f508a723eea43d69baf9576"
+    },
+    {
+      "path": "ath10k-port/shim-overrides/linux/rculist.h",
+      "bytes": 1557,
+      "sha256": "a4920f31ab4efeae62867c775c32ae263dad603f9d3f4bfeb2cd0c1a7424355f"
+    },
+    {
+      "path": "ath10k-port/tests/host_libc.h",
+      "bytes": 283,
+      "sha256": "00648be96198c19dd68a197247f53796e8118a93b9c94a68181b5716d37f3eab"
+    },
+    {
+      "path": "ath10k-port/tests/host_support.c",
+      "bytes": 1110,
+      "sha256": "52a083385f4271be7c04efe3287124183aba4efd813e39097c12a903e7360a0e"
+    },
+    {
+      "path": "ath10k-port/tests/wpa2_crypto_host.c",
+      "bytes": 1955,
+      "sha256": "8f51607511dc0729fb465df8189de954827ebdf7262217bbcc3eabc1b0fd7596"
+    },
+    {
+      "path": "ath10k-port/tests/wpa2_station_host.c",
+      "bytes": 24772,
+      "sha256": "6e0aec54df45fd5534bba7d051b92c3e9842f608eac55238f403350e81ec8931"
+    },
+    {
+      "path": "ath10k-port/vendor/include/nw_abi.h",
+      "bytes": 5458,
+      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath.h",
+      "bytes": 9498,
+      "sha256": "9d33ccc09e7ffdf980ccc93acafd6af304960d4e36bba491058e94e9994dd511"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/ahb.c",
+      "bytes": 20848,
+      "sha256": "2a88cfba9451b220b851462409d4102f46aba51076221e18e9cc05ce2d41886a"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/ahb.h",
+      "bytes": 1884,
+      "sha256": "0fc84efb19a19944f4cee18caa69fcae02b4efc1d7acf925edfbeda472661e30"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/bmi.c",
+      "bytes": 12514,
+      "sha256": "f14c60e89f1e4a9c4105e5f7dcf0571717b79a7825c44aceb9fd665e03917aa1"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/bmi.h",
+      "bytes": 7090,
+      "sha256": "8924f6fbf6ca4cfa494e7b6f38240ec44fa554e8850315b7442f3a534be30344"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/ce.c",
+      "bytes": 56058,
+      "sha256": "254411318440a6e3c7da76c0bf78e9ae764945abf04e91e1dce410cd6a75d6c8"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/ce.h",
+      "bytes": 13090,
+      "sha256": "53dfddb64dd54b61add0b14d36bc7fad016c3fc4ab63b8bff5f7b25fc93538b1"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/core.c",
+      "bytes": 101342,
+      "sha256": "e36c575f6ad996d58d1cbbd0b813a9c5f350a068d18fe92882ac397b9ba722c2"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/core.h",
+      "bytes": 33203,
+      "sha256": "da6f9d89225467310770e9ebf67ccdd66ad381c203a50e38afadc03c85da16b2"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/coredump.c",
+      "bytes": 35669,
+      "sha256": "d520b5a5004d95f3ff929ad598fffee3e257f4cfee163efc38cd722e498db2ba"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/coredump.h",
+      "bytes": 5407,
+      "sha256": "517e19f1f55afb8ff55eac6c8a55ec2eb95abca1f3484653fdd0f986f36eead9"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/debug.c",
+      "bytes": 65494,
+      "sha256": "3cbce26712d6f7511e6db574b17e5160e4bd1480b09a438a4c8fbd2965cf6833"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/debug.h",
+      "bytes": 7834,
+      "sha256": "4c7a83cc306871c8914bbd00840baf480c4e675b481c958520e59b8ad1009766"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/debugfs_sta.c",
+      "bytes": 21621,
+      "sha256": "e92f649a33b565b16e5f489b0a61489d97d695e6444ddeaa1868cd86af6a3667"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/hif.h",
+      "bytes": 6716,
+      "sha256": "f54e5b440367a0a999feccd14c435f79fd268ca0babc22c7306d6ca7a0f3a86a"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htc.c",
+      "bytes": 34594,
+      "sha256": "ba19a833a986bcdc097550aff81c620501243db3792db248da34b39c145b9629"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htc.h",
+      "bytes": 10983,
+      "sha256": "e2dc499ce2865b16456d436dc55db38da93282778d8cc86d03ed07a3c37c1963"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htt.c",
+      "bytes": 15548,
+      "sha256": "aaeaa40bd765bbe94b8371bcd91720317fd0955d73fa32d06f3af1e0c17f29c0"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htt.h",
+      "bytes": 75373,
+      "sha256": "0cbb9326399ac9685f2a863edfcd5e4ed3ee58885dfdb5053f536386311220f7"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htt_rx.c",
+      "bytes": 127076,
+      "sha256": "cabc2774651d670d247defc5f5f405640436dd131a0fc2522e605c2d8e7fb4d8"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/htt_tx.c",
+      "bytes": 50133,
+      "sha256": "3f73bddf26ec9e4e79a46c143a2fce35bf80a441068adbbe9aa29145692b33a3"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/hw.c",
+      "bytes": 32543,
+      "sha256": "7e176346c8def2054138bf3458acd4fbda7fc01d0753b77985f82215b51400f4"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/hw.h",
+      "bytes": 39573,
+      "sha256": "e9658e742445aa2049078a7da8c6ee6860762cec5f5dc40a99c552e6cd6cba13"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/leds.c",
+      "bytes": 2237,
+      "sha256": "87a529f502f028abb800a63bd0261052918d27e50c4a513d1d0ddd0c90765287"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/leds.h",
+      "bytes": 743,
+      "sha256": "3b595a775f9949917c5db64775cb2fe0ff5f35d27b23af54424531e90f429c18"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/mac.c",
+      "bytes": 271831,
+      "sha256": "e99b6749933719a39037645385ea88be181b380f1135d62aea07c0b474a8236c"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/mac.h",
+      "bytes": 3250,
+      "sha256": "feb68f132eb93d4ce0b4a92ad620946730ad09473b45021fa6c6f7d12df18784"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/p2p.c",
+      "bytes": 3630,
+      "sha256": "5af6e10987aa31fde46bf7286b968b79f60991160adaf63dc002561fdad827d0"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/p2p.h",
+      "bytes": 385,
+      "sha256": "473a74b6218b53d1420a56a980e6747f08d66ffbdc1bb597bd3896092eb47144"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/pci.c",
+      "bytes": 98009,
+      "sha256": "e5c8f5aec5312eb83bef7372706cdb7c979fcf81e423bb4fced3f18591e994fd"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/pci.h",
+      "bytes": 7731,
+      "sha256": "cf12ad23688946eb4093b1e061c20ab25986144730cd193dffc5c061e98b8282"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/qmi.c",
+      "bytes": 29241,
+      "sha256": "b42b73b11896ba70f932f4b115158263f191cd8f29effeddfef2c03687764b2b"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/qmi.h",
+      "bytes": 2759,
+      "sha256": "05b17d8878b5ceecce44a725d089f8e58e2336767e43951801328f669d326674"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/qmi_wlfw_v01.c",
+      "bytes": 62495,
+      "sha256": "5ab309ea0ad364715074ec1afb682ac73c0bd20c4350ae82e078257cfbc18a64"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/qmi_wlfw_v01.h",
+      "bytes": 18979,
+      "sha256": "de9e334dcd0585b094e6f365ec08598224f36bd42e3eacbd1ced8e3892cb8324"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/rx_desc.h",
+      "bytes": 42688,
+      "sha256": "fa3d9957d11ea1b48c54e40646c0b003228fad72009871b2f7e3f32d497a418e"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/sdio.c",
+      "bytes": 68154,
+      "sha256": "3878d81f614ffb061eb6cfba8739285aca5a3605907a0dca3024b270314ba0a1"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/sdio.h",
+      "bytes": 6911,
+      "sha256": "892538c47c569faab81abf99a3c2aafd1816c5163fc5321b02360852f9fa15c9"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/snoc.c",
+      "bytes": 47864,
+      "sha256": "c494128bc920f1a38e79966a9740fa8308dbc5f0361df521f781d3f71dd21478"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/snoc.h",
+      "bytes": 2142,
+      "sha256": "375144abb6d08edeaeeffebe11559631d282feef1b7521e4ede4927a53e32fff"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/spectral.c",
+      "bytes": 14361,
+      "sha256": "467b333b57b6e19afb3ae262fb7e3691cfa8bfab7f3c17579bc1b689c6a7456d"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/spectral.h",
+      "bytes": 1760,
+      "sha256": "d5f1859ba1b8447638078d19a4bfb64d2789209366b08932f805c0cd4ef4b866"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/swap.c",
+      "bytes": 5366,
+      "sha256": "397b5c5286dfbde7f11fc95be883d1f50af6711e5b640ba5efa942be3acd9820"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/swap.h",
+      "bytes": 1518,
+      "sha256": "15c7e2d40a87970f09370423ae18d2a6e155ab0455609d9b1c874a5ce1660660"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/targaddrs.h",
+      "bytes": 16661,
+      "sha256": "9daa97806342fcb0e8584c1ce69d094d3d1e281905fa9d488781b7f5e6db5b74"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/testmode.c",
+      "bytes": 16206,
+      "sha256": "c407f7c18c3998b90a16732a8c808f38245bd4a2fec37839583e29cae14c17e0"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/testmode.h",
+      "bytes": 696,
+      "sha256": "7a9c690022031036b0c148aa253f6f60c6ab3a66b956398098b2b03011784464"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/testmode_i.h",
+      "bytes": 2394,
+      "sha256": "11259ab47873e64b0d3fa6b915a63c50573246e5fa86aaf7e3f6a322974274df"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/thermal.c",
+      "bytes": 5493,
+      "sha256": "92ae362a2bb778335efec5f6385d3c85ef8ef27d41cd328b3d489d2f68f9848f"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/thermal.h",
+      "bytes": 1272,
+      "sha256": "0002db17f7d8c2a141ca76a025aa9904ebde7e679b37903ea40837c198681f06"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/trace.c",
+      "bytes": 299,
+      "sha256": "4a241033fc2162533f226624c1b8d3b772498d65ee6d79dc63d35321b1dc4abf"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/trace.h",
+      "bytes": 935,
+      "sha256": "df1d909107d46fdb4080c710a27ce1e809b0769c7e1cb58a7dc7dcd4130f2da3"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/txrx.c",
+      "bytes": 7222,
+      "sha256": "58d707e349ab6efeb4a447c8f7189a9150a4e4d5d92ce5b8f8209b03e45ac477"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/txrx.h",
+      "bytes": 833,
+      "sha256": "fd46d4bd40ce9c52ec7c99a71c6d491d52e0d8c89e1b6b12954d558675472a9f"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/usb.c",
+      "bytes": 28049,
+      "sha256": "483963303f0fbf947232322c762c170127d04f770bd7409ab00f46f3b75c8284"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/usb.h",
+      "bytes": 3127,
+      "sha256": "c74a6df9bc413862271b19ca757f971b2d23562fcee00f619ff0f291d326bc87"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wmi-ops.h",
+      "bytes": 44566,
+      "sha256": "b2d7a57c5a2b4e5161d5045d770ae4314ddf4434fb73fd1c77221320f3b529c9"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wmi-tlv.c",
+      "bytes": 137652,
+      "sha256": "02309cad56513a1ef0975c9d73e568e343c874d35124f39111ddd26d8a75c5bb"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wmi-tlv.h",
+      "bytes": 90234,
+      "sha256": "16c6b984177dd8c0f80dbc4df52597a6def435d8892fb55381091bdb88a258c9"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wmi.c",
+      "bytes": 322247,
+      "sha256": "68a4fedc3d0cd815c209dda9c0eb3aa3869bd3d35847c633e0c458ba53c320f4"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wmi.h",
+      "bytes": 220588,
+      "sha256": "fff0e5749d68c461ed08e69060321942d68bdb050954c39b2a57c0045457106c"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wow.c",
+      "bytes": 17019,
+      "sha256": "fbe5909725a2d864ec9db689a84426341856218bf4e255240c285e302ed7ddda"
+    },
+    {
+      "path": "ath10k-port/vendor/out/ath10k-src/wow.h",
+      "bytes": 643,
+      "sha256": "26bdf663baea18e8abf5182b12cf9542ec5d8cbe4e75a4e8c0433813ef88e061"
+    },
+    {
+      "path": "ath10k-port/vendor/out/dfs_pattern_detector.h",
+      "bytes": 3943,
+      "sha256": "c4f88b9a4ebfb29e24834274cdb411b1b85ef11d6db91991ddc686172f1ce6f0"
+    },
+    {
+      "path": "ath10k-port/vendor/out/dfs_pri_detector.h",
+      "bytes": 2675,
+      "sha256": "9d24ba269c7bf8177f9183a8bd4e324834b34cf8d1e5aa8817c44bbee7723b1e"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/hash.h",
+      "bytes": 2998,
+      "sha256": "3619d01cd90fdaa882cccd85e1dfefe200de0578f7e2f5ccccb8cda9add4629c"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/hashtable.h",
+      "bytes": 6827,
+      "sha256": "399a72ba6bf52f6b1a24f5d34b8f487fca8fa68f262ee0dd13d7c0c1f266a48e"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-eht.h",
+      "bytes": 39602,
+      "sha256": "7a11ee6cd22003bd05fb22c018513b48e727480c6aa829f53e0a51cbe8b44a57"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-he.h",
+      "bytes": 30526,
+      "sha256": "f8e110ec4c212914f45c36db1599be55da17823a1148d38241e227602390728e"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-ht.h",
+      "bytes": 9549,
+      "sha256": "99fe94dc9dd7efdfeee4ae356d3e78250de1ad37c6e91dd0f855ad55dd4e6a00"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-mesh.h",
+      "bytes": 7135,
+      "sha256": "7f6f841d763e1194902dfacef7278fc106d37e597f9ecbcf99d452bc9f99c970"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-nan.h",
+      "bytes": 1218,
+      "sha256": "f8f4d57d150841e286f56f029c5250e545e0f0a1b1dd22dc2e3b51cf61c3d7da"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-p2p.h",
+      "bytes": 2033,
+      "sha256": "c9dd020963cf8a63d24f50b792db55913fc5cb04dea49653da4f111568853040"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-s1g.h",
+      "bytes": 17245,
+      "sha256": "c1c1a8b57e40ee866b2b7862ee026f5940b3e8bd1dc820ff943d010c322e205b"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-uhr.h",
+      "bytes": 6397,
+      "sha256": "de458beb5ce6ccd1beed6d38b7b3c8d420ba0c6624424f029cd3ed13b4de5072"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211-vht.h",
+      "bytes": 9220,
+      "sha256": "eaae1e52bcaed0ecb9bbcf1c87a65e03a7ac5ea29733111a90e92bb993741775"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/ieee80211.h",
+      "bytes": 88164,
+      "sha256": "9c6a30842d7a8106c94e2ec0307e4d4844ac0d9c3dfebfd1c8d7e15fdf70e3ac"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/mhi.h",
+      "bytes": 26764,
+      "sha256": "b29d7537950bb8ed06860ecc4ccf10ce16a5a795ce7a3169e3b38094e6ac2b31"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/nl80211.h",
+      "bytes": 370525,
+      "sha256": "73d9d3019c9a249d282e30ff7c7ae6ad25c4eda8b69ecae1a648f3bb1c79c9ad"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/rfkill.h",
+      "bytes": 6623,
+      "sha256": "0e0a08fa3d66b2b5103b42c051e7fc6e7f27e3355447565b1392dc6ab08928da"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/linux/soc/qcom/qmi.h",
+      "bytes": 8047,
+      "sha256": "dfabf53ce8dd70df9e99feb7d71f6a9b20570da1168a265472c04d79a41f1136"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/net/cfg80211.h",
+      "bytes": 379566,
+      "sha256": "a9063b486ae96380de7cf839f38a3fdb99917ac2e765d6c8899a19314b350e86"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/net/codel.h",
+      "bytes": 6002,
+      "sha256": "5d30ddeb25bd9bdc8634bec0eb3cc6f81b5412c722f1252f149ebab47aec2f80"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/net/ieee80211_radiotap.h",
+      "bytes": 24220,
+      "sha256": "91ddfe6f25184ee0128b75da0c697cdc4023916629ff17039102bbd978ed94d8"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/net/mac80211.real.h",
+      "bytes": 317320,
+      "sha256": "a3db4d36268c13fa4c46dd7d3886310c12ba362889c95be73b78be24b364262e"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/net/regulatory.h",
+      "bytes": 10122,
+      "sha256": "f79e798657c7c688d851fa96d1fb65d8970ee6f866692f411c317f1d6b2ec179"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/uapi/linux/nl80211.h",
+      "bytes": 370525,
+      "sha256": "73d9d3019c9a249d282e30ff7c7ae6ad25c4eda8b69ecae1a648f3bb1c79c9ad"
+    },
+    {
+      "path": "ath10k-port/vendor/out/pinned/uapi/linux/rfkill.h",
+      "bytes": 6623,
+      "sha256": "0e0a08fa3d66b2b5103b42c051e7fc6e7f27e3355447565b1392dc6ab08928da"
+    },
+    {
+      "path": "ath10k-port/vendor/out/reg.h",
+      "bytes": 2429,
+      "sha256": "e719ccdd6f97dd727f158573a8a1ee20ca232acdf4564448514a2494a2a38464"
+    },
+    {
+      "path": "ath10k-port/vendor/out/regd.c",
+      "bytes": 20404,
+      "sha256": "928582bfaa3d72574eb40a69e6bc8f268ff7d37f87de805ec21c2c24beedc5c4"
+    },
+    {
+      "path": "ath10k-port/vendor/out/regd.h",
+      "bytes": 6559,
+      "sha256": "17ddca22d3e35d396cc6dc9005f364157dc34937d609156c80c48d37c7afc73f"
+    },
+    {
+      "path": "ath10k-port/vendor/out/regd_common.h",
+      "bytes": 14468,
+      "sha256": "95eca0ec1ab9e7ea248b4b9cc4ad3081cc9f61eb036e7faa9959acb49b356941"
+    },
+    {
+      "path": "ath10k-port/vendor/out/spectral_common.h",
+      "bytes": 2714,
+      "sha256": "9a5b5230a879f67636b4c84af10c7d4ce4015b126c47500dee585fe048a41fad"
+    },
+    {
+      "path": "ath10k-port/vendor/out/testmode_i.h",
+      "bytes": 2065,
+      "sha256": "07a2d13c54732ed14540f6ffe721bdc68c33faad1394d04e5741a1df2f461fbd"
+    },
+    {
+      "path": "ath10k-port/vendor/out/trace.h",
+      "bytes": 1889,
+      "sha256": "a2d747c063e669995fdd9c90fa628da116f3abe7a7c8678f9059bdbbe0118f66"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/asm/byteorder.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/asm/types.h",
+      "bytes": 80,
+      "sha256": "0c2483cb575fe895ee41bb2f4737abef8cd07adb8f3641d843a7d893e6d16d98"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/crypto/hash.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/gw_ath10k_port.h",
+      "bytes": 2935,
+      "sha256": "c20fdca90fee2d6335d50f6f52d75e0d03b68fd38f9f5983da8998c712b81975"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/acpi.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/atomic.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/average.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/bitfield.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/bitops.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/bits.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/bug.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/byteorder/generic.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/cleanup.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/clk.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/compiler.h",
+      "bytes": 80,
+      "sha256": "0c2483cb575fe895ee41bb2f4737abef8cd07adb8f3641d843a7d893e6d16d98"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/completion.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/crc32.h",
+      "bytes": 128,
+      "sha256": "7089cc55565ffda42678675b7ca541c11e5f8367dba66eb1958bebd9115fa687"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/ctype.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/debugfs.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/delay.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/devcoredump.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/device.h",
+      "bytes": 54,
+      "sha256": "60372a8fb8baef8e2985ad4d850103f84bbf86c9cb8619d8a4ba636bd87f4feb"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/dma-direction.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/dma-mapping.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/dmapool.h",
+      "bytes": 344,
+      "sha256": "671ba2838501402ffeecf7a4c01179f76650cbf1b7a5060185ac2c37f755d33e"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/dmi.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/elf.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/errno.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/etherdevice.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/ethtool.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/export.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/firmware/qcom/qcom_scm.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/firmware.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/idr.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/if_ether.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/inetdevice.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/interrupt.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/io.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/ioport.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/irq.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/jiffies.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/kernel.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/kfifo.h",
+      "bytes": 1085,
+      "sha256": "80340e960a007ad2bc9849bcf5ab23b6619b431b3ebf50f5003e89aa01761b0b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/kstrtox.h",
+      "bytes": 169,
+      "sha256": "682edc07fe484c5f3d4f03ef2c36c7fcefdf0374df9c3e76a8391e232786f3f6"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/ktime.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/leds.h",
+      "bytes": 265,
+      "sha256": "59db3760fbc2a195c3ff49ba609b3c0a11d8647a9762fa7257b31a3b8f4b1bb1"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/list.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/lockdep.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/log2.h",
+      "bytes": 212,
+      "sha256": "9a8c6661491a568ee1de0553986015bc94901b701e1ea8524a608ff2bbd1d01e"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/mod_devicetable.h",
+      "bytes": 256,
+      "sha256": "2a1edd64db73974a6f7b3b4500335f001364bd72de29cfea6536dc664d21adfc"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/module.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/msi.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/mutex.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/net.h",
+      "bytes": 20,
+      "sha256": "c75140ca987ae3be6c892097cc6ddedc7883568ce20a961e1e0d8586a0d85b42"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/netdevice.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/netlink.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/notifier.h",
+      "bytes": 84,
+      "sha256": "624db7339b1ee39f144d262b07c460cda3f55352cf0608e579f836ec4389d94b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/nvmem-consumer.h",
+      "bytes": 332,
+      "sha256": "98feae20c1ef02e7c11286c36246460bc8113a671ca06c7a9dad1b25cc841064"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/of.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/of_address.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/of_device.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/of_graph.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/of_reserved_mem.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/panic_notifier.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/pci.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/platform_device.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/pm_qos.h",
+      "bytes": 457,
+      "sha256": "78ba7236db4fc6e364eaf1c2c7ee48294ae814a050286b205b7a07300bea80a1"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/pm_runtime.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/pm_wakeirq.h",
+      "bytes": 20,
+      "sha256": "006a05a590a4d08aa641303da6ed83e891250163d2b0dc1b01c32cc29a986575"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/property.h",
+      "bytes": 221,
+      "sha256": "0035e41167d11c47216ce82e822b9d6d7a7ff07f8f508a723eea43d69baf9576"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/qrtr.h",
+      "bytes": 43,
+      "sha256": "ac8c7277fe244a7c2040b138f9b4bc32fed1421229dfc91c4005d2ac83b96566"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/random.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/random.h.new",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/rculist.h",
+      "bytes": 1557,
+      "sha256": "a4920f31ab4efeae62867c775c32ae263dad603f9d3f4bfeb2cd0c1a7424355f"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/rcupdate.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/remoteproc/qcom_rproc.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/remoteproc.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/rfkill.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/rhashtable.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/rtnetlink.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/skbuff.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/slab.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/soc/qcom/mdt_loader.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/soc/qcom/smem_state.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/socket.h",
+      "bytes": 20,
+      "sha256": "c75140ca987ae3be6c892097cc6ddedc7883568ce20a961e1e0d8586a0d85b42"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/spinlock.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/string.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/time.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/timer.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/tracepoint.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/types.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/uaccess.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/unaligned.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/uuid.h",
+      "bytes": 20,
+      "sha256": "5f9cce629391cc55cc5a0ade2f9a6dbbdcd4b1acda18e231aa6fac10a97db306"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/vmalloc.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/wait.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/linux/workqueue.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx.h",
+      "bytes": 13514,
+      "sha256": "e77762b44edec9676a113e653db8bcd53b418bccbb89cf242ebc52a7edf142b5"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_ath.h",
+      "bytes": 4523,
+      "sha256": "2b0d39abef71125e029bb686c0ae2fd859819f48ec0083903aaa3566e36df51a"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_net.h",
+      "bytes": 1411,
+      "sha256": "57249768fddf734bfab7159f5797cc2b9aedf29f0c09073945572db19581343d"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_os.h",
+      "bytes": 14646,
+      "sha256": "fb169a35694c93f9608d17049a9e2eabf2e4284a0c63b103b19496fd67f3e070"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_pci.h",
+      "bytes": 15863,
+      "sha256": "bfc102461eb9c3c63654d73a923024f97f3f1da81706b2e9ea79343976d90a61"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_plat.h",
+      "bytes": 216,
+      "sha256": "392925b535e6c97bdc5fc09fd6007b8ac8af20e97ae75bb4fe8851b3ea902a2a"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/lx_skb.h",
+      "bytes": 11902,
+      "sha256": "7186d7c24b71699455225a5c3eb02a36ac4bdf5f704d225cbfbc493f8e255d4d"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/addrconf.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/if_inet6.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/ipv6.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/mac80211.h",
+      "bytes": 125,
+      "sha256": "e8767d88fa1b2c17f69ab63d2080cf59806a24d1b92930816896494fba308248"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/netlink.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/net/sock.h",
+      "bytes": 20,
+      "sha256": "c75140ca987ae3be6c892097cc6ddedc7883568ce20a961e1e0d8586a0d85b42"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/trace/define_trace.h",
+      "bytes": 19,
+      "sha256": "982a490d7995534cb1b3339a7452737eff0cf52dc2056bab525f9d35221026f4"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/trace/events/sock.h",
+      "bytes": 20,
+      "sha256": "c75140ca987ae3be6c892097cc6ddedc7883568ce20a961e1e0d8586a0d85b42"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/uapi/linux/rfkill.h",
+      "bytes": 20,
+      "sha256": "a32b2ea349ca3008d54bf4f368497e7331e121b8e625207273ce184118b1961b"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/include/uapi_qrtr.h",
+      "bytes": 744,
+      "sha256": "994a05ed741afafa069a8fbbed5bcfa2d28f1711e104091acbeb7f24a25a8f50"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/libc/errno.h",
+      "bytes": 1167,
+      "sha256": "d59415a87d4ef3387f24aca8e324e27bf470b57a4f115f1dec9822cab93a258e"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/libc/limits.h",
+      "bytes": 245,
+      "sha256": "fc160876e53244b6db6ae5b73a9699fdee35800a5d62615731ffb5620dd90e11"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/libc/stdio.h",
+      "bytes": 236,
+      "sha256": "c50b1f6ea75cb188183410de8d124537cda8afefd9c9a38f2cb0d99bf63a9671"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/libc/stdlib.h",
+      "bytes": 128,
+      "sha256": "9e35a7701cdd00ca4d54840eb0efd707ed166897d41c2ee4d1c7eb0ca541c558"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/libc/string.h",
+      "bytes": 487,
+      "sha256": "46307b1a1303b852823157a880d56a61cab3be9cb48e8ad6a761395354479cbe"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/mhi/trace.h",
+      "bytes": 852,
+      "sha256": "2b12f73f2a179263b7a8283d57ed64c67ed18d8a87d1302bd6720d773875b980"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/src/lx_rt.c",
+      "bytes": 14634,
+      "sha256": "9377a0a264012f80aa7c148369cac06887c18ad3ea2ccbbd61c98bbacc427fd2"
+    },
+    {
+      "path": "ath10k-port/vendor/shim/src/mhi_hook.c",
+      "bytes": 239,
+      "sha256": "5e7e84b65b7480647328f841401cd816f71360b5a7b8124ffd0614523c0202bb"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_bitrate.c",
+      "bytes": 16346,
+      "sha256": "3c496cd67d75e459c926d384a1ff14bed22c0db842ec8d80e18a4e9d71ed1165"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_runtime.c",
+      "bytes": 11038,
+      "sha256": "083bbd8c85755838074cd13ab3600e02f105628d560dde9f69c691d0e069aba9"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_snoc.c",
+      "bytes": 24771,
+      "sha256": "bfe2c082b42cabea52b6960b9d2621b552397c559a2c09ba084f25850f4678a8"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_snoc_abi.h",
+      "bytes": 1631,
+      "sha256": "ef896a9b9d07c2246637ba487fa64bf179dc1b1a10984de7a7e3a59d4992f94d"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_snoc_api.c",
+      "bytes": 1112,
+      "sha256": "000005b53510b39bcfaa18c8eee386984a98bde98c44d0abdbed2e51431332d3"
+    },
+    {
+      "path": "ath10k-port/vendor/src/gw_snoc_tail.inc",
+      "bytes": 8887,
+      "sha256": "492965c35afa92488a720b0796e44499ac9ce7969132ea36c1a707f680d320bd"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_abi.h",
+      "bytes": 5458,
+      "sha256": "fa6f70fbe7de088ddb9e22799b59a773510c35929a70271632bdc9948f05a6c3"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_crypto.c",
+      "bytes": 8455,
+      "sha256": "a115b5ce35b563488f2a801cd07beb1fbe04302b729fb17b44e15d185e7d47d7"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_crypto.h",
+      "bytes": 1361,
+      "sha256": "785093d7946c949366041d991296f9cb95d6d0aefab60c18f50213850ca7981b"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_mac80211.c",
+      "bytes": 15732,
+      "sha256": "eb9ca6ef66325610af53630e78b7d6c66c55deccf42b4eaaab6499a84ca55409"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_mac80211.h",
+      "bytes": 1015,
+      "sha256": "cab70325b62c89e277533e4e89cdde1187ba2fa69b1ed5595033741eb3850f74"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_net.c",
+      "bytes": 6202,
+      "sha256": "2885481a8e1563d722fe81023af3334fb1f53216a5abbd360f79489d392fb594"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_sta.c",
+      "bytes": 61839,
+      "sha256": "870184fc12be9574798236534c0eb6c5e04b6f2806cf3472a3eb22add7ff4f4c"
+    },
+    {
+      "path": "ath10k-port/vendor/src/nw_sta.h",
+      "bytes": 358,
+      "sha256": "697029398cbaaa1dfb1836912d57243f8df3a32dbedd5388df119f70e2804075"
+    },
+    {
+      "path": "integration/BOOTSTRAP-ANALYSIS.md",
+      "bytes": 2757,
+      "sha256": "6760b6abcf9ae8500be896fb2ceb74197167f0ec9928b624b35664c353d7fc0a"
+    },
+    {
+      "path": "integration/README.md",
+      "bytes": 6599,
+      "sha256": "3dac90b48f21859d03a772b3856f50461a97b9421d5b9e5e64892b041cfcf4ac"
+    },
+    {
+      "path": "integration/SM6115-BOOTSTRAP-CONTRACT.md",
+      "bytes": 6456,
+      "sha256": "6d5f70703bbaa85ca81bf2b22b55f94889fba78844e00269c882dc984f08958b"
+    },
+    {
+      "path": "integration/guamp_wlfw_board.h",
+      "bytes": 2212,
+      "sha256": "32efa86dc1c079fcdf4903ebdfa4c83774dcb003e7c24d3143886b9f2b0d5d72"
+    },
+    {
+      "path": "integration/guamp_wlfw_bridge.h",
+      "bytes": 2476,
+      "sha256": "668eee02a17b99a2ab2d87a3ea7354610a612e22673d3696aedb631b17e5a922"
+    },
+    {
+      "path": "integration/guamp_xnu_dma.cpp",
+      "bytes": 128,
+      "sha256": "fd58f8aca8a18e1e1e80d6e6bc34352364ce21671f5db66363998b58f93fd2ea"
+    },
+    {
+      "path": "integration/guamp_xnu_dma.h",
+      "bytes": 10349,
+      "sha256": "4cea7527c1952ed8247c6f8d7dd342dda5ae72dc6089ff6e0cf143f04d555085"
+    },
+    {
+      "path": "integration/guamp_xnu_firmware.h",
+      "bytes": 676,
+      "sha256": "cba9aaf74a2fbc01872eccff480434a731bdec9bccfe153557f80f797c5977a4"
+    },
+    {
+      "path": "integration/guamp_xnu_sm6115_provider.h",
+      "bytes": 12867,
+      "sha256": "268a2a608b25396059dddb1f15285e09496e78f3f412f2152f4cd0c99bd9ea04"
+    },
+    {
+      "path": "integration/guamp_xnu_sm6115_runtime.cpp",
+      "bytes": 14346,
+      "sha256": "8de4c1a9e1a045b9fb6a9e27af05d48442983a688b4ad97ea25cfed84ef038fb"
+    },
+    {
+      "path": "integration/guamp_xnu_sm6115_runtime.h",
+      "bytes": 1244,
+      "sha256": "69db467ccb17559ad833e9dfc5ec97653435e7a3e278200955adc258dac86797"
+    },
+    {
+      "path": "integration/guamp_xnu_station.c",
+      "bytes": 17382,
+      "sha256": "9779893bf64bbeecf2b15bae5d7f4d3180ff332282898771a3a118e483578792"
+    },
+    {
+      "path": "integration/guamp_xnu_station.h",
+      "bytes": 485,
+      "sha256": "f8acdf3aef946ef00e66bb7d6bddce0076589da5a96e5cc3aff7f3ad17e54b7d"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampBatteryService.inc",
+      "bytes": 14646,
+      "sha256": "420e5d3785012e4ba3a18f3424a865ccdf3319970571d96e5d94f6adc2513f5b"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampDisplayExt.inc",
+      "bytes": 2174,
+      "sha256": "f7ecc8eb111ae46f8e9cbb48b77cb8e557128598ee578f994b760514cdfa0cde"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampExt4.inc",
+      "bytes": 14383,
+      "sha256": "32c10f1ac3850f3444624dafb41e8563a9fb982ca1644c2cab93e1531a12c570"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampFirmware.inc",
+      "bytes": 13409,
+      "sha256": "c174dc5a3f52db8c77b6dbc1c8f8179645fd9dc9e64bbd76c78ce061454f80af"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampGlink.inc",
+      "bytes": 15081,
+      "sha256": "363bf14d97e970a118bb5e13598ae0dfef4354c8ab45114ff44291cbeaed10a5"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampModem.inc",
+      "bytes": 7881,
+      "sha256": "b89998974650d8fac8c5b34fbe8bd4909b592e91f971f6c6d346fa93cfb23e76"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampModemCore.inc",
+      "bytes": 2716,
+      "sha256": "2b01b2c6510d0e53c632ee7720ad2efe2080c6683453712a7778381c4cd7ff10"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampMsa.inc",
+      "bytes": 2049,
+      "sha256": "464357744c56e93d3c2c641295a11b6973c431a9c9236515830837b3c9661ca6"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampPerf.inc",
+      "bytes": 5264,
+      "sha256": "cd09cf2710d202cf18c0600112ce2f324e3ee322d3f0e23f3ab8d73dc1606524"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampQftp.inc",
+      "bytes": 8517,
+      "sha256": "05bfd57f70919aaec100035ffd384bfc90f59a142abb6fd5d6862441895aca65"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampQmi.inc",
+      "bytes": 4180,
+      "sha256": "4cf5187d6fd78513d07b9a62db0b0e36c5051c67d00df471258c50385a6743d5"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampQrtr.inc",
+      "bytes": 10313,
+      "sha256": "29936c552599726a0d094d0ad40255300003f8b0ab8bb955f2df6403a56d9732"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampRpm.inc",
+      "bytes": 5294,
+      "sha256": "f8f2c874c698578a3fafc6ae6f85ffca690b542179328bab22bb8fd2049b4b28"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampScm.inc",
+      "bytes": 4351,
+      "sha256": "96184bb514d64b76b06a138962252c3d195aa2d22dd0f504e90fffaa3735053b"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampScmArm64.inc",
+      "bytes": 873,
+      "sha256": "4e8273ca2f517fa656adc9e28a4ab972271a0f357a4c58778702f286ce484b2a"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampServreg.inc",
+      "bytes": 2989,
+      "sha256": "7a4aff3ce8d7091706f625da9612b374ceb95226c673f18cabe9bfd1f6749933"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampSmem.inc",
+      "bytes": 9798,
+      "sha256": "236dea74bf28e30380192657fc88f0db4e509c11c99d580a9ddbee68f0c85760"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampSmemWrite.inc",
+      "bytes": 3273,
+      "sha256": "a95d802738d655e5617c030d394b3d77d4120b2df2a8e323a137c66536ec1819"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampSmmu.inc",
+      "bytes": 10760,
+      "sha256": "5aa2b28171bbff8a9884dd8f37ec7a208ee300b497a303177b89e3ba310e4ee6"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampSmp2p.inc",
+      "bytes": 2650,
+      "sha256": "b8c3624b933e3b9262d06f11b04ea2b86be6c55d7afbf0efc36348de15a47d1c"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampSnocCe.inc",
+      "bytes": 6858,
+      "sha256": "43c70d0b5d7e7ab7f589ac923e5ee309eb7f2f8116071eab4c4a81b920367bd4"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWifiControl.inc",
+      "bytes": 9104,
+      "sha256": "58bd7a6e4e205791fe83afe35a7d372f1c22111996efdbacfffa436f3d8f5a3c"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWifiFirmware.inc",
+      "bytes": 2060,
+      "sha256": "fc62d28c17cdb11c59d7962208114bf6e41ff430a3577529498ab782630195a7"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWifiPower.inc",
+      "bytes": 3038,
+      "sha256": "5647df6e92b5933a1eaee77f8c98a062e0a9e2e6201fc5e6e3bb3d36b11d50d2"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWifiPrep.inc",
+      "bytes": 22791,
+      "sha256": "05c5867c7d024156d9b842fc4388a022bc0ebb35e8cd06613b3d468e731ea772"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWifiWire.inc",
+      "bytes": 2738,
+      "sha256": "7474f7f8da016a713aeb4b627253ad9e8a5dc1a461daf60a2d773e35aa4c3900"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/GuampWlfw.inc",
+      "bytes": 9770,
+      "sha256": "bfc924e99d31229ec9bffa89981e0e62d4e7761f2b606d090c2b72d88d312b3c"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/glue_check.cpp",
+      "bytes": 91,
+      "sha256": "9de8a09d3a3d81f8691b8fa2dc6bdf7448054d15735b9735b430b3d4dfa1fb4c"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/kernel_stub.h",
+      "bytes": 2085,
+      "sha256": "ddff50dc63d7541cad2c4a6e2266a9253c8674b443b5a15a269c3f089af5c3db"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/modem_host.cpp",
+      "bytes": 9189,
+      "sha256": "538640507b9e87e914a273cb00e47b3052b3333658561178fde401c18fdcc90b"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/run-modem-tests.sh",
+      "bytes": 791,
+      "sha256": "bffa2200719c2fbdb721d4a2f5a39f13f63b3ca4c9a3d092229dcba6fd19aedc"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/run-prep-runtime-check.sh",
+      "bytes": 1564,
+      "sha256": "05b21e182ab2bd28a1bd048e31a928678887efa028f84b25e3281c4a130e73e6"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/run-transport-tests.sh",
+      "bytes": 691,
+      "sha256": "9605112d4a1a5cb2258e25a82b8c8448361631de51ff40029e4c8cd2f5dbb1bd"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/scm_host.cpp",
+      "bytes": 2907,
+      "sha256": "61548ad3cf864d604882644efdd88e5a64ffde2ca9ced1c8cdea0e79734f68c1"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/wifi_transport_arm64.cpp",
+      "bytes": 902,
+      "sha256": "6f12259787a0a162780fca34a99cf53035ee75f0800d4ab40aeaa73b2fd35502"
+    },
+    {
+      "path": "checkpoint-sorgenti/NativeEmmc/tests/wifi_transport_host.cpp",
+      "bytes": 33049,
+      "sha256": "7394e3e7210c3172afe3f8cfef5a4310a12fa8a9f21ccbbf3c75864ae5ab146a"
+    }
+  ]
+}

@@ -164,3 +164,14 @@ void start() {
     thread_deallocate(t);
 }
 }  // namespace rpm
+
+#if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
+// Single owner of the RPM edge: the Wi-Fi provider (GuampWifiRpm.inc, separate object) votes through this client
+// instead of opening a second GLINK session on the same FIFO. Ready once rpm::start() has created the lock.
+extern "C" int guamp_rpm_shared_ready(void) { return rpm::gLock != nullptr; }
+extern "C" int guamp_rpm_shared_vote(uint32_t resource, uint32_t id, uint32_t key, uint32_t value, uint32_t state,
+                                     uint32_t timeoutMs) {
+  if (state > RPM_SET_SLEEP) return RPM_ERR_PARAM;
+  return rpm::set(resource, id, key, value, state, timeoutMs);
+}
+#endif

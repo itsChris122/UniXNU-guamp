@@ -40,7 +40,7 @@ defconfig = "guamp_defconfig"
 archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
-  "build-arm-driver.py NativeEmmc",
+  "build-arm-driver.py NativeEmmc --wifi-runtime",   # GUAMP_WIFI_RUNTIME=1 + drivers/GuampWifi (R1): inert without guamp-wifi-start=1
   "build-guamp-adreno.py",          # NativeAdreno A6XX (xVanTuring/Adreno610) + GuampAdreno probe, guamp-adreno=1|2
   "build-native-adreno-accelerator.py",   # staged AGXAccelerator for guamp-adreno=2 (IOAcceleratorES ABI audited on f18b4df, slide -0x1000000)
   "build-arm-driver.py ArmDTPlatform",

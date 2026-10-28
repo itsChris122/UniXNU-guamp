@@ -7,12 +7,16 @@ void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 int memcmp(const void *, const void *, size_t);
 int strcmp(const char *, const char *);
+size_t strlen(const char *);
 void IOLog(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
+void IOSleep(unsigned int);   // C linkage as in IOKit/IOLib.h (the other glue checks declare it extern "C" too)
 }
 typedef struct _IOLock IOLock;
+IOLock *IOLockAlloc(void);
 void IOLockLock(IOLock *);
 void IOLockUnlock(IOLock *);
+void *IOMalloc(size_t);
 void *IOMallocZero(size_t);
 void IOFree(void *, size_t);
 typedef int wait_result_t;

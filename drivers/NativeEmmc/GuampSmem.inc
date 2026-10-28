@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
+#ifndef GUAMP_SMEM_INC
+#define GUAMP_SMEM_INC
 // Read-only Qualcomm SMEM parser for the guamp Wi-Fi preparation (GuampWifiPrep.inc), host-tested by
 // tests/wifi_host.cpp on synthetic images. Layout from the study of Linux drivers/soc/qcom/smem.c and smp2p.c (no code
 // copied). The owner supplies an aligned 32-bit reader over the region; nothing is ever written and no hardware
@@ -202,3 +204,4 @@ inline void readSmp2p(const Reader &r, uint32_t at, uint32_t size, const char *e
 }
 
 }  // namespace smem
+#endif // GUAMP_SMEM_INC
