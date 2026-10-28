@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// guamp Adreno 610 GPU frequency scaling, included by GpuService.inc below gpug2. Opt-in with boot argument
-// guamp-gpu-dcvs=1 (default off: the GPU keeps the guamp-gpu-freq rate, 320 MHz, and nothing here runs). Started by the
+// guamp Adreno 610 GPU frequency scaling, included by GpuService.inc below gpug2. On by default since 28/10 (owner request,
+// 320..900 MHz verified with 0 failures); guamp-gpu-dcvs=0 keeps the guamp-gpu-freq rate (320 MHz) and nothing here runs. Started by the
 // GPU thread once NativeAdreno is up with the core clock on PLL1 (guamp-gpu-freq 320 or 465), then on its own thread:
 //   limits  speed bin from the qfprom fuse (gpu_speed_bin, GuampGpuPower.h gp_speed_bin / gp_bin_top: bins 0 and 206
 //           reach 980 MHz, the top of bengal-gpu.dtsi; tb128fu's 1114.8 MHz is a khaje level this SoC does not have) or
@@ -106,8 +106,9 @@ void thread(void *, wait_result_t) {
 // After NativeAdreno started with the core clock at mhz (gpug2::setFreq): checks the RCG really runs from PLL1 / 2,
 // reads the limits, takes the rails at the current level and starts the governor thread.
 void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
-  unsigned on = 0;
-  if (!PE_parse_boot_argn("guamp-gpu-dcvs", &on, sizeof(on)) || on != 1) return;
+  unsigned on = 1;   // default on (28/10); the speed-bin fuse caps the top level (900 MHz on the owner's phone)
+  PE_parse_boot_argn("guamp-gpu-dcvs", &on, sizeof(on));
+  if (on != 1) return;
   gCc = gpucc;
   gGpu = gpu;
   if (!gCc || !gGpu) return;

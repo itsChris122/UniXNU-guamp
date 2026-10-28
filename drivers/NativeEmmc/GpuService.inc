@@ -473,7 +473,7 @@ void thread(void *, wait_result_t) {
       GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno, gpuzap::load, nullptr};   // guamp-adreno-zap
       const int started = guamp_adreno_start(&a);
       IOLog("GuampGpu: NativeAdreno start %d\n", started);
-      // guamp-gpu-dcvs=1: frequency scaling from the guamp-gpu-freq level (GuampGpuDcvs.inc); off by default.
+      // GPU frequency scaling from the guamp-gpu-freq level (GuampGpuDcvs.inc); on by default, guamp-gpu-dcvs=0 turns it off.
       if (started == GuampAdrenoOk && freq) gpudcvs::start(gBase[GM_GPUCC], gBase[GM_GPU], freq);
     }
     if (sqe) IOFree(sqe, gpum2::kSqeCap);
