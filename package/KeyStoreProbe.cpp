@@ -32,6 +32,16 @@ bool native_aks_state_enabled(void) {
     }
     return cached == 1;
 }
+// guamp-aks-wrap=1: the owned AppleKeyStore also answers aks_wrap_key/aks_unwrap_key (selectors 10/11) so securityd can store
+// keychain items, for instance the LE root keys of bluetoothd (scripts/guamp-aks-variant.py). The blob is not encrypted.
+bool native_aks_wrap_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        unsigned value = 0;
+        cached = PE_parse_boot_argn("guamp-aks-wrap", &value, sizeof(value)) && value == 1;
+    }
+    return cached == 1;
+}
 // sheng-aks-sls=<n> overrides the reported lock state (default 0 = unlocked; 3 = MobileKeyBag's "no passcode").
 uint32_t native_aks_lock_state(void) {
     static int cached = -1;
