@@ -96,6 +96,57 @@ uint64_t native_emmc_dma_failures = 0;
 int native_emmc_last_pid = -1;
 void proc_selfname(char *, int);
 int proc_selfpid(void);
+// Boot argument guamp-emmc-who=1: bytes read per process (the thread issuing the request), kept under the card gate and
+// printed with the 10 s report as the top readers of the period ("NativeEmmc who:"). Processes past the table go to "other".
+namespace emmcwho {
+constexpr unsigned kSlots = 24, kTop = 8;
+struct Entry { int pid; char name[20]; uint64_t bytes; };
+static Entry gTable[kSlots], gCopy[kSlots];
+static uint64_t gOther = 0, gOtherCopy = 0;
+static int gOn = -1;
+static bool on() {
+  if (gOn < 0) {
+    unsigned v = 0;
+    gOn = PE_parse_boot_argn("guamp-emmc-who", &v, sizeof(v)) && v == 1;
+  }
+  return gOn == 1;
+}
+// Card gate held.
+static void add(int pid, const char *name, uint64_t bytes) {
+  unsigned slot = kSlots;
+  for (unsigned i = 0; i < kSlots; i = i + 1) {
+    if (gTable[i].bytes && gTable[i].pid == pid) { gTable[i].bytes += bytes; return; }
+    if (!gTable[i].bytes && slot == kSlots) slot = i;
+  }
+  if (slot == kSlots) { gOther += bytes; return; }
+  gTable[slot].pid = pid;
+  strlcpy(gTable[slot].name, name, sizeof(gTable[slot].name));
+  gTable[slot].bytes = bytes;
+}
+// Card gate held: the period's table moves to the copy printed by report().
+static void take() {
+  memcpy(gCopy, gTable, sizeof(gCopy));
+  gOtherCopy = gOther;
+  bzero(gTable, sizeof(gTable));
+  gOther = 0;
+}
+static void report(uint64_t spanNs) {
+  char line[512];
+  int len = snprintf(line, sizeof(line), "NativeEmmc who: top readers in %llu ms (KiB):", spanNs / 1000000);
+  for (unsigned r = 0; r < kTop && len > 0 && static_cast<size_t>(len) < sizeof(line); r = r + 1) {
+    unsigned best = kSlots;
+    for (unsigned i = 0; i < kSlots; i = i + 1)
+      if (gCopy[i].bytes && (best == kSlots || gCopy[i].bytes > gCopy[best].bytes)) best = i;
+    if (best == kSlots) break;
+    len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s[%d] %llu", gCopy[best].name, gCopy[best].pid,
+                    gCopy[best].bytes / 1024);
+    gCopy[best].bytes = 0;
+  }
+  if (len > 0 && static_cast<size_t>(len) < sizeof(line) && gOtherCopy)
+    snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " other %llu", gOtherCopy / 1024);
+  IOLog("%s\n", line);
+}
+}  // namespace emmcwho
 // Panic region (osfmk/kern/debug.c, pexpert/arm/pe_init.c). guamp has none (no RAM survives a reset and /pram stopped
 // the boot), so without one XNU keeps no panic text at all; the driver gives it plain memory (startLater) and copies
 // it to kpan in the panic flush. Asm names: pexpert.h declares some of them with private types.
@@ -710,6 +761,8 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   const uint64_t logBytes = guamp_emmc_log_bytes, mirrorPeak = guamp_emmc_mirror_peak;
   if (report || !sampling) guamp_emmc_mirror_peak = 0;
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
+  const bool who = report && emmcwho::on();
+  if (emmcwho::on() && (report || !sampling)) emmcwho::take();   // the first pass only starts the period
   IOLockUnlock(card.gate);
   static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0;
   static uint64_t lastActive = 0, lastMirror = 0, lastFlush = 0, lastQueue = 0;
@@ -735,6 +788,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
           spanNs / 1000000, (logBytes - lastLogBytes) / 1024, ns[4] / 1000);
     IOLog("NativeEmmc: %llu reads (+%llu in %llu ms), %llu re-read 4K pages, last LBA %llu, %u free pages, last reader %d %s\n",
           reads, reads - lastReads, spanNs / 1000000, rereads, last, vm_page_free_count, native_emmc_last_pid, native_emmc_last_proc);
+    if (who) emmcwho::report(spanNs);
     static uint64_t lastLock = 0, lastCmd = 0, lastData = 0, lastCopy = 0, lastRuns = 0;
     uint64_t runs = native_emmc_t_runs - lastRuns;
     if (runs) {
@@ -859,10 +913,16 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   Card &card = gCard;
   if (!card.online) return kIOReturnNotReady;
   uint64_t started = mach_absolute_time();
+  int reader = -1;
+  char readerName[20] = {};
   if (!write) {
     __atomic_fetch_add(&native_emmc_requests, 1ULL, __ATOMIC_RELAXED);
     native_emmc_last_pid = proc_selfpid();
     proc_selfname(native_emmc_last_proc, sizeof(native_emmc_last_proc));
+    if (emmcwho::on()) {
+      reader = proc_selfpid();
+      proc_selfname(readerName, sizeof(readerName));
+    }
   }
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
@@ -886,6 +946,7 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     if (ok) {
       if (write) guamp_emmc_write_bytes += bytes;
       else guamp_emmc_read_bytes += bytes;
+      if (!write && reader >= 0) emmcwho::add(reader, readerName, bytes);
     }
     IOLockUnlock(card.gate);
     if (!ok) { status = kIOReturnIOError; break; }

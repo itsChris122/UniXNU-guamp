@@ -1,0 +1,109 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f8e3f0e..c704977 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8517,6 +8517,96 @@ native_guamp_home_reset(proc_t p, user_addr_t scratch)
+ 	native_guamp_home_reset_completed = !error;
+ }
+ 
++/* guamp-install-staged-apps=N (N > 0, owner request 28/10): one-shot install of the deletable system apps that sheng-staged-apps=1
++ * copied into Data's /private/var/staged_system_apps, without a cross-version data migration. The migration record written above
++ * keeps LastSystemVersion = this build, so datamigrator (XPC service, role account mobile) runs a same-version pass only because of
++ * its sentinel /private/var/datamigrator/migrate (isSentinelPresent = fileExistsAtPath:); in that pass SystemAppMigrator installs the
++ * staged bundles, then datamigrator removes the sentinel itself (removeSentinelIfPresent). The array
++ * /private/var/preferences/com.apple.demo.SADForceInstall.plist (SystemAppMigrator handleForceInstalledApps) forces the apps iOS
++ * records as user-uninstalled; identifiers that are not deletable system apps are ignored. /private/var/db/guamp-install-staged-apps-N.done
++ * marks cycle N as done: the argument can stay set, a new N runs it once more. Nothing is written when the staged directory is
++ * missing (copy it first with sheng-staged-apps=1). Never panics: the status goes to the boot log. */
++static const uint8_t native_guamp_sad_force_install[] =
++    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++    "<plist version=\"1.0\">\n<array>\n"
++    "\t<string>com.apple.tv</string>\n\t<string>com.apple.iBooks</string>\n\t<string>com.apple.MobileAddressBook</string>\n"
++    "\t<string>com.apple.facetime</string>\n\t<string>com.apple.DocumentsApp</string>\n\t<string>com.apple.findmy</string>\n"
++    "\t<string>com.apple.Fitness</string>\n\t<string>com.apple.freeform</string>\n\t<string>com.apple.Health</string>\n"
++    "\t<string>com.apple.Home</string>\n\t<string>com.apple.Magnifier</string>\n\t<string>com.apple.Maps</string>\n"
++    "\t<string>com.apple.measure</string>\n\t<string>com.apple.mobilecal</string>\n\t<string>com.apple.mobilemail</string>\n"
++    "\t<string>com.apple.mobilenotes</string>\n\t<string>com.apple.MobileStore</string>\n\t<string>com.apple.mobiletimer</string>\n"
++    "\t<string>com.apple.Music</string>\n\t<string>com.apple.news</string>\n\t<string>com.apple.Photo-Booth</string>\n"
++    "\t<string>com.apple.podcasts</string>\n\t<string>com.apple.reminders</string>\n\t<string>com.apple.Translate</string>\n"
++    "\t<string>com.apple.shortcuts</string>\n\t<string>com.apple.stocks</string>\n\t<string>com.apple.tips</string>\n"
++    "\t<string>com.apple.VoiceMemos</string>\n\t<string>com.apple.weather</string>\n"
++    "</array>\n</plist>\n";
++uint32_t native_guamp_install_staged_cycle;
++int native_guamp_install_staged_error = -1;
++static void
++native_guamp_install_staged_apps(proc_t p, user_addr_t scratch)
++{
++	uint32_t cycle = 0;
++	if (!PE_parse_boot_argn("guamp-install-staged-apps", &cycle, sizeof(cycle)) || !cycle) {
++		return;
++	}
++	native_guamp_install_staged_cycle = cycle;
++	vfs_context_t ctx = vfs_context_current();
++	char marker[96];
++	snprintf(marker, sizeof(marker), "/private/var/db/guamp-install-staged-apps-%u.done", cycle);
++	vnode_t vp = NULLVP;
++	if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		native_guamp_install_staged_error = 0;
++		printf("guamp-install-staged-apps: cycle %u already done\n", cycle);
++		return;
++	}
++	int error = vnode_lookup("/private/var/staged_system_apps", VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (!error) {
++		error = vnode_vtype(vp) == VDIR ? 0 : ENOTDIR;
++		vnode_put(vp);
++	}
++	if (error) {
++		native_guamp_install_staged_error = error;
++		printf("guamp-install-staged-apps: no staged directory (error %d): boot once with sheng-staged-apps=1 first\n", error);
++		return;
++	}
++	/* The sentinel's directory belongs to mobile, so datamigrator can remove the sentinel after its pass. */
++	static const char directory[] = "/private/var/datamigrator";
++	struct mkdir_args md = {.path = scratch + 0xa00, .mode = 0755};
++	int32_t result = 0;
++	error = copyout(directory, md.path, sizeof(directory));
++	if (!error) {
++		error = mkdir(p, &md, &result);
++		if (error == EEXIST) {
++			error = 0;
++		}
++	}
++	if (!error) {
++		error = vnode_lookup(directory, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	}
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, 501);
++		VATTR_SET(&va, va_gid, 501);
++		error = vnode_setattr(vp, &va, ctx);
++		vnode_put(vp);
++	}
++	int force = native_guamp_write_file(p, scratch, "/private/var/preferences/com.apple.demo.SADForceInstall.plist",
++	    native_guamp_sad_force_install, sizeof(native_guamp_sad_force_install) - 1, 0, 0644, 1);
++	int sentinel = error ? error : native_guamp_write_file(p, scratch, "/private/var/datamigrator/migrate", native_guamp_empty, 0, 501,
++	    0644, 1);
++	error = sentinel ? sentinel : force;
++	if (!error) {
++		static const uint8_t note[] = "staged system apps: datamigrator sentinel and SADForceInstall written\n";
++		error = native_guamp_write_file(p, scratch, marker, note, sizeof(note) - 1, 0, 0600, 0);
++	}
++	native_guamp_install_staged_error = error;
++	printf("guamp-install-staged-apps: cycle %u: SADForceInstall status %d, sentinel status %d, status %d\n", cycle, force, sentinel,
++	    error);
++}
++
+ static void
+ native_guamp_setup_skip(proc_t p, user_addr_t scratch)
+ {
+@@ -8611,6 +8701,7 @@ native_guamp_setup_skip(proc_t p, user_addr_t scratch)
+ 	 * the specific cache explicitly; never delete it as part of every boot. */
+ 	printf("guamp: MobileGestalt cache preserved (automatic removal disabled)\n");
+ 	native_guamp_ui_cache_cycle(p, scratch);
++	native_guamp_install_staged_apps(p, scratch);
+ 	printf("guamp: setup skip: %d files written, last error %d\n", native_guamp_setup_written, native_guamp_setup_error);
+ }
+ static void
