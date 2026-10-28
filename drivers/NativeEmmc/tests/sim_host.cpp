@@ -199,7 +199,27 @@ static void qrtrClients() {
   CHECK(q.addLocalClient(0x4400,nullptr,h)==Ok);   // idempotent
 }
 
+static void infoAndReset() {
+  Rig r; uint64_t now=1; uint16_t msg=0,txn=0;
+  r.server(true,SvcUim,0x21); r.server(true,SvcDms,0x20); r.server(true,SvcNas,0x22);
+  r.s.pump(now); Bytes b=r.take(0x21,0x4011,&msg,&txn); CHECK(msg==UimRegisterEvents);
+  r.reply(0x21,0x4011,msg,txn,{}); r.s.pump(++now);
+  b=r.take(0x21,0x4011,&msg,&txn); r.reply(0x21,0x4011,msg,txn,cardStatus(CardPresent,AppPuk1Required)); r.s.pump(++now);
+  GuampSimInfo i={}; fillInfo(r.s,&i);
+  CHECK(i.version==GUAMP_SIM_INFO_VERSION&&i.state==GUAMP_SIM_PUK&&i.appType==AppUsim&&i.registration==0xFF&&i.roaming==0xFF);
+  // IPCRTR reopened: endpoints forgotten, outstanding request dropped, waiting for NEW_SERVER again.
+  r.s.reset(100);
+  CHECK(r.s.step==SimProbe::WaitServices&&!r.s.ready(0)&&!r.s.ready(1)&&!r.s.ready(2)&&!r.s.ep[1].qmi.pending);
+  r.flush(); r.wire.clear(); r.s.pump(101); r.flush(); CHECK(r.wire.empty());
+  r.server(true,SvcUim,0x31); r.server(true,SvcDms,0x30); r.server(true,SvcNas,0x32);
+  r.s.pump(102); b=r.take(0x31,0x4011,&msg,&txn); CHECK(msg==UimRegisterEvents);
+  fakeInfo(&i);
+  CHECK(i.fake==1&&i.state==GUAMP_SIM_READY&&i.mcc==1&&i.mnc==1&&!strcmp(i.imsi,"001010000000001")&&!strcmp(i.plmn,"Test PLMN"));
+  r.s.ep[0].qmi.cancel(); r.s.ep[1].qmi.cancel(); r.s.ep[2].qmi.cancel();
+}
+
 int main() {
+  infoAndReset();
   decoders(); qrtrClients(); fullSequence(); pinRequired();
   printf("PASS: GuampSim.inc %u checks\n",checks);
   return 0;

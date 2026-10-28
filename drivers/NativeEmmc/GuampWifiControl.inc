@@ -11,6 +11,7 @@
 #include "GuampServreg.inc"
 #include "GuampRmtfs.inc"
 #include "GuampWlfw.inc"
+#include "GuampSim.inc"
 #include "GuampSnocCe.inc"
 #include "GuampWifiRpm.inc"
 namespace guampwifi {
@@ -27,6 +28,10 @@ struct WifiControl {
     // Optional RMTFS backing (shared region + EFS partitions). When set, service 14 is registered on QRTR next to
     // QFTP/SERVREG and announced as soon as IPCRTR opens, before the modem looks up its EFS server.
     const Rmtfs::Storage *rmtfs;
+    // Optional read-only SIM reader (guamp-sim=1): QMI clients for DMS/UIM/NAS on the same QRTR link.
+    // simSnapshot is called after every completed read sequence (transport thread).
+    bool sim;
+    void (*simSnapshot)(void *,const guampsim::SimProbe &);
   };
   // Gate timeouts after the modem PAS start (Linux: subsys err_ready 10 s; icnss has no WLFW timeout, the WLAN PD
   // only registers 0x45 after the modem has fetched wlanmdsp.mbn over QRTR TFTP).
@@ -34,6 +39,7 @@ struct WifiControl {
   SmemArena *arena=nullptr; Allocator allocator={}; Ops ops={};
   Smp2pEdge smp={}; Glink glink={}; Qrtr qrtr={}; QftpReadOnly tftp={};
   GuampServreg servreg={}; Rmtfs rmtfs={}; Wlfw wlan={};
+  guampsim::SimProbe sim={}; bool simOn=false;
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
   uint64_t deadline=0,now=0,started=0,beat=0;
@@ -61,6 +67,15 @@ struct WifiControl {
       gate="qrtr rmtfs";
       e=rmtfs.start(*ops.rmtfs,this,serviceTx);if(e)return fail(e);
       e=qrtr.addLocalService(Rmtfs::Service,Rmtfs::ServiceInstance,Rmtfs::Port,this,rmtfsRx);if(e)return fail(e);
+    }
+    simOn=false;
+    if(ops.sim) {
+      // Client ports and the NEW_SERVER directory must exist before qrtr.start(): the modem name service
+      // announces all its services right after our HELLO.
+      gate="qrtr sim clients";
+      sim.event=simNote; sim.eventCtx=this;
+      e=sim.start(&qrtr,0);if(e)return fail(e);
+      simOn=true;
     }
     smemSummary();
     // qcom_smp2p probe (before the modem boots): outbound 428 in the APPS-MPSS partition, kick bit 14.
@@ -141,9 +156,11 @@ struct WifiControl {
       sawServer=true; gate="wlfw qmi";
       trace("qrtr WLFW 0x45 server: node/port/ms",0,qrtr.serverNode,qrtr.serverPort,uint32_t(now-started));
     }
-    if(!routerStarted||!qrtr.serviceReady()) {
+    // With the SIM reader on, a missing WLFW server no longer tears down the QRTR link (UIM/DMS/NAS keep running).
+    if(!routerStarted||(!qrtr.serviceReady()&&!simOn)) {
       if(now>=deadline) return fail(Timeout);
     }
+    if(routerStarted&&simOn) { e=sim.pump(now); if(e&&e!=Again&&e!=NotReady&&e!=Busy) trace("sim pump",e,sim.step,0,0); }
     if(routerStarted) { e=qrtr.step(); if(e!=Again&&e) return fail(e); }
     if(wlanStarted) { e=wlan.step(now); if(e) return fail(e); }
     return Ok;
@@ -169,6 +186,10 @@ private:
     trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);
     trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
     if(rmtfs.ready) trace(" rmtfs requests/failures/overlay bytes",0,rmtfs.requests,rmtfs.failures,rmtfs.shadowBytes);
+    if(simOn) {
+      trace(" sim dms/uim/nas known",0,sim.ready(0),sim.ready(1),sim.ready(2));
+      trace(" sim step/snapshots/state",sim.cardStatus,sim.step,sim.snapshots,guampsim::simState(sim));
+    }
   }
   void smemSummary() {
     smem::Info i={};
@@ -183,7 +204,7 @@ private:
   }
   int fail(int e) {
     if(ops.trace) { trace("FAILED: stage/ms (gate on the next line)",e,stage,uint32_t(now-started),0); heartbeat(); }
-    error=e; stage=Failed; wlan.peerLost();
+    error=e; stage=Failed; wlan.peerLost(); if(simOn) sim.reset(now);
     qrtr.stop(); glink.stop(e); routerStarted=wlanStarted=false;
     tftp.stop(); servreg.stop(); rmtfs.stop();
     error=e;
@@ -237,6 +258,7 @@ private:
   static void channelEvent(void *p,uint16_t id,const char *name,bool up) {
     auto &c=*static_cast<WifiControl *>(p);
     if(!nameEquals(name,"IPCRTR",32)) return;
+    if(c.simOn) c.sim.reset(c.now);
     if(!up) { c.qrtr.stop(); c.routerStarted=false; c.wlan.peerLost(); c.wlanStarted=false; return; }
     c.channel=id;
     int e=c.qrtr.start(c.allocator,&c,glinkTx,serviceEvent,qrtrRx);
@@ -247,6 +269,14 @@ private:
     if(!up) { c.wlan.peerLost(); c.wlanStarted=false; c.error=PeerReset; return; }
     Wlfw::Ops w={&c,qmiTx,assign,power,fileSize,fileRead,wlanEvent};
     int e=c.wlan.start(w,c.now); if(e) c.error=e; else c.wlanStarted=true;
+  }
+  static void simNote(void *p,const char *what,int status) {
+    auto &c=*static_cast<WifiControl *>(p);
+    // "sim qmi service up/down" carries the QMI service id, everything else a transport/QMI result.
+    const bool service=nameEquals(what,"sim qmi service up",32)||nameEquals(what,"sim qmi service down",32);
+    c.trace(what,service?0:status,service?uint32_t(status):uint32_t(c.sim.step),c.sim.snapshots,
+            uint32_t(c.sim.lastQmiError[1]));
+    if(nameEquals(what,"sim snapshot",32)&&c.ops.simSnapshot) c.ops.simSnapshot(c.ops.ctx,c.sim);
   }
   static void glinkRx(void *p,uint16_t id,const uint8_t *v,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p);

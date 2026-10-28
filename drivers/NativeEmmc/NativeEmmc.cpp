@@ -1089,6 +1089,7 @@ static void usbProbe()
 #include "BtService.inc"
 #include "GuampBtNub.inc"
 #include "GuampWifiPrep.inc"
+#include "GuampSimService.inc"   // GuampSim registry service: SIM snapshot for guamp-ctd (guamp-sim=1 | guamp-sim-fake=1)
 #if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
 #include "GuampWlanNub.inc"     // Wi-Fi mode 2: IO80211Controller/IONetworkInterface for en0 (guamp-wifi-start=2)
 #endif
@@ -1232,6 +1233,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   rtc::boot();        // wall clock before the media exist, so before the root mount and launchd
   publish(0, card.capacity, "user area");
   publishWindows();
+  simsvc::start();     // before the modem thread: registry lock, guamp-sim-fake=1 test SIM
   wifiprep::start();   // guamp-wifi-prep=1: read-only SMEM and modem firmware checks, own thread
   // prepara-boot-smp-fix.py --short-base looks for this marker: the kernel has the verified boot arguments as code defaults.
   IOLog("NativeEmmc: guamp-defaults-1028: verified boot arguments are code defaults (=0 turns one off)\n");

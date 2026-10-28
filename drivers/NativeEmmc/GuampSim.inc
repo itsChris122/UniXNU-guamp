@@ -9,6 +9,7 @@
 #include "GuampWifiWire.inc"
 #include "GuampQmi.inc"
 #include "GuampQrtr.inc"
+#include "GuampSimInfo.h"
 namespace guampsim {
 using namespace guampwifi;
 enum : uint32_t { SvcDms=0x02,SvcNas=0x03,SvcUim=0x0B };
@@ -182,6 +183,11 @@ struct SimProbe {
     step=WaitServices; started=now; nextScan=0; cardStatus=servingStatus=NotReady; requestSent=false;
     return Ok;
   }
+  // IPCRTR (re)opened or closed: forget the remote endpoints, wait again for NEW_SERVER.
+  void reset(uint64_t now) {
+    for(auto &e:ep) { e.known=false; e.node=e.port=0; e.qmi.cancel(); e.qmi.consume(); }
+    step=WaitServices; started=now; requestSent=false; cardChanged=false;
+  }
   bool ready(uint32_t i) const { return ep[i].known; }
   const App *gwApp() const {
     if(cardStatus||card.slots==0||card.card[0].state!=CardPresent) return nullptr;
@@ -220,7 +226,7 @@ private:
     if(e.service==SvcUim&&msg==UimCardStatusInd) {
       CardStatus c={};
       if(!parseCardStatus(body,&c)) { e.owner->card=c; e.owner->cardStatus=Ok; }
-      e.owner->cardChanged=true; e.owner->note("uim card status indication",Ok);
+      e.owner->cardChanged=true; e.owner->note("sim uim card status indication",Ok);
     }
   }
   static void receive(void *p,uint32_t node,uint32_t port,const uint8_t *d,uint32_t n) {
@@ -231,9 +237,9 @@ private:
   static void directory(void *p,bool up,uint32_t service,uint32_t,uint32_t node,uint32_t port) {
     auto &s=*static_cast<SimProbe *>(p);
     for(auto &e:s.ep) {
-      if(up&&service==e.service&&!e.known) { e.node=node; e.port=port; e.known=true; s.note("qmi service up",int(service)); }
+      if(up&&service==e.service&&!e.known) { e.node=node; e.port=port; e.known=true; s.note("sim qmi service up",int(service)); }
       else if(!up&&e.known&&e.node==node&&(service==0||(service==e.service&&port==e.port))) {
-        e.known=false; e.qmi.cancel(); e.qmi.consume(); s.note("qmi service down",int(e.service));
+        e.known=false; e.qmi.cancel(); e.qmi.consume(); s.note("sim qmi service down",int(e.service));
       }
     }
   }
@@ -274,7 +280,7 @@ private:
         default: return Ok;
       }
       if(e) {
-        note("qmi request not sent",e);
+        note("sim qmi request not sent",e);
         return step==Serving?finish(now):advance(Step(step+1),now);
       }
       return Ok;
@@ -283,23 +289,23 @@ private:
     if(!q.done) return Ok;
     int st=q.status; lastQmiError[svc]=q.remoteError; TlvView r=q.reply(); FileRead f={};
     switch(step) {
-      case Register: note("uim register events",st); break;
+      case Register: note("sim uim register events",st); break;
       case CardStatusStep:
-        cardStatus=st?st:parseCardStatus(r,&card); note("uim card status",cardStatus);
+        cardStatus=st?st:parseCardStatus(r,&card); note("sim uim card status",cardStatus);
         if(!simPresent()) { iccid[0]=imsi[0]=spn[0]=msisdn[0]=0; q.consume(); return advance(Ids,now); }
         break;
-      case Iccid: if(!st&&!parseRead(r,&f)) iccidFromEf(f.data,f.size,iccid); note("uim read iccid",st); break;
-      case Imsi: if(!st&&!parseRead(r,&f)) imsiFromEf(f.data,f.size,imsi); note("uim read imsi",st); break;
-      case Spn: if(!st&&!parseRead(r,&f)) spnFromEf(f.data,f.size,spn); note("uim read spn",st); break;
-      case Msisdn: if(!st&&!parseRead(r,&f)) msisdnFromRecord(f.data,f.size,msisdn); note("uim read msisdn",st); break;
-      case Ids: if(!st) { stringTlv(r,0x11,imei,sizeof(imei)); stringTlv(r,0x12,meid,sizeof(meid)); } note("dms ids",st); break;
-      case Revision: if(!st) stringTlv(r,0x01,revision,sizeof(revision)); note("dms revision",st); break;
+      case Iccid: if(!st&&!parseRead(r,&f)) iccidFromEf(f.data,f.size,iccid); note("sim uim read iccid",st); break;
+      case Imsi: if(!st&&!parseRead(r,&f)) imsiFromEf(f.data,f.size,imsi); note("sim uim read imsi",st); break;
+      case Spn: if(!st&&!parseRead(r,&f)) spnFromEf(f.data,f.size,spn); note("sim uim read spn",st); break;
+      case Msisdn: if(!st&&!parseRead(r,&f)) msisdnFromRecord(f.data,f.size,msisdn); note("sim uim read msisdn",st); break;
+      case Ids: if(!st) { stringTlv(r,0x11,imei,sizeof(imei)); stringTlv(r,0x12,meid,sizeof(meid)); } note("sim dms ids",st); break;
+      case Revision: if(!st) stringTlv(r,0x01,revision,sizeof(revision)); note("sim dms revision",st); break;
       case Mode: {
         uint32_t n=0; const uint8_t *m=st?nullptr:r.find(0x01,&n);
         if(m&&n==1) operatingMode=m[0];
-        note("dms operating mode",st); break;
+        note("sim dms operating mode",st); break;
       }
-      case Serving: servingStatus=st?st:parseServingSystem(r,&serving); note("nas serving system",servingStatus); break;
+      case Serving: servingStatus=st?st:parseServingSystem(r,&serving); note("sim nas serving system",servingStatus); break;
       default: break;
     }
     q.consume();
@@ -311,5 +317,50 @@ private:
     return Ok;
   }
 };
+inline uint8_t simState(const SimProbe &s) {
+  if(s.cardStatus) return GUAMP_SIM_UNKNOWN;
+  if(!s.card.slots||s.card.card[0].state==CardAbsent) return GUAMP_SIM_ABSENT;
+  if(s.card.card[0].state!=CardPresent) return GUAMP_SIM_ERROR;
+  const App *a=s.gwApp();
+  if(!a) return GUAMP_SIM_DETECTED;
+  switch(a->state) {
+    case AppReady: return GUAMP_SIM_READY;
+    case AppPin1Required: return GUAMP_SIM_PIN;
+    case AppPuk1Required: return GUAMP_SIM_PUK;
+    case AppPin1Blocked: return GUAMP_SIM_BLOCKED;
+    case AppPerso: return GUAMP_SIM_PERSO;
+    case AppIllegal: return GUAMP_SIM_ERROR;
+    default: return GUAMP_SIM_DETECTED;
+  }
+}
+inline void fillInfo(const SimProbe &s,GuampSimInfo *o) {
+  memset(o,0,sizeof(*o));
+  o->version=GUAMP_SIM_INFO_VERSION; o->snapshots=s.snapshots; o->state=simState(s);
+  const App *a=s.gwApp();
+  if(a) { o->appType=a->type; o->pin1Retries=a->pin1Retries; o->puk1Retries=a->puk1Retries; }
+  o->operatingMode=s.operatingMode;
+  o->registration=s.servingStatus?0xFF:s.serving.reg;
+  if(!s.servingStatus) {
+    o->csAttached=s.serving.cs; o->psAttached=s.serving.ps; o->roaming=s.serving.hasRoaming?s.serving.roaming:0xFF;
+    o->radio=s.serving.radios?s.serving.radio[0]:0; o->hasPlmn=s.serving.hasPlmn;
+    o->mcc=s.serving.mcc; o->mnc=s.serving.mnc; memcpy(o->plmn,s.serving.plmn,sizeof(o->plmn));
+  } else o->roaming=0xFF;
+  memcpy(o->iccid,s.iccid,sizeof(o->iccid)); memcpy(o->imsi,s.imsi,sizeof(o->imsi));
+  memcpy(o->spn,s.spn,sizeof(o->spn)); memcpy(o->msisdn,s.msisdn,sizeof(o->msisdn));
+  memcpy(o->imei,s.imei,sizeof(o->imei)); memcpy(o->meid,s.meid,sizeof(o->meid));
+  memcpy(o->revision,s.revision,sizeof(o->revision));
+}
+// guamp-sim-fake=1: fixed test values (3GPP test PLMN 001/01), never real identifiers.
+inline void fakeInfo(GuampSimInfo *o) {
+  memset(o,0,sizeof(*o));
+  o->version=GUAMP_SIM_INFO_VERSION; o->snapshots=1; o->fake=1; o->state=GUAMP_SIM_READY; o->appType=AppUsim;
+  o->pin1Retries=3; o->puk1Retries=10; o->operatingMode=0; o->registration=1; o->csAttached=1; o->psAttached=1;
+  o->roaming=0; o->radio=8; o->hasPlmn=1; o->mcc=1; o->mnc=1;
+  static const char iccid[]="8900100000000000001",imsi[]="001010000000001",spn[]="GUAMP TEST",
+    msisdn[]="+10000000001",imei[]="000000000000000",rev[]="FAKE.MPSS",plmn[]="Test PLMN";
+  memcpy(o->iccid,iccid,sizeof(iccid)); memcpy(o->imsi,imsi,sizeof(imsi)); memcpy(o->spn,spn,sizeof(spn));
+  memcpy(o->msisdn,msisdn,sizeof(msisdn)); memcpy(o->imei,imei,sizeof(imei)); memcpy(o->revision,rev,sizeof(rev));
+  memcpy(o->plmn,plmn,sizeof(plmn));
+}
 } // namespace guampsim
 #endif
