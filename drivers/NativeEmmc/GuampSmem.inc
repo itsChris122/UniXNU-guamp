@@ -8,7 +8,7 @@
 //   header     region start: proc_comm[4] (64 bytes), version[32] (version[7] >> 16: 11 global heap, 12 partitions),
 //              initialized, free_offset, available, reserved, toc[512] of {allocated, offset, size, aux_base} (v11)
 //   ptable     last 4 KiB: "$TOC", version 1, num_entries, 5 reserved, entries of 48 bytes {offset, size, flags,
-//              host0:16 host1:16, cacheline, 7 reserved}, then "SIII" info with num_items
+//              host0:16 host1:16, cacheline, 7 reserved}, then "SIII" info {magic, size, base_addr, reserved, num_items:16 at +16}
 //   partition  "$PRT", host0, host1, size, offset_free_uncached, offset_free_cached, 3 reserved (32 bytes);
 //              uncached entries grow up from +32 {canary 0xa5a5, item, size, padding_data, padding_hdr, reserved}
 //              (data after the header + padding_hdr), cached entries grow down from the end (data before the header)
@@ -52,6 +52,7 @@ struct Partition {
 struct Info {
   int error;
   uint32_t version, initialized, ptableVersion, entries, numItems;
+  bool infoPresent;   // "SIII" smem_info found after the partition table
   uint32_t partitions;
   Partition part[kMaxPartitions];
 };
@@ -110,7 +111,11 @@ inline void parse(const Reader &r, Info *info) {
   info->entries = r.r32(table + 8);
   if (info->ptableVersion != 1 || info->entries > (4096 - 32) / 48) { info->error = kErrFormat; return; }
   uint32_t infoAt = table + 32 + 48 * info->entries;
-  info->numItems = r.ok(infoAt, 16) && r.r32(infoAt) == 0x49494953 ? r.r16(infoAt + 12) : kItemCount;   // "SIII"
+  // smem.c struct smem_info: magic[4], size, base_addr, reserved, num_items (le16 at +16). Reading +12 (reserved, 0 on
+  // guamp) gave "0 items max" and made every allocation Range (-102, Wi-Fi R1 28/10). Linux: no magic -> 512 items,
+  // magic -> num_items as found (qcom_smem_get_item_count).
+  info->infoPresent = r.ok(infoAt, 20) && r.r32(infoAt) == 0x49494953;   // "SIII"
+  info->numItems = info->infoPresent ? r.r16(infoAt + 16) : kItemCount;
   for (uint32_t i = 0; i < info->entries && info->partitions < kMaxPartitions; i++) {
     uint32_t e = table + 32 + 48 * i;
     Partition &p = info->part[info->partitions];
