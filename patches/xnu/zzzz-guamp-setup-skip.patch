@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,382 @@
+@@ -7858,6 +7858,388 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -289,7 +289,13 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +native_guamp_setup_skip(proc_t p, user_addr_t scratch)
 +{
 +	native_guamp_home_reset(p, scratch);
-+	static const char *const dirs[] = {"/private/var/db/com.apple.xpc.launchd"};
++	/* powerd (iOS 17) keeps its battery health record (service state and flags, maximum capacity, serial) in the
++	 * com.apple.batteryhealthdata domain under /var/MobileSoftwareUpdate/Hardware/Battery; cfprefsd refused every write
++	 * with "Directory needed" (log 28/10) because the Data volume has no such tree. */
++	static const char *const dirs[] = {"/private/var/db/com.apple.xpc.launchd", "/private/var/MobileSoftwareUpdate",
++	    "/private/var/MobileSoftwareUpdate/Hardware", "/private/var/MobileSoftwareUpdate/Hardware/Battery",
++	    "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library",
++	    "/private/var/MobileSoftwareUpdate/Hardware/Battery/Library/Preferences"};
 +	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 +		int32_t result = 0;
 +		struct mkdir_args md = {.path = scratch + 0xa00, .mode = 0755};
@@ -384,7 +390,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8359,7 @@
+@@ -7983,6 +8365,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);

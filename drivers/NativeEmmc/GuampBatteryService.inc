@@ -21,22 +21,44 @@ public:
     const OSSymbol *symbol = OSSymbol::withCString(key);
     if (symbol) { setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse); symbol->release(); }
   }
-  void batteryData(unsigned designMah, unsigned cycles) {
+  void text(const char *key, const char *value) {
+    const OSSymbol *symbol = OSSymbol::withCString(key);
+    OSString *s = OSString::withCString(value);
+    if (symbol && s) setPSProperty(symbol, s);
+    if (symbol) symbol->release();
+    if (s) s->release();
+  }
+  static void put(OSDictionary *d, const char *key, uint64_t value) {
+    OSNumber *n = OSNumber::withNumber(value, 64);
+    if (n) { d->setObject(key, n); n->release(); }
+  }
+  // BatteryData as AppleSmartBattery publishes it on iOS (subset): powerd reads DesignCapacity, CycleCount and WeightedRa
+  // here, thermalmonitord WeightedRa (ChemID absent: its default P0 threshold); Qmax is the gauge's capacity model.
+  void batteryData(const guamp_battery::Gauge &g, unsigned cycles, const guamp_battery::Health &h) {
     const OSSymbol *symbol = OSSymbol::withCString("BatteryData");
-    OSDictionary *d = OSDictionary::withCapacity(2);
-    OSNumber *design = OSNumber::withNumber(designMah, 32), *count = OSNumber::withNumber(cycles, 32);
-    if (symbol && d && design && count) {
-      d->setObject("DesignCapacity", design);
-      d->setObject("CycleCount", count);
+    OSDictionary *d = OSDictionary::withCapacity(8);
+    OSArray *qmax = OSArray::withCapacity(1);
+    OSNumber *q = OSNumber::withNumber(g.capMah, 64);
+    OSString *serial = OSString::withCString(guamp_battery::kBatterySerial);
+    if (symbol && d && qmax && q && serial) {
+      put(d, "DesignCapacity", guamp_battery::kDesignMah);
+      put(d, "CycleCount", cycles);
+      put(d, "StateOfCharge", static_cast<uint64_t>(g.msoc));
+      put(d, "NominalChargeCapacity", h.nominalMah);
+      put(d, "WeightedRa", guamp_battery::kWeightedRa);
+      qmax->setObject(q);
+      d->setObject("Qmax", qmax);
+      d->setObject("Serial", serial);
       setPSProperty(symbol, d);
     }
     if (symbol) symbol->release();
     if (d) d->release();
-    if (design) design->release();
-    if (count) count->release();
+    if (qmax) qmax->release();
+    if (q) q->release();
+    if (serial) serial->release();
   }
   void report(const guamp_battery::Gauge &g, unsigned uv, int ua, bool external, unsigned state, bool tempValid,
-              int deciC, unsigned cycles) {
+              int deciC, unsigned cycles, const guamp_battery::Health &h) {
     unsigned percent = static_cast<unsigned>(g.msoc);
     setBatteryInstalled(true);
     setExternalConnected(external);
@@ -50,14 +72,21 @@ public:
     setAtCriticalLevel(!external && percent <= 3);
     number("InstantAmperage", static_cast<uint64_t>(static_cast<int64_t>(ua / 1000)));
     // powerd (iOS 17) reads DesignCapacity, NominalChargeCapacity, AppleRawMaxCapacity, AppleRawCurrentCapacity,
-    // CycleCount, Temperature and BatteryData, and derives MaximumCapacityPercent from NominalCapacity/DesignCapacity.
+    // CycleCount, Temperature and BatteryData, and derives "Maximum Capacity Percent" (what Settings > Battery Health
+    // shows) as ceil(NominalChargeCapacity * 100 / DesignCapacity): NominalChargeCapacity is the Linux-learned capacity
+    // capped at the design value (guamp_battery::health). Its battery health record also needs Serial (no Serial =
+    // service state -1, page spinning forever) and BatteryCellDisconnectCount (absent = state 5, "unable to determine");
+    // the QG never reports a cell disconnect, so the count is 0. AppleRawMaxCapacity stays the gauge's running model
+    // (learned, or the profile FCC at the current temperature).
+    text("Serial", guamp_battery::kBatterySerial);
+    number("BatteryCellDisconnectCount", 0);
     number("DesignCapacity", guamp_battery::kDesignMah);
-    number("NominalChargeCapacity", g.capMah);
+    number("NominalChargeCapacity", h.nominalMah);
     number("AppleRawMaxCapacity", g.capMah);
     number("AppleRawCurrentCapacity", g.chargeMah());
-    unsigned health = (g.capMah * 100 + guamp_battery::kDesignMah / 2) / guamp_battery::kDesignMah;
-    number("MaximumCapacityPercent", health > 100 ? 100 : health);
-    batteryData(guamp_battery::kDesignMah, cycles);
+    number("MaximumCapacityPercent", h.percent);
+    flag("GuampCapacityLearned", h.learned);
+    batteryData(g, cycles, h);
     if (tempValid) number("Temperature", static_cast<uint64_t>(static_cast<int64_t>(deciC) * 10));   // 0.01 C
     flag("FullyCharged", g.full);
     flag("AppleRawExternalConnected", external);
@@ -70,6 +99,7 @@ public:
 OSDefineMetaClassAndStructors(GuampBattery, IOPMPowerSource)
 static GuampBattery *gBattery;
 static guamp_battery::Gauge gGauge;
+static guamp_battery::Health gBatteryHealth;
 static bool gBatteryEnabled, gBatteryTempEnabled = true, gBatterySdamStore, gBatteryTempValid;
 static int gBatteryTemp = 250;
 static unsigned gBatteryErrors, gBatterySamples, gBatterySkipped, gBatteryCycles, gBatteryGoodOcvRaw = 0x8000;
@@ -218,8 +248,8 @@ static void batteryPoll() {
     in.uv = uv; in.ua = ua;
     guamp_battery::PonResult pon = guamp_battery::determinePonSoc(in);
     unsigned learned = in.sdamOk ? in.sdam.learnedMah() : 0;
-    unsigned mah = learned >= guamp_battery::kDesignMah / 2 && learned <= guamp_battery::kDesignMah * 11 / 10
-                       ? learned : guamp_battery::nominalMah(in.temp, false);
+    unsigned mah = guamp_battery::plausibleLearned(learned) ? learned : guamp_battery::nominalMah(in.temp, false);
+    gBatteryHealth = guamp_battery::health(learned);
     gBatteryCycles = in.sdamOk ? in.sdam.cycles() : 0;
     gGauge.seed(pon, mah, s);
     IOLog("GuampBattery: PON soc %d%% from %s ocv %u uV (profile %d%%, full %d%% cutoff %d%%, live %d%%), temp %d dC %s; "
@@ -228,6 +258,10 @@ static void batteryPoll() {
           pon.liveSoc, in.temp, gBatteryTempValid ? "adc" : "assumed", in.sdamOk ? in.sdam.valid() : 0,
           in.sdamOk ? in.sdam.soc() : 0, in.sdamOk ? in.sdam.time() : 0, in.rtc, in.rtcOk ? "" : " (no rtc)", mah,
           learned, gBatteryCycles, guamp_profile::kBatteryType);
+    IOLog("GuampBattery: health %u%% for iOS (NominalChargeCapacity %u / DesignCapacity %u mAh, %s), cycles %u, "
+          "serial %s, BatteryCellDisconnectCount 0, WeightedRa %u\n", gBatteryHealth.percent, gBatteryHealth.nominalMah,
+          guamp_battery::kDesignMah, gBatteryHealth.learned ? "learned by Linux QG" : "not learned: design value",
+          gBatteryCycles, guamp_battery::kBatterySerial, guamp_battery::kWeightedRa);
   } else {
     events = gGauge.sample(s);
     if (events & guamp_battery::kGap) ++gBatterySkipped;
@@ -252,7 +286,8 @@ static void batteryPoll() {
     IOService *platform = IOService::getPlatform();
     GuampBattery *made = OSTypeAlloc(GuampBattery);
     if (!platform || !made || !made->init()) { if (made) made->release(); return; }
-    made->report(gGauge, uv, ua, external, chargerState & 7, gBatteryTempValid, gBatteryTemp, gBatteryCycles);
+    made->report(gGauge, uv, ua, external, chargerState & 7, gBatteryTempValid, gBatteryTemp, gBatteryCycles,
+                 gBatteryHealth);
     if (!made->attach(platform)) { made->release(); return; }
     made->setName("GuampBattery");
     if (!made->start(platform)) { made->detach(platform); made->release(); return; }
@@ -261,7 +296,8 @@ static void batteryPoll() {
     IOLog("GuampBattery: IOPMPowerSource registered; QG fuel gauge, profile %s; charger configuration unchanged\n",
           guamp_profile::kBatteryType);
   } else {
-    gBattery->report(gGauge, uv, ua, external, chargerState & 7, gBatteryTempValid, gBatteryTemp, gBatteryCycles);
+    gBattery->report(gGauge, uv, ua, external, chargerState & 7, gBatteryTempValid, gBatteryTemp, gBatteryCycles,
+                     gBatteryHealth);
   }
   if (gBatterySamples++ % 6 == 0)
     IOLog("GuampBattery: soc %d%% sys %d.%02d%% voltage %u uV avg %u current %d uA avg %d (positive=charging), "
