@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: APSL-2.0
 // guamp Wi-Fi mode 2 registry entries, included by NativeEmmc.cpp only with GUAMP_WIFI_REDWOOD=1
-// (scripts/build-arm-driver.py NativeEmmc --wifi-runtime --wifi-redwood). Nothing is published unless the iOS station
-// of guamp-wifi-start=2 attaches en0 (drivers/GuampWifi/ios/guamp_net.c calls guamp_wlan_publish once).
+// (scripts/build-arm-driver.py NativeEmmc --wifi-runtime --wifi-redwood). Nothing is published unless en0 is attached:
+// by the iOS station of guamp-wifi-start=2, or as the guamp-wifi-ui placeholder (default with mode 2) that the station
+// takes over (drivers/GuampWifi/ios/guamp_net.c calls guamp_wlan_publish once).
 //
 // From HakiOS xnu/files/iokit/Kernel/hakios.wlan.cpp (github.com/oosexgang/hackios-xnu-kernel 8851317, Apple Public
 // Source License 2.0, see drivers/GuampWifi/ios/README.md); changed: the service is GuampWLAN, log lines "GuampWLAN:".
@@ -58,6 +59,7 @@ OSDefineMetaClassAndStructors(GuampWLAN, IONetworkInterface)
 namespace wlannub {
 static unsigned gUserClientAsked;
 static unsigned gSelectorsSaid;
+static IOService *gController;  // the published IO80211Controller (guamp_wlan_set_address)
 constexpr uint32_t kIoctlBlockSize = 0x3c30;   // IO80211.framework 17.7.11: the selector-0 input
 constexpr uint32_t kIoctlRequestAt = 0x3c08;   // struct apple80211req inside it
 constexpr uint32_t kGetA80211 = 0xc02869c9u;   // SIOCGA80211
@@ -189,7 +191,8 @@ IOReturn IO80211UserClient::externalMethod(uint32_t selector, IOExternalMethodAr
   return result;
 }
 
-// Once, when en0 of the radio exists (guamp_net.c hakios_net_attach, on the station's attach thread).
+// Once, when en0 exists (guamp_net.c hakios_net_attach): on the station's attach thread, or from bsd_init for the
+// guamp-wifi-ui placeholder en0, which the station takes over later (then guamp_wlan_set_address).
 extern "C" void guamp_wlan_publish(const char *interface, const uint8_t *address) {
   IOService *platform = IOService::getPlatform();
   IO80211Controller *controller = OSTypeAlloc(IO80211Controller);
@@ -231,5 +234,37 @@ extern "C" void guamp_wlan_publish(const char *interface, const uint8_t *address
     IOLog("GuampWLAN: IO80211Controller and IONetworkInterface %s published\n", interface);
     wlan->release();
   }
-  controller->release();
+  wlannub::gController = controller;  // (kept: guamp_wlan_set_address)
+}
+
+// guamp-wifi-ui (guamp_net.c): the address of the placeholder en0, the one iOS already has from the ADT
+// (/chosen/mac-address-wifi0, which MobileGestalt reads for WifiAddress and the wifi capability). Not logged.
+extern "C" bool guamp_wlan_adt_address(uint8_t *address) {
+  bool found = false;
+  IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+  if (!chosen) {
+    return false;
+  }
+  OSData *mac = OSDynamicCast(OSData, chosen->getProperty("mac-address-wifi0"));
+  if (mac && mac->getLength() == 6) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(mac->getBytesNoCopy());
+    found = (bytes[0] | bytes[1] | bytes[2] | bytes[3] | bytes[4] | bytes[5]) != 0 && !(bytes[0] & 1);
+    if (found) {
+      memcpy(address, bytes, 6);
+    }
+  }
+  chosen->release();
+  return found;
+}
+
+// The station took over the placeholder en0 with the radio's own address: the controller says that one now.
+extern "C" void guamp_wlan_set_address(const uint8_t *address) {
+  if (!wlannub::gController || !address) {
+    return;
+  }
+  if (OSData *mac = OSData::withBytes(address, 6)) {
+    wlannub::gController->setProperty("IOMACAddress", mac);
+    mac->release();
+  }
+  IOLog("GuampWLAN: the controller's address is the radio's now\n");
 }

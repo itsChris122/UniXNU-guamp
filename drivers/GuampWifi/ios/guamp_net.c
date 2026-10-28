@@ -340,6 +340,46 @@ net_thread(void *parameter, __unused wait_result_t result)
 	}
 }
 
+/*
+ * guamp-wifi-ui (29/10, analisi/wifi/IMPOSTAZIONI-WIFI-20261029.md): en0 from bsd_init on, before the radio is up.
+ * Settings lists Wi-Fi from MobileGestalt (ADT /chosen/mac-address-wifi0), but wifid has no device until an 802.11
+ * interface exists, so the row cannot be used. The placeholder link carries nothing (its link is down, so net_output()
+ * never calls transmit) and the station side is absent (guamp_sta.c: power reads off, a power-on is remembered).
+ * When the station attaches its link takes the placeholder's place on the same en0 (hakios_net_attach below).
+ */
+extern bool guamp_wlan_adt_address(uint8_t *address);              /* NativeEmmc GuampWlanNub.inc */
+extern void guamp_wlan_set_address(const uint8_t *address);        /* likewise */
+
+static bool
+placeholder_transmit(__unused mbuf_t packet, __unused size_t length)
+{
+	return false;
+}
+
+static struct hakios_net_link net_placeholder = {
+	.name = "guamp Wi-Fi (radio not up yet)",
+	.unit = 0,
+	.wireless = true,
+	.up = false,
+	.transmit = placeholder_transmit,
+};
+
+/* The station's link on the placeholder's en0: same interface, same services, the radio's address. */
+static bool
+net_take_over(struct net_if *n, const struct hakios_net_link *link)
+{
+	lck_mtx_lock(&n->tx_lock);
+	n->link = link;
+	lck_mtx_unlock(&n->tx_lock);
+	if (bcmp(link->address, net_placeholder.address, ETHER_ADDR_LEN) != 0) {
+		ifnet_set_lladdr(n->ifp, link->address, ETHER_ADDR_LEN);
+		guamp_wlan_set_address(link->address);
+	}
+	printf("GuampWiFi: net: en%u taken over by %s (was the placeholder), link %s\n", n->unit, link->name, link->up ? "up" : "down");
+	hakios_net_link_state_unit(n->unit, link->up);
+	return true;
+}
+
 bool
 hakios_net_attach(const struct hakios_net_link *link)
 {
@@ -384,6 +424,9 @@ hakios_net_attach(const struct hakios_net_link *link)
 	if (net_lck_grp == NULL) {
 		printf("GuampWiFi: net: BSD networking is not up yet (no bsd_init hook); %s is not attached\n", link->name);
 		return false;
+	}
+	if (n->link == &net_placeholder && link != &net_placeholder && link->wireless) {
+		return net_take_over(n, link);
 	}
 	if (n->link != NULL) {
 		printf("GuampWiFi: net: en%u is on %s already; %s is not attached\n", unit, n->link->name, link->name);
@@ -438,10 +481,17 @@ hakios_net_attach(const struct hakios_net_link *link)
 void
 guamp_wifi_bsd_network_ready(void)
 {
-	unsigned mode = 0;
+	unsigned mode = 0, ui;
 
-	/* only the iOS station uses any of this; mode 1 (the diagnostic scan) and no mode: nothing at all is done */
-	if (!PE_parse_boot_argn("guamp-wifi-start", &mode, sizeof(mode)) || mode != 2 || net_lck_grp != NULL) {
+	/*
+	 * Mode 2 (the iOS station) uses all of this. guamp-wifi-ui (default 1 with mode 2, 0 otherwise; =0 turns it off)
+	 * attaches the placeholder en0 so that Settings has a Wi-Fi device (switch off) before the radio is up, or without
+	 * a radio at all (guamp-wifi-ui=1 alone). Mode 1 and no mode, without guamp-wifi-ui=1: nothing at all is done.
+	 */
+	PE_parse_boot_argn("guamp-wifi-start", &mode, sizeof(mode));
+	ui = mode == 2;
+	PE_parse_boot_argn("guamp-wifi-ui", &ui, sizeof(ui));
+	if ((mode != 2 && ui != 1) || net_lck_grp != NULL) {
 		return;
 	}
 	net_lck_grp = lck_grp_alloc_init("guamp-net", LCK_GRP_ATTR_NULL);
@@ -449,6 +499,19 @@ guamp_wifi_bsd_network_ready(void)
 	guamp_apple80211_init();
 	PE_parse_boot_argn("guamp-net-trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("guamp-net-names", &net_names, sizeof(net_names));
+	if (ui) {
+		if (!guamp_wlan_adt_address(net_placeholder.address)) {
+			/* (no /chosen/mac-address-wifi0: a locally administered address, 02:47:55 as the Bluetooth one) */
+			static const uint8_t laa[ETHER_ADDR_LEN] = { 0x02, 0x47, 0x55, 0x57, 0x4c, 0x30 };
+			memcpy(net_placeholder.address, laa, ETHER_ADDR_LEN);
+		}
+		printf("GuampWiFi: net: guamp-wifi-ui: placeholder en0 for Settings (%s)\n",
+		    hakios_net_attach(&net_placeholder) ? "attached, switch off until the radio is up" : "NOT attached");
+	}
+	if (mode != 2) {
+		printf("GuampWiFi: net: BSD networking is up; no radio in this run (guamp-wifi-start is not 2)\n");
+		return;
+	}
 	printf("GuampWiFi: net: BSD networking is up; the iOS station may attach en0\n");
 	guamp_sm6115_wifi_network_ready();
 }
