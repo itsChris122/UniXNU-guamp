@@ -621,7 +621,61 @@ static void controlTest() {
     CHECK(r.c->step(WifiControl::ReadyMs)==Timeout&&!strcmp(r.c->where(),"smp2p 435 slave-kernel ready (bit 1)"));
   }
 }
+// The modem as seen on guamp (boot p2, 29/10): its VERSION (features 7) and a burst of OPENs for every channel of the
+// mpss edge, an INTENT for IPCRTR before its OPEN_ACK of ours, SIGNALS, then the VERSION_ACK. The R1 code opened
+// IPCRTR first and refused the intent (-104 Protocol at "glink IPCRTR open/ack").
+static std::vector<uint8_t> named(uint16_t cmd,uint16_t id,const char *name) {
+  std::vector<uint8_t> n(name,name+strlen(name)+1); return frame(cmd,id,uint32_t(n.size()),n);
+}
+static void modemBurstTest() {
+  ControlRig r(512);
+  CHECK(r.prepare()==Ok&&r.c->modemStarted(0)==Ok);
+  uint32_t in=0; CHECK(r.a.allocate(1,435,340,&in)==Ok);
+  r.f.w(in,0x504d5324); r.f.w(in+8,1); r.f.w(in+12,16u|(1u<<16));
+  memcpy(r.f.bytes.data()+in+20,"slave-kernel",13); r.f.w(in+36,6); r.f.w(in+4,0x101);
+  uint32_t rx=0; CHECK(r.a.allocate(1,480,16384,&rx)==Ok);
+  auto m=r.f.memory(); const uint32_t d=r.c->descriptor;
+  GlinkPipe toHost={m,rx,16384,d+12,d+8,true},fromHost={m,r.c->outboundFifo,r.c->outboundBytes,d+4,d,false};
+  CHECK(r.c->step(1)==Ok&&r.c->stage==WifiControl::Running);   // ready and 480 already there: one step, as on guamp
+  auto push=[&](const std::vector<uint8_t> &p){ CHECK(toHost.push(p.data(),uint32_t(p.size()))==Ok); };
+  auto drain=[&]{
+    std::vector<std::vector<uint8_t>> out; uint32_t n=0; CHECK(fromHost.count(&n)==Ok);
+    while(n) {
+      uint8_t h[8]; fromHost.peek(0,h,8); uint16_t cmd=le16(h); uint32_t p2=le32(h+4),len=8;
+      if(cmd==2) len+=align8(p2&0xffffu); if(cmd==5) len+=p2*8;
+      std::vector<uint8_t> v(len); fromHost.peek(0,v.data(),len); CHECK(fromHost.advance(len)==Ok); out.push_back(v);
+      CHECK(fromHost.count(&n)==Ok);
+    }
+    return out;
+  };
+  auto first=drain(); CHECK(first.size()==1&&le16(first[0].data())==0);   // our VERSION
+  push(frame(0,1,7));
+  push(named(2,1,"glink_ssr")); push(named(2,2,"IPCRTR")); push(named(2,3,"fastrpcglink-apps-dsp"));
+  push(named(2,4,"LOOPBACK_CTL_MPSS")); push(named(2,5,"DIAG_CTRL"));
+  std::vector<uint8_t> pairs(16); put32(pairs.data(),0x800); put32(pairs.data()+4,1); put32(pairs.data()+8,0x800); put32(pairs.data()+12,2);
+  push(frame(5,2,2,pairs));      // IPCRTR intents before the remote's OPEN_ACK
+  push(frame(5,1,1,std::vector<uint8_t>(pairs.begin(),pairs.begin()+8)));   // intent of an ignored channel
+  push(frame(15,1,0)); push(frame(1,1,1));
+  CHECK(r.c->step(3)==Ok&&r.c->stage==WifiControl::Running&&r.c->glink.negotiated);
+  CHECK(r.c->glink.ignoredOpens==4&&r.c->glink.lastRefusal==nullptr);
+  auto out=drain();
+  // VERSION_ACK(features 1), OPEN_ACK(rcid 2), OPEN(lcid 1, "IPCRTR"); nothing for the ignored channels
+  CHECK(out.size()==3&&le16(out[0].data())==1&&le32(out[0].data()+4)==1);
+  CHECK(le16(out[1].data())==4&&le16(out[1].data()+2)==2);
+  CHECK(le16(out[2].data())==2&&le16(out[2].data()+2)==1&&!strcmp((const char *)out[2].data()+8,"IPCRTR"));
+  CHECK(!r.c->channel);
+  push(frame(4,1,0));            // the remote's OPEN_ACK of our OPEN
+  CHECK(r.c->step(4)==Ok&&r.c->channel==1&&r.c->routerStarted&&r.saw("glink IPCRTR up"));
+  out=drain();                   // our intents (5x0x800, 3x0x2000, 2x0x4400) and the QRTR HELLO on IPCRTR
+  bool intents=false; for(auto &v:out) if(le16(v.data())==5&&le32(v.data()+4)==10) intents=true;
+  CHECK(intents);
+  int remote=0; for(auto &ri:r.c->glink.channels[0].remoteIntent) if(ri.id) remote++;
+  CHECK(remote==2);
+  // a malformed frame is still refused, with its header kept for the failure log
+  push(frame(9,9,1,std::vector<uint8_t>(8)));
+  CHECK(r.c->step(5)==Protocol&&r.c->glink.refusedCmd==9&&r.c->glink.refusedP1==9&&r.saw("glink REFUSED rx command/param1/param2 0 9 9 1"));
+}
 int main() {
-  smemTest(); smpTest(); glinkTest(); rpmTest(); msaTest(); powerPlanTest(); qrtrTest(); firmwareServiceTest(); wlanTest(); ceTest(); controlTest(); malformedTest();
+  smemTest(); smpTest(); glinkTest(); rpmTest(); msaTest(); powerPlanTest(); qrtrTest(); firmwareServiceTest(); wlanTest(); ceTest(); controlTest(); modemBurstTest(); malformedTest();
   printf("PASS %u checks: SMEM/SMP2P/GLINK/QRTR/QMI/WLFW/SNOC-CE actual sources, independent wire peer, malformed inputs\n",checks);
 }

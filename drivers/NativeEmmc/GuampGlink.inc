@@ -87,6 +87,12 @@ struct Glink {
   uint32_t rxPackets=0,txPackets=0,readNotifications=0;
   bool negotiated=false,notifySent=false,running=false,intentless=false;
   int error=0;
+  // Optional local-user filter for remote OPENs (null: every name, as the RPM edge). Diagnostics below.
+  bool (*wants)(void *,const char *)=nullptr;
+  uint32_t rxCommands=0,ignoredOpens=0,ignoredCommands=0,droppedIntents=0;
+  char lastIgnored[32]={};
+  const char *lastRefusal=nullptr;
+  uint32_t refusedCmd=0,refusedP1=0,refusedP2=0,refusedBytes=0,refusedAvail=0,refusedTail=0,refusedHead=0;
 
   int start(const GlinkPipe &out,const GlinkPipe &in,const Allocator &a,
             void *opaque,void (*notify)(void *),
@@ -98,6 +104,8 @@ struct Glink {
     memset(channels,0,sizeof(channels)); memset(control,0,sizeof(control));
     qRead=qWrite=qCount=0; intentless=rpmIntentless; features=intentless?0u:1u; error=0; negotiated=notifySent=false;
     rxPackets=txPackets=readNotifications=0;
+    rxCommands=ignoredOpens=ignoredCommands=droppedIntents=0; lastIgnored[0]=0; lastRefusal=nullptr;
+    refusedCmd=refusedP1=refusedP2=refusedBytes=refusedAvail=refusedTail=refusedHead=0;
     // Remote-owned head/tail words are never cleared by APPS.
     tx.mem.w32(tx.head,0); rx.mem.w32(rx.tail,0); tx.mem.fence();
     running=true; return queue(Version,1,features);
@@ -116,12 +124,8 @@ struct Glink {
       if(id) *id=c.local;
       return Ok;
     }
-    Channel *c=nullptr;
-    for(uint32_t k=0;k<MaxChannels;k++) if(!channels[k].local) {
-      c=&channels[k]; memset(c,0,sizeof(*c)); c->local=uint16_t(k+1); break;
-    }
+    Channel *c=create(name,n);
     if(!c) return NoMemory;
-    memcpy(c->name,name,n+1);
     int e=queue(Open,c->local,n+1,reinterpret_cast<const uint8_t *>(name),n+1);
     if(e) { memset(c,0,sizeof(*c)); return e; }
     c->openSent=true; if(id) *id=c->local; return Ok;
@@ -169,6 +173,12 @@ struct Glink {
     return Ok;
   }
 private:
+  Channel *create(const char *name,uint32_t n) {
+    for(uint32_t k=0;k<MaxChannels;k++) if(!channels[k].local) {
+      Channel *c=&channels[k]; memset(c,0,sizeof(*c)); c->local=uint16_t(k+1); memcpy(c->name,name,n); c->name[n]=0; return c;
+    }
+    return nullptr;
+  }
   int fail(int e) { stop(e); return e; }
   Channel *local(uint16_t id) {
     for(auto &c:channels) if(c.local==id&&id) return &c;
@@ -255,99 +265,113 @@ private:
     }
     return Ok;
   }
+  // Diagnostics of the last refused RX command: its header, FIFO state and the rule that refused it.
+  void refuse(const char *why,uint16_t cmd,uint16_t p1,uint32_t p2,uint32_t bytes,uint32_t avail) {
+    lastRefusal=why; refusedCmd=cmd; refusedP1=p1; refusedP2=p2; refusedBytes=bytes; refusedAvail=avail;
+    refusedTail=rx.mem.r32(rx.tail); refusedHead=rx.mem.r32(rx.head);
+  }
   int receiveOne() {
-    uint32_t available=0; int e=rx.count(&available); if(e) return e;
+    uint32_t available=0; int e=rx.count(&available);
+    if(e) { refuse("rx fifo indices",0xffff,0,0,0,0); return e; }
     if(available<8) return Again;
     uint8_t hdr[16]={}; rx.peek(0,hdr,8);
     uint16_t cmd=le16(hdr),p1=le16(hdr+2); uint32_t p2=le32(hdr+4),bytes=8;
     if(cmd==Open) {
-      uint32_t n=p2&0xffffu; if(!n||n>32) return Protocol;
+      uint32_t n=p2&0xffffu; if(!n||n>32) { refuse("open name length",cmd,p1,p2,0,available); return Protocol; }
       bytes+=align8(n);
     } else if(cmd==Intent) {
-      if(p2>MaxRemote) return Protocol;
+      if(!p2||p2>MaxRemote) { refuse("intent count",cmd,p1,p2,0,available); return Protocol; }
       bytes+=p2*8;
     } else if(cmd==Data||cmd==DataCont) {
       if(available<16) return Again;
       rx.peek(0,hdr,16); uint32_t chunk=le32(hdr+8);
-      if(!chunk||chunk>MaxPacket||le32(hdr+12)>MaxPacket-chunk) return Protocol;
+      if(!chunk||chunk>MaxPacket||le32(hdr+12)>MaxPacket-chunk) { refuse("data chunk size",cmd,p1,p2,chunk,available); return Protocol; }
       bytes=16+align8(chunk);
-    }
-    if(bytes>rx.length-8) return Protocol;
+    } else if(cmd>Signals||cmd==10) { refuse("unknown command",cmd,p1,p2,0,available); return Unsupported; }
+    if(bytes>rx.length-8) { refuse("command larger than the fifo",cmd,p1,p2,bytes,available); return Protocol; }
     if(available<bytes) return Again;
+    rxCommands++;
     Channel *c=remote(p1);
+    // Tolerant like qcom_glink_native.c and the working ADSP edge (GuampGlinkEdge.inc): commands for channels without
+    // a local user are consumed and counted, never fatal. Only DATA for an unknown channel or a malformed frame fails.
     switch(cmd) {
       case Version:
-        if(!p1) return Unsupported;
-        features&=p2;
+        if(!p1) break;                       // version 0: ignored (qcom_glink_receive_version)
+        if(p1==1) features&=p2;
         e=queue(VersionAck,1,features);
+        negotiated=true;                     // the remote's VERSION is an agreement as well
         break;
       case VersionAck:
-        if(p1!=1) return Unsupported;
-        if(p2!=features) { features&=p2; e=queue(Version,1,features); }
-        else negotiated=true;
+        if(!p1) { refuse("version-ack 0 (remote refused)",cmd,p1,p2,bytes,available); return Unsupported; }
+        if(p1==1&&p2==features) { negotiated=true; break; }
+        if(p1==1) features&=p2;
+        e=queue(Version,1,features);
         break;
       case Open: {
-        if(!negotiated||!p1) return Protocol;
-        char name[32]={}; uint32_t n=p2&0xffffu;
+        if(!p1) { refuse("open rcid 0",cmd,p1,p2,bytes,available); return Protocol; }
+        char name[33]={}; uint32_t n=p2&0xffffu;
         rx.peek(8,reinterpret_cast<uint8_t *>(name),n);
-        if(name[n-1]||!name[0]) return Protocol;
-        if(c) return Protocol;
-        uint16_t id=0; e=open(name,&id); if(e) break;
-        c=local(id);
-        if(c->remote) return Protocol;
+        if(name[n-1]||!name[0]) { refuse("open name not terminated",cmd,p1,p2,bytes,available); return Protocol; }
+        if(c) { refuse("open of an rcid already open",cmd,p1,p2,bytes,available); return Protocol; }
+        if(wants&&!wants(ctx,name)) {        // no local user: no ACK, as a Linux channel without a driver
+          ignoredOpens++; memcpy(lastIgnored,name,n<32?n:31); lastIgnored[31]=0; break;
+        }
+        for(auto &x:channels) if(x.local&&nameEquals(x.name,name,32)) c=&x;
+        if(!c) c=create(name,n-1);
+        if(!c) { refuse("open: no local slot",cmd,p1,p2,bytes,available); e=NoMemory; break; }
+        if(c->remote) { refuse("open: local channel has another rcid",cmd,p1,c->remote,bytes,available); return Protocol; }
         c->remote=p1; c->remoteOpen=true;
-        e=queue(OpenAck,p1,0); if(!e) e=prepare(*c);
+        // qcom_glink_create_remote: OPEN_ACK first, then our OPEN (unless we opened first).
+        e=queue(OpenAck,p1,0);
+        if(!e&&!c->openSent) { e=queue(Open,c->local,n,reinterpret_cast<const uint8_t *>(name),n); if(!e) c->openSent=true; }
+        if(!e) e=prepare(*c);
         break;
       }
       case OpenAck:
-        c=local(p1); if(!c||c->openAck) return Protocol;
+        c=local(p1);
+        if(!c||!c->openSent||c->openAck) { refuse("open-ack for an lcid not waiting",cmd,p1,p2,bytes,available); return Protocol; }
         c->openAck=true; e=prepare(*c); break;
       case Intent: {
-        if(intentless) return Protocol;
-        if(!c||!c->announced) return Protocol;
+        if(intentless||!c) { ignoredCommands++; break; }
+        // Intents may precede the remote's OPEN_ACK of our OPEN (the remote side is open once it got our ACK).
         uint8_t pair[8];
         for(uint32_t i=0;i<p2;i++) {
           rx.peek(8+8*i,pair,8); uint32_t size=le32(pair),id=le32(pair+4);
-          if(!size||!id) return Protocol;
+          if(!size||!id) { ignoredCommands++; continue; }
           RemoteIntent *slot=nullptr;
-          for(auto &ri:c->remoteIntent) {
-            if(ri.id==id) return Protocol;
-            if(!ri.id&&!slot) slot=&ri;
-          }
-          if(!slot) return NoMemory;
+          for(auto &ri:c->remoteIntent) if(ri.id==id) slot=&ri;
+          for(auto &ri:c->remoteIntent) if(!slot&&!ri.id) slot=&ri;
+          if(!slot) { droppedIntents++; continue; }
+          if(slot->used&&slot->id==id) continue;   // in flight: keep it until its RX_DONE
           *slot={id,size,false};
         }
         c->requestPending=false; break;
       }
       case IntentReq: {
-        if(!c||!c->announced) return Protocol;
+        if(!c||!c->announced) { ignoredCommands++; break; }
         bool granted=false;
         for(auto &li:c->localIntent) if(li.advertised&&!li.active&&li.size>=p2) granted=true;
         // Pre-advertised reusable intents suffice for bounded QMI packets.
         e=queue(IntentReqAck,c->local,granted?1u:0u); break;
       }
       case IntentReqAck:
-        if(!c) return Protocol;
-        if(!p2) c->requestPending=false;
+        if(c&&!p2) c->requestPending=false;
         break;
       case RxDone: case RxDoneReuse: {
-        if(intentless) return Protocol;
-        // RX_DONE is sent using the peer's local id, like DATA and INTENT.
-        if(!c) return Protocol;
+        if(intentless||!c) { ignoredCommands++; break; }
         RemoteIntent *ri=nullptr;
-        for(auto &r:c->remoteIntent) if(r.id==p2) ri=&r;
-        if(!ri||!ri->used||(cmd==RxDoneReuse&&!(features&1))) return Protocol;
-        if(c->pending&&c->pendingIntent==p2) return Protocol;
+        for(auto &r:c->remoteIntent) if(r.id&&r.id==p2) ri=&r;
+        if(!ri||!ri->used||(c->pending&&c->pendingIntent==p2)) { ignoredCommands++; break; }
         if(cmd==RxDoneReuse) ri->used=false; else *ri={};
         break;
       }
       case Data: case DataCont: {
-        if(!c||!c->announced||(!intentless&&(p2<1||p2>MaxLocal))) return Protocol;
+        if(!c||!c->announced||(!intentless&&(p2<1||p2>MaxLocal))) { refuse("data for a channel/intent not ready",cmd,p1,p2,bytes,available); return Protocol; }
         auto &li=c->localIntent[intentless?0:p2-1];
         uint32_t chunk=le32(hdr+8),left=le32(hdr+12);
-        if(!li.advertised||!li.data||(cmd==Data&&li.active)||(cmd==DataCont&&!li.active)) return Protocol;
-        if(chunk>li.size-li.used||left>li.size-li.used-chunk) return Range;
-        if(li.active&&li.remaining!=chunk+left) return Protocol;
+        if(!li.advertised||!li.data||(cmd==Data&&li.active)||(cmd==DataCont&&!li.active)) { refuse("data intent state",cmd,p1,p2,bytes,available); return Protocol; }
+        if(chunk>li.size-li.used||left>li.size-li.used-chunk) { refuse("data larger than the intent",cmd,p1,p2,chunk+left,available); return Range; }
+        if(li.active&&li.remaining!=chunk+left) { refuse("data continuation length",cmd,p1,p2,chunk+left,available); return Protocol; }
         rx.peek(16,li.data+li.used,chunk); li.used+=chunk; li.remaining=left; li.active=true;
         if(!left) {
           received(ctx,c->local,li.data,li.used); rxPackets++;
@@ -364,15 +388,14 @@ private:
         break;
       }
       case ReadNotif: kick(ctx); break;
-      case Signals: if(!c) return Protocol; break;
+      case Signals: break;
       case Close:
-        if(!c) return Protocol;
-        e=queue(CloseAck,p1,0); release(*c); break;
+        e=queue(CloseAck,p1,0); if(c) release(*c); break;
       case CloseAck:
         c=local(p1); if(c) release(*c); break;
-      default: return Unsupported;
+      default: ignoredCommands++; break;
     }
-    if(e) return e;
+    if(e) { if(!lastRefusal) refuse("reply queue",cmd,p1,p2,bytes,available); return e; }
     return rx.advance(bytes);
   }
 };

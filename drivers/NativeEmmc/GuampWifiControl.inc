@@ -121,6 +121,7 @@ struct WifiControl {
       gate="glink start";
       GlinkPipe out={arena->mem,outboundFifo,outboundBytes,descriptor+4,descriptor,true};
       GlinkPipe in={arena->mem,incoming,size,descriptor+12,descriptor+8,false};
+      glink.wants=wantsChannel;   // only IPCRTR has a local user (Linux qrtr-smd); other remote OPENs get no ACK
       e=glink.start(out,in,allocator,this,kick,channelEvent,glinkRx); if(e) return fail(e);
       deadline=now+ServiceMs; transition(Running); gate="glink version (mpss edge)";
     }
@@ -131,8 +132,12 @@ struct WifiControl {
       sawNegotiated=true; gate="glink IPCRTR open/ack";
       trace("glink negotiated: features/rx/ms",0,glink.features,glink.rxPackets,uint32_t(now-started));
     }
-    if(glink.negotiated&&!channel) { e=glink.open("IPCRTR",&channel); if(e!=Again&&e) return fail(e); }
-    if(channel&&!sawOpenSent) { sawOpenSent=true; trace("glink IPCRTR open sent: lcid",0,channel,0,0); }
+    // No proactive OPEN: as Linux (rpmsg device created by qcom_glink_rx_open, then qcom_glink_create_remote) and the
+    // working ADSP edge, IPCRTR is opened in answer to the modem's OPEN (OPEN_ACK, then our OPEN, then intents).
+    if(channel&&!sawOpenSent) {
+      sawOpenSent=true; gate="qrtr HELLO from the modem";
+      trace("glink IPCRTR up: lcid/rx commands/ignored opens",0,channel,glink.rxCommands,glink.ignoredOpens);
+    }
     if(routerStarted&&qrtr.remoteKnown&&!sawRemote) {
       sawRemote=true; gate="qrtr NEW_SERVER 0x45 (WLFW) from the modem ns";
       trace("qrtr first packet from node",0,qrtr.remoteNode,0,uint32_t(now-started));
@@ -166,6 +171,16 @@ private:
     trace(" smp2p 435 present/valid/slave",0,smp.inPresent,smp.inValid,smp.slave);
     trace(" smp2p wlan/flags/entries",0,smp.wlan,smp.inFlags,smp.inEntries);
     trace(" glink running/negotiated/rx",0,glink.running,glink.negotiated,glink.rxPackets);
+    trace(" glink rx commands/ignored opens/ignored commands",0,glink.rxCommands,glink.ignoredOpens,glink.ignoredCommands);
+    if(glink.ignoredOpens) trace(" glink last ignored open (name)",0,0,0,0), trace(glink.lastIgnored,0,0,0,0);
+    for(const auto &ch:glink.channels) if(ch.local)
+      trace(" glink channel lcid/rcid/flags(openSent,openAck,remoteOpen,announced)",0,ch.local,ch.remote,
+        uint32_t(ch.openSent)|uint32_t(ch.openAck)<<1|uint32_t(ch.remoteOpen)<<2|uint32_t(ch.announced)<<3);
+    if(glink.lastRefusal) {
+      trace(" glink REFUSED rx command/param1/param2",0,glink.refusedCmd,glink.refusedP1,glink.refusedP2);
+      trace(glink.lastRefusal,0,glink.refusedBytes,glink.refusedAvail,0);
+      trace(" glink refused at rx tail/head (fifo 480)",0,glink.refusedTail,glink.refusedHead,glink.rx.length);
+    }
     trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);
     trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
     if(rmtfs.ready) trace(" rmtfs requests/failures/overlay bytes",0,rmtfs.requests,rmtfs.failures,rmtfs.shadowBytes);
@@ -190,6 +205,7 @@ private:
     if(ops.event) ops.event(ops.ctx,Failed,e); return e;
   }
   static void kick(void *p) { auto &c=*static_cast<WifiControl *>(p); c.ops.glinkKick(c.ops.ctx); }
+  static bool wantsChannel(void *,const char *name) { return nameEquals(name,"IPCRTR",32); }
   static int glinkTx(void *p,const uint8_t *v,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p); return c.glink.send(c.channel,v,n);
   }
