@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,479 @@
+@@ -7858,6 +7858,487 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -36,13 +36,17 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 + * starts). Back on since 29/10: photoanalysisd (launch on demand: PhotosPosterProvider and the Photos widget ask it for featured
 + * photos and wallpaper suggestions). Opt-in, outside the legacy list: guamp-slim-spotlight=1 enables IndexAgent and
 + * corespotlightservice (Settings and Home search; the first index reads and writes a lot), guamp-slim-media=1 enables
-+ * mediaanalysisd and mediaanalysisd.service (Live Text, Visual Look Up, photo analysis). iconservicesagent is always written as
++ * mediaanalysisd and mediaanalysisd.service (Live Text, Visual Look Up, photo analysis). Off since 29/10 (NOW list only):
++ * fairplayd.A2 (KeepAlive; the kernel has no FairPlayIOKit, so it exits at once and launchd respawned it every ~10 s, 191 pids in
++ * one log; its clients then got stuck on the throttled port, e.g. lockdownd in FairPlayGetHWInfo). Disabled, its Mach services
++ * are not registered and clients fail at once; guamp-slim-fairplay=1 enables it again. iconservicesagent is always written as
 + * enabled. The file is rewritten every boot, so a boot with another argument restores the matching list. */
 +#define GUAMP_SLIM_NOW 1
 +#define GUAMP_SLIM_LEGACY 2
 +#define GUAMP_SLIM_BT 4
 +#define GUAMP_SLIM_SPOTLIGHT 8	/* skipped by guamp-slim-spotlight=1 (not in the legacy list) */
 +#define GUAMP_SLIM_MEDIA 16	/* skipped by guamp-slim-media=1 (not in the legacy list) */
++#define GUAMP_SLIM_FAIRPLAY 32	/* skipped by guamp-slim-fairplay=1 (NOW list only) */
 +#define GUAMP_SLIM_ALL (GUAMP_SLIM_NOW | GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT)
 +static const struct {
 +	const char *label;
@@ -54,6 +58,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	{"com.apple.biomesyncd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.bluetoothd", GUAMP_SLIM_BT, 1},
 +	{"com.apple.corespotlightservice", GUAMP_SLIM_ALL | GUAMP_SLIM_SPOTLIGHT, 1},
++	{"com.apple.fairplayd.A2", GUAMP_SLIM_NOW | GUAMP_SLIM_FAIRPLAY, 1},
 +	{"com.apple.iconservices.iconservicesagent", GUAMP_SLIM_ALL, 0},
 +	{"com.apple.identityservicesd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.itunescloudd", GUAMP_SLIM_ALL, 1},
@@ -386,6 +391,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	PE_parse_boot_argn("guamp-slim-legacy", &guamp_slim_legacy, sizeof(guamp_slim_legacy));
 +	PE_parse_boot_argn("guamp-slim-spotlight", &guamp_slim_spotlight, sizeof(guamp_slim_spotlight));
 +	PE_parse_boot_argn("guamp-slim-media", &guamp_slim_media, sizeof(guamp_slim_media));
++	unsigned int guamp_slim_fairplay = 0;	/* 29/10: 1 leaves fairplayd.A2 enabled */
++	PE_parse_boot_argn("guamp-slim-fairplay", &guamp_slim_fairplay, sizeof(guamp_slim_fairplay));
 +	unsigned int guamp_kb_prefs = 1;	/* default 1 (28/10): guamp-kb-prefs=0 leaves /private/var/preferences/.GlobalPreferences.plist as is */
 +	PE_parse_boot_argn("guamp-kb-prefs", &guamp_kb_prefs, sizeof(guamp_kb_prefs));
 +	for (size_t i = 0; i < sizeof(native_guamp_setup_files) / sizeof(native_guamp_setup_files[0]); i++) {
@@ -398,15 +405,16 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		if (guamp_slim && data == native_guamp_disabled) {
 +			int list = guamp_slim == 2 ? GUAMP_SLIM_BT : guamp_slim_legacy == 1 ? GUAMP_SLIM_LEGACY : GUAMP_SLIM_NOW;
 +			int skip = list == GUAMP_SLIM_NOW ? (guamp_slim_spotlight == 1 ? GUAMP_SLIM_SPOTLIGHT : 0) |
-+			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) : 0;
++			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) | (guamp_slim_fairplay == 1 ? GUAMP_SLIM_FAIRPLAY : 0) : 0;
 +			size_t built = native_guamp_slim_build(list, skip);
 +			if (built) {
 +				data = (const uint8_t *)native_guamp_slim_plist;
 +				size = built;
 +			}
-+			printf("guamp-slim=%u: launchd disabled list with %s (%s, spotlight %s, media %s, %zu bytes)\n", guamp_slim,
++			printf("guamp-slim=%u: launchd disabled list with %s (%s, spotlight %s, media %s, fairplayd %s, %zu bytes)\n", guamp_slim,
 +			    guamp_slim == 2 ? "services + bluetoothd" : "services", list == GUAMP_SLIM_NOW ? "29/10 list" : "27/10 list",
-+			    (skip & GUAMP_SLIM_SPOTLIGHT) ? "on" : "off", (skip & GUAMP_SLIM_MEDIA) ? "on" : "off", built);
++			    (skip & GUAMP_SLIM_SPOTLIGHT) ? "on" : "off", (skip & GUAMP_SLIM_MEDIA) ? "on" : "off",
++			    (list == GUAMP_SLIM_NOW && !(skip & GUAMP_SLIM_FAIRPLAY)) ? "off" : "on", built);
 +		}
 +		if (guamp_migration_rerun == 1 && strcmp(native_guamp_setup_files[i].path, "/private/var/mobile/Library/Preferences/com.apple.migration.plist") == 0) {
 +			int32_t result = 0;
@@ -481,7 +489,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8456,7 @@
+@@ -7983,6 +8464,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
