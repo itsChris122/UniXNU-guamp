@@ -244,8 +244,6 @@ static void testRxMacro() {
   Board b;
   setup(b);
   gah_ops o = makeOps(false);
-  gah_fsgen(&o, 1);
-  CHECK(b.cdc[0x3000] == 1 && b.cdc[0x3004] == 1 && b.cdc[0x3080] == 2);
   b.cdc[RXM_FS_CNT_CONTROL] = 0x02;
   gah_rxm_mclk(&o, 1);
   CHECK(b.cdc[RXM_MCLK_CONTROL] == 0x03 && b.cdc[RXM_FS_CNT_CONTROL] == 0x01);
@@ -266,24 +264,14 @@ static void testRxMacro() {
   CHECK(b.cdc[0x1440] == 0 && b.cdc[0x140c] == 0 && b.cdc[RXM_CLSH_CRC] == 0 && b.cdc[0x1408] == 0x01);
   gah_rxm_mclk(&o, 0);
   CHECK(b.cdc[RXM_MCLK_CONTROL] == 0 && b.cdc[RXM_FS_CNT_CONTROL] == 0x02);
-  gah_fsgen(&o, 0);
-  CHECK(b.cdc[0x3000] == 0 && b.cdc[0x3004] == 0 && b.cdc[0x3080] == 0);
 }
 
 static void testWcd() {
   Board b;
   setup(b);
   gah_ops none = makeOps(false);
-  CHECK(gah_wcd_init(&none) == GAH_ERR_NOTSUP && b.gpio.empty());
-  CHECK(gah_wcd_hph(&none, 1, 4) == GAH_ERR_NOTSUP);
-  gah_ops o = makeOps(true);
-  b.wcd[WCD_EFUSE_16] = 0x02;
-  b.wcd[WCD_EFUSE_29] = 0x0a;
-  CHECK(gah_wcd_init(&o) == 0);
-  CHECK(b.gpio.size() == 2 && b.gpio[0] == std::make_pair(92u, 0) && b.gpio[1] == std::make_pair(92u, 1));
-  CHECK(b.wcd[WCD_SLEEP_CTL] == (0x80 | 0x40 | (0x0a & 0x0e)));
-  CHECK(b.wcd[WCD_ANA_BIAS] == 0x80 && b.wcd[WCD_HPH_SURGE_EN] == 0xd9 && b.wcd[WCD_MICB2_TEST_CTL_1] == 0xfa);
-  CHECK(b.wcd[WCD_BIAS_VBG_FINE_ADJ] == 0xb0 && b.wcd[WCD_RDAC_GAIN_CTL] == 0x50 && b.wcd[WCD_RDAC_HD2_CTL_L] == 0x04);
+  CHECK(gah_wcd_hph(&none, 1, 4) == GAH_ERR_NOTSUP && b.gpio.empty());
+  gah_ops o = makeOps(true);   // init_reg + reset now live in GuampMicCodec.inc / guamp_wcd937x_power (mic_capture_host)
   CHECK(gah_wcd_hph(&o, 1, gah_wcd_gain_code(-600)) == 0);
   CHECK(b.wcd[WCD_ANA_HPH] == 0x30 && b.wcd[WCD_HPH_L_EN] == 0x24 && b.wcd[WCD_HPH_R_EN] == 0x24);
   CHECK(b.wcd[WCD_DIG_ANA_CLK_CTL] == 0x03 && b.wcd[WCD_DIG_DIG_CLK_CTL] == 0x0b && b.wcd[WCD_ANA_RX_SUPPLIES] == 0x03);

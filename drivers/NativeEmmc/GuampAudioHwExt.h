@@ -31,9 +31,7 @@ int guamp_audio_hw_get_state(uint32_t route, struct guamp_audio_hw_state *st);
 typedef int (*guamp_audio_lpass_clock_fn)(uint32_t clk_id, uint32_t hz, int on);
 void guamp_audio_hw_set_lpass_clock_hook(guamp_audio_lpass_clock_fn fn);
 
-// Shared bolero FS generator (fs-gen-sequence, VA macro registers 0x0a730000 +0x0/+0x4/+0x80), reference counted
-// between the RX path (this module) and the TX/VA capture path. Caller must already have the VA/RX macro clocks.
-int guamp_audio_hw_bolero_fsgen(int on);
+// The shared bolero FS generator is guamp_bolero_fsgen (GuampAudioMicHw.h, one refcounted owner in GuampMicDev.inc).
 
 #ifdef __cplusplus
 }

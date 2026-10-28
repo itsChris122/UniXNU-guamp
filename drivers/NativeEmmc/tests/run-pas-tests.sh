@@ -31,5 +31,8 @@ g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/adsp_ipc_host.cpp" -o "$WOR
 echo "== audio PCM side (GuampAudioRing.inc, GuampAsm.inc builders + PcmPath, AfeTone hold mode) (clang + ASan/UBSan, gcc)"
 clang++ ${FLAGS/-O2/-O1} -g -fsanitize=address,undefined -fno-omit-frame-pointer "$HERE/audio_pcm_host.cpp" -o "$WORK/pcm"   && "$WORK/pcm" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/audio_pcm_host.cpp" -o "$WORK/pcm_gcc" && "$WORK/pcm_gcc" >/dev/null || rc=1
+echo "== microphone (guamp_mic_dev.h ABI, GuampMicRing.inc, GuampMicCodec.inc on a simulated LPASS/SoundWire/wcd937x, apr::MicPath on a simulated ADSP) (clang + ASan/UBSan, gcc)"
+clang++ ${FLAGS/-O2/-O1} -g -fsanitize=address,undefined -fno-omit-frame-pointer "$HERE/mic_capture_host.cpp" -o "$WORK/mic" && "$WORK/mic" || rc=1
+g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/mic_capture_host.cpp" -o "$WORK/mic_gcc" && "$WORK/mic_gcc" >/dev/null || rc=1
 echo "== result: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc

@@ -308,13 +308,7 @@ static inline void gah_cdc_bits(const struct gah_ops *o, uint32_t reg, uint32_t 
     o->cdc_wr(o->ctx, reg, (v & ~mask) | (val & mask));
 }
 
-// bolero_clk_rsc_fs_gen_request: on = update_bits(reg, mask, mask) in order, off = (reg, mask, 0) in reverse order.
-static inline void gah_fsgen(const struct gah_ops *o, int on) {
-    static const uint32_t seq[3][2] = {{VAM_MCLK_CONTROL, 1}, {VAM_FS_CNT_CONTROL, 1}, {VAM_TOP_CSR_TOP_CFG0, 2}};
-    if (on) for (int i = 0; i < 3; i++) gah_cdc_bits(o, seq[i][0], seq[i][1], seq[i][1]);
-    else for (int i = 2; i >= 0; i--) gah_cdc_bits(o, seq[i][0], seq[i][1], 0);
-    gah_note(o, on ? "bolero fs-gen on (0x3000/0x3004/0x3080)" : "bolero fs-gen off", 0, 0, 0);
-}
+// bolero fs-gen: not here, one refcounted owner for RX and TX = guamp_bolero_fsgen (GuampMicDev.inc, guampmic::Codec::fsGen).
 
 // rx_macro_mclk_enable after the clock request (rx core/npl running): MCLK on, FS counter on; plus rx_macro_reg_init
 // (written by Linux at probe into the register cache and synced here). Off: the reverse.
@@ -403,44 +397,8 @@ static inline uint8_t gah_wcd_get(const struct gah_ops *o, uint16_t reg) {
     return v;
 }
 
-// wcd937x_reset + wcd937x_init_reg.
-static inline int gah_wcd_init(const struct gah_ops *o) {
-    if (!o->wcd_rd || !o->wcd_wr) { gah_note(o, "wcd937x: no SoundWire master (rx_swr 0x0a610000) yet", GAH_ERR_NOTSUP, 0, 0); return GAH_ERR_NOTSUP; }
-    o->gpio_out(o->ctx, GAH_GPIO_WCD_RESET, 0);
-    o->delay_us(o->ctx, 20);
-    o->gpio_out(o->ctx, GAH_GPIO_WCD_RESET, 1);
-    o->delay_us(o->ctx, 20);
-    uint8_t e29 = gah_wcd_get(o, WCD_EFUSE_29) & 0x0f, e16 = gah_wcd_get(o, WCD_EFUSE_16), e17 = gah_wcd_get(o, WCD_EFUSE_17);
-    int r = gah_wcd_bits(o, WCD_SLEEP_CTL, 0x0e, (e16 == 0x02 || e17 > 0x09) ? e29 : 0x0e);
-    if (r) { gah_note(o, "wcd937x first register access", r, 0, 0); return r; }
-    gah_wcd_bits(o, WCD_SLEEP_CTL, 0x80, 0x80);
-    o->sleep_ms(o->ctx, 1);
-    gah_wcd_bits(o, WCD_SLEEP_CTL, 0x40, 0x40);
-    o->sleep_ms(o->ctx, 1);
-    gah_wcd_bits(o, WCD_LDORXTX_CONFIG, 0x10, 0x00);
-    gah_wcd_bits(o, WCD_BIAS_VBG_FINE_ADJ, 0xf0, 0x80);
-    gah_wcd_bits(o, WCD_ANA_BIAS, 0x80, 0x80);
-    gah_wcd_bits(o, WCD_ANA_BIAS, 0x40, 0x40);
-    o->sleep_ms(o->ctx, 10);
-    gah_wcd_bits(o, WCD_ANA_BIAS, 0x40, 0x00);
-    gah_wcd_bits(o, WCD_HPH_SURGE_EN, 0xff, 0xd9);
-    gah_wcd_bits(o, WCD_MICB1_TEST_CTL_1, 0xff, 0xfa);
-    gah_wcd_bits(o, WCD_MICB2_TEST_CTL_1, 0xff, 0xfa);
-    gah_wcd_bits(o, WCD_MICB3_TEST_CTL_1, 0xff, 0xfa);
-    gah_wcd_bits(o, WCD_MICB1_TEST_CTL_2, 0x38, 0x00);
-    gah_wcd_bits(o, WCD_MICB2_TEST_CTL_2, 0x38, 0x00);
-    gah_wcd_bits(o, WCD_MICB3_TEST_CTL_2, 0x38, 0x00);
-    if (e16 == 0x01) {
-        gah_wcd_bits(o, WCD_BIAS_VBG_FINE_ADJ, 0xf0, 0xb0);
-    } else if (e16 == 0x02) {
-        gah_wcd_bits(o, WCD_RDAC_HD2_CTL_L, 0x1f, 0x04);
-        gah_wcd_bits(o, WCD_RDAC_HD2_CTL_R, 0x1f, 0x04);
-        gah_wcd_bits(o, WCD_BIAS_VBG_FINE_ADJ, 0xf0, 0xb0);
-        gah_wcd_bits(o, WCD_RDAC_GAIN_CTL, 0xf0, 0x50);
-    }
-    gah_note(o, "wcd937x init_reg done (efuse16, efuse17)", 0, e16, e17);
-    return 0;
-}
+// wcd937x_reset + wcd937x_init_reg: not here. Reset/rails = guamp_wcd937x_power (GuampAudioHw.inc), init_reg =
+// guampmic::Codec::wcdSetup (GuampMicCodec.inc, run at every bring-up of the SoundWire link).
 
 // HPHL+HPHR, class AB, no compander: wcd937x_rx_clk_enable, hph{l,r}_dac_event PRE/POST_PMU, enable_hph{l,r}_pa
 // PRE/POST_PMU. Not modelled: the class-H FSM (wcd-clsh.c) and the SoundWire port/datapath enables.

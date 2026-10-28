@@ -1096,6 +1096,8 @@ static void usbProbe()
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
 #include "GuampAudioHw.inc"    // audio output HW (guamp-audio-hw=1|2): aw882xx speaker amp, LPI i2s1, RX macro; before GuampAdsp.inc
+#define GUAMP_AUDIO_SHM_PROVIDED 1  // guamp_audio_shm_get/put: GuampAudioPlay.inc (stream 0x1c1 buffer for the capture)
+#include "GuampMicDev.inc"     // microphone: /dev/guamp-mic + codec TX/VA/SoundWire/wcd937x + ASM read (guamp-audio-mic=1)
 #include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
 #include "GuampAsm.inc"        // q6asm/q6adm PCM chain (apr::Playback, guamp-adsp-ipc=5|6), after GuampAdsp.inc
 #include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
@@ -1246,6 +1248,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   audioplay::start(); // glue of the ADSP PCM chain (buffer/SMMU probe, ring hooks): before the guamp-adsp thread
   audiohw::start();   // guamp-audio-hw=1|2: speaker amplifier side of the ADSP tone/PCM path (=2: boot probe thread)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
+  micglue::configure();  // guamp-audio-mic=1: /dev/guamp-mic (null source until the ADSP capture runs)
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
 }
 

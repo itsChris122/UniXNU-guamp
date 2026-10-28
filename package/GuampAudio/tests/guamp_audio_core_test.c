@@ -3,6 +3,8 @@
 // guamp_audio_dev.h. Built and run by check-guamp-audio.sh with clang (ASan/UBSan) and gcc.
 #include "../GuampAudioCore.h"
 #include "../guamp_audio_dev.h"
+#include "../GuampMicCore.h"
+#include "../guamp_mic_dev.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -226,7 +228,23 @@ static void testAbi(void) {
   CHECK(GUAMP_FIFO_FRAMES && !(GUAMP_FIFO_FRAMES & (GUAMP_FIFO_FRAMES - 1)));
 }
 
+static void testMic(void) {
+  const int16_t in[4] = {0, 16384, -32768, 32767};
+  float out[8];
+  guamp_s16_to_f32_dup(in, out, 4, 2);
+  CHECK(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.5f && out[3] == 0.5f && out[4] == -1.0f && out[6] < 1.0f && out[7] > 0.999f);
+  guamp_s16_to_f32_dup(in, out, 4, 1);
+  CHECK(out[1] == 0.5f && out[2] == -1.0f);
+  CHECK(guamp_mic_excess(0, 512) == 0 && guamp_mic_excess(512 + GUAMP_MIC_KEEP_FRAMES, 512) == 0);
+  CHECK(guamp_mic_excess(16384, 512) == 16384 - 512 - GUAMP_MIC_KEEP_FRAMES);
+  CHECK(sizeof(struct guamp_mic_info) == 64 && sizeof(struct guamp_mic_position) == 24);
+  CHECK(GUAMP_MIC_IOC_INFO == 0x40404d01u && GUAMP_MIC_IOC_START == 0x20004d02u && GUAMP_MIC_IOC_STOP == 0x20004d03u);
+  CHECK(GUAMP_MIC_IOC_POSITION == 0x40184d04u && GUAMP_MIC_IOC_GAIN == 0x80044d05u && GUAMP_MIC_IOC_SET_MIC == 0x80044d06u);
+  CHECK(GUAMP_MIC_RATE == GUAMP_AUDIO_RATE && GUAMP_MIC_FRAME_BYTES == 2);
+}
+
 int main(void) {
+  testMic();
   testClock();
   testVolume();
   testConvert();

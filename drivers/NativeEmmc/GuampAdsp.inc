@@ -326,6 +326,10 @@ void start() {
   unsigned route = 0, bits = 0;
   if (PE_parse_boot_argn("guamp-adsp-route", &route, sizeof(route)) && route >= 1 && route <= 3) adspipc::gPcmRoute = route;
   if (PE_parse_boot_argn("guamp-adsp-pcm-bits", &bits, sizeof(bits)) && (bits == 16 || bits == 24)) adspipc::gPcmBits = bits;
+  if (micglue::configure() && mode == 1 && adspipc::gLevel < 3) {   // guamp-audio-mic=1 needs APR (level 3)
+    IOLog("GuampAdsp: guamp-audio-mic=1: ipc level %u raised to 3\n", adspipc::gLevel);
+    adspipc::gLevel = 3;
+  }
   unsigned toneMs = 0, toneGain = 0;
   if (PE_parse_boot_argn("guamp-adsp-tone", &toneMs, sizeof(toneMs)) && toneMs >= 100 && toneMs <= 20000)
     adspipc::gToneMs = toneMs;

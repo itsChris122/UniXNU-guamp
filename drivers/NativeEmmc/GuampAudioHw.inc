@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp audio output hardware, included by NativeEmmc.cpp BEFORE GuampAdsp.inc (it provides GuampAudioHw.h strongly,
 // so GuampAudioHwWeak.inc leaves its stand-ins out). Speaker: LPASS LPI i2s1 pins + Awinic aw882xx on QUP0 SE1 I2C
-// (0x34, reset gpio97). Headphone: bolero RX macro (needs the DSP clock hook) + wcd937x (needs a SoundWire master:
-// not written yet, the call says so). Sequences in GuampAudioHwCore.h, I2C in GeniI2cCpp.inc; this file owns MMIO,
-// GPIO, the lock and the "GuampAudioHw:" log lines (one per step).
+// (0x34, reset gpio97). Headphone: bolero RX macro (needs the DSP clock hook) + wcd937x. wcd937x registers (RX ones
+// too) are reached only through the VA SoundWire master of the capture side (guamp_wcd937x_read/write, GuampMicDev.inc);
+// the HPH audio itself also needs the RX SoundWire data port (rx_swr 0x0a610000): not written yet, the call says so.
+// This file also owns the wcd937x power (guamp_wcd937x_power: L9A + L14A RPM votes, reset gpio92, refcounted for the
+// RX and TX sides). The bolero fs-gen has one owner: guamp_bolero_fsgen (GuampMicDev.inc, refcounted).
+// Sequences in GuampAudioHwCore.h, I2C in GeniI2cCpp.inc; this file owns MMIO, GPIO, the lock and the "GuampAudioHw:"
+// log lines (one per step).
 // Boot arguments:
 //   guamp-audio-hw=0      default: every call answers GUAMP_AUDIO_HW_ABSENT (same as without this file)
 //   guamp-audio-hw=1      speaker path live for the DSP side (prepare/amp/volume/release)
@@ -13,11 +17,13 @@
 //   guamp-audio-hw-att=<dB>    attenuation at prepare (default 30 dB), guamp-audio-hw-floor=<dB> minimum attenuation
 //                              any volume call can reach (default 6 dB, 0 = full scale allowed)
 //   guamp-audio-hw-i2c=<kHz>   100, 400 (default, as Linux) or 1000
-//   guamp-audio-hw-rxm=1       headphone route: run the RX macro part even though wcd937x is unreachable (test of the
-//                              DSP clock hook and the RX macro registers)
+//   guamp-audio-hw-rxm=1       headphone route: run the RX macro part + wcd937x power/chip id read even though the RX
+//                              SoundWire data port is missing (test of the DSP clock hook and the RX macro registers)
 #define GUAMP_AUDIO_HW_PROVIDED 1
+#define GUAMP_WCD937X_POWER_PROVIDED 1   // guamp_wcd937x_power below; GuampMicDev.inc leaves its stand-in out
 #include "GuampAudioHw.h"
 #include "GuampAudioHwExt.h"
+#include "GuampAudioMicHw.h"
 #include "GuampAudioHwCore.h"
 #include "GuampTouchBoard.h"
 #include "GeniI2cCpp.inc"
@@ -33,8 +39,10 @@ bool gMuted = true, gHph;
 uint16_t gChip, gSysst;
 int32_t gLevelCb = INT32_MIN;   // last volume request; INT32_MIN = use guamp-audio-hw-att
 int32_t gLastRc;
-int gFsgen;
 guamp_audio_lpass_clock_fn gClock;
+IOLock *gWcdLock;               // guamp_wcd937x_power (allocated whatever guamp-audio-hw says: the mic side needs it)
+unsigned gWcdUsers;
+bool gWcdRails;
 
 uint32_t mrd(volatile uint8_t *b, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(b + off); }
 void mwr(volatile uint8_t *b, uint32_t off, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(b + off) = v; __asm__ volatile("dsb sy" ::: "memory"); }
@@ -89,7 +97,11 @@ uint32_t cdcRd(void *, uint32_t reg) { uint32_t o = 0; volatile uint8_t *b = cdc
 void cdcWr(void *, uint32_t reg, uint32_t v) { uint32_t o = 0; volatile uint8_t *b = cdcAt(reg, &o); if (b) mwr(b, o, v); }
 void sleepMs(void *, unsigned ms) { IOSleep(ms ? ms : 1); }
 
-gah_ops gOps = {nullptr, i2cW16, i2cR16, gpioOut, lpiRd, lpiWr, cdcRd, cdcWr, nullptr, nullptr, sleepMs, delayUs, note};
+// wcd937x registers: the one SoundWire access of the capture side (VA master, TX slave); -19 while that link is down
+int wcdRd(void *, uint16_t reg, uint8_t *v) { return guamp_wcd937x_read(reg, v); }
+int wcdWr(void *, uint16_t reg, uint8_t v) { return guamp_wcd937x_write(reg, v); }
+
+gah_ops gOps = {nullptr, i2cW16, i2cR16, gpioOut, lpiRd, lpiWr, cdcRd, cdcWr, wcdRd, wcdWr, sleepMs, delayUs, note};
 
 uint32_t floorCb() { return gFloorDb * 100u; }
 uint32_t attNowCb() { return gah_att_from_level(gLevelCb == INT32_MIN ? -static_cast<int32_t>(gAttDb * 100u) : gLevelCb, floorCb()); }
@@ -173,7 +185,7 @@ int speakerPrepare(const guamp_audio_hw_format *fmt) {
 
 int headphonePrepare() {
   if (!gRxm) {
-    note(nullptr, "headphone: wcd937x is reachable only over SoundWire (rx_swr 0x0a610000), not implemented", -95, 0, 0);
+    note(nullptr, "headphone: RX SoundWire data port (rx_swr 0x0a610000) not implemented yet, no HPH audio", -95, 0, 0);
     return -95;
   }
   if (!gClock) { note(nullptr, "headphone: no LPASS clock hook from the DSP side; RX macro left alone", GUAMP_AUDIO_HW_ABSENT, 0, 0); return GUAMP_AUDIO_HW_ABSENT; }
@@ -184,19 +196,26 @@ int headphonePrepare() {
   if (!gRxmMap) gRxmMap = mapPhysical(GAH_RXM_BASE, 0x1000);
   if (!gVamMap) gVamMap = mapPhysical(GAH_VAM_BASE, 0x1000);
   if (!gRxmMap || !gVamMap) { note(nullptr, "headphone: map rx/va macro", -12, 0, 0); return -12; }
-  if (gFsgen++ == 0) gah_fsgen(&gOps, 1);
+  guamp_bolero_fsgen(1);
   gah_rxm_mclk(&gOps, 1);
   const int32_t lvl = -static_cast<int32_t>(attNowCb());
   gah_rxm_hph(&gOps, 1, lvl / 100);
   gHph = true;
-  return gah_wcd_init(&gOps);   // -95 until a SoundWire master exists; the RX macro stays on until release
+  const int p = guamp_wcd937x_power(1);
+  uint8_t id = 0;
+  const int rd = p ? p : guamp_wcd937x_read(0x3401 /* CHIP_ID0 */, &id);
+  note(nullptr, "headphone: wcd937x power + chip id over the VA SoundWire (-19: capture link down)", rd, id, static_cast<uint32_t>(p));
+  // the RX macro stays on until release; HPH PA (gah_wcd_hph) waits for the RX SoundWire data port
+  note(nullptr, "headphone: RX SoundWire data port (rx_swr 0x0a610000) not implemented yet, no HPH audio", GAH_ERR_NOTSUP, 0, 0);
+  return GAH_ERR_NOTSUP;
 }
 
 void headphoneRelease() {
   if (!gHph) return;
   gah_rxm_hph(&gOps, 0, 0);
   gah_rxm_mclk(&gOps, 0);
-  if (gFsgen > 0 && --gFsgen == 0) gah_fsgen(&gOps, 0);
+  guamp_bolero_fsgen(0);
+  guamp_wcd937x_power(0);
   if (gClock) { gClock(GAH_LPASS_CLK_RX_NPL, GAH_LPASS_CLK_RX_HZ, 0); gClock(GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_HZ, 0); }
   gHph = false;
   note(nullptr, "headphone: released", 0, 0, 0);
@@ -215,6 +234,7 @@ void probeThread(void *, wait_result_t) {
 }
 
 void start() {
+  gWcdLock = IOLockAlloc();
   PE_parse_boot_argn("guamp-audio-hw", &gMode, sizeof(gMode));
   if (!gMode) return;
   PE_parse_boot_argn("guamp-audio-hw-att", &gAttDb, sizeof(gAttDb));
@@ -328,16 +348,41 @@ extern "C" int guamp_audio_hw_get_state(uint32_t route, struct guamp_audio_hw_st
 
 extern "C" void guamp_audio_hw_set_lpass_clock_hook(guamp_audio_lpass_clock_fn fn) { audiohw::gClock = fn; }
 
-extern "C" int guamp_audio_hw_bolero_fsgen(int on) {
+// wcd937x power (wcd937x.c probe + wcd937x_reset, guamp DT): cdc-vdd-rxtx/vddpx = L9A 1.8 V (static), cdc-vdd-buck =
+// L14A 1.8 V, one RPM vote each (active set, swen 1, as BtService.inc votes its rails; never voted off: L9A is the panel
+// VDDIO too), then reset gpio92 sleep -> 20 us -> active -> 20 us. Refcounted: only the first user resets the codec,
+// the last one puts it back in reset (SoundWire slave detached; the next user enumerates again).
+extern "C" int guamp_wcd937x_power(int on) {
   using namespace audiohw;
-  if (!gMode || !gLock) return GUAMP_AUDIO_HW_ABSENT;
-  IOLockLock(gLock);
-  if (!gVamMap) gVamMap = mapPhysical(GAH_VAM_BASE, 0x1000);
-  int r = gVamMap ? 0 : -12;
-  if (!r) {
-    if (on) { if (gFsgen++ == 0) gah_fsgen(&gOps, 1); }
-    else if (gFsgen > 0 && --gFsgen == 0) gah_fsgen(&gOps, 0);
+  if (!gWcdLock) return GUAMP_AUDIO_HW_ABSENT;
+  IOLockLock(gWcdLock);
+  int r = 0;
+  if (!gTlmm) gTlmm = mapPhysical(GT_TLMM_WEST, GAH_TLMM_WEST_SIZE);
+  if (!gTlmm) {
+    r = -12;
+  } else if (on) {
+    if (gWcdUsers++ == 0) {
+      if (!gWcdRails) {
+        const rpm_kvp kv[2] = {{RPM_KEY_SWEN, 4, 1}, {RPM_KEY_UV, 4, 1800000}};
+        const int l9 = rpm::request(RPM_SET_ACTIVE, RPM_RES_LDOA, 9, kv, 2, 500);
+        const int l14 = rpm::request(RPM_SET_ACTIVE, RPM_RES_LDOA, 14, kv, 2, 500);
+        IOLog("GuampAudioHw: wcd937x rails: rpm L9A %s, L14A %s (1.8 V, swen 1)\n", rpm_err_name(l9), rpm_err_name(l14));
+        gWcdRails = !l9 && !l14;
+        if (!gWcdRails) r = l9 ? l9 : l14;   // logged; the reset is pulsed anyway (ABL may have left the rails on)
+      }
+      gpioOut(nullptr, GAH_GPIO_WCD_RESET, 0);
+      IODelay(20);
+      gpioOut(nullptr, GAH_GPIO_WCD_RESET, 1);
+      IODelay(20);
+      IOLog("GuampAudioHw: wcd937x power on: reset gpio92 low 20 us, high 20 us (rails rc %d)\n", r);
+      r = 0;
+    }
+  } else if (gWcdUsers && --gWcdUsers == 0) {
+    gpioOut(nullptr, GAH_GPIO_WCD_RESET, 0);
+    IOLog("GuampAudioHw: wcd937x power off: reset gpio92 low (rails left on)\n");
   }
-  IOLockUnlock(gLock);
+  const unsigned users = gWcdUsers;
+  IOLockUnlock(gWcdLock);
+  if (on && users > 1) IOLog("GuampAudioHw: wcd937x power: already on (%u users)\n", users);
   return r;
 }

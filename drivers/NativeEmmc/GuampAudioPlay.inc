@@ -13,10 +13,13 @@
 //   guamp-adsp-pcm-mem=1 physical address, msw 0 (forced, whatever the probe says)
 //   guamp-adsp-pcm-mem=2 physical address, msw 1 (forced)
 // Next step if the probe says "translate" or "fault": an own context bank for 0x1c1 (GuampSmmu.inc pattern) - not here.
+// The capture side (GuampMicDev.inc, ASM session 2, its own SHARED_MEM_MAP handle) gets a SECOND buffer of the same
+// kind through guamp_audio_shm_get() (GuampAudioMicHw.h): same SMMU decision and msw, separate memory, never freed.
 #ifndef GUAMP_AUDIO_PLAY_INC
 #define GUAMP_AUDIO_PLAY_INC
 #include "GuampAsm.inc"
 #include "GuampAudioDev.inc"
+#include "GuampAudioMicHw.h"
 #if __has_include("GuampAudioHwExt.h")   // the HW side (codex/audio-hw-20261029): its RX macro asks for LPASS clocks
 #include "GuampAudioHwExt.h"
 #define GUAMP_AUDIO_PLAY_CLOCK_HOOK 1
@@ -26,7 +29,9 @@ namespace audioplay {
 
 constexpr uint64_t kSmmuPhys = 0x0c600000;
 constexpr uint32_t kStream = 0x1c1, kBytes = apr::PcmPath::kSlots * apr::PcmPath::kSlotStride;
-IOBufferMemoryDescriptor *gBuf = nullptr;
+IOBufferMemoryDescriptor *gBuf = nullptr;      // playback (apr::Playback, session 1)
+IOBufferMemoryDescriptor *gCapBuf = nullptr;   // capture (apr::MicPath, session 2)
+uint32_t gCapBytes = 0;
 unsigned gMemMode = 0;
 
 apr::SmmuView probe() {
@@ -52,32 +57,36 @@ apr::SmmuView probe() {
   return v;
 }
 
-bool shm(apr::Shm *out) {
+// One ADSP-visible buffer: probe, msw decision, allocation (once per slot and boot), zeroed. who = log name.
+bool alloc(IOBufferMemoryDescriptor **slot, uint32_t bytes, const char *who, apr::Shm *out) {
   const apr::SmmuView v = probe();
   uint32_t msw = 1;
   if (gMemMode == 1) msw = 0;
   else if (gMemMode == 0 && !v.usable()) {
-    IOLog("GuampAudioPlay: stream %x is not in bypass (%s): no physical buffer for the ADSP; try guamp-adsp-pcm-mem=2 "
-          "(msw 1) or =1 (msw 0)\n", kStream, apr::smmuPathName(v.path));
+    IOLog("GuampAudioPlay: stream %x is not in bypass (%s): no physical %s buffer for the ADSP; try guamp-adsp-pcm-mem=2 "
+          "(msw 1) or =1 (msw 0)\n", kStream, apr::smmuPathName(v.path), who);
     return false;
   }
-  if (!gBuf)
-    gBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+  if (!*slot)
+    *slot = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous) |
-                         static_cast<IOOptionBits>(kIOMapInhibitCache), kBytes, 0xFFFFF000ULL);
-  uint8_t *cpu = gBuf ? static_cast<uint8_t *>(gBuf->getBytesNoCopy()) : nullptr;
-  const uint64_t phys = gBuf ? gBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) : 0;
-  if (!cpu || !phys || phys + kBytes > 0x100000000ULL || (phys & 0xfff)) {
-    IOLog("GuampAudioPlay: shared buffer allocation failed (phys %llx)\n", static_cast<unsigned long long>(phys));
+                         static_cast<IOOptionBits>(kIOMapInhibitCache), bytes, 0xFFFFF000ULL);
+  IOBufferMemoryDescriptor *buf = *slot;
+  uint8_t *cpu = buf ? static_cast<uint8_t *>(buf->getBytesNoCopy()) : nullptr;
+  const uint64_t phys = buf ? buf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) : 0;
+  if (!cpu || !phys || phys + bytes > 0x100000000ULL || (phys & 0xfff) || buf->getLength() < bytes) {
+    IOLog("GuampAudioPlay: %s buffer allocation failed (phys %llx)\n", who, static_cast<unsigned long long>(phys));
     return false;
   }
-  for (uint32_t i = 0; i < kBytes; i++) cpu[i] = 0;
-  *out = {cpu, static_cast<uint32_t>(phys), msw, kBytes};
-  IOLog("GuampAudioPlay: shared buffer phys %llx, %u bytes uncached, ADSP address msw %u lsw %x (mode %u: %s)\n",
-        static_cast<unsigned long long>(phys), kBytes, msw, static_cast<uint32_t>(phys), gMemMode,
+  for (uint32_t i = 0; i < bytes; i++) cpu[i] = 0;
+  *out = {cpu, static_cast<uint32_t>(phys), msw, bytes};
+  IOLog("GuampAudioPlay: %s buffer phys %llx, %u bytes uncached, ADSP address msw %u lsw %x (mode %u: %s)\n", who,
+        static_cast<unsigned long long>(phys), bytes, msw, static_cast<uint32_t>(phys), gMemMode,
         gMemMode ? "forced" : "probe says bypass");
   return true;
 }
+
+bool shm(apr::Shm *out) { return alloc(&gBuf, kBytes, "shared (playback)", out); }
 
 // The /dev/guamp-audio ring as the ADSP source (guamp-adsp-ipc=6)
 uint32_t source(void *, uint8_t *dst, uint32_t frames, uint32_t bits) {
@@ -121,4 +130,21 @@ void start() {
 }
 
 }  // namespace audioplay
+
+// GuampAudioMicHw.h: the capture's buffer (one per boot, at most 64 KiB, size fixed by the first call)
+extern "C" int guamp_audio_shm_get(uint32_t bytes, struct guamp_audio_shm *out) {
+  using namespace audioplay;
+  if (!out || !bytes || bytes > 0x10000) return -22;
+  bytes = (bytes + 0xfffu) & ~0xfffu;
+  if (gCapBuf && bytes > gCapBytes) return -22;
+  if (!gCapBuf) gCapBytes = bytes;
+  apr::Shm s;
+  if (!alloc(&gCapBuf, gCapBytes, "capture", &s)) return -12;
+  *out = {s.cpu, s.iovaLsw, s.msw, s.bytes};
+  return 0;
+}
+// Never freed: the ADSP may still hold the mapping (err-fatal, unanswered unmap); the next get reuses it.
+extern "C" void guamp_audio_shm_put(struct guamp_audio_shm *shm) {
+  if (shm) *shm = {};
+}
 #endif
