@@ -88,12 +88,11 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
   if(mode!=1 && mode!=2)return kQueried;
   if(!transport.discover()) {IOLog("%s: SCM convention unavailable; no RAM written\n",p.tag);return kErrScm;}
   IOLog("%s: SCM%u detected, PAS id %u, mode %u\n",p.tag,transport.wide?64u:32u,p.id,mode);
+  // PAS_IS_SUPPORTED is informational, as in Linux's remoteproc PAS driver (which never asks it): on guamp TrustZone answers 0
+  // for the modem (28/10). The firmware is still authenticated by TrustZone in INIT_IMAGE and AUTH_AND_RESET, whose refusal stops here.
   scm::Result supported=transport.supported(p.id);
-  if(supported.transport || !supported.value) {
-    IOLog("%s: PAS %u unsupported transport %d result %d; no RAM written\n",p.tag,p.id,supported.transport,
-          scm::code(supported.value));
-    return kErrScm;
-  }
+  IOLog("%s: PAS %u is-supported transport %d result %d (informational)\n",p.tag,p.id,supported.transport,
+        scm::code(supported.value));
   static const unsigned commands[]={1,2,5,6};
   for(unsigned command : commands) {
     scm::Result r=transport.available(2,command);
