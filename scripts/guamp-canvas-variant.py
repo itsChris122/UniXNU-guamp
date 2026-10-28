@@ -17,7 +17,7 @@ Without the two arguments nothing changes.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '842725ba8d271d0d4662464d017b6b9020ec177336ba810f6acc0c24ff81e75e'
+PATCHED_SHA256 = 'e8a045bb557aa03667d1981e6bb87182ed5b7ff3d60a1f98e286bf889e04b953'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -145,7 +145,7 @@ EDITS.append((r'''    bool gpuRetired=false;
     // The canvas arguments. Off unless the canvas is at least the panel and less than twice it each way (two taps cover at most a
     // 2:1 reduction); mode 1 also needs the provider to take both properties before any client opens the display.
     bool startCanvas(IOService *provider) {
-        uint32_t w=0,h=0;unsigned mode=1,filter=1;
+        uint32_t w=750,h=1666;unsigned mode=1,filter=1;   // default 375x833 pt (owner 28/10); guamp-canvas-width=0 disables
         PE_parse_boot_argn("guamp-canvas-width",&w,sizeof(w));
         PE_parse_boot_argn("guamp-canvas-height",&h,sizeof(h));
         PE_parse_boot_argn("guamp-canvas-mode",&mode,sizeof(mode));
@@ -277,9 +277,9 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
-        unsigned v=0;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;
+        unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
         v=1;PE_parse_boot_argn("guamp-fast-copy-flush",&v,sizeof v);fastFlush=v!=0;
-        v=0;PE_parse_boot_argn("guamp-map-cache",&v,sizeof v);mapCache=v==1;
+        v=1;PE_parse_boot_argn("guamp-map-cache",&v,sizeof v);mapCache=v==1;   // default on (owner 28/10)
         v=0;PE_parse_boot_argn("guamp-async-copy",&v,sizeof v);asyncMode=v<=2?v:0;
         PE_parse_boot_argn("guamp-copy-probe",&probeBudget,sizeof probeBudget);if(probeBudget>64)probeBudget=64;
         copyOptions=1;

@@ -301,7 +301,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	 * datamigrator runs the first-boot migrators once (SystemAppMigrator installs /var/staged_system_apps). */
 +	unsigned int guamp_migration_rerun = 0;
 +	PE_parse_boot_argn("guamp-migration-rerun", &guamp_migration_rerun, sizeof(guamp_migration_rerun));
-+	unsigned int guamp_slim = 0;
++	unsigned int guamp_slim = 1;	/* default 1 (owner 28/10): guamp-slim=0 restores the stock list */
 +	PE_parse_boot_argn("guamp-slim", &guamp_slim, sizeof(guamp_slim));
 +	for (size_t i = 0; i < sizeof(native_guamp_setup_files) / sizeof(native_guamp_setup_files[0]); i++) {
 +		const uint8_t *data = native_guamp_setup_files[i].data;

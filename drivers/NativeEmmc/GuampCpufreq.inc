@@ -28,7 +28,7 @@ static void wr(volatile uint8_t *b, uint32_t off, uint32_t v) {
 }
 
 void start() {
-  unsigned mode = 0, force[2] = {0xff, 0xff};
+  unsigned mode = 1, force[2] = {0xff, 0xff};   // default 1 (owner 28/10): highest regular state; guamp-cpufreq=0 to keep the boot state
   PE_parse_boot_argn("guamp-cpufreq", &mode, sizeof(mode));
   PE_parse_boot_argn("guamp-cpufreq-silver", &force[0], sizeof(force[0]));
   PE_parse_boot_argn("guamp-cpufreq-gold", &force[1], sizeof(force[1]));

@@ -461,7 +461,7 @@ void thread(void *, wait_result_t) {
     else {
       // guamp-gpu-freq=320|465: the core clock leaves XO before NativeAdreno starts the CP (no ring in flight while the
       // RCG switches; hw_init and the ME_INIT / MEM_WRITE fences then run at the new rate and check it).
-      unsigned freq = 0;
+      unsigned freq = 320;   // default 320 MHz (verified 28/10); guamp-gpu-freq=0 keeps XO
       PE_parse_boot_argn("guamp-gpu-freq", &freq, sizeof(freq));
       if (freq) gpug2::setFreq(gBase[GM_GPUCC], gBase[GM_GPU], freq);
       GuampAdrenoStart a = {gBase[GM_GPU], GM_GPU_SIZE, sqe, sqeBytes, adreno};

@@ -209,7 +209,7 @@ OSDefineMetaClassAndStructors(GuampBacklight, IOService)
 
 namespace backlight {
 void start() {
-  unsigned enabled = 0, control = 1, selfTest = 0;
+  unsigned enabled = 1, control = 1, selfTest = 0;   // default on (owner 28/10); guamp-backlight=0 to disable
   PE_parse_boot_argn("guamp-backlight", &enabled, sizeof(enabled));
   if (enabled != 1) return;
   PE_parse_boot_argn("guamp-backlight-control", &control, sizeof(control));

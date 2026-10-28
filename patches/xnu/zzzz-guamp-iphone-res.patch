@@ -32,8 +32,8 @@ index 2962759..a482dc3 100644
 +static int
 +native_guamp_iphone_res_enabled(void)
 +{
-+	uint32_t enabled = 0;
-+	return PE_parse_boot_argn("guamp-iphone-res", &enabled, sizeof(enabled)) && enabled == 1;
++	uint32_t enabled = 1;	/* default on (owner 28/10): guamp-iphone-res=0 disables */
++	return !PE_parse_boot_argn("guamp-iphone-res", &enabled, sizeof(enabled)) || enabled == 1;
 +}
 +/* The addon install creates directories only below /private/var/ngpu; a guamp Data volume does not have that one. */
 +static void

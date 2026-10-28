@@ -219,8 +219,8 @@ bool naContext(Session &s) {
   native_adreno_wc_enabled = 1;
   // The A610 is not IO-coherent: render targets the GPU writes are cleaned when mapped and left alone afterwards.
   native_adreno_written_imports_owned = 1;
-  // The BO pool, one contiguous block taken early. 4 GiB of RAM: 256 MiB by default (guamp-adreno-pool, 0 = scattered BOs only).
-  native_adreno_pool_mib = bootArg("guamp-adreno-pool", 256);
+  // The BO pool, one contiguous block taken early. 4 GiB of RAM: 0 by default: a 256 MiB pool left no contiguous room for the context (e00002bd on guamp); guamp-adreno-pool=<MiB>.
+  native_adreno_pool_mib = bootArg("guamp-adreno-pool", 0);
   const IOReturn ctx = NativeAdrenoGpuContextBringup(reinterpret_cast<volatile uint8_t *>(s.smmu.va), kSmmuBytes, 0, 2, 0, 0, 1, 1,
                                                      naProgress, &s.report);
   IOLog("GuampAdreno: context bringup %x (step %u, output bits %u)\n", ctx, gContextStep, s.report.output_bits);
