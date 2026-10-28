@@ -1095,6 +1095,7 @@ static void usbProbe()
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
+#include "GuampAudioHw.inc"    // audio output HW (guamp-audio-hw=1|2): aw882xx speaker amp, LPI i2s1, RX macro; before GuampAdsp.inc
 #include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
 #include "GuampAsm.inc"        // q6asm/q6adm PCM chain (apr::Playback, guamp-adsp-ipc=5|6), after GuampAdsp.inc
 #include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
@@ -1243,6 +1244,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
   camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
   audioplay::start(); // glue of the ADSP PCM chain (buffer/SMMU probe, ring hooks): before the guamp-adsp thread
+  audiohw::start();   // guamp-audio-hw=1|2: speaker amplifier side of the ADSP tone/PCM path (=2: boot probe thread)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
 }
