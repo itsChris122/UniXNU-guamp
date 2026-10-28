@@ -42,5 +42,7 @@ public:
   void release() const;
 };
 constexpr uint32_t kBlock = 512, kBounceBlocks = 128;
-struct Card { IOLock *gate; bool online; uint64_t capacity; bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out); };
+struct Host { bool flushCache(); };   // CMD6 FLUSH_CACHE (RMTFS eMMC write-through)
+struct Card { IOLock *gate; bool online; uint64_t capacity; Host host; bool readBlocks(uint64_t lba, uint32_t count, uint8_t *out);
+  bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in); };
 extern Card gCard;

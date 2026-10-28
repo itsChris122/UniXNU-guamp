@@ -515,3 +515,80 @@ extern "C" int guamp_wifi_firmware_file_read(const char *path,uint32_t at,uint8_
     return guampwifi::NotFound;
   return wifiprep::gFirmwareStore.read(path,at,out,bytes);
 }
+
+// RMTFS backing for the Wi-Fi runtime (GuampRmtfs.inc): the four modem EFS partitions only, by fixed index
+// (0 modemst1, 1 modemst2, 2 fsc, 3 fsg). Labels are resolved as linux-msm/rmtfs storage_open does: the plain
+// GPT label first, then label + "_" + active slot (guamp has fsg_a/fsg_b). Reads under the card gate in 64 KiB runs.
+// Writes reach eMMC only for modemst1/modemst2 and only with the boot argument guamp-rmtfs-write=1 (checked here
+// as well as in the runtime); each write is followed by CMD6 FLUSH_CACHE (rmtfs calls storage_sync after a write).
+namespace wifiprep {
+struct RmtfsWindow { uint64_t first, blocks; bool present; };
+RmtfsWindow gRmtfsWindows[4];
+static bool rmtfsRange(unsigned index, uint64_t offset, uint32_t bytes) {
+  if (index >= 4 || !gRmtfsWindows[index].present || !bytes || (offset % kBlock) || (bytes % kBlock)) return false;
+  const uint64_t first = offset / kBlock, count = bytes / kBlock, blocks = gRmtfsWindows[index].blocks;
+  return first < blocks && count <= blocks - first && gCard.online && gCard.gate;
+}
+}  // namespace wifiprep
+
+extern "C" int guamp_rmtfs_partition(unsigned index, const char *label, uint64_t *bytes) {
+  static const char *const names[4] = {"modemst1", "modemst2", "fsc", "fsg"};
+  if (index >= 4 || !label || !bytes || strcmp(label, names[index])) return guampwifi::Invalid;
+  if (!gCard.online || !gCard.gate) return guampwifi::NotReady;
+  auto &w = wifiprep::gRmtfsWindows[index];
+  w = {};
+  uint64_t attributes = 0;
+  char resolved[16] = {};
+  const size_t n = strlen(label);
+  if (n + 3 > sizeof(resolved)) return guampwifi::Range;
+  memcpy(resolved, label, n + 1);
+  bool found = wifiprep::findPartition(label, &w.first, &w.blocks, &attributes);
+  if (!found) {
+    resolved[n] = '_'; resolved[n + 1] = wifiprep::activeSlot(); resolved[n + 2] = 0;
+    found = wifiprep::findPartition(resolved, &w.first, &w.blocks, &attributes);
+  }
+  if (!found) { IOLog("GuampRmtfs: GPT partition %s not found\n", label); return guampwifi::NotFound; }
+  w.present = true;
+  *bytes = w.blocks * kBlock;
+  IOLog("GuampRmtfs: GPT %s -> %s, LBA %llu + %llu blocks (%llu KiB)\n", label, resolved, w.first, w.blocks,
+        w.blocks * kBlock / 1024);
+  return guampwifi::Ok;
+}
+extern "C" int guamp_rmtfs_partition_read(unsigned index, uint64_t offset, uint8_t *out, uint32_t bytes) {
+  if (!out || !wifiprep::rmtfsRange(index, offset, bytes)) return guampwifi::Range;
+  const auto &w = wifiprep::gRmtfsWindows[index];
+  for (uint32_t done = 0; done < bytes;) {
+    uint32_t count = (bytes - done) / kBlock;
+    if (count > kBounceBlocks) count = kBounceBlocks;
+    IOLockLock(gCard.gate);
+    const bool ok = gCard.online && gCard.readBlocks(w.first + (offset + done) / kBlock, count, out + done);
+    IOLockUnlock(gCard.gate);
+    if (!ok) { IOLog("GuampRmtfs: eMMC read error, partition %u offset %llu\n", index, offset + done); return guampwifi::Io; }
+    done += count * kBlock;
+  }
+  return guampwifi::Ok;
+}
+extern "C" int guamp_rmtfs_partition_write(unsigned index, uint64_t offset, const uint8_t *in, uint32_t bytes) {
+  unsigned enabled = 0;
+  if (!PE_parse_boot_argn("guamp-rmtfs-write", &enabled, sizeof(enabled)) || enabled != 1 || index >= 2)
+    return guampwifi::Unsupported;
+  if (!in || !wifiprep::rmtfsRange(index, offset, bytes)) return guampwifi::Range;
+  const auto &w = wifiprep::gRmtfsWindows[index];
+  bool ok = true;
+  for (uint32_t done = 0; ok && done < bytes;) {
+    uint32_t count = (bytes - done) / kBlock;
+    if (count > kBounceBlocks) count = kBounceBlocks;
+    IOLockLock(gCard.gate);
+    ok = gCard.online && gCard.writeBlocks(w.first + (offset + done) / kBlock, count, in + done);
+    IOLockUnlock(gCard.gate);
+    done += count * kBlock;
+  }
+  IOLockLock(gCard.gate);
+  const bool flushed = ok && gCard.online && gCard.host.flushCache();
+  IOLockUnlock(gCard.gate);
+  if (!ok || !flushed) {
+    IOLog("GuampRmtfs: eMMC WRITE %s, partition %u offset %llu bytes %u\n", ok ? "flush failed" : "error", index, offset, bytes);
+    return guampwifi::Io;
+  }
+  return guampwifi::Ok;
+}
