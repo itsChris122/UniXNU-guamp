@@ -1,7 +1,7 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7901,6 +7901,276 @@
+@@ -7901,6 +7901,336 @@
  	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
  	    point, native_guamp_audio_plugin_stage, native_guamp_audio_plugin_status);
  }
@@ -275,15 +275,76 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	printf("guamp-ls-rebuild: cycle %u: %u containers, %u deleted, status %d\n", cycle, n_containers,
 +	    native_guamp_ls_rebuild_deleted, error);
 +}
++/* guamp-home-reset=N (N > 0, owner request 29/10): one-shot Home Screen layout reset, like Settings > General > Transfer or
++ * Reset > Reset Home Screen Layout. Deletes only SpringBoard's icon layout files (the Data backup of 29/10 holds just
++ * IconState.plist; the other names are older/iPad layouts). SpringBoard then rebuilds its default layout at first start.
++ * Widgets (TodayViewArchive.plist), app switcher (RecentAppLayouts), wallpapers (PosterBoard) and preferences are left alone.
++ * Runs before launchd, so SpringBoard is not running. /private/var/db/guamp-home-reset-N.done marks cycle N as done.
++ * (zzzz-guamp-setup-skip's receipt-gated reset reads the same argument and changes nothing without its ADT receipt.) */
++uint32_t native_guamp_home_layout_cycle, native_guamp_home_layout_deleted;
++int native_guamp_home_layout_error;
++static void
++native_guamp_home_layout_reset(proc_t p, user_addr_t scratch)
++{
++	static const char *const files[] = {
++		"/private/var/mobile/Library/SpringBoard/IconState.plist",
++		"/private/var/mobile/Library/SpringBoard/IconState~ipad.plist",
++		"/private/var/mobile/Library/SpringBoard/DesiredIconState.plist",
++		"/private/var/mobile/Library/SpringBoard/IconSupportState.plist",
++	};
++	uint32_t cycle = 0;
++	if (!PE_parse_boot_argn("guamp-home-reset", &cycle, sizeof(cycle)) || !cycle) {
++		return;
++	}
++	native_guamp_home_layout_cycle = cycle;
++	vfs_context_t ctx = vfs_context_current();
++	char marker[96];
++	snprintf(marker, sizeof(marker), "/private/var/db/guamp-home-reset-%u.done", cycle);
++	vnode_t vp = NULLVP;
++	if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		printf("guamp-home-reset: cycle %u already done\n", cycle);
++		return;
++	}
++	int error = 0;
++	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		struct unlink_args request = {.path = scratch + 0xa00};
++		int32_t result = 0;
++		int unlink_error = copyout(files[i], request.path, strlen(files[i]) + 1);
++		if (!unlink_error) {
++			unlink_error = unlink(p, &request, &result);
++		}
++		if (unlink_error == ENOENT) {
++			continue;
++		}
++		if (!unlink_error) {
++			native_guamp_home_layout_deleted = native_guamp_home_layout_deleted + 1;
++		} else {
++			error = unlink_error;
++		}
++		printf("guamp-home-reset: %s status %d\n", files[i], unlink_error);
++	}
++	if (!error) {
++		(void)native_guamp_mkdir(p, scratch, "/private/var/db");
++		vp = NULLVP;
++		error = vnode_open(marker, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx);
++		if (!error) {
++			error = vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	native_guamp_home_layout_error = error;
++	printf("guamp-home-reset: cycle %u: %u deleted, status %d\n", cycle, native_guamp_home_layout_deleted, error);
++}
  static void
  native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -7921,6 +8191,8 @@
+@@ -7921,6 +8251,9 @@
  		native_guamp_iphone_res_mount(p, scratch);
  	}
  	native_guamp_bt_tool(p, scratch);	/* guamp-bt-tool=1 with sheng-gpu-addon=1 or guamp-iphone-res=1 */
 +	native_guamp_cryptex_os(p, scratch);	/* cryptex at /private/preboot/Cryptexes/OS, guamp-cryptex-os=0 skips */
 +	native_guamp_ls_rebuild(p, scratch);	/* guamp-ls-rebuild=N, one shot */
++	native_guamp_home_layout_reset(p, scratch);	/* guamp-home-reset=N, one shot */
  	if (audio_plugin) {
  		native_guamp_audio_plugin_mount(p, scratch);
  	}
