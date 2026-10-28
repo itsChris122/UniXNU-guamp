@@ -321,6 +321,11 @@ static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
   guampprof::setTargets(top.cpuPid, top.cpuName, 6);
 }
 extern char guamp_cpufreq_summary[2][160];   // GuampCpufreq.inc
+// zzy-native-gpu-addon-mount.patch (kern_exec.c, always in the series): GPU addon install below /private/var/ngpu and the union
+// mounts over /System/Library/Extensions (plugin), /System/Library/LaunchDaemons (adrenoprobed job) and the wallpaper.
+extern "C" volatile int native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed,
+    native_gpu_addon_error, native_gpu_addon_stage, native_gpu_addon_status, native_gpu_addon2_stage, native_gpu_addon2_status,
+    native_gpu_addon3_stage, native_gpu_addon3_status;
 
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
@@ -359,6 +364,11 @@ static void guampPerfSample() {
     if (cpufreqRound % 6 == 1)
       for (unsigned d = 0; d < 2; ++d)
         if (guamp_cpufreq_summary[d][0]) IOLog("GuampCpufreq: %s\n", guamp_cpufreq_summary[d]);
+    if (cpufreqRound % 6 == 1 && cpufreqRound < 20)
+      IOLog("GuampGpuAddon: files %d written %d same %d failed %d error %d; extensions stage %d status %d, launchdaemons stage %d "
+            "status %d, wallpaper stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same,
+            native_gpu_addon_failed, native_gpu_addon_error, native_gpu_addon_stage, native_gpu_addon_status, native_gpu_addon2_stage,
+            native_gpu_addon2_status, native_gpu_addon3_stage, native_gpu_addon3_status);
     if (guamp_gpu_step[2]) IOLog("GuampGpu: progress step %u reg %x seq %u\n", guamp_gpu_step[0], guamp_gpu_step[1], guamp_gpu_step[2]);
     // Per-core heartbeat: a core whose timer and IPI counts (ArmCpu) did not move over the sample is quiet; the debugger mask
     // marks cores that never answered a stackshot IPI. Printed while anything is wrong (first 3 times, then every minute).

@@ -594,7 +594,11 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
     if ((result = naPublish(s))) break;
     tested = naSelfTest();   // user IBs: the first submissions that do not come from this probe's ring
     IOLog("GuampAdreno: self test %s\n", tested ? "ok" : "FAILED (the stages go on)");
-    if (in->level >= 2) result = naAccelerator();
+    // The staged AGXAccelerator (IOAcceleratorES) makes every Metal client of the system (CoreImage in Settings > Screen Time,
+    // QuartzCore...) load the plugin; until the plugin is proven on guamp it is registered only with guamp-adreno-accel=1. The
+    // user clients of level 1 (NativeAdrenoGpuPublished, used by adrenoprobed and the self test) stay published either way.
+    if (in->level >= 2 && bootArg("guamp-adreno-accel", 0) == 1) result = naAccelerator();
+    else if (in->level >= 2) IOLog("GuampAdreno: accelerator not registered (guamp-adreno-accel=1 to register IOAcceleratorES)\n");
   } while (false);
   IOLog("GuampAdreno: RESULT %d (level %u, context step %u, irqs %u, idle sleeps %llu spins %llu)\n", result, in->level,
         gContextStep, gIrqCount, native_gpu_idle_sleeps, native_gpu_idle_spins);
