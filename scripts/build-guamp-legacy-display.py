@@ -237,6 +237,7 @@ archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 print(run(['python3',ROOT/'scripts/guamp-hid-variant.py'],text=True),end='')
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid_dir=ROOT/'build/native-hid-input'
+print(run(['python3',ROOT/'scripts/guamp-aks-variant.py'],text=True),end='')
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
 keyevents=ROOT/'build/native-keystore-events'
 keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
@@ -250,7 +251,7 @@ run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDispla
      hid_dir/'NativeHidInput.late.o',hid_dir/'hid-original-bindings.o'])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          keystore_source,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',hid_source,touch_source,
-         ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',ROOT/'scripts/guamp-canvas-variant.py']
+         ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',ROOT/'scripts/build-native-hid-input.py',ROOT/'scripts/guamp-canvas-variant.py',ROOT/'scripts/guamp-aks-variant.py']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

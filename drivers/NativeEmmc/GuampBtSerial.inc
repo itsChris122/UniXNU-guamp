@@ -21,6 +21,13 @@
 //                                 are skipped); thread context, takes the shim lock.
 //   btshim::start()               once, from the platform start path: boot-arg, allocation, device nodes.
 // Nothing here touches hardware; reset/power reach it only through the link the M1 driver attaches.
+//
+// Kernel controls (guamp-bt-ctl=1, with guamp-bt-shim=1; default off): iOS 17's BlueTool and bluetoothd open the UART
+// as PF_SYSTEM kernel controls "com.apple.uart.bluetooth" / "com.apple.uart.sk.bluetooth" (AppleOnboardSerialBSDClient
+// on Apple hardware), not as /dev/cu.bluetooth; protocol in GuampBtShim.h (bts_ctl_sockopt). Both names are
+// registered here with ctl_register and carry the same H4 stream as the tty; the tty and a control share the one
+// client slot (gOpen). Controller bytes reach the socket through pumpCtl (ctl_getenqueuespace, then ctl_enqueuedata),
+// again on ctl_rcvd once the client has read.
 #include "GuampBtShim.h"
 #ifndef GUAMP_BT_SERIAL_HOST_CHECK
 #include <sys/conf.h>
@@ -29,6 +36,8 @@
 #include <sys/errno.h>
 #include <sys/fcntl.h>
 #include <sys/vnode.h>
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
 #include <miscfs/devfs/devfs.h>
 #endif
 
@@ -41,9 +50,20 @@ struct selinfo gSel;
 bool gEnabled = false, gOpen = false;
 bool gCtl[3] = {};                 // btreset, btwake, btpoweroff currently open
 int gMajor = -1, gCtlMajor = -1;
-uint32_t gOpens = 0, gReads = 0, gWrites = 0;
+uint32_t gOpens = 0, gReads = 0, gWrites = 0, gIoctls = 0, gNodes = 0;
+uint32_t gCtlOpens[3] = {};        // btreset, btwake, btpoweroff opens (the periodic GuampBt line shows them)
 const char *const kTtyNames[2] = {"cu.bluetooth", "uart.bluetooth"};
 const char *const kCtlNames[3] = {"btreset", "btwake", "btpoweroff"};
+// Kernel controls: the connected client (gViaKctl, under gLock), registration refs, counters for the GuampBt line.
+const char *const kKctlNames[2] = {"com.apple.uart.bluetooth", "com.apple.uart.sk.bluetooth"};
+kern_ctl_ref gKctlRefs[2] = {};
+IOLock *gPumpLock = nullptr;        // one pumpCtl at a time: keeps the byte order toward the socket
+bool gViaKctl = false;
+kern_ctl_ref gKctlRef = nullptr;
+uint32_t gKctlUnit = 0, gKctlWhich = 0;
+uint32_t gKctlRegs = 0, gKctlConnects = 0, gKctlBusy = 0, gKctlSends = 0, gKctlOpts = 0, gKctlOptErrs = 0;
+uint32_t gKctlFull = 0, gKctlEnqErrs = 0;
+uint64_t gKctlTxBytes = 0, gKctlRxBytes = 0;
 
 int bsOpen(dev_t dev, int flags, int devtype, struct proc *p);
 int bsClose(dev_t dev, int flags, int devtype, struct proc *p);
@@ -140,6 +160,7 @@ int bsWrite(dev_t dev, struct uio *uio, int ioflag) {
 }
 
 int bsIoctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p) {
+  gIoctls = gIoctls + 1;
   IOLockLock(gLock);
   int flush = 0;
   const bts_ioctl_result r = bts_tty_ioctl(&gTty, static_cast<uint32_t>(cmd), reinterpret_cast<uint8_t *>(data),
@@ -185,6 +206,7 @@ int ctlOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   IOLockLock(gLock);
   if (gCtl[m]) { IOLockUnlock(gLock); return EBUSY; }
   gCtl[m] = true;
+  gCtlOpens[m] = gCtlOpens[m] + 1;
   IOLockUnlock(gLock);
   ctlCall(static_cast<unsigned>(m), true);
   return 0;
@@ -214,16 +236,20 @@ void attach(const bts_link *link) {
         link->power ? "yes" : "no", link->set_bdaddr ? "yes" : "no");
 }
 
+void pumpCtl();
+
 void controllerBytes(const uint8_t *data, size_t len) {
   if (!gEnabled || !len) return;
   IOLockLock(gLock);
   const size_t before = bts_shim_readable(gShim);
   bts_shim_ctrl_input(gShim, data, len);
   const bool more = gOpen && bts_shim_readable(gShim) > before;
+  const bool kctl = gViaKctl;
   if (!gOpen) bts_shim_flush_rx(gShim);   // nobody reads: do not let stale events greet the next open
-  if (more) IOLockWakeup(gLock, &gShim->rx, false);
+  if (more && !kctl) IOLockWakeup(gLock, &gShim->rx, false);
   IOLockUnlock(gLock);
-  if (more) selwakeup(&gSel);
+  if (more && kctl) pumpCtl();
+  else if (more) selwakeup(&gSel);
 }
 
 // The controller was reset or powered off (BtService.inc transport): forget a half-reassembled controller packet.
@@ -232,6 +258,160 @@ void controllerReset() {
   IOLockLock(gLock);
   bts_h4_reset(&gShim->ctrl);
   IOLockUnlock(gLock);
+}
+
+// ---- kernel controls com.apple.uart.bluetooth / com.apple.uart.sk.bluetooth (guamp-bt-ctl=1) ----------------------
+bool kctlMine(kern_ctl_ref ref, uint32_t unit) { return gViaKctl && gKctlRef == ref && gKctlUnit == unit; }
+
+// Controller bytes waiting in the shim FIFO go to the connected socket, no more than its receive buffer has room for;
+// the rest waits for ctl_rcvd (the client read) or the next controller bytes. Called without gLock (ctl_enqueuedata
+// takes the socket lock; the ctl callbacks run with it dropped and take gLock, so gLock is never held around it).
+void pumpCtl() {
+  uint8_t buf[1024];
+  IOLockLock(gPumpLock);
+  for (;;) {
+    IOLockLock(gLock);
+    const bool on = gViaKctl && bts_shim_readable(gShim) > 0;
+    kern_ctl_ref ref = gKctlRef;
+    const uint32_t unit = gKctlUnit;
+    IOLockUnlock(gLock);
+    if (!on) break;
+    size_t space = 0;
+    if (ctl_getenqueuespace(ref, unit, &space) != 0) break;   // unit gone: the disconnect callback follows
+    if (!space) { gKctlFull = gKctlFull + 1; break; }
+    IOLockLock(gLock);
+    const size_t n = kctlMine(ref, unit) ? bts_ctl_take(gShim, buf, sizeof buf, space) : 0;
+    IOLockUnlock(gLock);
+    if (!n) break;
+    if (ctl_enqueuedata(ref, unit, buf, n, 0) != 0) { gKctlEnqErrs = gKctlEnqErrs + 1; break; }
+    gKctlRxBytes = gKctlRxBytes + n;
+  }
+  IOLockUnlock(gPumpLock);
+}
+
+errno_t kctlConnect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo) {
+  const uint32_t which = ref == gKctlRefs[1] ? 1 : 0;
+  *unitinfo = nullptr;
+  IOLockLock(gLock);
+  if (gOpen) {   // one client: the tty or one control (BlueTool, then bluetoothd)
+    gKctlBusy = gKctlBusy + 1;
+    const bool tty = !gViaKctl;
+    IOLockUnlock(gLock);
+    IOLog("GuampBtShim: connect %s unit %u refused: %s already open\n", kKctlNames[which], sac->sc_unit,
+          tty ? "the tty" : kKctlNames[gKctlWhich]);
+    return EBUSY;
+  }
+  gOpen = true;
+  gViaKctl = true;
+  gKctlRef = ref;
+  gKctlUnit = sac->sc_unit;
+  gKctlWhich = which;
+  gKctlConnects = gKctlConnects + 1;
+  bts_tty_init(&gTty);
+  bts_shim_flush_rx(gShim);
+  bts_shim_flush_tx(gShim);
+  const bool linked = gShim->link.tx != nullptr;
+  IOLockUnlock(gLock);
+  IOLog("GuampBtShim: connect %s unit %u (%u), link %s\n", kKctlNames[which], sac->sc_unit, gKctlConnects,
+        linked ? "attached" : "NOT attached: commands fail");
+  return 0;
+}
+
+errno_t kctlDisconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo) {
+  IOLockLock(gLock);
+  const bool mine = kctlMine(ref, unit);
+  if (mine) { gViaKctl = false; gOpen = false; gKctlRef = nullptr; }
+  const bts_stats st = gShim->st;
+  const uint32_t baud = gShim->baud;
+  const uint64_t speed = gTty.speed;
+  IOLockUnlock(gLock);
+  if (mine)
+    IOLog("GuampBtShim: disconnect %s unit %u; host %u pkts (%u cmds, %u forwarded, %u emulated, %u tx errors), "
+          "controller %u pkts; socket %llu bytes in %llu out, %u full %u lost; baud %u, termios speed %llu\n",
+          kKctlNames[gKctlWhich], unit, st.hostPkts, st.hostCmds, st.forwarded, st.emulated, st.txErrors, st.ctrlPkts,
+          static_cast<unsigned long long>(gKctlTxBytes), static_cast<unsigned long long>(gKctlRxBytes), gKctlFull,
+          gKctlEnqErrs, baud, static_cast<unsigned long long>(speed));
+  return 0;
+}
+
+// write()/send() of the client: one record, possibly an mbuf chain; the H4 reassembly of the shim takes any split.
+errno_t kctlSend(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags) {
+  bool more = false;
+  IOLockLock(gLock);
+  const bool mine = kctlMine(ref, unit);
+  if (mine) {
+    gKctlSends = gKctlSends + 1;
+    for (mbuf_t n = m; n; n = mbuf_next(n)) {
+      const size_t len = mbuf_len(n);
+      if (!len) continue;
+      const size_t before = bts_shim_readable(gShim);
+      bts_shim_host_write(gShim, static_cast<const uint8_t *>(mbuf_data(n)), len);
+      gKctlTxBytes = gKctlTxBytes + len;
+      more = more || bts_shim_readable(gShim) > before;   // synthetic replies (vendor commands, tx errors)
+    }
+  }
+  IOLockUnlock(gLock);
+  mbuf_freem(m);   // the send callback owns the chain
+  if (more) pumpCtl();
+  return mine ? 0 : ENOTCONN;
+}
+
+errno_t kctlOption(kern_ctl_ref ref, uint32_t unit, int opt, bool set, void *data, size_t *len) {
+  const size_t given = len ? *len : 0;
+  IOLockLock(gLock);
+  if (!kctlMine(ref, unit)) { IOLockUnlock(gLock); return ENOTCONN; }
+  int flush = 0;
+  const bts_ctl_opt_result r = bts_ctl_sockopt(&gTty, static_cast<uint32_t>(opt), set, static_cast<uint8_t *>(data),
+                                               len, bts_shim_readable(gShim), &flush);
+  if (r == BTS_CTL_OPT_FLUSH) {
+    if (flush & 1) bts_shim_flush_rx(gShim);
+    if (flush & 2) bts_shim_flush_tx(gShim);
+  }
+  const bool refused = r == BTS_CTL_OPT_NOPROTO || r == BTS_CTL_OPT_INVAL;
+  gKctlOpts = gKctlOpts + 1;
+  if (refused) gKctlOptErrs = gKctlOptErrs + 1;
+  const uint32_t count = gKctlOpts;
+  const uint64_t speed = gTty.speed;
+  IOLockUnlock(gLock);
+  if (count <= 32 || refused) {   // the first 32 options since boot (BlueTool, then bluetoothd) and every refusal
+    const char *what = r == BTS_CTL_OPT_NOPROTO ? "ENOPROTOOPT" : r == BTS_CTL_OPT_INVAL ? "EINVAL" : "ok";
+    IOLog("GuampBtShim: %s %s %#x (%zu bytes): %s, speed %llu\n", kKctlNames[gKctlWhich],
+          set ? "setsockopt" : "getsockopt", static_cast<unsigned>(opt), given, what,
+          static_cast<unsigned long long>(speed));
+  }
+  return r == BTS_CTL_OPT_NOPROTO ? ENOPROTOOPT : r == BTS_CTL_OPT_INVAL ? EINVAL : 0;
+}
+
+errno_t kctlSetopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len) {
+  return kctlOption(ref, unit, opt, true, data, &len);
+}
+
+errno_t kctlGetopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len) {
+  return kctlOption(ref, unit, opt, false, data, len);
+}
+
+void kctlRcvd(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int flags) { pumpCtl(); }
+
+void registerCtls() {
+  gPumpLock = IOLockAlloc();
+  if (!gPumpLock) { IOLog("GuampBtShim: kernel control lock allocation failed\n"); return; }
+  for (unsigned i = 0; i < 2; i = i + 1) {
+    struct kern_ctl_reg reg;
+    bts_zero(&reg, sizeof reg);
+    strlcpy(reg.ctl_name, kKctlNames[i], sizeof reg.ctl_name);
+    reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM | CTL_FLAG_REG_EXTENDED;   // Apple's: SOCK_STREAM; EXTENDED for ctl_rcvd
+    reg.ctl_recvsize = 64 * 1024;
+    reg.ctl_connect = kctlConnect;
+    reg.ctl_disconnect = kctlDisconnect;
+    reg.ctl_send = kctlSend;
+    reg.ctl_setopt = kctlSetopt;
+    reg.ctl_getopt = kctlGetopt;
+    reg.ctl_rcvd = kctlRcvd;
+    const errno_t e = ctl_register(&reg, &gKctlRefs[i]);
+    if (!e) gKctlRegs = gKctlRegs + 1;
+    IOLog("GuampBtShim: kernel control %s id %u: %s %d\n", kKctlNames[i], reg.ctl_id,
+          e ? "ctl_register error" : "registered", e);
+  }
 }
 
 void start() {
@@ -254,7 +434,11 @@ void start() {
     nodes += devfs_make_node(makedev(gMajor, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", kTtyNames[m]) ? 1 : 0;
   for (int m = 0; m < 3; m = m + 1)
     nodes += devfs_make_node(makedev(gCtlMajor, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", kCtlNames[m]) ? 1 : 0;
-  gEnabled = nodes != 0;
+  gNodes = nodes;
+  unsigned ctl = 0;
+  PE_parse_boot_argn("guamp-bt-ctl", &ctl, sizeof(ctl));
+  if (ctl == 1) registerCtls();
+  gEnabled = nodes != 0 || gKctlRegs != 0;
   IOLog("GuampBtShim: tty major %d (kqueue %d), control major %d, %u/5 nodes; identity %s manufacturer %u subver "
         "%04x, fc01->fc14 %u (%u bytes state)\n", gMajor, kq, gCtlMajor, nodes, gShim->id.name,
         gShim->id.manufacturer, gShim->id.lmpSubver, gShim->id.translateBdaddr ? 1u : 0u,

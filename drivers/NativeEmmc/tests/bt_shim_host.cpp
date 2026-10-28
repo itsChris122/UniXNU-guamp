@@ -371,7 +371,96 @@ static void testReview() {
     CHECK(n == r.size() && !memcmp(out, r.data(), n));
 }
 
+// Kernel control (com.apple.uart.bluetooth): socket options as BlueTool 0x10001ecc4 and bluetoothd 0x1000ddaa8 issue
+// them, a write split over mbufs, and controller bytes leaving through a receive buffer of varying room.
+static void testCtl() {
+    bts_tty t; bts_tty_init(&t);
+    int flush = -1;
+    uint8_t tio[80]; size_t len = 72;
+    memset(tio, 0xee, sizeof tio);
+    CHECK(bts_ctl_sockopt(&t, 0x40487413, false, tio, &len, 0, &flush) == BTS_CTL_OPT_OK && len == 72);   // TIOCGETA
+    uint64_t v; memcpy(&v, tio + 64, 8); CHECK(v == 115200);
+    CHECK(tio[72] == 0xee);                                  // nothing past the 72-byte argument
+    // cfmakeraw + cfsetspeed(3000000) + c_iflag |= IGNPAR, c_cflag = CS8|CREAD|CLOCAL|CCTS_OFLOW|CRTS_IFLOW
+    v = 4; memcpy(tio, &v, 8); v = 0x38b00; memcpy(tio + 16, &v, 8);
+    v = 3000000; memcpy(tio + 56, &v, 8); memcpy(tio + 64, &v, 8);
+    uint8_t sent[72]; memcpy(sent, tio, 72);
+    len = 72;
+    CHECK(bts_ctl_sockopt(&t, 0x80487414, true, tio, &len, 0, &flush) == BTS_CTL_OPT_OK && t.speed == 3000000);
+    uint8_t back[72] = {}; len = sizeof back;
+    CHECK(bts_ctl_sockopt(&t, 0x40487413, false, back, &len, 0, &flush) == BTS_CTL_OPT_OK && !memcmp(back, sent, 72));
+    uint8_t t32[44]; len = 44;                               // 32-bit TIOCGETA also answered (the kext has both)
+    CHECK(bts_ctl_sockopt(&t, 0x402c7413, false, t32, &len, 0, &flush) == BTS_CTL_OPT_OK && len == 44);
+    // Length and direction checks.
+    len = 44;
+    CHECK(bts_ctl_sockopt(&t, 0x80487414, true, tio, &len, 0, &flush) == BTS_CTL_OPT_INVAL);
+    len = 16;
+    CHECK(bts_ctl_sockopt(&t, 0x40487413, false, back, &len, 0, &flush) == BTS_CTL_OPT_INVAL);
+    len = 72;
+    CHECK(bts_ctl_sockopt(&t, 0x80487414, false, back, &len, 0, &flush) == BTS_CTL_OPT_INVAL);   // get of a set
+    CHECK(bts_ctl_sockopt(&t, 0x40487413, true, tio, &len, 0, &flush) == BTS_CTL_OPT_INVAL);     // set of a get
+    CHECK(bts_ctl_sockopt(&t, 0x80487414, true, nullptr, &len, 0, &flush) == BTS_CTL_OPT_INVAL);
+    // bluetoothd's Skywalk options on com.apple.uart.sk.bluetooth: no nexus here.
+    uint8_t spec[12] = {0, 4, 0, 0, 0x3f, 0, 0, 0, 0x3f, 0, 0, 0}; len = 12;
+    CHECK(bts_ctl_sockopt(&t, 0x800c5414, true, spec, &len, 0, &flush) == BTS_CTL_OPT_NOPROTO);   // SETCHANNELSPEC
+    uint8_t uuid[16]; len = 16;
+    CHECK(bts_ctl_sockopt(&t, 0x40105412, false, uuid, &len, 0, &flush) == BTS_CTL_OPT_NOPROTO);  // GETCHANNELUUID
+    len = 4; uint8_t big[4] = {};
+    CHECK(bts_ctl_sockopt(&t, 0xc0ff7400, false, big, &len, 0, &flush) == BTS_CTL_OPT_NOPROTO);   // 0xff bytes
+    // Void and small options.
+    len = 0;
+    CHECK(bts_ctl_sockopt(&t, 0x2000745e, true, nullptr, &len, 0, &flush) == BTS_CTL_OPT_OK);     // TIOCDRAIN
+    uint8_t w[4] = {1, 0, 0, 0}; len = 4;
+    CHECK(bts_ctl_sockopt(&t, 0x80047410, true, w, &len, 0, &flush) == BTS_CTL_OPT_FLUSH && flush == 1);
+    uint8_t q[4] = {}; len = 4;
+    CHECK(bts_ctl_sockopt(&t, 0x4004667f, false, q, &len, 9, &flush) == BTS_CTL_OPT_OK && q[0] == 9);   // FIONREAD
+    uint8_t m[4] = {}; len = 4;
+    CHECK(bts_ctl_sockopt(&t, 0x4004746a, false, m, &len, 0, &flush) == BTS_CTL_OPT_OK && (m[0] & 0x20));  // CTS
+
+    // Framing: H4 written in mbuf-sized pieces reaches the controller as whole packets.
+    static bts_shim s;
+    Link l = {};
+    bts_link link = {&l, linkTx, linkAddr, nullptr, nullptr};
+    bts_shim_init(&s, &link, nullptr);
+    Bytes reset = pktCmd(0x0c03, {}), acl = pktAcl(7, 300), bdaddr = pktCmd(0xfc01, {1, 2, 3, 4, 5, 6});
+    Bytes host = reset;
+    host.insert(host.end(), acl.begin(), acl.end());
+    host.insert(host.end(), bdaddr.begin(), bdaddr.end());
+    const size_t cuts[] = {1, 2, 5, 256, 3, 1000};
+    size_t at = 0;
+    for (size_t i = 0; at < host.size(); i++) {
+        const size_t n = cuts[i % 6] < host.size() - at ? cuts[i % 6] : host.size() - at;
+        bts_shim_host_write(&s, host.data() + at, n);
+        at += n;
+    }
+    CHECK(l.sent.size() == 2 && l.sent[0] == reset && l.sent[1] == acl);
+    // The emulated "bcm -A" reply, then controller events, leave in pieces no bigger than the room the socket has.
+    Bytes want = cc(0xfc01, {0});
+    Bytes ev1 = cc(0x0c03, {0}), ev2 = pktEvt(0x13, {1, 7, 0, 1, 0});
+    Bytes ctrl = ev1;
+    ctrl.insert(ctrl.end(), ev2.begin(), ev2.end());
+    bts_shim_ctrl_input(&s, ctrl.data(), 3);
+    bts_shim_ctrl_input(&s, ctrl.data() + 3, ctrl.size() - 3);
+    want.insert(want.end(), ctrl.begin(), ctrl.end());
+    Bytes sock;
+    const size_t room[] = {0, 1, 3, 0, 2, 7, 64};
+    for (size_t i = 0; bts_shim_readable(&s) && i < 100; i++) {
+        uint8_t buf[16];
+        const size_t space = room[i % 7];
+        const size_t n = bts_ctl_take(&s, buf, sizeof buf, space);
+        CHECK(n <= space && n <= sizeof buf);
+        sock.insert(sock.end(), buf, buf + n);
+    }
+    CHECK(sock == want);
+    // The client (BlueTool uart_get_hci_event) reads type, 2-byte header, body: the same packets come back.
+    size_t p = 0;
+    unsigned events = 0;
+    while (p + 3 <= sock.size() && sock[p] == BTS_H4_EVT) { p += 3 + sock[p + 2]; events++; }
+    CHECK(p == sock.size() && events == 3);
+}
+
 int main() {
+    testCtl();
     testReassembly();
     testEncoders();
     testFifo();

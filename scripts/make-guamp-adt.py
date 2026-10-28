@@ -173,6 +173,16 @@ def main():
         # pmap_bootstrap() asserts /defaults; no suspend on this board
         # vmm-present (kern.hv_vmm_present): the original watchdogd exits normally in a VM without a watchdog service and
         # stops with SIGTRAP otherwise; it is a critical daemon, so the trap panicked the boot (UniXNU-qemu does the same)
+        # Side effect: bluetoothd reads kern.hv_vmm_present too (0x10037796c, 21H461) and then skips chip initialization (no
+        # BlueTool, nothing on /dev/cu.bluetooth); the Bluetooth ADT clears it for bluetoothd only with the text fixup
+        # bluetoothd,3779ac,e8079f1a,08008052 (cset w8, ne -> mov w8, #0), see analisi/bt/BLUETOOTH-RIPRESA-20261028.md.
+        # bluetoothd also picks its platform with MGIsDeviceOneOfType, which compares /product/product-id (20 bytes, read by
+        # libMobileGestalt from IODeviceTree:/product); without it MGGetProductType is -1, bluetoothd logs "Unknown platform
+        # 0x-1" and restarts. The Bluetooth ADT (cpu-config-8-bt4) carries the D22 product-id fd079b29...d8f0e7eb (iPhone X).
+        # bluetoothd's UART is the kernel control com.apple.uart.sk.bluetooth (0x1000ddaa8); for the sk name it moves the
+        # data to a Skywalk os_channel, which this kernel lacks. cpu-config-8-bt6 adds bluetoothd,ddd20,a0050034,1f2003d5
+        # (cbz w0 after the strcmp with the sk name -> nop): bluetoothd then uses the plain read()/write() path on the
+        # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc). 32 fixups, the max.
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the

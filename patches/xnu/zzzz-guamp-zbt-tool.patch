@@ -2,11 +2,11 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 3edb139..e03d4d7 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7542,6 +7542,65 @@ native_guamp_iphone_res_mount(proc_t p, user_addr_t scratch)
+@@ -7542,6 +7542,67 @@ native_guamp_iphone_res_mount(proc_t p, user_addr_t scratch)
  		    native_guamp_iphone_res_status[i]);
  	}
  }
-+/* guamp-bt-tool=1 (with guamp-iphone-res=1, after its views): BlueTool's override scripts for the Bluetooth shim. BlueTool runs
++/* guamp-bt-tool=1 (with sheng-gpu-addon=1 or guamp-iphone-res=1, after the iPhone views when present): BlueTool's override scripts for the Bluetooth shim. BlueTool runs
 + * /etc/bluetool/<HWModel>.<script>.script in place of its built-in Broadcom sequence when that file exists (strings "HW Model there
 + * is override script file %s", "/etc/bluetool/%s.%s.script"); this iPadOS has no /private/etc/bluetool. The kernel writes reduced
 + * boot/init/deepsleep scripts (no firmware download "bcm -W", no calibration "bcm -Q"; the WCN3950 is brought up by the kernel's
@@ -14,7 +14,9 @@ index 3edb139..e03d4d7 100644
 + * directory over the sealed /private/etc with the same read-only union bindfs view as the iPhone resources: /private/etc keeps every
 + * sealed name, only the new name bluetool comes from Data. HWModel is MobileGestalt's HWModelStr, the root compatible string
 + * (hw.model, "motorola,guamp" on this ADT); D22AP (target-type D22) and J120AP are written too. Never panics: failures are only
-+ * logged (stage 5 = mounted, /private/etc/hosts and a script both visible). */
++ * logged (stage 5 = mounted, /private/etc/hosts and a script both visible). BlueTool 21H461 reads the override scripts only on
++ * vendor or internal installs (runCommandForCurrentConfig 0x100016ed4, b.ne past the lookup): the Bluetooth ADT adds the text
++ * fixup BlueTool,16ed4,e1150054,1f2003d5 (that b.ne -> nop). */
 +static int native_guamp_write_file(proc_t p, user_addr_t scratch, const char *path, const uint8_t *data, size_t size, uid_t owner,
 +    int mode, int overwrite);
 +volatile int native_guamp_bt_tool_stage = 0;
@@ -68,11 +70,11 @@ index 3edb139..e03d4d7 100644
  /* guamp-cc-reset=N (N > 0, owner request): one-shot removal of Control Center's saved module layout, Data's
   * /private/var/mobile/Library/ControlCenter/ModuleConfiguration*.plist, so Control Center rebuilds it from its defaults (with
   * guamp-iphone-res=1 the iPhone ones). /private/var/db/guamp-cc-reset-N.done marks cycle N as done: the argument can stay set
-@@ -7693,6 +7752,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -7693,6 +7754,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	native_gpu_addon_install(p, scratch);
  	if (iphone_res) {
  		native_guamp_iphone_res_mount(p, scratch);
-+		native_guamp_bt_tool(p, scratch);
  	}
++	native_guamp_bt_tool(p, scratch);	/* guamp-bt-tool=1 with sheng-gpu-addon=1 or guamp-iphone-res=1 */
  	if (enabled != 1) {
  		return;
