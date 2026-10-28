@@ -17,8 +17,9 @@
 //                  ("ADSP PCM OK|FAILED"), 6 = sink of /dev/guamp-audio (needs guamp-audio-dev=1)
 //   guamp-adsp-route=1|2|3  with ipc 5: speaker (default, PRIMARY_MI2S_RX 0x1000) / earpiece / headphone (0xB030)
 //   guamp-adsp-pcm-bits=16|24  ASM stream width (default 16)
-//   guamp-adsp-pcm-mem=0|1|2  shared buffer address for the ADSP (GuampAudioPlay.inc): 0 auto (SMMU probe),
-//                  1 physical with msw 0, 2 physical with msw 1 (SID bits of msm_audio_ion)
+//   guamp-adsp-pcm-mem=0|1|2|3  shared buffer address for the ADSP (GuampAudioPlay.inc): 0 auto (physical if
+//                  stream 0x1c1 bypasses, else an own apps SMMU context bank), 1 physical with msw 0, 2 physical with
+//                  msw 1 (SID bits of msm_audio_ion), 3 always the context bank (IOVA 0x10000000.., msw 1)
 // Default: nothing runs. The original signed firmware is loaded unchanged; TrustZone authenticates it.
 // Facts (guamp device tree: decompiled ~/moto/guamp.dts = bengal.dtsi + guamp dtbo, guamp kernel sources):
 //   qcom,lpass@ab00000 (qcom,pil-tz-generic): qcom,pas-id 1, qcom,firmware-name "adsp", memory-region

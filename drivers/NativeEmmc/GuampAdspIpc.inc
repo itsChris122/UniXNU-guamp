@@ -77,6 +77,7 @@ constinit bool gToneStarted = false;
 // Levels 5/6: the playback chain; the kernel parts (buffer + SMMU probe, the /dev/guamp-audio ring) come through
 // gPlayGlue (GuampAudioPlay.inc registers them before adsp::start; a host test sets its own)
 struct PlayGlue {
+  void (*report)(const char *when) = nullptr;   // SMMU fault registers of the ADSP stream (logs only on change)
   bool (*shm)(apr::Shm *out) = nullptr;
   uint32_t (*source)(void *, uint8_t *dst, uint32_t frames, uint32_t bits) = nullptr;
   bool (*wanted)(void *, uint32_t *route) = nullptr;
@@ -424,6 +425,7 @@ void run() {
     }
     if (verdict && !playVerdict && (gPlay.finished() || gPlayNoShm || !gCore.stateAnswered)) {
       playVerdict = true;
+      if (gPlayGlue.report) gPlayGlue.report("at the PCM verdict");
       const apr::PcmPath &c = gPlay.pcm;
       if (!gPlayStarted)
         IOLog("GuampAdsp: ADSP PCM FAILED (%s)\n", gPlayNoShm ? "no shared buffer" : "no APR");
@@ -439,6 +441,11 @@ void run() {
       IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
     }
     // 8 x 10 ms periods in flight: poll faster while the ASM stream runs
+    static uint32_t lastReport = 0;
+    if (gPlayGlue.report && gPlayStarted && gPlay.active() && nowMs() - lastReport >= 1000) {
+      lastReport = nowMs();
+      gPlayGlue.report("while streaming");
+    }
     IOSleep(gPlayStarted && gPlay.active() ? 5 : kLoopMs);
   }
 }
