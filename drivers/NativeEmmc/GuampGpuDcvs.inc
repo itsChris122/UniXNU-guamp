@@ -51,9 +51,9 @@ bool none(void *) { return false; }
 const gp_ops kOps = {nullptr, corner, bus, gdsc, none, none};
 
 void logState(unsigned busy, unsigned switches, unsigned fails, const uint32_t *ms) {
-  IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 900:%u 820:%u 745:%u 600:%u 465:%u "
-        "320:%u xo:%u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails, busy * 100u / GP_GOV_WINDOW,
-        ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7]);
+  IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u "
+        "465:%u 320:%u xo:%u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails, busy * 100u / GP_GOV_WINDOW,
+        ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8]);
 }
 
 void thread(void *, wait_result_t) {
@@ -106,7 +106,7 @@ void thread(void *, wait_result_t) {
 // After NativeAdreno started with the core clock at mhz (gpug2::setFreq): checks the RCG really runs from PLL1 / 2,
 // reads the limits, takes the rails at the current level and starts the governor thread.
 void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
-  unsigned on = 1;   // default on (28/10); the speed-bin fuse caps the top level (900 MHz on the owner's phone)
+  unsigned on = 1;   // default on (28/10); the speed-bin fuse caps the top level (950 MHz on the owner's phone, bin 200)
   PE_parse_boot_argn("guamp-gpu-dcvs", &on, sizeof(on));
   if (on != 1) return;
   gCc = gpucc;

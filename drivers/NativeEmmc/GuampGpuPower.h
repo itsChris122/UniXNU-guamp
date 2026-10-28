@@ -105,9 +105,11 @@ struct gp_level {
   uint32_t mx;                // VDD_MX corner the PLL rate needs (PLL rate_max on vdd_mx)
   uint8_t bus, busMin, busMax;  // grp3d bus indices
 };
-// bengal-gpu.dtsi speed bin 0 (default), fastest first, plus the XO level kgsl does not list (our boot state).
+// bengal-gpu.dtsi speed bins 0 / 206 plus the 950 MHz top of bin 200 (phone DT pwrlevels-2: CX TURBO_L1 opp-950000000,
+// bus 11/10/11), fastest first, plus the XO level kgsl does not list (our boot state).
 static constexpr gp_level kGpLevels[] = {
     {980, GP_PLL0, 1960, GP_RPM_TURBO_L1, GP_RPM_NOM, 11, 10, 11},
+    {950, GP_PLL0, 1900, GP_RPM_TURBO_L1, GP_RPM_NOM, 11, 10, 11},   // speed bin 200 only
     {900, GP_PLL0, 1800, GP_RPM_TURBO, GP_RPM_NOM, 11, 10, 11},
     {820, GP_PLL0, 1640, GP_RPM_NOM_L1, GP_RPM_NOM, 10, 10, 11},
     {745, GP_PLL0, 1490, GP_RPM_NOM, GP_RPM_NOM, 9, 8, 10},
@@ -117,17 +119,17 @@ static constexpr gp_level kGpLevels[] = {
     {19, GP_PLL_XO, 19, GP_RPM_LOW_SVS, GP_RPM_MIN_SVS, 1, 0, 3},   // 19.2 MHz, not a kgsl level
 };
 #define GP_NLEVELS (sizeof(kGpLevels) / sizeof(kGpLevels[0]))
-#define GP_LEVEL_320 6u   // qcom,initial-pwrlevel
-#define GP_LEVEL_XO 7u
+#define GP_LEVEL_320 7u   // qcom,initial-pwrlevel
+#define GP_LEVEL_XO 8u
 
-// Fastest allowed level for a fused speed bin (FMAX / 4.8 MHz + 2, bengal-gpu.dtsi): 0 / 206 -> 980 MHz, 200 -> 950
-// (not in our PLL0 table: capped at 900), 157 -> 745, 127 -> 600; an unknown bin gets 600 MHz.
+// Fastest allowed level for a fused speed bin (qcom,gpu-pwrlevel-bins of the phone DT): 0 / 206 -> 980 MHz, 200 -> 950,
+// 157 -> 745, 127 -> 600; an unknown bin gets 600 MHz.
 static inline unsigned gp_bin_top(uint32_t speedBin) {
   switch (speedBin) {
     case 0: case 206: return 0;
     case 200: return 1;
-    case 157: return 3;
-    default: return 4;
+    case 157: return 4;
+    default: return 5;
   }
 }
 static inline uint32_t gp_bus_bimc_khz(unsigned busIdx) {
@@ -238,7 +240,7 @@ static inline const char *gp_err_name(int e) {
 
 struct gp_state {
   unsigned level = GP_LEVEL_XO;   // current level index into kGpLevels
-  unsigned top = 4;               // fastest allowed (gp_bin_top)
+  unsigned top = 5;               // fastest allowed (gp_bin_top), 600 MHz
   unsigned bottom = GP_LEVEL_320; // slowest DCVS level (XO only on request)
   uint32_t cx = 0, mx = 0, busKhz = 0;   // votes currently held
   gp_pll_id pllOn = GP_PLL_XO;    // PLL currently feeding the RCG

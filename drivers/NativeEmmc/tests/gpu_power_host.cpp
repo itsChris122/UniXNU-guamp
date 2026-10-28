@@ -122,6 +122,8 @@ static void testLalpha() {
   CHECK(a.l == 48 && a.alpha == 0 && a.alphaHi == 0x70);
   a = gp_pll_lalpha(1200000000ull);
   CHECK(a.l == 0x3e && a.alpha == 0 && a.alphaHi == 0x80);   // gpu_cc_pll0_config
+  a = gp_pll_lalpha(1900000000ull);   // 950 MHz level: L 98, alpha ceil(18.4 / 19.2 * 2^32) << 8
+  CHECK(a.l == 98 && a.alpha == 0x55555600u && a.alphaHi == 0xf5);
   a = gp_pll_lalpha(1920000000ull);
   CHECK(a.l == 100 && a.alpha == 0 && a.alphaHi == 0);
   for (const gp_level &l : kGpLevels) {
@@ -139,8 +141,8 @@ static void testLalpha() {
   CHECK((c.userVal & (3u << 20)) == 0 && (c.userVal & 7u) == 7u && (c.userVal & (1u << 24)));
   c = gp_pll_cfg(GP_PLL1, 640000000ull);
   CHECK((c.userVal & (3u << 20)) == (2u << 20) && (c.userVal & 3u) == 3u);
-  CHECK(gp_bin_top(0) == 0 && gp_bin_top(206) == 0 && gp_bin_top(200) == 1 && gp_bin_top(157) == 3 && gp_bin_top(127) == 4);
-  CHECK(gp_bin_top(77) == 4);
+  CHECK(gp_bin_top(0) == 0 && gp_bin_top(206) == 0 && gp_bin_top(200) == 1 && gp_bin_top(157) == 4 && gp_bin_top(127) == 5);
+  CHECK(gp_bin_top(77) == 5 && kGpLevels[1].mhz == 950 && kGpLevels[1].cx == GP_RPM_TURBO_L1);
   CHECK(gp_bus_bimc_khz(4) == 451000u && gp_bus_bimc_khz(11) == 1804000u && gp_bus_bimc_khz(0) == 0 && gp_bus_bimc_khz(12) == 0);
 }
 
@@ -159,8 +161,8 @@ static void testLevels() {
   CHECK(indexOf(f, "rcg 0/0") >= 0 && indexOf(f, "rcg 0/0") < indexOf(f, "pll1 L 33"));   // parked on XO first
   // 320 -> 600: PLL0 at 1200 MHz, PLL1 off afterwards, MX at NOM
   f.ev.clear();
-  CHECK(gp_set_level(&kIo, &kOps, &s, 4) == GP_OK);
-  CHECK(s.level == 4 && s.pllOn == GP_PLL0 && s.cx == GP_RPM_SVS_L1 && s.mx == GP_RPM_NOM);
+  CHECK(gp_set_level(&kIo, &kOps, &s, 5) == GP_OK);
+  CHECK(s.level == 5 && s.pllOn == GP_PLL0 && s.cx == GP_RPM_SVS_L1 && s.mx == GP_RPM_NOM);
   CHECK(indexOf(f, "cx 192") < indexOf(f, "mx 256") && indexOf(f, "mx 256") < indexOf(f, "bus 1017000"));
   CHECK(indexOf(f, "bus 1017000") < indexOf(f, "pll0 L 62") && indexOf(f, "pll0 L 62") < indexOf(f, "rcg 2/3"));
   CHECK((f.cc[GG2_PLL1 + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
@@ -168,10 +170,10 @@ static void testLevels() {
   CHECK(f.cc[GP_PLL0_BASE + GG2_PLL_ALPHA_U] == 0x80);
   // the bin forbids 980 MHz
   f.ev.clear();
-  CHECK(gp_set_level(&kIo, &kOps, &s, 0) == GP_E_LEVEL && s.level == 4 && f.ev.empty());
+  CHECK(gp_set_level(&kIo, &kOps, &s, 0) == GP_E_LEVEL && s.level == 5 && f.ev.empty());
   // 600 -> 465 (slower): clock first, then bus, then corners
-  CHECK(gp_set_level(&kIo, &kOps, &s, 5) == GP_OK);
-  CHECK(s.level == 5 && s.pllOn == GP_PLL1);
+  CHECK(gp_set_level(&kIo, &kOps, &s, 6) == GP_OK);
+  CHECK(s.level == 6 && s.pllOn == GP_PLL1);
   CHECK(indexOf(f, "rcg 3/3") < indexOf(f, "bus 768000"));
   CHECK(indexOf(f, "bus 768000") < indexOf(f, "mx 48") && indexOf(f, "mx 48") < indexOf(f, "cx 128"));
   CHECK(indexOf(f, "pll1 L 48") >= 0);
@@ -180,11 +182,11 @@ static void testLevels() {
   // a refused corner raise changes nothing else
   f.ev.clear();
   f.refuseCorner = GP_RAIL_CX;
-  CHECK(gp_set_level(&kIo, &kOps, &s, 4) == GP_E_CORNER && s.level == 5 && f.ev.empty());
+  CHECK(gp_set_level(&kIo, &kOps, &s, 5) == GP_E_CORNER && s.level == 6 && f.ev.empty());
   f.refuseCorner = -1;
   // a PLL that never locks leaves the RCG on XO and the level at XO
   f.lockable = false;
-  CHECK(gp_set_level(&kIo, &kOps, &s, 4) == GP_E_PLL);
+  CHECK(gp_set_level(&kIo, &kOps, &s, 5) == GP_E_PLL);
   CHECK(s.level == GP_LEVEL_XO && s.pllOn == GP_PLL_XO && ((f.cc[GG2_GFX_CFG] >> 8) & 7) == 0);
   CHECK((f.cc[GG2_PLL1 + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0 && (f.cc[GP_PLL0_BASE + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
   f.lockable = true;
@@ -198,19 +200,19 @@ static void testLevels() {
 
 static void testDcvs() {
   gp_state s;
-  s.top = 4;
+  s.top = 5;
   s.level = GP_LEVEL_320;
   gp_dcvs d;
   uint32_t pct = 7;
   CHECK(gp_dcvs_sample(&d, &s, 0, 0, 0, &pct) == GP_ACT_NONE && pct == 0);   // first sample primes
   CHECK(gp_dcvs_sample(&d, &s, 900000, 1000000, 0, &pct) == GP_ACT_UP && pct == 90);
-  CHECK(gp_dcvs_next(&s, GP_ACT_UP) == 5);
-  s.level = 4;   // at the bin top: no further up
+  CHECK(gp_dcvs_next(&s, GP_ACT_UP) == 6);
+  s.level = 5;   // at the bin top: no further up
   CHECK(gp_dcvs_sample(&d, &s, 1900000, 2000000, 0, &pct) == GP_ACT_NONE && pct == 100);
-  CHECK(gp_dcvs_next(&s, GP_ACT_UP) == 4);
+  CHECK(gp_dcvs_next(&s, GP_ACT_UP) == 5);
   CHECK(gp_dcvs_sample(&d, &s, 2000000, 3000000, 0, &pct) == GP_ACT_NONE && pct == 10);   // first low sample
   CHECK(gp_dcvs_sample(&d, &s, 2100000, 4000000, 0, &pct) == GP_ACT_DOWN);                // second: step down
-  CHECK(gp_dcvs_next(&s, GP_ACT_DOWN) == 5);
+  CHECK(gp_dcvs_next(&s, GP_ACT_DOWN) == 6);
   CHECK(gp_dcvs_sample(&d, &s, 2150000, 5000000, 0, &pct) == GP_ACT_NONE);                // run restarted
   CHECK(gp_dcvs_sample(&d, &s, 2650000, 6000000, 0, &pct) == GP_ACT_NONE && pct == 50);   // middle band resets it
   CHECK(gp_dcvs_sample(&d, &s, 2650000, 7000000, 0, &pct) == GP_ACT_NONE);
@@ -232,16 +234,16 @@ static void testSlumberWake() {
   Fake f;
   gF = &f;
   gp_state s;
-  s.top = 4;
-  CHECK(gp_set_level(&kIo, &kOps, &s, 4) == GP_OK);
+  s.top = 5;
+  CHECK(gp_set_level(&kIo, &kOps, &s, 5) == GP_OK);
   gp_hwcg_set(&kIo, true);
   gp_saved sv;
   f.gpuBusy = true;
-  CHECK(gp_slumber(&kIo, &kOps, &s, true, &sv) == GP_E_BUSY && s.level == 4);
+  CHECK(gp_slumber(&kIo, &kOps, &s, true, &sv) == GP_E_BUSY && s.level == 5);
   f.gpuBusy = false;
   f.ev.clear();
   CHECK(gp_slumber(&kIo, &kOps, &s, true, &sv) == GP_OK);
-  CHECK(sv.level == 4 && sv.cxOff && s.level == GP_LEVEL_XO && s.busKhz == 0 && s.cx == 0 && s.mx == 0);
+  CHECK(sv.level == 5 && sv.cxOff && s.level == GP_LEVEL_XO && s.busKhz == 0 && s.cx == 0 && s.mx == 0);
   CHECK(indexOf(f, "hwcg off") == 0);
   CHECK(indexOf(f, "rcg 0/0") < indexOf(f, "bus 0") && indexOf(f, "bus 0") < indexOf(f, "gx off"));
   CHECK(indexOf(f, "gx off") < indexOf(f, "cxgdsc off") && indexOf(f, "cxgdsc off") < indexOf(f, "mx 0"));
@@ -249,7 +251,7 @@ static void testSlumberWake() {
   CHECK((f.cc[GP_PLL0_BASE + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
   f.ev.clear();
   CHECK(gp_wake(&kIo, &kOps, &s, &sv) == GP_OK);
-  CHECK(s.level == 4 && s.pllOn == GP_PLL0);
+  CHECK(s.level == 5 && s.pllOn == GP_PLL0);
   CHECK(indexOf(f, "cx 64") == 0 && indexOf(f, "cxgdsc on") == 1 && indexOf(f, "smmu") == 2 && indexOf(f, "gx on") == 3);
   CHECK(indexOf(f, "gx on") < indexOf(f, "restart") && indexOf(f, "restart") < indexOf(f, "hwcg on"));
   CHECK(indexOf(f, "hwcg on") < indexOf(f, "protect") && indexOf(f, "protect") < indexOf(f, "pll0 L 62"));
@@ -272,9 +274,10 @@ static void testGovernor() {
   // speed bin: 0x6006 bits 5..12 = dword 0x6004 bits 21..28
   CHECK(gp_speed_bin(0) == 0 && gp_speed_bin(206u << 21) == 206 && gp_speed_bin((157u << 21) | 0x1fffffu | (7u << 29)) == 157);
   // limits: bin top, cap in MHz, never slower than 320
-  CHECK(gp_gov_top(0, 0) == 0 && gp_gov_top(206, 0) == 0 && gp_gov_top(157, 0) == 3 && gp_gov_top(99, 0) == 4);
-  CHECK(gp_gov_top(0, 980) == 0 && gp_gov_top(0, 979) == 1 && gp_gov_top(0, 600) == 4 && gp_gov_top(0, 465) == 5);
-  CHECK(gp_gov_top(0, 320) == GP_LEVEL_320 && gp_gov_top(0, 100) == GP_LEVEL_320 && gp_gov_top(127, 900) == 4);
+  CHECK(gp_gov_top(0, 0) == 0 && gp_gov_top(206, 0) == 0 && gp_gov_top(157, 0) == 4 && gp_gov_top(99, 0) == 5);
+  CHECK(gp_gov_top(200, 0) == 1 && gp_gov_top(200, 949) == 2 && gp_gov_top(0, 950) == 1);
+  CHECK(gp_gov_top(0, 980) == 0 && gp_gov_top(0, 979) == 1 && gp_gov_top(0, 600) == 5 && gp_gov_top(0, 465) == 6);
+  CHECK(gp_gov_top(0, 320) == GP_LEVEL_320 && gp_gov_top(0, 100) == GP_LEVEL_320 && gp_gov_top(127, 900) == 5);
   // windows
   gp_state s;
   s.level = GP_LEVEL_320;
@@ -296,13 +299,13 @@ static void testGovernor() {
   // a cap: busy goes to the capped top only
   s.level = GP_LEVEL_320;
   s.top = gp_gov_top(0, 465);
-  CHECK(gp_gov_window(&g, &s, GP_GOV_WINDOW) == 5);
+  CHECK(gp_gov_window(&g, &s, GP_GOV_WINDOW) == 6);
   // failure bookkeeping
   s.top = 0;
   CHECK(gp_gov_failed(&s, 0, GP_LEVEL_320) == GP_LEVEL_320 && s.top == 1);
-  CHECK(gp_gov_failed(&s, 4, 5) == 5 && s.top == 5);
-  CHECK(gp_gov_failed(&s, 2, 5) == 5 && s.top == 5);           // already capped lower
-  CHECK(gp_gov_failed(&s, GP_LEVEL_320, 5) == 5 && s.top == 5); // a failed step down caps nothing
+  CHECK(gp_gov_failed(&s, 5, 6) == 6 && s.top == 6);
+  CHECK(gp_gov_failed(&s, 3, 6) == 6 && s.top == 6);           // already capped lower
+  CHECK(gp_gov_failed(&s, GP_LEVEL_320, 6) == 6 && s.top == 6); // a failed step down caps nothing
   CHECK(gp_gov_failed(&s, GP_LEVEL_320, GP_LEVEL_XO) == GP_LEVEL_320);
   // A switch the governor asks for, through gp_set_level: up raises CX then MX before the PLL and the RCG, down
   // lowers them after the RCG.
@@ -322,11 +325,15 @@ static void testGovernor() {
   CHECK((f.cc[GG2_PLL1 + GG2_PLL_MODE] & GG2_MODE_OUTCTRL) == 0);
   for (unsigned i = 0; i < GP_GOV_QUIET; ++i) t = gp_gov_window(&h, &r, 0);
   f.ev.clear();
-  CHECK(t == 1 && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == 1 && r.cx == GP_RPM_TURBO);
+  CHECK(t == 1 && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == 1 && r.cx == GP_RPM_TURBO_L1);   // 950
+  CHECK(indexOf(f, "pll0 L 98") >= 0 && indexOf(f, "cx 384") < 0 && indexOf(f, "mx 256") < 0);
+  for (unsigned i = 0; i < GP_GOV_QUIET; ++i) t = gp_gov_window(&h, &r, 0);
+  f.ev.clear();
+  CHECK(t == 2 && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == 2 && r.cx == GP_RPM_TURBO);   // 900
   CHECK(indexOf(f, "rcg 2/3") >= 0 && indexOf(f, "rcg 2/3") < indexOf(f, "cx 384") && indexOf(f, "mx 256") < 0);
   // down to 320 one level per quiet run: PLL1 back, MX and CX released after the RCG
   f.ev.clear();
-  for (unsigned lv = 2; lv <= GP_LEVEL_320; ++lv) {
+  for (unsigned lv = 3; lv <= GP_LEVEL_320; ++lv) {
     for (unsigned i = 0; i < GP_GOV_QUIET; ++i) t = gp_gov_window(&h, &r, 0);
     CHECK(t == lv && gp_set_level(&kIo, &kOps, &r, t) == GP_OK && r.level == lv);
   }
