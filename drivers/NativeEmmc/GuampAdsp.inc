@@ -13,6 +13,12 @@
 //                  PRIMARY_MI2S_RX 0x1000, GuampAfe.inc, "ADSP TONE OK|FAILED"). Default 0 = phase 1 only.
 //   guamp-adsp-tone=<ms>  with ipc 4: tone length 100..20000 ms (default 3000)
 //   guamp-adsp-tone-gain=<n>  with ipc 4: AFE DTMF gain 1..0xffff (default 0x800)
+//   guamp-adsp-ipc=5|6  the PCM chain (GuampAsm.inc apr::Playback): 5 = 1 kHz sine test for guamp-adsp-tone ms
+//                  ("ADSP PCM OK|FAILED"), 6 = sink of /dev/guamp-audio (needs guamp-audio-dev=1)
+//   guamp-adsp-route=1|2|3  with ipc 5: speaker (default, PRIMARY_MI2S_RX 0x1000) / earpiece / headphone (0xB030)
+//   guamp-adsp-pcm-bits=16|24  ASM stream width (default 16)
+//   guamp-adsp-pcm-mem=0|1|2  shared buffer address for the ADSP (GuampAudioPlay.inc): 0 auto (SMMU probe),
+//                  1 physical with msw 0, 2 physical with msw 1 (SID bits of msm_audio_ion)
 // Default: nothing runs. The original signed firmware is loaded unchanged; TrustZone authenticates it.
 // Facts (guamp device tree: decompiled ~/moto/guamp.dts = bengal.dtsi + guamp dtbo, guamp kernel sources):
 //   qcom,lpass@ab00000 (qcom,pil-tz-generic): qcom,pas-id 1, qcom,firmware-name "adsp", memory-region
@@ -316,7 +322,10 @@ void start() {
   started = true;
   gMode = mode;
   unsigned ipc = 0;
-  if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 4) adspipc::gLevel = ipc;
+  if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 6) adspipc::gLevel = ipc;
+  unsigned route = 0, bits = 0;
+  if (PE_parse_boot_argn("guamp-adsp-route", &route, sizeof(route)) && route >= 1 && route <= 3) adspipc::gPcmRoute = route;
+  if (PE_parse_boot_argn("guamp-adsp-pcm-bits", &bits, sizeof(bits)) && (bits == 16 || bits == 24)) adspipc::gPcmBits = bits;
   unsigned toneMs = 0, toneGain = 0;
   if (PE_parse_boot_argn("guamp-adsp-tone", &toneMs, sizeof(toneMs)) && toneMs >= 100 && toneMs <= 20000)
     adspipc::gToneMs = toneMs;

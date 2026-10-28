@@ -21,6 +21,11 @@
 //               num_ports 1, port_ids, reserved}
 // Every command is answered with APR_BASIC_RSP_RESULT {opcode, status} (0 = ADSP_EOK), the vote with 0x100f5.
 // Port: PRIMARY_MI2S_RX 0x1000 (speaker, aw882xx; DTBO0 afe-rx-portid, bengal.c LPASS_BE_PRI_MI2S_RX).
+// Codec DMA (earpiece / headphone through bolero RX macro + wcd937x, mixer_paths.xml RX_CDC_DMA_RX_0): port
+// RX_CODEC_DMA_RX_0 0xB030, AFE_PARAM_ID_CODEC_DMA_CONFIG 0x102b8 {1, rate, bit_width, data_format 0, channels,
+// active_channels_mask} (16 bytes, sent in the 144-byte union as Linux), plus what audio-ext-clk-up.c does for the
+// macro: LPASS votes MACRO (3, lpass_hw_vote_clk) and DCODEC (4, lpass_audio_hw_vote_clk), and the AFE clocks
+// rx_core 0x30E / rx_npl 0x30F at 22579200 Hz (DTBO0 fragment@26 audio-ref-clk, COUPLE_NO, root 0).
 #ifndef GUAMP_AFE_INC
 #define GUAMP_AFE_INC
 #include "GuampApr.inc"
@@ -34,6 +39,9 @@ constexpr uint32_t kAfeModuleClockSet = 0x0001028f, kAfeParamClockSet = 0x000102
 constexpr uint16_t kPortPriMi2sRx = 0x1000, kPortPriMi2sTx = 0x1001;
 constexpr uint32_t kClkPriMi2sIbit = 0x100, kClkAttrCoupleNo = 1, kHwBlockDcodec = 4, kPortConfigUnion = 144;
 constexpr uint32_t kI2sCfgBytes = 20, kClkSetBytes = 20, kParamHdrBytes = 12, kMemHdrBytes = 12;
+constexpr uint16_t kPortRxCdcDma0 = 0xb030;
+constexpr uint32_t kAfeParamCdcDmaConfig = 0x000102b8, kCdcDmaCfgBytes = 16, kHwBlockMacro = 3;
+constexpr uint32_t kClkRxCore = 0x30e, kClkRxNpl = 0x30f, kRxMacroClkHz = 22579200;
 
 // AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST: client_name is 8 bytes, NUL padded (strlcpy in Linux)
 inline uint32_t afeHwVote(uint8_t *out, uint32_t cap, uint32_t token, uint32_t block, const char *name) {
@@ -69,7 +77,28 @@ inline uint32_t afeClock(uint8_t *out, uint32_t cap, uint32_t token, uint32_t cl
 struct I2sConfig {
   uint16_t port = kPortPriMi2sRx, bits = 16, lines = 1 /* AFE_PORT_I2S_SD0 */, stereo = 1, wsSrc = 1;
   uint32_t rate = 48000, paramBytes = kPortConfigUnion;   // Linux: sizeof(union afe_port_config); 20 also accepted?
+  bool cdcDma = false;   // codec DMA port: AFE_PARAM_ID_CODEC_DMA_CONFIG, channels = stereo + 1 (1 or 2)
 };
+// AFE_PORT_CMD_SET_PARAM_V2 + AFE_PARAM_ID_CODEC_DMA_CONFIG in band (msm_dai_q6_cdc_dma_hw_params)
+inline uint32_t afeCdcDma(uint8_t *out, uint32_t cap, uint32_t token, const I2sConfig &c) {
+  uint8_t p[4 + kMemHdrBytes + kParamHdrBytes + kPortConfigUnion] = {};
+  if (c.paramBytes < kCdcDmaCfgBytes || c.paramBytes > kPortConfigUnion || (c.paramBytes & 3)) return 0;
+  const uint32_t n = 4 + kMemHdrBytes + kParamHdrBytes + c.paramBytes;
+  const uint16_t channels = c.stereo ? 2 : 1;
+  wr16(p, c.port);
+  wr16(p + 2, static_cast<uint16_t>(kParamHdrBytes + c.paramBytes));
+  uint8_t *h = p + 4 + kMemHdrBytes, *d = h + kParamHdrBytes;
+  wr32(h, kAfeModuleDevInterface);
+  wr32(h + 4, kAfeParamCdcDmaConfig);
+  wr16(h + 8, static_cast<uint16_t>(c.paramBytes));
+  wr32(d, 1);   // AFE_API_VERSION_CODEC_DMA_CONFIG
+  wr32(d + 4, c.rate);
+  wr16(d + 8, c.bits);
+  wr16(d + 10, 0);   // AFE_LINEAR_PCM_DATA
+  wr16(d + 12, channels);
+  wr16(d + 14, static_cast<uint16_t>((1u << channels) - 1));
+  return build(out, cap, kSvcAfe, 0, token, kAfePortSetParamV2, p, n);
+}
 // AFE_PORT_CMD_SET_PARAM_V2 + AFE_PARAM_ID_I2S_CONFIG in band (__afe_port_start -> q6afe_set_params_v2)
 inline uint32_t afeI2s(uint8_t *out, uint32_t cap, uint32_t token, const I2sConfig &c) {
   uint8_t p[4 + kMemHdrBytes + kParamHdrBytes + kPortConfigUnion] = {};
@@ -116,8 +145,8 @@ inline uint32_t afeDtmf(uint8_t *out, uint32_t cap, uint32_t token, int64_t ms, 
 // the DSP part (its answers are the point of the test), they only mean no sound.
 struct AfeTone {
   enum Step : int {
-    Vote, HwPrepare, ClockOn, PortConfig, Start, AmpOn, DtmfOn, Play, DtmfOff, AmpOff, Stop, ClockOff, Devote, HwRelease,
-    Done
+    Vote, VoteMacro, HwPrepare, ClockOn, ClockOn2, PortConfig, Start, AmpOn, DtmfOn, Play, DtmfOff, AmpOff, Stop,
+    ClockOff2, ClockOff, DevoteMacro, Devote, HwRelease, Done
   };
   static constexpr uint32_t kAnswerMs = 1000;
   void *ctx = nullptr;
@@ -131,6 +160,8 @@ struct AfeTone {
   // until release(); then the same undo steps.
   bool useDtmf = true, holdPort = false;
   int step = Vote;
+  bool votedMacro = false, clockOn2 = false;   // codec DMA only (port.cdcDma)
+  uint32_t handleMacro = 0;
   bool waiting = false, voted = false, clockOn = false, started = false, ampOn = false, dtmfOn = false, setupFailed = false;
   bool played = false;
   uint32_t token = 0, waitOpcode = 0, deadline = 0, playUntil = 0, handle = 0, configTries = 0;
@@ -146,9 +177,10 @@ struct AfeTone {
   void release() { holdPort = false; }
   bool ok() const { return finished() && played && !setupFailed; }
   static const char *stepName(int s) {
-    static const char *const n[] = {"lpass vote", "codec prepare", "mi2s clock on", "port config", "port start",
-                                    "amp on", "dtmf on", "playing", "dtmf off", "amp off", "port stop",
-                                    "mi2s clock off", "lpass devote", "codec release", "done"};
+    static const char *const n[] = {"lpass vote", "lpass macro vote", "codec prepare", "clock on", "npl clock on",
+                                    "port config", "port start", "amp on", "dtmf on", "playing", "dtmf off",
+                                    "amp off", "port stop", "npl clock off", "clock off", "lpass macro devote",
+                                    "lpass devote", "codec release", "done"};
     return s >= 0 && s <= Done ? n[s] : "?";
   }
 
@@ -181,10 +213,10 @@ struct AfeTone {
       return note("malformed or foreign packet", n, 0);
     }
     if (h.opcode == kAfeHwVoteRsp && pn >= 4 && waiting && waitOpcode == kAfeHwVote && h.token == token) {
-      handle = rd32(pl);
+      (step == VoteMacro ? handleMacro : handle) = rd32(pl);
       answered++;
       waiting = false;
-      note("vote handle", handle, 0);
+      note("vote handle", rd32(pl), static_cast<uint32_t>(step));
       result(now, true, 0);
       return stepAt(now);
     }
@@ -227,14 +259,25 @@ private:
     const uint32_t t = token + 1;
     switch (step) {
       case Vote: n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockDcodec, "GUAMP"); break;
+      case VoteMacro:
+        if (!port.cdcDma) { step = HwPrepare; return true; }
+        n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockMacro, "GUAMPM");
+        break;
       case HwPrepare: {
         const int e = callHw(HwPrepare, true);
         note("codec prepare result", static_cast<uint32_t>(e), 0);
         step = ClockOn;
         return true;
       }
-      case ClockOn: n = afeClock(pkt, sizeof(pkt), t, kClkPriMi2sIbit, clockHz, kClkAttrCoupleNo, 0, true); break;
-      case PortConfig: n = afeI2s(pkt, sizeof(pkt), t, port); break;
+      case ClockOn:
+        n = port.cdcDma ? afeClock(pkt, sizeof(pkt), t, kClkRxCore, kRxMacroClkHz, kClkAttrCoupleNo, 0, true)
+                        : afeClock(pkt, sizeof(pkt), t, kClkPriMi2sIbit, clockHz, kClkAttrCoupleNo, 0, true);
+        break;
+      case ClockOn2:
+        if (!port.cdcDma) { step = PortConfig; return true; }
+        n = afeClock(pkt, sizeof(pkt), t, kClkRxNpl, kRxMacroClkHz, kClkAttrCoupleNo, 0, true);
+        break;
+      case PortConfig: n = port.cdcDma ? afeCdcDma(pkt, sizeof(pkt), t, port) : afeI2s(pkt, sizeof(pkt), t, port); break;
       case Start: n = afePort(pkt, sizeof(pkt), t, kAfeDeviceStart, port.port); break;
       case AmpOn: {
         const int e = callHw(AmpOn, true);
@@ -261,12 +304,21 @@ private:
         step = Stop;
         return true;
       case Stop:
-        if (!started) { step = ClockOff; return true; }
+        if (!started) { step = ClockOff2; return true; }
         n = afePort(pkt, sizeof(pkt), t, kAfeDeviceStop, port.port);
         break;
+      case ClockOff2:
+        if (!clockOn2) { step = ClockOff; return true; }
+        n = afeClock(pkt, sizeof(pkt), t, kClkRxNpl, kRxMacroClkHz, kClkAttrCoupleNo, 0, false);
+        break;
       case ClockOff:
-        if (!clockOn) { step = Devote; return true; }
-        n = afeClock(pkt, sizeof(pkt), t, kClkPriMi2sIbit, clockHz, kClkAttrCoupleNo, 0, false);
+        if (!clockOn) { step = DevoteMacro; return true; }
+        n = port.cdcDma ? afeClock(pkt, sizeof(pkt), t, kClkRxCore, kRxMacroClkHz, kClkAttrCoupleNo, 0, false)
+                        : afeClock(pkt, sizeof(pkt), t, kClkPriMi2sIbit, clockHz, kClkAttrCoupleNo, 0, false);
+        break;
+      case DevoteMacro:
+        if (!votedMacro) { step = Devote; return true; }
+        n = afeHwDevote(pkt, sizeof(pkt), t, kHwBlockMacro, handleMacro);
         break;
       case Devote:
         if (!voted) { step = HwRelease; return true; }
@@ -288,17 +340,23 @@ private:
     if (!good) note(status == 0xffffffffu ? "no answer" : "refused", static_cast<uint32_t>(step), status);
     if (!good && step >= DtmfOff) undoErrors++;
     switch (step) {
-      case Vote: voted = good; step = HwPrepare; break;   // no vote: LPI may be unreachable, the DSP part still runs
+      case Vote: voted = good; step = VoteMacro; break;   // no vote: LPI may be unreachable, the DSP part still runs
+      case VoteMacro: votedMacro = good; step = HwPrepare; break;
       case ClockOn:
         clockOn = good;
+        if (good) step = ClockOn2;
+        else fail(status);
+        break;
+      case ClockOn2:
+        clockOn2 = good;
         if (good) step = PortConfig;
         else fail(status);
         break;
       case PortConfig:
-        if (!good && configTries == 0 && port.paramBytes != kI2sCfgBytes) {
+        if (!good && configTries == 0 && port.paramBytes != (port.cdcDma ? kCdcDmaCfgBytes : kI2sCfgBytes)) {
           configTries = 1;
-          port.paramBytes = kI2sCfgBytes;   // retry once with the bare 20-byte struct
-          note("port config retry with param size", kI2sCfgBytes, 0);
+          port.paramBytes = port.cdcDma ? kCdcDmaCfgBytes : kI2sCfgBytes;   // retry once with the bare struct
+          note("port config retry with param size", port.paramBytes, 0);
         } else if (good) {
           step = Start;
         } else {
@@ -320,8 +378,10 @@ private:
         }
         break;
       case DtmfOff: dtmfOn = false; step = AmpOff; break;
-      case Stop: started = false; step = ClockOff; break;
-      case ClockOff: clockOn = false; step = Devote; break;
+      case Stop: started = false; step = ClockOff2; break;
+      case ClockOff2: clockOn2 = false; step = ClockOff; break;
+      case ClockOff: clockOn = false; step = DevoteMacro; break;
+      case DevoteMacro: votedMacro = false; step = Devote; break;
       case Devote: voted = false; step = HwRelease; break;
       default: break;
     }

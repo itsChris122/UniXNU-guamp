@@ -1,58 +1,88 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The PCM ring of /dev/guamp-audio (guamp_audio_dev.h) and its playback clock, without any kernel call: the device glue
-// (GuampAudioDev.inc) holds the lock and passes the time in host ticks; tests/audio_pcm_host.cpp drives it on the PC.
-// Producer: write() of the plug-in. Consumer: the null sink (consume(now): frames due at 48 kHz since the anchor) or the
-// ADSP path (pull(): one ASM period at a time, GuampAsm.inc). Counters are 64-bit byte totals: used = wr - rd.
+// The PCM ring of /dev/guamp-audio (ABI v2, package/GuampAudio/guamp_audio_dev.h: the one header shared with the
+// plug-in) and its playback clock, without any kernel call: the device glue (GuampAudioDev.inc) holds the lock and
+// passes the time in host ticks; tests/audio_pcm_host.cpp drives it on the PC.
+// Producer: write() of the plug-in. Consumers: the null sink (consume(now): frames due at 48 kHz since the anchor) or
+// the ADSP sink (pull(): one ASM period at a time, apr::Playback in GuampAsm.inc), which also applies the SET_VOLUME
+// gain and widens to 24-bit when the ADSP stream is 24-bit. Counters are 64-bit byte totals: used = wr - rd.
 #ifndef GUAMP_AUDIO_RING_INC
 #define GUAMP_AUDIO_RING_INC
-#include "guamp_audio_dev.h"
+#include "../../package/GuampAudio/guamp_audio_dev.h"
 namespace guampaudio {
+
+constexpr uint32_t kRingBytes = GUAMP_AUDIO_RING_FRAMES * GUAMP_AUDIO_BYTES_PER_FRAME;
+enum Sink : uint32_t { SinkNull = 0, SinkAdsp = 1 };
+
+// gainQ16 0..0x10000 (unity = copy)
+inline int32_t scale(int16_t s, uint32_t gainQ16) {
+  return gainQ16 >= GUAMP_AUDIO_GAIN_UNITY ? s : static_cast<int32_t>((static_cast<int64_t>(s) * gainQ16) >> 16);
+}
 
 struct Stream {
   uint8_t *buf = nullptr;
   uint32_t bytes = 0;                // power of two, multiple of 4
   uint64_t wr = 0, rd = 0;
   uint64_t ticksPerSec = 0;          // host clock (mach_absolute_time) frequency
-  uint64_t anchorTicks = 0, anchorFrame = 0;   // null-sink clock: frame anchorFrame was due at anchorTicks
+  uint64_t anchorTicks = 0, anchorFrame = 0;   // clock: frame anchorFrame was due (null) / taken (ADSP) at anchorTicks
   bool running = false, clockRunning = false;
-  uint32_t sink = GUAMP_AUDIO_SINK_NULL, route = GUAMP_AUDIO_DEV_ROUTE_SPEAKER, underruns = 0;
-  int32_t volume = 0;
-  uint32_t muted = 0;
+  uint32_t sink = SinkNull, route = GUAMP_AUDIO_DEV_ROUTE_SPEAKER, underruns = 0;
+  uint32_t routes = 1u << GUAMP_AUDIO_DEV_ROUTE_SPEAKER;   // wired routes (set by the device glue)
+  uint32_t gainQ16 = GUAMP_AUDIO_GAIN_UNITY, mute = 0, dspBits = 0;
+  int32_t centiDb = 0;
+  bool adspEnabled = false, hwReady = false;   // ADSP sink configured in this boot / path streaming now
+  uint32_t routeChanges = 0, volumeChanges = 0;
 
   uint32_t used() const { return static_cast<uint32_t>(wr - rd); }
   uint32_t space() const { return bytes - used(); }
-  uint64_t framesPlayed() const { return rd / GUAMP_AUDIO_FRAME_BYTES; }
+  uint64_t framesPlayed() const { return rd / GUAMP_AUDIO_BYTES_PER_FRAME; }
   void reset() {
     wr = rd = 0;
     running = clockRunning = false;
     underruns = 0;
+    gainQ16 = GUAMP_AUDIO_GAIN_UNITY;
+    mute = 0;
+    centiDb = 0;
   }
   // Producer: copies up to n bytes (whole frames) that fit; returns the bytes taken
   uint32_t push(const uint8_t *src, uint32_t n, uint64_t now) {
     uint32_t take = n < space() ? n : space();
-    take -= take % GUAMP_AUDIO_FRAME_BYTES;
+    take -= take % GUAMP_AUDIO_BYTES_PER_FRAME;
     for (uint32_t i = 0; i < take; i++) buf[(wr + i) & (bytes - 1)] = src[i];
     wr += take;
-    if (take && running && sink == GUAMP_AUDIO_SINK_NULL && !clockRunning) anchor(now);   // restart after a dry ring
+    if (take && running && sink == SinkNull && !clockRunning) anchor(now);   // restart after a dry ring
     return take;
   }
-  // ADSP consumer: up to n bytes into dst (silence for the missing part while running: an underrun)
-  uint32_t pull(uint8_t *dst, uint32_t n) {
-    const uint32_t have = used() < n ? used() : n;
-    for (uint32_t i = 0; i < have; i++) dst[i] = buf[(rd + i) & (bytes - 1)];
-    for (uint32_t i = have; i < n; i++) dst[i] = 0;
-    rd += have;
-    if (have < n && running) underruns++;
+  // ADSP consumer: `frames` frames into dst as `bits`-bit samples (16: s16 LE; 24: s24 in the top 24 bits of an s32 LE,
+  // the playback rule of asm_multi_channel_pcm_fmt_blk_v2), with the volume gain; silence for the missing part (an
+  // underrun while running). Returns the frames taken from the ring.
+  uint32_t pull(uint8_t *dst, uint32_t frames, uint32_t bits, uint64_t now) {
+    const uint32_t avail = used() / GUAMP_AUDIO_BYTES_PER_FRAME, have = avail < frames ? avail : frames;
+    const uint32_t width = bits == 24 ? 4 : 2, samples = frames * GUAMP_AUDIO_CHANNELS;
+    for (uint32_t i = 0; i < samples; i++) {
+      int32_t v = 0;
+      if (i < have * GUAMP_AUDIO_CHANNELS) {
+        const uint64_t at = rd + 2ull * i;
+        const uint16_t raw = static_cast<uint16_t>(buf[at & (bytes - 1)] | (buf[(at + 1) & (bytes - 1)] << 8));
+        v = scale(static_cast<int16_t>(raw), gainQ16);
+      }
+      const uint32_t out = width == 4 ? static_cast<uint32_t>(v) << 16 : static_cast<uint32_t>(v);
+      for (uint32_t b = 0; b < width; b++) dst[i * width + b] = static_cast<uint8_t>(out >> (8 * b));
+    }
+    rd += static_cast<uint64_t>(have) * GUAMP_AUDIO_BYTES_PER_FRAME;
+    if (have < frames && running) underruns++;
+    anchorTicks = now;          // position: frames handed to the ADSP so far, at the time they were taken
+    anchorFrame = framesPlayed();
+    clockRunning = true;
     return have;
   }
   // Null sink: consume what is due at now. The clock stops when the ring runs dry (underrun) and restarts at a write.
   void consume(uint64_t now) {
-    if (!running || sink != GUAMP_AUDIO_SINK_NULL || !clockRunning || !ticksPerSec || now < anchorTicks) return;
+    if (!running || sink != SinkNull || !clockRunning || !ticksPerSec || now < anchorTicks) return;
     const uint64_t due = anchorFrame + (now - anchorTicks) * GUAMP_AUDIO_RATE / ticksPerSec;
-    const uint64_t played = framesPlayed(), queued = used() / GUAMP_AUDIO_FRAME_BYTES;
+    const uint64_t played = framesPlayed(), queued = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
     if (due <= played) return;
     if (due - played <= queued) {
-      rd += (due - played) * GUAMP_AUDIO_FRAME_BYTES;
+      rd += (due - played) * GUAMP_AUDIO_BYTES_PER_FRAME;
       return;
     }
     rd = wr;   // ran dry before now
@@ -69,45 +99,62 @@ struct Stream {
     if (!clockRunning || !ticksPerSec) return now;
     return anchorTicks + (framesPlayed() - anchorFrame) * ticksPerSec / GUAMP_AUDIO_RATE;
   }
+  // Switches the consumer (under the device lock): the ADSP path streaming or not
+  void setSink(uint32_t s, uint64_t now) {
+    if (s == sink) return;
+    sink = s;
+    hwReady = s == SinkAdsp;
+    clockRunning = false;
+    if (running && s == SinkNull && used()) anchor(now);
+  }
+  uint32_t flags() const {
+    return (running ? GUAMP_AUDIO_INFO_RUNNING : 0u) | (hwReady ? GUAMP_AUDIO_INFO_HW_READY : 0u) |
+           GUAMP_AUDIO_INFO_HW_VOLUME | (adspEnabled ? GUAMP_AUDIO_INFO_SINK_ADSP : 0u);
+  }
 
   // ioctl core: errno-style result (0 = ok). data is the kernel copy of the argument (sized by the command).
   int ioctl(uint32_t cmd, void *data, uint64_t now, uint64_t framesWritten) {
     switch (cmd) {
-      case GUAMP_AUDIO_IOC_INFO: {
+      case GUAMP_AUDIO_GET_INFO: {
         consume(now);
         guamp_audio_info *i = static_cast<guamp_audio_info *>(data);
-        *i = {GUAMP_AUDIO_ABI, GUAMP_AUDIO_RATE, GUAMP_AUDIO_CHANNELS, GUAMP_AUDIO_BITS, bytes, GUAMP_AUDIO_PERIOD_FRAMES,
-              running ? 1u : 0u, sink, route, volume, muted, underruns, framesWritten, framesPlayed()};
+        *i = {GUAMP_AUDIO_ABI_VERSION, GUAMP_AUDIO_RATE, GUAMP_AUDIO_CHANNELS, GUAMP_AUDIO_BITS,
+              bytes / GUAMP_AUDIO_BYTES_PER_FRAME, GUAMP_AUDIO_PERIOD_FRAMES, flags(), routes, framesWritten,
+              framesPlayed(), underruns, route, adspEnabled ? dspBits : 0u};
         return 0;
       }
-      case GUAMP_AUDIO_IOC_START:
+      case GUAMP_AUDIO_START:
         if (!running) {
           running = true;
           clockRunning = false;
-          if (used() && sink == GUAMP_AUDIO_SINK_NULL) anchor(now);
+          if (used() && sink == SinkNull) anchor(now);
         }
         return 0;
-      case GUAMP_AUDIO_IOC_STOP:
+      case GUAMP_AUDIO_STOP:
         running = clockRunning = false;
         rd = wr;
         return 0;
-      case GUAMP_AUDIO_IOC_VOLUME: {
+      case GUAMP_AUDIO_SET_VOLUME: {
         const guamp_audio_volume *v = static_cast<const guamp_audio_volume *>(data);
-        volume = v->centibel > 0 ? 0 : v->centibel < -9600 ? -9600 : v->centibel;
-        muted = v->muted ? 1 : 0;
+        gainQ16 = v->gain_q16 > GUAMP_AUDIO_GAIN_UNITY ? GUAMP_AUDIO_GAIN_UNITY : v->gain_q16;
+        centiDb = v->centi_db;
+        mute = v->mute ? 1 : 0;
+        volumeChanges++;
         return 0;
       }
-      case GUAMP_AUDIO_IOC_ROUTE: {
+      case GUAMP_AUDIO_SET_ROUTE: {
         const uint32_t r = *static_cast<const uint32_t *>(data);
         if (r < GUAMP_AUDIO_DEV_ROUTE_SPEAKER || r > GUAMP_AUDIO_DEV_ROUTE_HEADPHONE) return 22;   // EINVAL
-        if (r != GUAMP_AUDIO_DEV_ROUTE_SPEAKER) return 19;                                         // ENODEV: not wired yet
+        if (!(routes & (1u << r))) return 19;                                                       // ENODEV
+        if (r != route) routeChanges++;
         route = r;
         return 0;
       }
-      case GUAMP_AUDIO_IOC_POSITION: {
+      case GUAMP_AUDIO_GET_ROUTE: *static_cast<uint32_t *>(data) = route; return 0;
+      case GUAMP_AUDIO_GET_POSITION: {
         consume(now);
         guamp_audio_position *p = static_cast<guamp_audio_position *>(data);
-        *p = {framesPlayed(), positionTicks(now), used() / GUAMP_AUDIO_FRAME_BYTES, underruns};
+        *p = {framesPlayed(), positionTicks(now), used() / GUAMP_AUDIO_BYTES_PER_FRAME, underruns};
         return 0;
       }
       default: return 25;   // ENOTTY (DRAIN is handled by the glue: it sleeps)

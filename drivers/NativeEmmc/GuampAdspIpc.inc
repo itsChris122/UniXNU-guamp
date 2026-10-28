@@ -16,6 +16,15 @@
 //                     until wt-audio-hw links its own), MI2S IBIT clock, I2S config, DEVICE_START, amplifier on,
 //                     AFE DTMF for guamp-adsp-tone=<ms> (default 3000, 100..20000; gain guamp-adsp-tone-gain, default
 //                     0x800), then all undone: "ADSP TONE OK|FAILED". No shared memory, no ASM/ADM.
+//   guamp-adsp-ipc=5  instead of the tone, the PCM chain of Linux q6afe/q6adm/q6asm (GuampAsm.inc apr::Playback): AFE
+//                     port held (vote, codec prepare, clock, port config, start, amp), shared buffer mapped with
+//                     ASM_CMD_SHARED_MEM_MAP_REGIONS, ADM COPP open, ASM stream open, matrix route, media format, run,
+//                     a 1 kHz sine written in 10 ms periods refilled on WRITE_DONE for guamp-adsp-tone ms, then all
+//                     closed in reverse: "ADSP PCM OK|FAILED". Route guamp-adsp-route (1 speaker, 2 earpiece,
+//                     3 headphone), stream width guamp-adsp-pcm-bits (16|24), buffer address mode guamp-adsp-pcm-mem
+//                     (GuampAudioPlay.inc: 0 auto from the SMMU probe, 1 physical msw 0, 2 physical msw 1)
+//   guamp-adsp-ipc=6  the same chain as the sink of /dev/guamp-audio (with guamp-audio-dev=1): up while the plug-in
+//                     plays, down 2 s after STOP/close, route from GUAMP_AUDIO_SET_ROUTE
 // Default 0: GuampAdsp.inc behaves exactly as in phase 1 (SMEM read-only). Other GLINK channels the ADSP opens
 // (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here).
 // Facts (guamp DT ~/moto/guamp.dts and kernel): SMEM 0x46000000 + 2 MiB, hwlocks = <&tcsr_mutex 3>, tcsr_mutex syscon
@@ -32,6 +41,7 @@
 #include "GuampApr.inc"
 #include "GuampAfe.inc"
 #include "GuampAudioHwWeak.inc"
+#include "GuampAsm.inc"
 
 namespace adspipc {
 
@@ -56,6 +66,19 @@ constinit apr::Core gCore;
 constinit apr::AfeTone gTone;
 constinit uint32_t gToneMs = 3000, gToneGain = 0x800;
 constinit bool gToneStarted = false;
+// Levels 5/6: the playback chain; the kernel parts (buffer + SMMU probe, the /dev/guamp-audio ring) come through
+// gPlayGlue (GuampAudioPlay.inc registers them before adsp::start; a host test sets its own)
+struct PlayGlue {
+  bool (*shm)(apr::Shm *out) = nullptr;
+  uint32_t (*source)(void *, uint8_t *dst, uint32_t frames, uint32_t bits) = nullptr;
+  bool (*wanted)(void *, uint32_t *route) = nullptr;
+  void (*attach)(void *, bool on) = nullptr;
+};
+constinit PlayGlue gPlayGlue = {};
+constinit apr::Playback gPlay;
+constinit bool gPlayStarted = false, gPlayNoShm = false;
+constinit uint32_t gPcmBits = 16, gPcmRoute = GUAMP_AUDIO_DEV_ROUTE_SPEAKER;
+void startPlay();
 constinit uint16_t gApr = 0;
 constinit bool gReady = false, gNegotiatedLogged = false, gOpenLogged = false, gAprStarted = false, gFailed = false;
 constinit uint32_t gSlave = 0, gDesc = 0, gTxFifo = 0, gReadyAt = 0, gLinkError = 0;
@@ -109,6 +132,23 @@ int afeHw(void *, int step, bool on) {
           apr::AfeTone::stepName(step));
   return e;
 }
+void playLog(void *, const char *what, uint32_t a, uint32_t b) {
+  IOLog("GuampAdsp: %s %x %x at %u ms\n", what, a, b, nowMs());
+}
+// GuampAudioHw.h for the playback route: prepare(route, {48000, 16, channels, port}), amp on/off, release
+int playHw(void *, uint32_t route, uint16_t port, uint32_t channels, int step, bool on) {
+  static_assert(GUAMP_AUDIO_ROUTE_SPEAKER == GUAMP_AUDIO_DEV_ROUTE_SPEAKER &&
+                GUAMP_AUDIO_ROUTE_EARPIECE == GUAMP_AUDIO_DEV_ROUTE_EARPIECE &&
+                GUAMP_AUDIO_ROUTE_HEADPHONE == GUAMP_AUDIO_DEV_ROUTE_HEADPHONE, "route values of the ABI and GuampAudioHw.h");
+  const guamp_audio_hw_format fmt = {48000, 16, channels, port};
+  int e = 0;
+  if (step == apr::AfeTone::HwPrepare) e = guamp_audio_hw_prepare(route, &fmt);
+  else if (step == apr::AfeTone::AmpOn || step == apr::AfeTone::AmpOff) e = guamp_audio_hw_amp(route, on);
+  else guamp_audio_hw_release(route);
+  IOLog("GuampAdsp: play hw %s route %u port %x %u ch: %d%s\n", apr::AfeTone::stepName(step), route, port, channels, e,
+        e == GUAMP_AUDIO_HW_ABSENT ? " (codec side not linked: DSP part only, no sound expected)" : "");
+  return e;
+}
 int aprSend(void *, const uint8_t *p, uint32_t n) { return gGlink && gGlink->send(gApr, p, n) == qipc::Ok ? 0 : -1; }
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   apr::Header h;
@@ -119,6 +159,7 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
         n, ok ? "ok" : "MALFORMED", ok ? h.srcDomain : 0, ok ? h.srcSvc : 0, ok ? h.srcPort : 0, ok ? h.destDomain : 0,
         ok ? h.destSvc : 0, ok ? h.destPort : 0, ok ? h.token : 0, ok ? h.opcode : 0, bytes);
   if (gLevel < 3 || channel != gApr || !ok) return;
+  if (gPlayStarted && gPlay.receive(p, n, nowMs())) return;
   if (h.srcSvc == apr::kSvcAfe && gToneStarted) gTone.receive(p, n, nowMs());
   else gCore.receive(p, n, nowMs());
 }
@@ -240,7 +281,9 @@ void service() {
       gCore.begin(nowMs());
     }
     gCore.step(nowMs());
-    if (gLevel >= 4 && gCore.finished() && gCore.stateAnswered && !gToneStarted) {
+    if (gLevel >= 5 && gCore.finished() && gCore.stateAnswered && !gPlayStarted && !gPlayNoShm) startPlay();
+    if (gPlayStarted) gPlay.stepAt(nowMs());
+    if (gLevel == 4 && gCore.finished() && gCore.stateAnswered && !gToneStarted) {
       gToneStarted = true;
       gTone.ctx = nullptr;
       gTone.send = aprSend;
@@ -258,6 +301,36 @@ void service() {
   }
 }
 
+// Levels 5/6: shared buffer, then the chain (test sine or /dev/guamp-audio sink)
+void startPlay() {
+  apr::Shm shm;
+  if (!gPlayGlue.shm || !gPlayGlue.shm(&shm) || !shm.cpu || shm.bytes < apr::PcmPath::kSlots * apr::PcmPath::kSlotStride) {
+    gPlayNoShm = true;
+    IOLog("GuampAdsp: play: no shared buffer for the ADSP (%s): PCM path not started\n",
+          gPlayGlue.shm ? "allocation or SMMU check failed" : "kernel glue not registered");
+    return;
+  }
+  gPlayStarted = true;
+  gPlay.mode = gLevel == 5 ? apr::Playback::Test : apr::Playback::Sink;
+  gPlay.route = gPcmRoute;
+  gPlay.bits = gPcmBits;
+  gPlay.testMs = gToneMs;
+  gPlay.shm = shm;
+  gPlay.hooks.ctx = nullptr;
+  gPlay.hooks.send = aprSend;
+  gPlay.hooks.log = playLog;
+  gPlay.hooks.hw = playHw;
+  gPlay.hooks.source = gPlayGlue.source;
+  gPlay.hooks.wanted = gPlayGlue.wanted;
+  gPlay.hooks.attach = gPlayGlue.attach;
+  IOLog("GuampAdsp: play %s: route %u port %x, %u ch on the port, stream %u bit 48000 Hz stereo, %u x %u-byte periods, "
+        "buffer %x:%08x %u bytes%s\n", gLevel == 5 ? "test (1 kHz sine)" : "sink of /dev/guamp-audio", gPlay.route,
+        apr::Playback::portOf(gPlay.route), apr::Playback::channelsOf(gPlay.route), gPlay.bits, apr::PcmPath::kSlots,
+        apr::PcmPath::kFrames * 2 * (gPlay.bits == 24 ? 4 : 2), shm.msw, shm.iovaLsw, shm.bytes,
+        gLevel == 5 ? "" : ", waiting for the plug-in");
+  gPlay.stepAt(nowMs());
+}
+
 // From awaitReady when err-ready is seen (Linux: SUBSYS_AFTER_POWERUP)
 void onReady() {
   if (gReady || !gSmem) return;
@@ -272,7 +345,7 @@ void run() {
   if (!gSmem) return;
   if (!gReady) onReady();
   const uint32_t begin = nowMs();
-  bool rxLogged = false, verdict = gLevel < 2, toneVerdict = gLevel < 4;
+  bool rxLogged = false, verdict = gLevel < 2, toneVerdict = gLevel != 4, playVerdict = gLevel != 5;
   for (;;) {
     service();
     const uint32_t t = nowMs() - begin;
@@ -327,7 +400,24 @@ void run() {
               gTone.undoErrors);
       IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
     }
-    IOSleep(kLoopMs);
+    if (verdict && !playVerdict && (gPlay.finished() || gPlayNoShm || !gCore.stateAnswered)) {
+      playVerdict = true;
+      const apr::PcmPath &c = gPlay.pcm;
+      if (!gPlayStarted)
+        IOLog("GuampAdsp: ADSP PCM FAILED (%s)\n", gPlayNoShm ? "no shared buffer" : "no APR");
+      else if (gPlay.ok())
+        IOLog("GuampAdsp: ADSP PCM OK (route %u port %x, %u bit, %u ms, %u writes, %u done, 0 errors, copp %x, handle %x, "
+              "max gap %u ms, codec errors %u)\n", gPlay.route, c.afePort, gPlay.bits, gPlay.testMs, c.writes,
+              c.writeDones, c.copp, c.handle, c.maxLateMs, gPlay.afe.hwErrors);
+      else
+        IOLog("GuampAdsp: ADSP PCM FAILED (afe %s status %x; pcm %s status %x; %u writes, %u done, %u errors (last %x), "
+              "%u unexpected)\n", gPlay.afe.setupFailed ? apr::AfeTone::stepName(static_cast<int>(gPlay.afe.failedStep)) : "ok",
+              gPlay.afe.failedStatus, c.failed ? apr::PcmPath::stepName(static_cast<int>(c.failedStep)) : "ok",
+              c.failedStatus, c.writes, c.writeDones, c.writeErrors, c.lastError, c.unexpected);
+      IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
+    }
+    // 8 x 10 ms periods in flight: poll faster while the ASM stream runs
+    IOSleep(gPlayStarted && gPlay.active() ? 5 : kLoopMs);
   }
 }
 

@@ -1,14 +1,17 @@
 // Host test of the PCM side of guamp audio: GuampAudioRing.inc (the /dev/guamp-audio ring, its 48 kHz null-sink clock
-// and the ioctl core of guamp_audio_dev.h), the q6asm/q6adm builders of GuampAsm.inc checked byte by byte against
+// and the ioctl core of the ABI v2 header package/GuampAudio/guamp_audio_dev.h), the q6asm/q6adm builders of GuampAsm.inc checked byte by byte against
 // the Linux struct layouts (offsets written out here, from include/dsp/apr_audio-v2.h compiled with a 20-byte
 // apr_hdr), apr::PcmPath against a simulated ADSP (map, ADM open, ASM open, route, format, run, 4 periods in flight
 // refilled from the ring on WRITE_DONE, stop, close in reverse, refusal undo), and apr::AfeTone in hold mode (port up
-// without DTMF until release()). No device access. Build: see run-pas-tests.sh.
+// without DTMF until release(), MI2S and codec DMA), apr::Playback (the whole chain: test sine and /dev/guamp-audio
+// sink, route change, refusals) and the SMMU decision for stream 0x1c1. No device access. Build: see run-pas-tests.sh.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <vector>
+#include <string>
 #include "../GuampAsm.inc"
 #include "../GuampAudioRing.inc"
 
@@ -19,19 +22,22 @@ static uint32_t u16(const std::vector<uint8_t> &p, uint32_t at) { uint16_t v; me
 
 // ---- ABI values the plug-in compiles against (Apple sys/ioccom.h encoding) -------------------------------------------
 static void abi() {
-  CHECK(sizeof(guamp_audio_info) == 64 && sizeof(guamp_audio_position) == 24 && sizeof(guamp_audio_volume) == 8);
-  CHECK(GUAMP_AUDIO_IOC_INFO == 0x40404101u && GUAMP_AUDIO_IOC_START == 0x20004102u && GUAMP_AUDIO_IOC_STOP == 0x20004103u);
-  CHECK(GUAMP_AUDIO_IOC_VOLUME == 0x80084104u && GUAMP_AUDIO_IOC_ROUTE == 0x80044105u);
-  CHECK(GUAMP_AUDIO_IOC_POSITION == 0x40184106u && GUAMP_AUDIO_IOC_DRAIN == 0x20004107u);
-  printf("abi: struct sizes 64/24/8, ioctl numbers INFO %08x START %08x STOP %08x VOLUME %08x ROUTE %08x POSITION %08x "
-         "DRAIN %08x\n", (unsigned)GUAMP_AUDIO_IOC_INFO, (unsigned)GUAMP_AUDIO_IOC_START, (unsigned)GUAMP_AUDIO_IOC_STOP,
-         (unsigned)GUAMP_AUDIO_IOC_VOLUME, (unsigned)GUAMP_AUDIO_IOC_ROUTE, (unsigned)GUAMP_AUDIO_IOC_POSITION,
-         (unsigned)GUAMP_AUDIO_IOC_DRAIN);
+  CHECK(sizeof(guamp_audio_info) == 64 && sizeof(guamp_audio_position) == 24 && sizeof(guamp_audio_volume) == 16);
+  CHECK(GUAMP_AUDIO_ABI_VERSION == 2);
+  CHECK(GUAMP_AUDIO_GET_INFO == 0x40406740u && GUAMP_AUDIO_START == 0x20006741u && GUAMP_AUDIO_STOP == 0x20006742u);
+  CHECK(GUAMP_AUDIO_SET_VOLUME == 0x80106743u && GUAMP_AUDIO_SET_ROUTE == 0x80046744u && GUAMP_AUDIO_GET_ROUTE == 0x40046745u);
+  CHECK(GUAMP_AUDIO_GET_POSITION == 0x40186746u && GUAMP_AUDIO_DRAIN == 0x20006747u);
+  CHECK(offsetof(guamp_audio_info, flags) == 24 && offsetof(guamp_audio_info, underruns) == 48 &&
+        offsetof(guamp_audio_info, route) == 56 && offsetof(guamp_audio_info, dsp_bits) == 60);
+  printf("abi v2: GET_INFO %08x START %08x STOP %08x SET_VOLUME %08x SET_ROUTE %08x GET_ROUTE %08x GET_POSITION %08x "
+         "DRAIN %08x\n", (unsigned)GUAMP_AUDIO_GET_INFO, (unsigned)GUAMP_AUDIO_START, (unsigned)GUAMP_AUDIO_STOP,
+         (unsigned)GUAMP_AUDIO_SET_VOLUME, (unsigned)GUAMP_AUDIO_SET_ROUTE, (unsigned)GUAMP_AUDIO_GET_ROUTE,
+         (unsigned)GUAMP_AUDIO_GET_POSITION, (unsigned)GUAMP_AUDIO_DRAIN);
 }
 
 // ---- ring + null-sink clock + ioctl core ---------------------------------------------------------------------------
 static void ring() {
-  static uint8_t mem[GUAMP_AUDIO_RING_BYTES];
+  static uint8_t mem[guampaudio::kRingBytes];
   guampaudio::Stream s;
   s.buf = mem;
   s.bytes = sizeof(mem);
@@ -43,17 +49,18 @@ static void ring() {
   s.consume(24000000);
   CHECK(s.framesPlayed() == 0);
   guamp_audio_info info;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_INFO, &info, 0, 1200) == 0 && info.abi == 1 && info.rate == 48000 && info.state == 0 &&
-        info.ring_bytes == 65536 && info.frames_written == 1200 && info.sink == GUAMP_AUDIO_SINK_NULL && info.route == 1);
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_INFO, &info, 0, 1200) == 0 && info.abi == 2 && info.rate == 48000 &&
+        info.flags == GUAMP_AUDIO_INFO_HW_VOLUME && info.ring_frames == 16384 && info.frames_written == 1200 &&
+        info.route == 1 && info.routes == 2 && info.dsp_bits == 0 && info.period_frames == 480);
   // start at t = 1 s: 10 ms later 480 frames played
   const uint64_t t0 = 24000000;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_START, nullptr, t0, 0) == 0 && s.running && s.clockRunning);
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, t0, 0) == 0 && s.running && s.clockRunning);
   guamp_audio_position pos;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_POSITION, &pos, t0 + 240000, 0) == 0);
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_POSITION, &pos, t0 + 240000, 0) == 0);
   CHECK(pos.frames_played == 480 && pos.host_time == t0 + 240000 && pos.queued_frames == 720 && pos.underruns == 0);
   // more data keeps the clock continuous
   CHECK(s.push(pcm.data(), 48000, t0 + 240000) == 48000);
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_POSITION, &pos, t0 + 2400000 + 7, 0) == 0);   // 100 ms (+7 ticks: not a whole frame)
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_POSITION, &pos, t0 + 2400000 + 7, 0) == 0);   // 100 ms (+7 ticks: not a whole frame)
   CHECK(pos.frames_played == 4800 && pos.host_time == t0 + 2400000 && pos.underruns == 0);
   // the ring fills: push takes only the space
   CHECK(s.push(pcm.data(), static_cast<uint32_t>(pcm.size()), t0 + 2400000) == 65536 - (13200 - 4800) * 4);
@@ -63,34 +70,56 @@ static void ring() {
   CHECK(!s.clockRunning && s.underruns == 1 && s.used() == 0 && s.framesPlayed() * 4 == s.wr);
   const uint64_t dry = s.framesPlayed(), t1 = t0 + 24000000 * 3ull;
   CHECK(s.push(pcm.data(), 1920, t1) == 1920 && s.clockRunning && s.anchorTicks == t1);
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_POSITION, &pos, t1 + 120000, 0) == 0 && pos.frames_played == dry + 240);
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_POSITION, &pos, t1 + 120000, 0) == 0 && pos.frames_played == dry + 240);
   // data integrity through the wrap (ADSP consumer)
   guampaudio::Stream d;
   d.buf = mem;
   d.bytes = sizeof(mem);
-  d.sink = GUAMP_AUDIO_SINK_ADSP;
+  d.sink = guampaudio::SinkAdsp;
   d.running = true;
   std::vector<uint8_t> out(1920);
   for (int i = 0; i < 100; i++) {
     CHECK(d.push(&pcm[(i * 1920) % 96000], 1920, 0) == 1920);
-    CHECK(d.pull(out.data(), 1920) == 1920 && !memcmp(out.data(), &pcm[(i * 1920) % 96000], 1920));
+    CHECK(d.pull(out.data(), 480, 16, 0) == 480 && !memcmp(out.data(), &pcm[(i * 1920) % 96000], 1920));
   }
-  CHECK(d.pull(out.data(), 1920) == 0 && out[0] == 0 && out[1919] == 0 && d.underruns == 1);   // silence when short
+  CHECK(d.pull(out.data(), 480, 16, 0) == 0 && out[0] == 0 && out[1919] == 0 && d.underruns == 1);   // silence when short
+  // 24-bit container (top 24 bits of s32) and Q16 gain
+  {
+    const uint8_t two[8] = {0x34, 0x12, 0xcc, 0xed, 0, 0x80, 0xff, 0x7f};   // 0x1234, -0x1234, -32768, 32767
+    std::vector<uint8_t> o(16);
+    CHECK(d.push(two, 8, 0) == 8 && d.pull(o.data(), 2, 24, 0) == 2);
+    CHECK(u32(o, 0) == 0x12340000u && u32(o, 4) == 0xedcc0000u && u32(o, 8) == 0x80000000u && u32(o, 12) == 0x7fff0000u);
+    d.gainQ16 = 0x8000;
+    CHECK(d.push(two, 8, 0) == 8 && d.pull(o.data(), 2, 16, 0) == 2);
+    CHECK(u16(o, 0) == 0x091a && u16(o, 2) == 0xf6e6 && u16(o, 4) == 0xc000 && u16(o, 6) == 0x3fff);
+  }
   // volume clamp, routes, stop, unknown ioctl
-  guamp_audio_volume v = {-20000, 1};
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_VOLUME, &v, 0, 0) == 0 && s.volume == -9600 && s.muted == 1);
-  v = {300, 0};
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_VOLUME, &v, 0, 0) == 0 && s.volume == 0 && s.muted == 0);
-  uint32_t r = 2;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_ROUTE, &r, 0, 0) == 19);
+  guamp_audio_volume v = {0x20000, -100, 0, 0};
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_VOLUME, &v, 0, 0) == 0 && s.gainQ16 == 0x10000 && s.mute == 0);
+  v = {0, -4800, 1, 0};
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_VOLUME, &v, 0, 0) == 0 && s.gainQ16 == 0 && s.mute == 1 && s.centiDb == -4800);
+  uint32_t r = GUAMP_AUDIO_DEV_ROUTE_HEADPHONE;
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_ROUTE, &r, 0, 0) == 19);   // not wired without guamp-audio-cdc=1
   r = 9;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_ROUTE, &r, 0, 0) == 22);
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_ROUTE, &r, 0, 0) == 22);
+  s.routes |= 1u << GUAMP_AUDIO_DEV_ROUTE_HEADPHONE;
+  r = GUAMP_AUDIO_DEV_ROUTE_HEADPHONE;
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_ROUTE, &r, 0, 0) == 0 && s.route == 3 && s.routeChanges == 1);
+  r = 0;
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_ROUTE, &r, 0, 0) == 0 && r == 3);
   r = 1;
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_ROUTE, &r, 0, 0) == 0);
-  CHECK(s.ioctl(GUAMP_AUDIO_IOC_STOP, nullptr, 0, 0) == 0 && !s.running && s.used() == 0);
+  CHECK(s.ioctl(GUAMP_AUDIO_SET_ROUTE, &r, 0, 0) == 0);
+  s.adspEnabled = true;
+  s.dspBits = 24;
+  s.setSink(guampaudio::SinkAdsp, 0);
+  CHECK(s.ioctl(GUAMP_AUDIO_GET_INFO, &info, 0, 0) == 0 &&
+        info.flags == (GUAMP_AUDIO_INFO_RUNNING | GUAMP_AUDIO_INFO_HW_READY | GUAMP_AUDIO_INFO_HW_VOLUME |
+                       GUAMP_AUDIO_INFO_SINK_ADSP) && info.dsp_bits == 24);
+  s.setSink(guampaudio::SinkNull, 0);
+  CHECK(s.ioctl(GUAMP_AUDIO_STOP, nullptr, 0, 0) == 0 && !s.running && s.used() == 0);
   CHECK(s.ioctl(0x12345678u, nullptr, 0, 0) == 25);
   printf("ring: pre-fill, 48 kHz clock from START, exact positions, full ring, dry -> underrun + re-anchor, wrap, "
-         "silence padding, volume/route/stop: ok\n");
+         "silence padding, s24 container + gain, volume/route/info flags/stop: ok\n");
 }
 
 // ---- ASM/ADM builders ----------------------------------------------------------------------------------------------
@@ -111,6 +140,23 @@ static void builders() {
   hdr(o, 8, 0x1000, 0x1000, 0x10326);
   CHECK(u16(o, 20) == 0 && u16(o, 22) == 1 && u16(o, 24) == 0x1000 && u16(o, 26) == 0xffff && u32(o, 28) == 0x10312);
   CHECK(u16(o, 32) == 2 && u16(o, 34) == 16 && u32(o, 36) == 48000 && o[40] == 1 && o[41] == 2 && o[42] == 0 && o[47] == 0);
+  auto om = pkt(apr::admOpen(b, sizeof(b), 2, 0xb030, 0x10312, 1, 16, 48000), b);   // mono: FC
+  CHECK(om.size() == 48 && u16(om, 24) == 0xb030 && u16(om, 32) == 1 && om[40] == 3 && om[41] == 0);
+  auto w24 = pkt(apr::asmOpenWrite(b, sizeof(b), 3, apr::asmPort(1, 1), 24), b);
+  CHECK(u16(w24, 26) == 24);
+  apr::I2sConfig cdc;
+  cdc.port = 0xb030;
+  cdc.cdcDma = true;
+  auto cd = pkt(apr::afeCdcDma(b, sizeof(b), 11, cdc), b);   // afe_port_cmd_set_param_v2 36 + param_hdr 12 + union 144
+  CHECK(cd.size() == 20 + 16 + 12 + 144);
+  hdr(cd, 4, 0, 0, 0x100ef);
+  CHECK(u16(cd, 20) == 0xb030 && u16(cd, 22) == 12 + 144 && u32(cd, 36) == 0x1020c && u32(cd, 40) == 0x102b8 &&
+        u16(cd, 44) == 144 && u32(cd, 48) == 1 && u32(cd, 52) == 48000 && u16(cd, 56) == 16 && u16(cd, 58) == 0 &&
+        u16(cd, 60) == 2 && u16(cd, 62) == 3 && u32(cd, 64) == 0);
+  cdc.stereo = 0;
+  cdc.paramBytes = 16;
+  auto cm = pkt(apr::afeCdcDma(b, sizeof(b), 12, cdc), b);
+  CHECK(cm.size() == 20 + 16 + 12 + 16 && u16(cm, 60) == 1 && u16(cm, 62) == 1);
   auto w = pkt(apr::asmOpenWrite(b, sizeof(b), 3, apr::asmPort(1, 1), 16), b);   // asm_stream_cmd_open_write_v3
   CHECK(w.size() == 36);
   hdr(w, 7, 0x101, 0x101, 0x10db3);
@@ -163,11 +209,11 @@ static void pcmPath() {
   for (int variant = 0; variant < 2; variant++) {
     Dsp dsp;
     dsp.refuse = variant ? 0x10db3 : 0;   // variant 1: ASM open refused -> ADM close + unmap
-    static uint8_t shmem[4 * 4096], ringMem[GUAMP_AUDIO_RING_BYTES];
+    static uint8_t shmem[8 * 4096], ringMem[guampaudio::kRingBytes];
     guampaudio::Stream ring;
     ring.buf = ringMem;
     ring.bytes = sizeof(ringMem);
-    ring.sink = GUAMP_AUDIO_SINK_ADSP;
+    ring.sink = guampaudio::SinkAdsp;
     ring.running = true;
     std::vector<uint8_t> pcm(1920 * 3);
     for (size_t i = 0; i < pcm.size(); i++) pcm[i] = static_cast<uint8_t>(i + 1);
@@ -178,7 +224,7 @@ static void pcmPath() {
     path.send = [](void *c, const uint8_t *p, uint32_t n) { static_cast<Dsp *>(c)->rx.emplace_back(p, p + n); return 0; };
     static guampaudio::Stream *gRing;
     gRing = &ring;
-    path.fill = [](void *, uint8_t *dst, uint32_t n) { return gRing->pull(dst, n); };
+    path.fill = [](void *, uint8_t *dst, uint32_t frames, uint32_t bits) { return gRing->pull(dst, frames, bits, 0); };
     path.begin(0);
     size_t seen = 0;
     uint32_t now = 0;
@@ -231,7 +277,7 @@ static void pcmPath() {
       CHECK(dsp.ops == (std::vector<uint32_t>{0x10d92, 0x10326, 0x10db3, 0x10327, 0x10d94}));
     }
   }
-  printf("pcm path: setup order, 4 periods in flight refilled from the ring on WRITE_DONE, silence on underrun, stop "
+  printf("pcm path: setup order, 8 periods in flight refilled from the ring on WRITE_DONE, silence on underrun, stop "
          "after drain, close/unmap; refused ASM open undone: ok\n");
 }
 
@@ -268,12 +314,230 @@ static void holdMode() {
   printf("afe hold mode: port held without DTMF for 30 s until release, then undone: ok\n");
 }
 
+// ---- AfeTone hold mode on the codec DMA port (earpiece/headphone): macro vote + rx_core/rx_npl clocks -------------
+static void holdModeCdc() {
+  std::vector<std::vector<uint8_t>> sent;
+  apr::AfeTone t;
+  t.ctx = &sent;
+  t.send = [](void *c, const uint8_t *p, uint32_t n) {
+    static_cast<std::vector<std::vector<uint8_t>> *>(c)->emplace_back(p, p + n);
+    return 0;
+  };
+  t.hw = [](void *, int, bool) { return 0; };
+  t.useDtmf = false;
+  t.holdPort = true;
+  t.port.port = 0xb030;
+  t.port.cdcDma = true;
+  t.port.stereo = 0;
+  t.begin(0);
+  size_t seen = 0;
+  for (uint32_t now = 0; now < 20000 && !t.finished(); now += 10) {
+    t.stepAt(now);
+    while (seen < sent.size()) {
+      const auto &q = sent[seen++];
+      const uint32_t op = u32(q, 16);
+      const auto a = op == 0x100f4 ? answer(4, 0, u32(q, 12), 0x100f5, {u32(q, 20) + 10})
+                                   : answer(4, 0, u32(q, 12), 0x110e8, {op, 0});
+      t.receive(a.data(), static_cast<uint32_t>(a.size()), now);
+    }
+    if (now == 10000) {
+      CHECK(t.portRunning());
+      t.release();
+    }
+  }
+  std::vector<uint32_t> ops, extra;
+  for (const auto &q : sent) ops.push_back(u32(q, 16));
+  CHECK(t.ok() && ops == (std::vector<uint32_t>{0x100f4, 0x100f4, 0x100f3, 0x100f3, 0x100ef, 0x100e5, 0x100e6, 0x100f3,
+                                                0x100f3, 0x100f6, 0x100f6}));
+  CHECK(u32(sent[0], 20) == 4 && u32(sent[1], 20) == 3);                               // DCODEC then MACRO
+  CHECK(u32(sent[2], 48 + 4) == 0x30e && u32(sent[2], 48 + 8) == 22579200);              // rx_core
+  CHECK(u32(sent[3], 48 + 4) == 0x30f && u32(sent[3], 48 + 16) == 1);                    // rx_npl on
+  CHECK(u32(sent[4], 40) == 0x102b8 && u16(sent[4], 60) == 1 && u16(sent[4], 20) == 0xb030);
+  CHECK(u32(sent[7], 48 + 4) == 0x30f && u32(sent[7], 48 + 16) == 0 && u32(sent[8], 48 + 4) == 0x30e);
+  CHECK(u32(sent[9], 20) == 3 && u32(sent[9], 24) == 13 && u32(sent[10], 20) == 4 && u32(sent[10], 24) == 14);
+  printf("afe hold mode, codec DMA 0xB030: macro + dcodec votes, rx_core/rx_npl clocks, CODEC_DMA_CONFIG mono, undone in "
+         "reverse: ok\n");
+}
+
+// ---- SMMU decision for stream 0x1c1 -----------------------------------------------------------------------------------
+static void smmu() {
+  uint32_t smr[4] = {0, 0, 0, 0}, s2cr[4] = {0, 0, 0, 0};
+  CHECK(apr::smmuDecide(1, smr, s2cr, 4, 0x1c1).path == apr::SmmuDisabled);
+  CHECK(apr::smmuDecide(0, smr, s2cr, 4, 0x1c1).path == apr::SmmuUnmatchedBypass);
+  CHECK(apr::smmuDecide(1u << 10, smr, s2cr, 4, 0x1c1).path == apr::SmmuUnmatchedFault);
+  smr[2] = (1u << 31) | (0xfu << 16) | 0x1c0;   // 0x1c0 mask 0xf covers 0x1c1
+  s2cr[2] = (1u << 16);
+  apr::SmmuView v = apr::smmuDecide(1u << 10, smr, s2cr, 4, 0x1c1);
+  CHECK(v.path == apr::SmmuBypass && v.slot == 2 && v.usable());
+  s2cr[2] = 5;
+  v = apr::smmuDecide(0, smr, s2cr, 4, 0x1c1);
+  CHECK(v.path == apr::SmmuTranslate && v.cb == 5 && !v.usable());
+  s2cr[2] = 2u << 16;
+  CHECK(apr::smmuDecide(0, smr, s2cr, 4, 0x1c1).path == apr::SmmuFault);
+  smr[2] = (1u << 31) | 0x1a0;   // another stream only
+  CHECK(apr::smmuDecide(0, smr, s2cr, 4, 0x1c1).path == apr::SmmuUnmatchedBypass);
+  printf("smmu decision for 0x1c1: disabled, bypass, translate, fault, unmatched bypass/fault: ok\n");
+}
+
+// ---- Playback: the whole chain against a simulated ADSP (AFE + ADM + ASM) ---------------------------------------------
+struct Rig {
+  std::vector<std::vector<uint8_t>> rx;
+  std::vector<uint32_t> ops;
+  std::vector<std::vector<uint8_t>> pendingDone;
+  std::vector<std::string> hw;
+  uint32_t refuse = 0, attach = 0, detach = 0, sineChecks = 0;
+  bool wanted = false;
+  uint32_t route = 1;
+  guampaudio::Stream *ring = nullptr;
+  uint8_t *shm = nullptr;
+  std::vector<uint8_t> pulled;   // what the ADSP buffer received, first periods
+};
+static void runPlayback(apr::Playback &pb, Rig &rig, uint32_t from, uint32_t until, uint32_t (*event)(apr::Playback &, Rig &, uint32_t)) {
+  size_t seen = rig.rx.size();
+  for (uint32_t now = from; now < until; now += 5) {
+    if (event) event(pb, rig, now);
+    pb.stepAt(now);
+    while (seen < rig.rx.size()) {
+      const auto q = rig.rx[seen++];
+      const uint32_t token = u32(q, 12), op = u32(q, 16);
+      const uint16_t port = static_cast<uint16_t>(u16(q, 10));
+      rig.ops.push_back(op);
+      if (op == 0x10dab) {
+        rig.pendingDone.push_back(answer(7, port, token, 0x10d99, {u32(q, 20), u32(q, 24), u32(q, 28), 0}));
+        if (pb.mode == apr::Playback::Test && rig.shm) {   // the sine: 1 kHz, -12 dBFS, both channels equal
+          const uint8_t *slot = rig.shm + (u32(q, 20) - 0x20000000u);
+          const uint32_t w = pb.bits == 24 ? 4 : 2;
+          int32_t peak = 0;
+          for (uint32_t f = 0; f < 480; f++) {
+            int32_t l = 0, r = 0;
+            memcpy(&l, slot + f * 2 * w, w);
+            memcpy(&r, slot + f * 2 * w + w, w);
+            if (w == 2) { l = static_cast<int16_t>(l); r = static_cast<int16_t>(r); } else { l >>= 16; r >>= 16; }
+            CHECK(l == r);
+            if (l > peak) peak = l;
+          }
+          CHECK(peak == 8192);
+          rig.sineChecks++;
+        }
+        continue;
+      }
+      std::vector<uint8_t> a;
+      if (op == 0x100f4) a = answer(4, 0, token, 0x100f5, {7});
+      else if (op == 0x10d92) a = answer(7, 0, token, 0x10d93, {0x55});
+      else if (op == 0x10326) a = answer(8, port, token, 0x10329, {0, 9});
+      else a = answer(q[4], port, token, 0x110e8, {op, op == rig.refuse ? 0x2u : 0u});
+      pb.receive(a.data(), static_cast<uint32_t>(a.size()), now);
+    }
+    if (pb.state == apr::Playback::Streaming && now % 10 == 0 && !rig.pendingDone.empty()) {
+      const auto e = rig.pendingDone.front();
+      rig.pendingDone.erase(rig.pendingDone.begin());
+      pb.receive(e.data(), static_cast<uint32_t>(e.size()), now);
+    }
+    if (pb.state == apr::Playback::PathDown && !rig.pendingDone.empty()) {
+      const auto e = rig.pendingDone.front();
+      rig.pendingDone.erase(rig.pendingDone.begin());
+      pb.receive(e.data(), static_cast<uint32_t>(e.size()), now);
+    }
+  }
+}
+static void playbackSetup(apr::Playback &pb, Rig &rig, uint8_t *shm) {
+  rig.shm = shm;
+  pb.shm = {shm, 0x20000000u, 1, 8 * 4096};
+  pb.hooks.ctx = &rig;
+  pb.hooks.send = [](void *c, const uint8_t *p, uint32_t n) { static_cast<Rig *>(c)->rx.emplace_back(p, p + n); return 0; };
+  pb.hooks.hw = [](void *c, uint32_t route, uint16_t port, uint32_t ch, int step, bool on) {
+    static_cast<Rig *>(c)->hw.push_back(std::to_string(route) + " " + std::to_string(port) + " " + std::to_string(ch) + " " +
+                                        apr::AfeTone::stepName(step) + (on ? " on" : " off"));
+    return 0;
+  };
+}
+static void playback() {
+  static uint8_t shm[8 * 4096];
+  // test mode, speaker, 24-bit: full chain order, sine in every period, verdict
+  {
+    Rig rig;
+    apr::Playback pb;
+    playbackSetup(pb, rig, shm);
+    pb.mode = apr::Playback::Test;
+    pb.bits = 24;
+    pb.testMs = 500;
+    runPlayback(pb, rig, 0, 5000, nullptr);
+    CHECK(pb.finished() && pb.ok() && pb.sessions == 1 && pb.failures == 0);
+    CHECK(rig.sineChecks >= 50 && pb.pcm.writeDones == pb.pcm.writes && pb.pcm.copp == 9 && pb.pcm.handle == 0x55);
+    std::vector<uint32_t> head(rig.ops.begin(), rig.ops.begin() + 10);
+    CHECK(head == (std::vector<uint32_t>{0x100f4, 0x100f3, 0x100ef, 0x100e5, 0x10d92, 0x10326, 0x10db3, 0x10325, 0x10d98,
+                                         0x10daa}));
+    std::vector<uint32_t> tail6(rig.ops.end() - 6, rig.ops.end());
+    CHECK(tail6 == (std::vector<uint32_t>{0x10bcd, 0x10327, 0x10d94, 0x100e6, 0x100f3, 0x100f6}));
+    const auto &open = rig.rx[6];   // ASM open write: 24 bit
+    CHECK(u32(open, 16) == 0x10db3 && u16(open, 26) == 24);
+    CHECK(rig.hw == (std::vector<std::string>{"1 4096 2 codec prepare on", "1 4096 2 amp on on", "1 4096 2 amp off off",
+                                              "1 4096 2 codec release off"}));
+  }
+  // test mode, ADM open refused: ASM never opened, unmap, port down, failed verdict
+  {
+    Rig rig;
+    rig.refuse = 0x10db3;
+    apr::Playback pb;
+    playbackSetup(pb, rig, shm);
+    pb.testMs = 300;
+    runPlayback(pb, rig, 0, 5000, nullptr);
+    CHECK(pb.finished() && !pb.ok() && pb.failures == 1 && pb.pcm.failed && pb.pcm.failedStep == apr::PcmPath::AsmOpen);
+    std::vector<uint32_t> tail(rig.ops.end() - 5, rig.ops.end());
+    CHECK(tail == (std::vector<uint32_t>{0x10327, 0x10d94, 0x100e6, 0x100f3, 0x100f6}));
+  }
+  // sink mode: idle until wanted, ring data reaches the buffer, attach/detach, linger, route change restarts
+  {
+    Rig rig;
+    static uint8_t ringMem[guampaudio::kRingBytes];
+    guampaudio::Stream ring;
+    ring.buf = ringMem;
+    ring.bytes = sizeof(ringMem);
+    ring.running = true;
+    std::vector<uint8_t> pcm(1920 * 4);
+    for (size_t i = 0; i < pcm.size(); i++) pcm[i] = static_cast<uint8_t>(i * 3 + 1);
+    CHECK(ring.push(pcm.data(), static_cast<uint32_t>(pcm.size()), 0) == pcm.size());
+    rig.ring = &ring;
+    apr::Playback pb;
+    playbackSetup(pb, rig, shm);
+    pb.mode = apr::Playback::Sink;
+    pb.hooks.source = [](void *c, uint8_t *dst, uint32_t frames, uint32_t bits) {
+      Rig *r = static_cast<Rig *>(c);
+      const uint32_t n = r->ring->pull(dst, frames, bits, 0);
+      if (r->pulled.size() < 4 * 1920) r->pulled.insert(r->pulled.end(), dst, dst + frames * 4);
+      return n;
+    };
+    pb.hooks.wanted = [](void *c, uint32_t *route) { *route = static_cast<Rig *>(c)->route; return static_cast<Rig *>(c)->wanted; };
+    pb.hooks.attach = [](void *c, bool on) { (on ? static_cast<Rig *>(c)->attach : static_cast<Rig *>(c)->detach)++; };
+    runPlayback(pb, rig, 0, 1000, nullptr);
+    CHECK(pb.state == apr::Playback::Idle && rig.rx.empty());
+    rig.wanted = true;
+    runPlayback(pb, rig, 1000, 3000, nullptr);
+    CHECK(pb.state == apr::Playback::Streaming && rig.attach == 1 && ring.used() == 0 && ring.underruns > 0);
+    CHECK(rig.pulled.size() == pcm.size() && rig.pulled == pcm);   // the ring's frames, in order, into the slots
+    rig.route = GUAMP_AUDIO_DEV_ROUTE_HEADPHONE;   // route change: down, then up on 0xB030
+    runPlayback(pb, rig, 3000, 6000, nullptr);
+    CHECK(pb.state == apr::Playback::Streaming && pb.route == 3 && pb.sessions == 1 && rig.detach == 1 && rig.attach == 2);
+    CHECK(pb.afe.port.port == 0xb030 && pb.afe.port.cdcDma && pb.pcm.afePort == 0xb030 && pb.lastOk);
+    rig.wanted = false;   // plug-in stopped: 2 s linger, then down
+    runPlayback(pb, rig, 6000, 7500, nullptr);
+    CHECK(pb.state == apr::Playback::Streaming);
+    runPlayback(pb, rig, 7500, 12000, nullptr);
+    CHECK(pb.state == apr::Playback::Idle && pb.sessions == 2 && pb.failures == 0 && rig.detach == 2);
+  }
+  printf("playback: test sine 24-bit through AFE/ADM/ASM + verdict, ASM refusal undone, sink idle/attach/route change/"
+         "linger: ok\n");
+}
+
 int main() {
   abi();
   ring();
   builders();
   pcmPath();
   holdMode();
+  holdModeCdc();
+  smmu();
+  playback();
   printf("audio_pcm_host: PASS\n");
   return 0;
 }
