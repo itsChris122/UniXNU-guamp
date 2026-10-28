@@ -11,6 +11,11 @@
 //                     descriptor 478 + TX FIFO 479 (16 KiB), version 1 / INTENT_REUSE, RX FIFO 480 of the ADSP,
 //                     channel "apr_audio_svc" opened with its DT intents (20 x 512 bytes); every step logged
 //   guamp-adsp-ipc=3  + APR on that channel: q6core ADSP state query, then the framework version: "ADSP APR OK"
+//   guamp-adsp-ipc=4  + after "ADSP APR OK": the first tone (GuampAfe.inc apr::AfeTone) on the speaker port
+//                     PRIMARY_MI2S_RX 0x1000: LPASS DCODEC vote, codec side prepare (GuampAudioHw.h, weak stand-in
+//                     until wt-audio-hw links its own), MI2S IBIT clock, I2S config, DEVICE_START, amplifier on,
+//                     AFE DTMF for guamp-adsp-tone=<ms> (default 3000, 100..20000; gain guamp-adsp-tone-gain, default
+//                     0x800), then all undone: "ADSP TONE OK|FAILED". No shared memory, no ASM/ADM.
 // Default 0: GuampAdsp.inc behaves exactly as in phase 1 (SMEM read-only). Other GLINK channels the ADSP opens
 // (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here).
 // Facts (guamp DT ~/moto/guamp.dts and kernel): SMEM 0x46000000 + 2 MiB, hwlocks = <&tcsr_mutex 3>, tcsr_mutex syscon
@@ -25,6 +30,8 @@
 #include "GuampSmp2pEdge.inc"
 #include "GuampGlinkEdge.inc"
 #include "GuampApr.inc"
+#include "GuampAfe.inc"
+#include "GuampAudioHwWeak.inc"
 
 namespace adspipc {
 
@@ -46,6 +53,9 @@ constinit qipc::SmemArena gArena = {};
 constinit qipc::Smp2pEdge gSmp2p;
 constinit qipc::Glink *gGlink = nullptr;
 constinit apr::Core gCore;
+constinit apr::AfeTone gTone;
+constinit uint32_t gToneMs = 3000, gToneGain = 0x800;
+constinit bool gToneStarted = false;
 constinit uint16_t gApr = 0;
 constinit bool gReady = false, gNegotiatedLogged = false, gOpenLogged = false, gAprStarted = false, gFailed = false;
 constinit uint32_t gSlave = 0, gDesc = 0, gTxFifo = 0, gReadyAt = 0, gLinkError = 0;
@@ -84,6 +94,21 @@ void glinkTrace(void *, int event, const char *name, uint32_t a, uint32_t b) {
 void aprLog(void *, const char *what, uint32_t a, uint32_t b) {
   IOLog("GuampAdsp: apr core %s %x %x at %u ms\n", what, a, b, nowMs());
 }
+void afeLog(void *, const char *what, uint32_t a, uint32_t b) {
+  IOLog("GuampAdsp: afe %s %x %x at %u ms\n", what, a, b, nowMs());
+}
+// The codec/amplifier side (GuampAudioHw.h), speaker route, 48 kHz 16-bit stereo on PRIMARY_MI2S_RX
+int afeHw(void *, int step, bool on) {
+  const guamp_audio_hw_format fmt = {48000, 16, 2, apr::kPortPriMi2sRx};
+  int e = 0;
+  if (step == apr::AfeTone::HwPrepare) e = guamp_audio_hw_prepare(GUAMP_AUDIO_ROUTE_SPEAKER, &fmt);
+  else if (step == apr::AfeTone::AmpOn || step == apr::AfeTone::AmpOff) e = guamp_audio_hw_amp(GUAMP_AUDIO_ROUTE_SPEAKER, on);
+  else guamp_audio_hw_release(GUAMP_AUDIO_ROUTE_SPEAKER);
+  if (e == GUAMP_AUDIO_HW_ABSENT)
+    IOLog("GuampAdsp: afe %s: codec side not linked (GuampAudioHw.h stand-in): DSP part only, no sound expected\n",
+          apr::AfeTone::stepName(step));
+  return e;
+}
 int aprSend(void *, const uint8_t *p, uint32_t n) { return gGlink && gGlink->send(gApr, p, n) == qipc::Ok ? 0 : -1; }
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   apr::Header h;
@@ -93,7 +118,9 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   IOLog("GuampAdsp: apr rx ch %u %u bytes: %s src %x:%x port %x dst %x:%x port %x token %x opcode %x payload %u\n", channel,
         n, ok ? "ok" : "MALFORMED", ok ? h.srcDomain : 0, ok ? h.srcSvc : 0, ok ? h.srcPort : 0, ok ? h.destDomain : 0,
         ok ? h.destSvc : 0, ok ? h.destPort : 0, ok ? h.token : 0, ok ? h.opcode : 0, bytes);
-  if (gLevel >= 3 && channel == gApr) gCore.receive(p, n, nowMs());
+  if (gLevel < 3 || channel != gApr || !ok) return;
+  if (h.srcSvc == apr::kSvcAfe && gToneStarted) gTone.receive(p, n, nowMs());
+  else gCore.receive(p, n, nowMs());
 }
 
 // pas::Hooks::prepare (after the stopped-peer check, before any vote or RAM write): mappings + SMP2P 443.
@@ -213,6 +240,20 @@ void service() {
       gCore.begin(nowMs());
     }
     gCore.step(nowMs());
+    if (gLevel >= 4 && gCore.finished() && gCore.stateAnswered && !gToneStarted) {
+      gToneStarted = true;
+      gTone.ctx = nullptr;
+      gTone.send = aprSend;
+      gTone.log = afeLog;
+      gTone.hw = afeHw;
+      gTone.toneMs = gToneMs;
+      gTone.gain = static_cast<uint16_t>(gToneGain);
+      IOLog("GuampAdsp: afe tone: port %x, mi2s ibit %u Hz, i2s %u bit SD0 stereo %u Hz, dtmf %u/%u Hz gain %x for %u ms\n",
+            gTone.port.port, gTone.clockHz, gTone.port.bits, gTone.port.rate, gTone.high, gTone.low, gTone.gain,
+            gTone.toneMs);
+      gTone.begin(nowMs());
+    }
+    if (gToneStarted) gTone.stepAt(nowMs());
     gGlink->step();
   }
 }
@@ -231,7 +272,7 @@ void run() {
   if (!gSmem) return;
   if (!gReady) onReady();
   const uint32_t begin = nowMs();
-  bool rxLogged = false, verdict = gLevel < 2;
+  bool rxLogged = false, verdict = gLevel < 2, toneVerdict = gLevel < 4;
   for (;;) {
     service();
     const uint32_t t = nowMs() - begin;
@@ -270,7 +311,21 @@ void run() {
                 gCore.service[i].branch);
         verdict = true;
       }
-      if (verdict) IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
+      if (verdict && toneVerdict) IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
+    }
+    if (verdict && !toneVerdict && (gTone.finished() || !gCore.stateAnswered)) {
+      toneVerdict = true;
+      if (!gToneStarted)
+        IOLog("GuampAdsp: ADSP TONE FAILED (no APR)\n");
+      else if (gTone.ok())
+        IOLog("GuampAdsp: ADSP TONE OK (%u ms on port %x, %u answers, vote %s, codec errors %u, undo errors %u)\n",
+              gTone.toneMs, gTone.port.port, gTone.answered, gTone.handle ? "held" : "missing", gTone.hwErrors,
+              gTone.undoErrors);
+      else
+        IOLog("GuampAdsp: ADSP TONE FAILED (%s status %x, %u answers, undo errors %u)\n",
+              apr::AfeTone::stepName(static_cast<int>(gTone.failedStep)), gTone.failedStatus, gTone.answered,
+              gTone.undoErrors);
+      IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
     }
     IOSleep(kLoopMs);
   }

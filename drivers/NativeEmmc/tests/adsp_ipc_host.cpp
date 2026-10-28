@@ -5,7 +5,10 @@
 // it allocates its SMP2P item 429 (ready, restart-done) and, once the apps GLINK descriptor 478 exists, its RX FIFO
 // 480 (small, to force wrap-around), speaks GLINK (own VERSION, OPEN of IPCRTR and apr_audio_svc, intents, SIGNALS,
 // fragmented DATA, RX_INTENT_REQ for a reply bigger than the apps intents) and answers APR q6core like the AVS
-// firmware (state 0 twice, then 1; framework version with 40 services = 532 bytes). Then unit tests of the edge
+// firmware (state 0 twice, then 1; framework version with 40 services = 520 bytes), then q6afe for the level-4 tone
+// (vote, MI2S clock, I2S config, start, DTMF on/off, stop, clock off, devote: every packet checked byte by byte
+// against the Linux struct layouts) with the codec side replaced by counting strong definitions of GuampAudioHw.h.
+// Then unit tests of the edge
 // cases (allocation layout, EEXIST, lock timeout, full partition, SMP2P layout/negotiation, TX FIFO full ->
 // READ_NOTIF, protocol errors, APR parsing). No device access. Build: see run-pas-tests.sh.
 #include <stdint.h>
@@ -61,6 +64,17 @@ static volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length) {
   fprintf(stderr, "unexpected mapping %llx + %llx\n", (unsigned long long)physical, (unsigned long long)length);
   abort();
 }
+#define GUAMP_AUDIO_HW_PROVIDED 1
+#include "../GuampAudioHw.h"
+static std::vector<std::string> hwCalls;
+extern "C" int guamp_audio_hw_prepare(uint32_t route, const struct guamp_audio_hw_format *f) {
+  hwCalls.push_back("prepare " + std::to_string(route) + " " + std::to_string(f->rate) + " " + std::to_string(f->bits) +
+                    " " + std::to_string(f->channels) + " " + std::to_string(f->afe_port));
+  return 0;
+}
+extern "C" int guamp_audio_hw_amp(uint32_t route, int on) { hwCalls.push_back("amp " + std::to_string(on)); return 0; }
+extern "C" int guamp_audio_hw_volume(uint32_t, int32_t) { return 0; }
+extern "C" void guamp_audio_hw_release(uint32_t) { hwCalls.push_back("release"); }
 #include "../GuampAdspIpc.inc"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
@@ -131,7 +145,9 @@ struct Peer {
   std::vector<std::vector<uint8_t>> outbox;   // APR replies waiting for an apps intent
   bool requestOut = false;
   uint32_t stateQueries = 0, fwkQueries = 0, rxDones = 0, rxDoneReuse = 0, intentReqAcks = 0, opensSeen = 0, readNotif = 0;
-  uint64_t fwkSentAtMs = 0;
+  uint64_t fwkSentAtMs = 0, afeDoneAtMs = 0;
+  std::vector<uint32_t> afeOps;
+  uint64_t dtmfOnAtMs = 0, dtmfOffAtMs = 0;
   std::vector<uint8_t> assembly;
   uint32_t assemblyLeft = 0, lastIntent = 0, appsFeatures = 0, versionAcksRx = 0;
   uint32_t kicksSmp2p = 0, kicksGlink = 0;
@@ -210,22 +226,72 @@ struct Peer {
     CHECK(cmd(5, kRcidApr, 2, pairs, 16));
     CHECK(cmd(15, kRcidApr, 0x3));     // SIGNALS
   }
-  void reply(uint32_t token, uint32_t opcode, const std::vector<uint32_t> &payload) {
-    std::vector<uint8_t> p(32 + 4 * payload.size());
-    const uint16_t f = 0x0280, size = static_cast<uint16_t>(p.size());
+  // ADSP answers: 20-byte header, CMD_RSP type (apr_cb_func takes any type below 4)
+  void reply(uint32_t token, uint32_t opcode, const std::vector<uint32_t> &payload, uint8_t svc = 3) {
+    std::vector<uint8_t> p(20 + 4 * payload.size());
+    const uint16_t f = 0x0150, size = static_cast<uint16_t>(p.size());
     memcpy(&p[0], &f, 2);
     memcpy(&p[2], &size, 2);
-    p[4] = 3; p[5] = 4; p[8] = 3; p[9] = 5;
+    p[4] = svc; p[5] = 4; p[8] = svc; p[9] = 5;
     memcpy(&p[12], &token, 4);
     memcpy(&p[16], &opcode, 4);
-    memcpy(&p[32], payload.data(), 4 * payload.size());
+    memcpy(&p[20], payload.data(), 4 * payload.size());
     outbox.push_back(p);
   }
+  static uint32_t u32(const std::vector<uint8_t> &p, uint32_t at) { uint32_t v; memcpy(&v, &p[at], 4); return v; }
+  static uint32_t u16(const std::vector<uint8_t> &p, uint32_t at) { uint16_t v; memcpy(&v, &p[at], 2); return v; }
+  // q6afe, layouts of apr_audio-v2.h / q6afe-v2.h (independent of GuampAfe.inc: offsets written out here)
+  void afe(const std::vector<uint8_t> &p, uint32_t token, uint32_t opcode) {
+    afeOps.push_back(opcode);
+    const uint32_t n = static_cast<uint32_t>(p.size());
+    switch (opcode) {
+      case 0x100f4:   // vote {hw_block_id, client_name[8]}
+        CHECK(n == 32 && u32(p, 20) == 4 && !memcmp(&p[24], "GUAMP\0\0\0", 8));
+        reply(token, 0x100f5, {0x77}, 4);
+        return;
+      case 0x100f6:   // devote {hw_block_id, handle}
+        CHECK(n == 28 && u32(p, 20) == 4 && u32(p, 24) == 0x77);
+        afeDoneAtMs = nowMs();
+        break;
+      case 0x100f3: {   // svc set param v1 {payload_size, mem_hdr[3], param_hdr_v1, afe_clk_set}
+        CHECK(n == 68 && u32(p, 20) == 32 && !u32(p, 24) && !u32(p, 28) && !u32(p, 32));
+        CHECK(u32(p, 36) == 0x1028f && u32(p, 40) == 0x10290 && u16(p, 44) == 20 && u16(p, 46) == 0);
+        CHECK(u32(p, 48) == 1 && u32(p, 52) == 0x100 && u32(p, 56) == 1536000 && u16(p, 60) == 1 && u16(p, 62) == 0);
+        CHECK(u32(p, 64) == (afeOps.size() < 4 ? 1u : 0u));
+        break;
+      }
+      case 0x100ef: {   // port set param v2 {port_id, payload_size, mem_hdr[3], param_hdr_v1, i2s_cfg + union pad}
+        CHECK(n == 20 + 4 + 12 + 12 + 144 && u16(p, 20) == 0x1000 && u16(p, 22) == 12 + 144);
+        CHECK(!u32(p, 24) && !u32(p, 28) && !u32(p, 32));
+        CHECK(u32(p, 36) == 0x1020c && u32(p, 40) == 0x1020d && u16(p, 44) == 144 && u16(p, 46) == 0);
+        CHECK(u32(p, 48) == 1 && u16(p, 52) == 16 && u16(p, 54) == 1 && u16(p, 56) == 1 && u16(p, 58) == 1);
+        CHECK(u32(p, 60) == 48000 && u16(p, 64) == 0 && u16(p, 66) == 0);
+        for (uint32_t i = 68; i < n; i++) CHECK(p[i] == 0);
+        break;
+      }
+      case 0x100e5: case 0x100e6:   // {port_id, reserved}
+        CHECK(n == 24 && u16(p, 20) == 0x1000 && u16(p, 22) == 0);
+        break;
+      case 0x10102: {   // dtmf {int64 duration, high, low, gain, num_ports, port_ids, reserved}
+        CHECK(n == 40 && u16(p, 28) == 1209 && u16(p, 30) == 697 && u16(p, 32) == 0x800 && u16(p, 34) == 1);
+        CHECK(u16(p, 36) == 0x1000 && u16(p, 38) == 0);
+        const uint64_t d = u32(p, 20) | (static_cast<uint64_t>(u32(p, 24)) << 32);
+        CHECK(d == (dtmfOnAtMs ? 0 : ~0ull));
+        (dtmfOnAtMs ? dtmfOffAtMs : dtmfOnAtMs) = nowMs();
+        break;
+      }
+      default: CHECK(!"unexpected AFE opcode");
+    }
+    reply(token, 0x110e8, {opcode, 0}, 4);
+  }
   void apr(const std::vector<uint8_t> &p) {
-    CHECK(p.size() == 32 && p[0] == 0x80 && p[1] == 2 && p[2] == 32 && p[4] == 3 && p[5] == 5 && p[8] == 3 && p[9] == 4);
+    CHECK(p.size() >= 20 && p[0] == 0x50 && p[1] == 2 && u16(p, 2) == p.size() && p[5] == 5 && p[9] == 4 && p[4] == p[8]);
+    CHECK(u16(p, 6) == 0 && u16(p, 10) == 0);
     uint32_t token, opcode;
     memcpy(&token, &p[12], 4);
     memcpy(&opcode, &p[16], 4);
+    if (p[4] == 4) return afe(p, token, opcode);
+    CHECK(p[4] == 3 && p.size() == 20);
     if (opcode == 0x1290c) {
       stateQueries++;
       reply(token, 0x1290d, {stateQueries >= 3 ? 1u : 0u});
@@ -233,7 +299,7 @@ struct Peer {
       fwkQueries++;
       std::vector<uint32_t> v = {2, 8, 3, 1, 40};
       for (uint32_t i = 0; i < 40; i++) { v.push_back(i + 1); v.push_back(i % 5); v.push_back(0); }
-      reply(token, 0x1292d, v);      // 32 + 20 + 480 = 532 bytes: needs a bigger apps intent
+      reply(token, 0x1292d, v);      // 20 + 20 + 480 = 520 bytes: needs a bigger apps intent
       fwkSentAtMs = nowMs();
     } else {
       CHECK(!"unexpected APR opcode");
@@ -351,7 +417,7 @@ struct Peer {
       txAdvance(bytes);
     }
     if (aprAcked) flushOutbox();
-    if (fwkSentAtMs && outbox.empty() && nowMs() >= fwkSentAtMs + 200) fatalSent = true;   // ends run()
+    if (afeDoneAtMs && outbox.empty() && nowMs() >= afeDoneAtMs + 200) fatalSent = true;   // ends run()
   }
   void step() {
     const uint32_t ipc = rd(apcsPage, 8);
@@ -375,7 +441,7 @@ static void endToEnd() {
   buildSmem(smemImage);
   Peer peer;
   gPeer = &peer;
-  adspipc::gLevel = 3;
+  adspipc::gLevel = 4;
   CHECK(adspipc::prepare(nullptr) == qipc::Ok);   // pas::Hooks::prepare: 0 = go on
   uint32_t at = 0, bytes = 0;
   CHECK(remoteGet(smemImage, kPartAdsp, 443, &at, &bytes) && bytes == 340);
@@ -400,20 +466,28 @@ static void endToEnd() {
   adspipc::run();   // returns on the simulated err-fatal after the APR exchange
   if (getenv("IPC_LOG") == nullptr && logs.find("ADSP APR OK") == std::string::npos) fputs(logs.c_str(), stderr);
   CHECK(logs.find("GuampAdsp: ADSP APR OK (state 1 after 3 tries, fwk answered 2.8.3.1, 40 services)") != std::string::npos);
+  CHECK(logs.find("GuampAdsp: ADSP TONE OK (3000 ms on port 1000, 9 answers, vote held, codec errors 0, undo errors 0)") !=
+        std::string::npos);
+  const std::vector<uint32_t> ops = {0x100f4, 0x100f3, 0x100ef, 0x100e5, 0x10102, 0x10102, 0x100e6, 0x100f3, 0x100f6};
+  CHECK(peer.afeOps == ops);
+  CHECK(peer.dtmfOffAtMs - peer.dtmfOnAtMs >= 3000 && peer.dtmfOffAtMs - peer.dtmfOnAtMs <= 3100);
+  CHECK(hwCalls.size() == 4 && hwCalls[0] == "prepare 1 48000 16 2 4096" && hwCalls[1] == "amp 1" && hwCalls[2] == "amp 0" &&
+        hwCalls[3] == "release");
   CHECK(logs.find("glink open ignored (no local user) IPCRTR 3") != std::string::npos);
   CHECK(logs.find("glink signals rx apr_audio_svc 7 3") != std::string::npos);
   CHECK(logs.find("ipc ADSP err-fatal") != std::string::npos);
   CHECK(peer.stateQueries == 3 && peer.fwkQueries == 1 && peer.versionAcked && peer.appsFeatures == 1);
   CHECK(adspipc::gCore.listed == 24 && adspipc::gCore.services == 40 && adspipc::gCore.service[23].id == 24);
-  CHECK(peer.rxDoneReuse == 3 && peer.rxDones == 1);   // 3 state answers reused, the big reply in a one-shot intent
+  CHECK(peer.rxDoneReuse == 3 + 9 && peer.rxDones == 1);   // state + AFE answers reused, the big reply one-shot
   CHECK(peer.kicksSmp2p >= 1 && peer.kicksGlink >= 3);
   const qipc::Glink::Channel *c = adspipc::gGlink->channel(adspipc::gApr);
   uint32_t local = 0;
   for (const auto &li : c->intent) local += li.data ? 1 : 0;
-  CHECK(local == 20 && c->rxPackets == 4 && c->txPackets == 4 && c->remote == Peer::kRcidApr);
+  CHECK(local == 20 && c->rxPackets == 13 && c->txPackets == 13 && c->remote == Peer::kRcidApr);
   CHECK(adspipc::gGlink->ignoredOpens == 1 && adspipc::gGlink->rx.length == 1024);
   printf("end to end: SMP2P 443 + negotiation + SSR ack, GLINK version/open/intents/signals, APR state x3 + fwk "
-         "(532-byte reply via RX_INTENT_REQ, fragmented, RX FIFO wrapped), ADSP APR OK, err-fatal exit\n");
+         "(520-byte reply via RX_INTENT_REQ, fragmented, RX FIFO wrapped), ADSP APR OK, AFE tone sequence with every "
+         "packet checked, ADSP TONE OK, err-fatal exit\n");
   gPeer = nullptr;
 }
 
@@ -591,20 +665,24 @@ static void glinkUnit() {
 }
 static void aprUnit() {
   uint8_t p[64];
-  CHECK(apr::build(p, sizeof(p), 3, 0, 9, 0x1290c, nullptr, 0) == 32);
-  CHECK(p[0] == 0x80 && p[1] == 2 && p[2] == 32 && p[5] == 5 && p[9] == 4 && p[12] == 9);
+  CHECK(apr::build(p, sizeof(p), 3, 0, 9, 0x1290c, nullptr, 0) == 20);
+  CHECK(p[0] == 0x50 && p[1] == 2 && p[2] == 20 && p[3] == 0 && p[5] == 5 && p[9] == 4 && p[12] == 9 && p[16] == 0x0c);
   CHECK(apr::build(p, sizeof(p), 3, 0, 9, 0x1290c, p, 3) == 0);                 // payload must be words
   apr::Header h;
   const uint8_t *pl;
   uint32_t n;
-  CHECK(apr::parse(p, 32, &h, &pl, &n) && n == 0 && h.opcode == 0x1290c);
-  CHECK(!apr::parse(p, 31, &h, &pl, &n));
-  p[2] = 40;
-  CHECK(!apr::parse(p, 32, &h, &pl, &n));                                      // pkt_size beyond the message
-  p[2] = 32; p[0] = 0x70;
-  CHECK(!apr::parse(p, 32, &h, &pl, &n));                                      // header of 7 words
-  p[0] = 0x81;
-  CHECK(!apr::parse(p, 32, &h, &pl, &n));                                      // version 1
+  CHECK(apr::parse(p, 20, &h, &pl, &n) && n == 0 && h.opcode == 0x1290c);
+  CHECK(!apr::parse(p, 19, &h, &pl, &n));
+  p[2] = 28;
+  CHECK(!apr::parse(p, 20, &h, &pl, &n));                                      // pkt_size beyond the message
+  p[2] = 20; p[0] = 0x40;
+  CHECK(!apr::parse(p, 20, &h, &pl, &n));                                      // header of 4 words
+  p[0] = 0x51;
+  CHECK(apr::parse(p, 20, &h, &pl, &n));                                       // version 1: accepted as apr_cb_func
+  p[0] = 0x52;
+  CHECK(!apr::parse(p, 20, &h, &pl, &n));                                      // version 2
+  p[0] = 0x60; p[2] = 24;
+  CHECK(apr::parse(p, 24, &h, &pl, &n) && n == 0);                             // longer header: payload after it
   apr::Core core;
   int sent = 0;
   core.send = [](void *c, const uint8_t *, uint32_t) { ++*static_cast<int *>(c); return 0; };
@@ -616,8 +694,88 @@ static void aprUnit() {
   printf("apr: header build/parse, malformed packets, ready budget without answers: ok\n");
 }
 
+// AfeTone alone: a refused port start undoes clock and vote, a dead ADSP times out step by step, the 144-byte
+// I2S config refused once is retried with 20 bytes, a stale answer is ignored.
+struct ToneRig {
+  std::vector<std::vector<uint8_t>> sent;
+  std::vector<int> hw;
+  uint32_t refuse = 0, refuseCount = 1;   // opcode to refuse with status 0x12 (ADSP_EBADPARAM-like) this many times
+};
+static void afeUnit() {
+  auto run = [](ToneRig &rig, bool answer) {
+    apr::AfeTone t;
+    t.ctx = &rig;
+    t.send = [](void *c, const uint8_t *p, uint32_t n) {
+      static_cast<ToneRig *>(c)->sent.emplace_back(p, p + n);
+      return 0;
+    };
+    t.hw = [](void *c, int s, bool) { static_cast<ToneRig *>(c)->hw.push_back(s); return GUAMP_AUDIO_HW_ABSENT; };
+    t.toneMs = 500;
+    t.begin(0);
+    size_t seen = 0;
+    for (uint32_t now = 0; now < 30000 && !t.finished(); now += 10) {
+      t.stepAt(now);
+      while (answer && seen < rig.sent.size()) {
+        const auto &q = rig.sent[seen++];
+        uint32_t token, opcode;
+        memcpy(&token, &q[12], 4);
+        memcpy(&opcode, &q[16], 4);
+        uint8_t r[28] = {0x50, 0x01, 28, 0, 4, 4, 0, 0, 4, 5};
+        uint32_t ro = 0x110e8, a = opcode, b = 0;
+        if (opcode == rig.refuse && rig.refuseCount) { b = 0x12; rig.refuseCount--; }
+        if (opcode == 0x100f4) { ro = 0x100f5; a = 5; r[2] = 24; }
+        uint8_t stale[28];
+        memcpy(stale, r, 28);
+        const uint32_t wrongToken = token + 100;
+        memcpy(stale + 12, &wrongToken, 4); memcpy(stale + 16, &ro, 4); memcpy(stale + 20, &a, 4); memcpy(stale + 24, &b, 4);
+        t.receive(stale, r[2], now);   // ignored: not the token in flight
+        memcpy(r + 12, &token, 4); memcpy(r + 16, &ro, 4); memcpy(r + 20, &a, 4); memcpy(r + 24, &b, 4);
+        t.receive(r, r[2], now);
+      }
+    }
+    return t;
+  };
+  auto ops = [](const ToneRig &rig) {
+    std::vector<uint32_t> v;
+    for (const auto &q : rig.sent) { uint32_t o; memcpy(&o, &q[16], 4); v.push_back(o); }
+    return v;
+  };
+  {
+    ToneRig rig;
+    rig.refuse = 0x100e5;
+    const apr::AfeTone t = run(rig, true);
+    CHECK(t.finished() && !t.ok() && t.setupFailed && t.failedStep == apr::AfeTone::Start && t.failedStatus == 0x12);
+    CHECK(ops(rig) == (std::vector<uint32_t>{0x100f4, 0x100f3, 0x100ef, 0x100e5, 0x100f3, 0x100f6}));
+    CHECK(rig.hw == (std::vector<int>{apr::AfeTone::HwPrepare, apr::AfeTone::HwRelease}) && t.unexpected == 6);
+  }
+  {
+    ToneRig rig;
+    rig.refuse = 0x100ef;   // 144 bytes refused once, 20 accepted
+    const apr::AfeTone t = run(rig, true);
+    CHECK(t.ok() && t.port.paramBytes == 20 && t.hwErrors == 3);
+    CHECK(ops(rig) == (std::vector<uint32_t>{0x100f4, 0x100f3, 0x100ef, 0x100ef, 0x100e5, 0x10102, 0x10102, 0x100e6, 0x100f3,
+                                             0x100f6}));
+    CHECK(rig.sent[2].size() == 192 && rig.sent[3].size() == 68 && rig.sent[3][44] == 20);
+    // amplifier never reported on (stand-in): no amp-off call
+    CHECK(rig.hw == (std::vector<int>{apr::AfeTone::HwPrepare, apr::AfeTone::AmpOn, apr::AfeTone::HwRelease}));
+  }
+  {
+    ToneRig rig;   // nobody answers: vote times out (goes on), clock times out (fails), clock-off still sent
+    const apr::AfeTone t = run(rig, false);
+    CHECK(t.finished() && !t.ok() && t.failedStep == apr::AfeTone::ClockOn && t.failedStatus == 0xffffffffu);
+    CHECK(ops(rig) == (std::vector<uint32_t>{0x100f4, 0x100f3}));   // clock never confirmed on: nothing to undo
+  }
+  uint8_t b[64];
+  CHECK(apr::afeDtmf(b, sizeof(b), 1, -1, 1000, 1000, 1, 0x1000) == 40 && b[20] == 0xff && b[27] == 0xff);
+  apr::I2sConfig bad;
+  bad.paramBytes = 22;
+  CHECK(apr::afeI2s(b, sizeof(b), 1, bad) == 0);
+  printf("afe: refused start undone, 144 -> 20 byte I2S retry, timeouts, stale answers, builders: ok\n");
+}
+
 int main() {
   endToEnd();
+  afeUnit();
   allocation();
   sharedLock();
   smp2pUnit();

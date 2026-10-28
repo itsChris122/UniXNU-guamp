@@ -1032,6 +1032,8 @@ static void usbProbe()
 #include "GuampBacklight.inc"
 #include "GuampCpufreq.inc"
 #include "GuampAdsp.inc"       // ADSP authenticated PAS start (guamp-adsp=1|2), after GuampWifiPrep.inc and GuampRpm.inc
+#include "GuampAsm.inc"        // q6asm/q6adm PCM path skeleton (not wired yet), after GuampAdsp.inc
+#include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
 
 static void startLater(thread_call_param_t, thread_call_param_t)
@@ -1166,6 +1168,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread
   camtl::start();     // guamp-ca-metal=2: render server watchdog for the Metal boot count (zzzzzz-guamp-ca-metal.patch)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
+  audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
