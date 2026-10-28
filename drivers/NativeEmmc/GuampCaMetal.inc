@@ -91,6 +91,13 @@ static void thread(void *, wait_result_t) {
     IOSleep(1000);
     waited = waited + 1;
   }
+  // The kern_exec patch decides at launchd's exec, long before the device (guamp-gpu-delay): the gate is final by now.
+  if (guamp_ca_metal_mode != 2 || !guamp_ca_metal_enabled) {
+    IOLog("GuampCaMetal: watchdog off after %u s: gate closed (mode %u, attempts %d)\n", waited, guamp_ca_metal_mode,
+          guamp_ca_metal_attempts);
+    return;
+  }
+  IOLog("GuampCaMetal: Metal boot %d of %u before the software fallback\n", guamp_ca_metal_attempts + 1, kMaxAttempts);
   if (gReady != 1) {
     const int parked = park();
     guamp_ca_metal_enabled = 0;
@@ -128,10 +135,12 @@ static void thread(void *, wait_result_t) {
   }
 }
 
+// Runs from the kext start, before the patch has parsed the mode (launchd's exec): read the boot arg here, the thread checks the gate.
 void start() {
-  if (guamp_ca_metal_mode != 2 || !guamp_ca_metal_enabled) return;
-  IOLog("GuampCaMetal: watchdog on (Metal boot %d of %u before the software fallback)\n", guamp_ca_metal_attempts + 1,
-        kMaxAttempts);
+  unsigned mode = 0;
+  PE_parse_boot_argn("guamp-ca-metal", &mode, sizeof(mode));
+  if (mode != 2) return;
+  IOLog("GuampCaMetal: watchdog on, waiting for the Metal device\n");
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
