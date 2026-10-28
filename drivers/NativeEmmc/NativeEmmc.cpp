@@ -1084,6 +1084,7 @@ static void usbProbe()
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
+#include "GuampRtc.inc"       // wall clock: PM6125 RTC + offset in kpan (guamp-rtc=0 off), after PmicService.inc
 #include "GuampBtSerial.inc"   // Bluetooth M2 device nodes (guamp-bt-shim=1), the transport of BtService.inc
 #include "BtService.inc"
 #include "GuampBtNub.inc"
@@ -1228,6 +1229,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
         card.logIntervalMs, card.fbEvery);
   card.mirrorCall = thread_call_allocate(mirrorEntry, nullptr);
   if (card.mirrorCall) mirrorEntry(nullptr, nullptr);
+  rtc::boot();        // wall clock before the media exist, so before the root mount and launchd
   publish(0, card.capacity, "user area");
   publishWindows();
   wifiprep::start();   // guamp-wifi-prep=1: read-only SMEM and modem firmware checks, own thread
@@ -1435,6 +1437,7 @@ extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *u
 extern "C" void guamp_emmc_flush(unsigned type)
 {
   pmic::torch::shutdown(type >= kPEPanicRestartCPU && type != kPEPagingOff);   // flash LED off first, gate or not
+  if (type < kPEPanicRestartCPU || type == kPEPagingOff) rtc::flush();       // pending settimeofday offset, own gate use
   Card &card = gCard;
   if (!card.online || !card.gate) return;
   bool panic = type >= kPEPanicRestartCPU && type != kPEPagingOff;
