@@ -228,6 +228,11 @@ extern "C" void guamp_wlan_publish(const char *interface, const uint8_t *address
   wlan->setProperty("IOBuiltin", true);
   wlan->setProperty("IOPrimaryInterface", true);
   wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
+  // saf1 (29/10): "Protobox: wifid(42) deny(1) iokit-open-service GuampWLAN": wifid's protobox profile names Apple's
+  // WLAN classes only, so Apple80211BindToInterface's IOServiceOpen failed. The sandbox grant of
+  // patches/xnu/zzw-native-adreno-sandbox-grant.patch (is_io_service_open_extended: service open, user client open and
+  // the UC filter) for this one service and wifid alone; newUserClient above only makes type 0.
+  wlan->setProperty("NativeSandboxGrantProcess", "wifid");
   if (!wlannub::publish(wlan, controller, "GuampWLAN")) {
     IOLog("GuampWLAN: the service did not start\n");
   } else {
