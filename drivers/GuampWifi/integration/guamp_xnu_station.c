@@ -584,17 +584,23 @@ int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_sn
   g_public_state.phase = REDWOOD_STA_OFF;
   lck_spin_unlock(guamp_wifi_state_lock);
   nw_wifi_set_events(&g_events);
+  /* guamp-wifi-trace (nw_abi.h): breadcrumbs only, nothing below changes with it */
+  if (nw_wifi_trace_budget) nw_wifi_trace("attach: nw_wifi_start_snoc");
   int error = nw_wifi_start_snoc(g_platform, board);
+  if (nw_wifi_trace_budget) nw_wifi_trace("attach: nw_wifi_start_snoc result %d", error);
   if (error) { __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE); return error; }
   bool have_address = false;
   for (unsigned ms = 0; ms < 10000; ++ms) {
     nw_wifi_status_get(&status);
     if (status.state == NW_STA_IDLE && status.channels && !(status.mac[0] & 1) &&
         bcmp(status.mac, "\0\0\0\0\0\0", 6) != 0) { have_address = true; break; }
+    if (nw_wifi_trace_budget && ms < nw_wifi_trace_budget)
+      nw_wifi_trace("attach: loop %u: state %u channels %u, nw_wifi_step", ms, (unsigned)status.state, (unsigned)status.channels);
     int work = nw_wifi_step();
     if (work < 0) { nw_wifi_stop(); __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE); return EIO; }
     g_platform->sleep_ms(1);
   }
+  if (nw_wifi_trace_budget) nw_wifi_trace("attach: probe loop left, address %s", have_address ? "ready" : "NOT ready");
   if (!have_address) { nw_wifi_stop(); __atomic_store_n(&g_worker_started, 0, __ATOMIC_RELEASE); return ETIMEDOUT; }
   bzero(&g_link, sizeof(g_link));
   g_link.name = "guamp WCN3990 ath10k"; g_link.wireless = true;

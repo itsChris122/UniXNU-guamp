@@ -76,9 +76,24 @@ void lx_irq_raise(unsigned int irq) { for (int i = 0; i < 64; i++) if (g_irq[i].
 
 void lx_irq_raise_all(void);
 volatile uint64_t nw_wifi_where[4];
+/* guamp-wifi-trace (nw_abi.h): off while the budget is 0 */
+volatile unsigned nw_wifi_trace_budget;
+void (*volatile nw_wifi_trace_sink)(const char *line);
+int nw_wifi_trace_take(volatile unsigned *count) {
+  if (!nw_wifi_trace_budget || !nw_wifi_trace_sink || *count >= nw_wifi_trace_budget) return 0;
+  ++*count; return 1; }
+void nw_wifi_trace(const char *fmt, ...) {
+  void (*sink)(const char *) = nw_wifi_trace_sink;
+  if (!nw_wifi_trace_budget || !sink) return;
+  char b[200]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap); sink(b); }
+static volatile unsigned g_trace_where;
 static void where(int kind, const void *fn) {
   nw_wifi_where[0] = kind; nw_wifi_where[1] = fn ? (uint64_t)((uintptr_t)fn - (uintptr_t)lx_now_ms) : 0;
-  nw_wifi_where[2] = g_depth; nw_wifi_where[3] = lx_now_ms(); }
+  nw_wifi_where[2] = g_depth; nw_wifi_where[3] = lx_now_ms();
+  /* the first N interrupt handlers, timers and work items the dispatcher runs (board polls and idle are left out) */
+  if (nw_wifi_trace_budget && kind >= 1 && kind <= 3 && nw_wifi_trace_take(&g_trace_where))
+    nw_wifi_trace("pump %u: runs %s, fn lx_now_ms+0x%llx (64-bit offset), depth %d", g_trace_where,
+                  kind == 1 ? "irq" : kind == 2 ? "timer" : "work", (unsigned long long)nw_wifi_where[1], g_depth); }
 /* The dispatcher: interrupts first, then due timers, then one round of queued work. */
 int lx_pump(void) {
   int ran = 0;

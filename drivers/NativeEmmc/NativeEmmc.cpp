@@ -66,6 +66,7 @@ extern volatile int native_owner_data_stage, native_owner_data_status;
 extern volatile int native_owner_boot_manifest_status;
 void guamp_emmc_start(IOService *platform);
 void guamp_emmc_flush(unsigned type);
+void guamp_emmc_log_sync(void);
 // Observation: last failing init stage (0 = ready), blocks moved, mirror passes.
 volatile uint32_t native_emmc_stage = 0xff;
 uint64_t native_emmc_reads = 0, native_emmc_writes = 0, native_emmc_errors = 0, native_emmc_mirrors = 0;   // under the gate
@@ -1572,4 +1573,16 @@ extern "C" void guamp_emmc_flush(unsigned type)
   card.mirror(true);
   card.host.flushCache();                  // Data window writes still in the card cache
   if (locked) IOLockUnlock(card.gate);
+}
+
+// guamp-wifi-trace-kpan=1 (GuampWifi diagnostics only): one periodic-style kpan pass of the kernel log (no framebuffer,
+// flush type unchanged) from a thread that may sleep, so the line just logged is on the eMMC before the next register
+// access. Not for panic or interrupt context; the caller checks that it may block.
+extern "C" void guamp_emmc_log_sync(void)
+{
+  Card &card = gCard;
+  if (!card.online || !card.gate) return;
+  IOLockLock(card.gate);
+  card.mirror(false);
+  IOLockUnlock(card.gate);
 }
