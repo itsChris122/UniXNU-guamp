@@ -1,0 +1,67 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -1450,6 +1450,50 @@
+  * Given a vnode in a union mount, traverse to the equivalent
+  * vnode in the underlying mount.
+  */
++/* guamp (29/10): the SystemOS cryptex is union-mounted on "/" over the sealed root, where ~30 cryptex bundles
++ * (MobileSafari.framework, WebKit.framework, ExtensionKit/Extensions/{WebContent,Networking,GPU,...}Extension.appex, ...)
++ * are symlinks to /System/Cryptexes/OS/... . A directory read on such a cryptex bundle (upper) moves to the "lower" entry
++ * with the same path at the upper EOF, and that entry is the symlink: getdirentries then fails with EINVAL and
++ * getattrlistbulk with ENOTDIR. libc opendir() reads a whole MNT_UNION directory at open (__filldir) and fails on that
++ * error, so CFBundle cannot list any cryptex bundle (identifier (null), URLForResource nil, "Unable to create bundleRef"
++ * in lsd) and LaunchServices never registers the WebKit extensions. A lower entry that is not a directory is no union
++ * counterpart: report ENOENT (plain end of directory / plain lookup miss). guamp-union-lowerdir=0 restores the old
++ * behaviour; guamp-union-log=N logs the first N cases (default 24). */
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++static volatile SInt32 guamp_union_lowerdir_state = -1;
++static volatile SInt32 guamp_union_log_limit = -1;
++static volatile SInt32 guamp_union_log_used = 0;
++static int
++guamp_union_lowerdir_enabled(void)
++{
++	SInt32 state = guamp_union_lowerdir_state;
++	if (state < 0) {
++		uint32_t value = 1;
++		(void)PE_parse_boot_argn("guamp-union-lowerdir", &value, sizeof(value));
++		state = value ? 1 : 0;
++		guamp_union_lowerdir_state = state;
++	}
++	return state;
++}
++static void
++guamp_union_lowerdir_log(const char *path, vnode_t vp)
++{
++	SInt32 limit = guamp_union_log_limit;
++	if (limit < 0) {
++		uint32_t value = 24;
++		(void)PE_parse_boot_argn("guamp-union-log", &value, sizeof(value));
++		limit = value > 10000 ? 10000 : (SInt32)value;
++		guamp_union_log_limit = limit;
++	}
++	if (OSIncrementAtomic(&guamp_union_log_used) >= limit) {
++		return;
++	}
++	proc_t p = current_proc();
++	printf("guamp-union: %s[%d] lower of /%s is type %d, not a directory: end of union (ENOENT)\n",
++	    p ? proc_best_name(p) : "?", p ? proc_pid(p) : -1, path, vnode_vtype(vp));
++}
++
+ int
+ lookup_traverse_union(vnode_t dvp, vnode_t *new_dvp, vfs_context_t ctx)
+ {
+@@ -1510,6 +1554,12 @@
+ 	error = namei(&nd);
+ 	if (error == 0) {
+ 		*new_dvp = nd.ni_vp;
++		if (nd.ni_vp->v_type != VDIR && guamp_union_lowerdir_enabled()) {
++			guamp_union_lowerdir_log(pp, nd.ni_vp);
++			vnode_put(nd.ni_vp);
++			*new_dvp = NULL;
++			error = ENOENT;
++		}
+ 	}
+ 	nameidone(&nd);
+ done:
