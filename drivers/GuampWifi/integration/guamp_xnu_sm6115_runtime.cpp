@@ -31,7 +31,7 @@ volatile int guamp_wifi_provider_error=0;
 namespace guampwifi {
 struct Sm6115Runtime {
   enum Stage : unsigned { Off,Mapping,RpmConnect,ProxyVotes,Prepared,Modem,
-    Firmware,RadioProbe,Scanning,ScanComplete,IosAttached,Failed,AwaitNetwork };
+    Firmware,RadioProbe,Scanning,ScanComplete,IosAttached,Failed,AwaitNetwork,TransportOnly };
   GuampXnuSm6115Provider owner{};
   GuampXnuBuffer msaPayload{},pageTables{};
   // qcom,rmtfs_sharedmem (msm_sharedmem client "rmtfs"): reg <0 0x200000> = dynamic 2 MiB, qcom,guard-memory
@@ -51,7 +51,7 @@ struct Sm6115Runtime {
   int error=0;
   bool remoteMayRun=false,shutdownFailed=false,dmaStarted=false;
   bool pumping=false,ath10kStarted=false,workerLive=false;
-  bool scanDone=false;
+  bool scanDone=false,modemReady=false;
   int scanResult=NW_RES_FAILED;
   unsigned workerMode=0,networkReady=0;
 
@@ -92,6 +92,7 @@ struct Sm6115Runtime {
     WifiControl::Ops ops{};ops.ctx=this;ops.smpKick=smpKick;ops.glinkKick=glinkKick;
     ops.wlan={this,nullptr,assignMsa,wlanPower,fileSize,fileRead,wlfwEvent};
     ops.event=controlEvent;ops.trace=controlTrace;ops.qrtrTrace=qrtrTrace;
+    ops.qftpTrace=qftpTrace;ops.servregTrace=servregTrace;
     rmtfsReady=setupRmtfs(base,bytes);ops.rmtfs=rmtfsReady?&rmtfsIo:nullptr;
     unsigned sim=0;PE_parse_boot_argn("guamp-sim",&sim,sizeof(sim));
     ops.sim=sim==1;ops.simSnapshot=simSnapshot;
@@ -138,18 +139,54 @@ struct Sm6115Runtime {
     return true;
   }
 
+  // PAS readiness = the modem's own ready signal (SMP2P 435 ready bit, as subsys-pil-tz err_ready), nothing more.
+  // Only a modem that never gets there (control fails after ReadyMs, or a fatal) is handed back for PAS SHUTDOWN,
+  // and the transport is closed first (quiesce). From the ready signal on, no Wi-Fi outcome (WLFW never announced,
+  // ath10k failure...) shuts the modem down: the station worker awaits WLFW and keeps QRTR/RMTFS/TFTP/SIM pumped.
   int modemStarted() {
     if(stage!=Prepared)return NotReady;
     remoteMayRun=true;transition(Modem);
-    int e=control.modemStarted(nowMs());if(e)return fail(e,"modem handoff");
-    const uint64_t deadline=nowMs()+120000;
-    while(!control.firmwareReady()) {
-      e=pump();if(e)return e;
-      if(nowMs()>=deadline)return fail(Timeout,"WLFW firmware ready");
+    int e=control.modemStarted(nowMs());
+    if(e){control.quiesce();return fail(e,"modem handoff");}
+    while(control.stage==WifiControl::AwaitModem) {
+      e=pump();
+      if(e){control.quiesce();IOLog("GuampWiFi: modem not ready (%d %s): transport closed before the PAS shutdown\n",e,errorName(e));return e;}
       IOSleep(1);
     }
-    if(!physicalReady())return fail(NotReady,"radio prerequisites");
-    transition(Firmware);return Ok;
+    if(control.stage==WifiControl::Failed||control.stage==WifiControl::Off) {
+      control.quiesce();return fail(control.error?control.error:Io,"modem ready");
+    }
+    modemReady=true;
+    IOLog("GuampWiFi: modem ready at %llu ms: never shut down by the Wi-Fi path from now on; WLFW awaited by the station worker\n",nowMs());
+    return Ok;
+  }
+
+  // Station worker, first step: WLFW firmware-ready while pumping the transport. guamp-wifi-wlfw-wait=<s> (default
+  // 300, 0 = no limit). A timeout stops the Wi-Fi part only.
+  bool awaitFirmware() {
+    unsigned wait=300;PE_parse_boot_argn("guamp-wifi-wlfw-wait",&wait,sizeof(wait));
+    const uint64_t began=nowMs(),deadline=wait?began+uint64_t(wait)*1000:0;
+    uint64_t beat=began;
+    while(!control.firmwareReady()) {
+      if(pump())return false;
+      const uint64_t now=nowMs();
+      if(deadline&&now>=deadline) {
+        IOLog("GuampWiFi: WLFW 0x45 not announced after %u s: Wi-Fi part stopped; modem, QRTR, RMTFS, TFTP, SERVREG_LOC "
+              "and SIM keep running (guamp-wifi-wlfw-wait=0 waits without limit)\n",wait);
+        transition(TransportOnly);return false;
+      }
+      if(now-beat>=30000){beat=now;IOLog("GuampWiFi: still waiting for WLFW 0x45 (%llu s, modem alive)\n",(now-began)/1000);}
+      IOSleep(1);
+    }
+    if(!physicalReady()){fail(NotReady,"radio prerequisites");return false;}
+    transition(Firmware);return true;
+  }
+  // The live modem keeps needing RMTFS/TFTP/SERVREG_LOC/SIM after any Wi-Fi outcome: pump the transport for the boot.
+  void transportOnly() {
+    if(__atomic_load_n(&stage,__ATOMIC_ACQUIRE)==IosAttached)return;   // the iOS worker owns dispatch
+    IOLog("GuampWiFi: worker keeps the modem transport running (QRTR, RMTFS, TFTP, SERVREG_LOC, SIM)\n");
+    while(control.stage!=WifiControl::Failed&&control.stage!=WifiControl::Off){(void)pump();IOSleep(1);}
+    IOLog("GuampWiFi: modem transport stopped (control %u, error %d); modem left running\n",unsigned(control.stage),control.error);
   }
 
   int applyVotes(bool wlan) {
@@ -197,15 +234,18 @@ struct Sm6115Runtime {
     return remoteMayRun&&!shutdownFailed&&owner.power.wlanHeld&&smmu.active&&dmaStarted&&
       (control.firmwareReady()||control.radioEnabled())&&control.wlan.capability.chipValid;
   }
+  // The transport is stepped even after a Wi-Fi failure (error set): only the CE poll stops. The result is the
+  // Wi-Fi error (so Wi-Fi loops end), or the transport error that failed it.
   int pump() {
-    if(pumping)return Ok;
-    if(error)return error;
+    if(pumping)return error;
     pumping=true;
     int e=owner.stepRpm(nowMs());
-    if(!e&&control.stage!=WifiControl::Off&&control.stage!=WifiControl::Prepared)e=control.step(nowMs());
-    if(!e&&ath10kStarted)gw_snoc_poll_ce();
+    if(!e&&control.stage!=WifiControl::Off&&control.stage!=WifiControl::Prepared&&control.stage!=WifiControl::Failed)
+      e=control.step(nowMs());
+    if(!e&&ath10kStarted&&!error)gw_snoc_poll_ce();
     pumping=false;
-    return e?fail(e,"transport pump"):Ok;
+    if(e&&!error)return fail(e,"transport pump");
+    return error;
   }
 
   int configureStation() {
@@ -223,13 +263,11 @@ struct Sm6115Runtime {
   }
 
   int startStation(unsigned mode) {
-    if(__atomic_load_n(&stage,__ATOMIC_ACQUIRE)!=Firmware||workerLive)return Busy;
+    if(!modemReady||workerLive)return Busy;
     if(mode!=1&&mode!=2)return Invalid;
 #if !defined(GUAMP_WIFI_REDWOOD) || !GUAMP_WIFI_REDWOOD
     if(mode==2)return Unsupported;
 #endif
-    int e=configureStation();if(e)return fail(e,"station config");
-    transition(RadioProbe);
     thread_t worker=nullptr;workerLive=true;workerMode=mode;
     if(kernel_thread_start(scanWorker,this,&worker)!=KERN_SUCCESS) {
       workerLive=false;return fail(NoMemory,"scan worker");
@@ -238,17 +276,20 @@ struct Sm6115Runtime {
   }
 
   void runStation() {
-    if(workerMode==1){runScan();return;}
+    if(!awaitFirmware()){transportOnly();return;}
+    int e=configureStation();if(e){fail(e,"station config");transportOnly();return;}
+    transition(RadioProbe);
+    if(workerMode==1){runScan();transportOnly();return;}
 #if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
     transition(AwaitNetwork);const uint64_t deadline=nowMs()+120000;
     while(!__atomic_load_n(&networkReady,__ATOMIC_ACQUIRE)) {
-      if(pump())return;
-      if(nowMs()>=deadline){fail(Timeout,"BSD network-ready hook");return;}
+      if(pump()){transportOnly();return;}
+      if(nowMs()>=deadline){fail(Timeout,"BSD network-ready hook");transportOnly();return;}
       IOSleep(1);
     }
     transition(RadioProbe);ath10kStarted=true;
-    const int e=guamp_xnu_wifi_attach(&platform,&board);
-    if(e){fail(e,"iOS attach");return;}
+    e=guamp_xnu_wifi_attach(&platform,&board);
+    if(e){fail(e,"iOS attach");transportOnly();return;}
     // attach has handed dispatch to its own worker. Do not resume provider
     // pumping here, and do not overwrite an error reported by that worker.
     Stage expected=RadioProbe;
@@ -405,6 +446,14 @@ struct Sm6115Runtime {
     else
       IOLog("GuampQrtr: %s %s %x:%x -> %x:%x (header type %u, %u bytes) node %u port 0x%x: %d %s\n",
             dir,cmd,h.sn,h.sp,h.dn,h.dp,h.type,n,w[1],w[2],e,errorName(e));
+  }
+  static void qftpTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
+    IOLog("GuampQftp: %s%s%s: %llu/%llu/%llu (0x%llx/0x%llx/0x%llx) result %d %s at %llu ms\n",
+      name?name:"",name?" ":"",what,a,b,c,a,b,c,e,errorName(e),nowMs());
+  }
+  static void servregTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
+    IOLog("GuampServreg: %s%s%s: %llu/%llu/%llu result %d %s at %llu ms\n",
+      name?name:"",name?" ":"",what,a,b,c,e,errorName(e),nowMs());
   }
   static void rmtfsTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
     IOLog("GuampRmtfs: %s%s%s: %llu/%llu/%llu (0x%llx/0x%llx/0x%llx) result %d %s at %llu ms\n",

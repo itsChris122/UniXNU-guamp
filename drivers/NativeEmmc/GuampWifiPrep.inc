@@ -512,18 +512,16 @@ extern "C" int guamp_ath10k_firmware_get(const char *name,const uint8_t **data,s
   return wifiprep::ath10kFirmwareGet(name,data,bytes);
 }
 
-// Narrow C ABI for the WLFW QFTP provider callbacks. QFTP itself accepts only
-// these two read-only assets; do not expose an arbitrary ext4 path to callers.
+// C ABI for the WLFW BDF and QFTP callbacks: read only, files under /image of the modem firmware partition only
+// (Ext4FirmwareSource::allowed: no "..", no empty component), as tqftpserv serves its firmware directory.
 extern "C" int guamp_wifi_firmware_file_size(const char *path,uint32_t *bytes) {
   if(!path||!bytes)return guampwifi::Invalid;
-  if(strcmp(path,"/image/wlanmdsp.mbn")&&strcmp(path,"/image/bdwlan_guamp_ipa.bin"))
-    return guampwifi::NotFound;
+  if(!guampwifi::Ext4FirmwareSource::allowed(path))return guampwifi::NotFound;
   return wifiprep::gFirmwareStore.size(path,bytes);
 }
 extern "C" int guamp_wifi_firmware_file_read(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
   if(!path||(!out&&bytes)||!bytes)return guampwifi::Invalid;
-  if(strcmp(path,"/image/wlanmdsp.mbn")&&strcmp(path,"/image/bdwlan_guamp_ipa.bin"))
-    return guampwifi::NotFound;
+  if(!guampwifi::Ext4FirmwareSource::allowed(path))return guampwifi::NotFound;
   return wifiprep::gFirmwareStore.read(path,at,out,bytes);
 }
 

@@ -32,6 +32,9 @@ struct WifiControl {
     // simSnapshot is called after every completed read sequence (transport thread).
     bool sim;
     void (*simSnapshot)(void *,const guampsim::SimProbe &);
+    // Optional one-line logs of the TFTP and SERVREG_LOC servers (what, file or service name, result, a/b/c).
+    void (*qftpTrace)(void *,const char *,const char *,int,uint64_t,uint64_t,uint64_t);
+    void (*servregTrace)(void *,const char *,const char *,int,uint64_t,uint64_t,uint64_t);
     // Optional per-packet QRTR control log (rx and tx), see Qrtr::trace.
     void (*qrtrTrace)(void *,bool tx,const Qrtr::Header &,const uint8_t *,uint32_t,int);
   };
@@ -41,6 +44,7 @@ struct WifiControl {
   SmemArena *arena=nullptr; Allocator allocator={}; Ops ops={};
   Smp2pEdge smp={}; Glink glink={}; Qrtr qrtr={}; QftpReadOnly tftp={};
   GuampServreg servreg={}; Rmtfs rmtfs={}; Wlfw wlan={};
+  struct TftpPort { WifiControl *control; uint32_t port; } tftpPorts[Qftp::Sessions]={};
   guampsim::SimProbe sim={}; bool simOn=false;
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
@@ -60,10 +64,17 @@ struct WifiControl {
     sawInbound=sawNegotiated=sawOpenSent=sawRemote=sawServer=false;
     qrtr.traceCtx=platform.ctx; qrtr.trace=platform.qrtrTrace;
     gate="qrtr tftp/servreg";
-    e=tftp.start(this,qftpTx,qftpSize,qftpRead);if(e)return fail(e);
-    e=qrtr.addLocalService(QftpReadOnly::Service,QftpReadOnly::ServiceInstance,QftpReadOnly::Port,this,qftpRx);
+    e=tftp.start(this,qftpTx,qftpSize,qftpRead,&allocator);if(e)return fail(e);
+    tftp.traceCtx=platform.ctx; tftp.trace=platform.qftpTrace;
+    e=qrtr.addLocalService(Qftp::Service,Qftp::ServiceInstance,Qftp::Port,this,qftpRx);
     if(e)return fail(e);
+    // tqftpserv answers every transfer from a new socket of its own: one local port per session.
+    for(uint32_t i=0;i<Qftp::Sessions;i++) {
+      tftpPorts[i]={this,Qftp::sessionPort(i)};
+      e=qrtr.addLocalClient(tftpPorts[i].port,&tftpPorts[i],qftpSessionRx);if(e)return fail(e);
+    }
     e=servreg.start(this,serviceTx);if(e)return fail(e);
+    servreg.traceCtx=platform.ctx; servreg.trace=platform.servregTrace;
     e=qrtr.addLocalService(GuampServreg::Service,GuampServreg::Instance,GuampServreg::Port,this,serviceRx);
     if(e)return fail(e);
     if(ops.rmtfs) {
@@ -143,7 +154,7 @@ struct WifiControl {
       e=glink.start(out,in,allocator,this,kick,channelEvent,glinkRx); if(e) return fail(e);
       deadline=now+ServiceMs; transition(Running); gate="glink version (mpss edge)";
     }
-    e=tftp.step(now);if(e!=Ok&&e!=Again)return fail(e);
+    e=tftp.step(now);if(e!=Ok&&e!=Again&&e!=NotReady)trace("tftp retransmission",e,0,0,0);
     rmtfs.step();
     e=glink.step(); if(e||error) return fail(e?e:error);
     if(glink.negotiated&&!sawNegotiated) {
@@ -164,16 +175,23 @@ struct WifiControl {
       sawServer=true; gate="wlfw qmi";
       trace("qrtr WLFW 0x45 server: node/port/ms",0,qrtr.serverNode,qrtr.serverPort,uint32_t(now-started));
     }
-    // With the SIM reader on, a missing WLFW server no longer tears down the QRTR link (UIM/DMS/NAS keep running).
-    if(!routerStarted||(!qrtr.serviceReady()&&!simOn)) {
-      if(now>=deadline) return fail(Timeout);
-    }
+    // Only a link that never came up times out here. A missing WLFW server never tears the QRTR link down: the live
+    // modem keeps needing RMTFS, TFTP, SERVREG_LOC (and the SIM clients); the owner decides how long WLFW is awaited.
+    if(!routerStarted&&now>=deadline) return fail(Timeout);
     if(routerStarted&&simOn) { e=sim.pump(now); if(e&&e!=Again&&e!=NotReady&&e!=Busy) trace("sim pump",e,sim.step,0,0); }
     if(routerStarted) { e=qrtr.step(); if(e!=Again&&e) return fail(e); }
     if(wlanStarted) { e=wlan.step(now); if(e) return fail(e); }
     return Ok;
   }
   const char *where() const { return gate; }
+  // Before a PAS SHUTDOWN of a modem that never became ready: stop talking to it first (GLINK/QRTR, then RMTFS, TFTP,
+  // SERVREG), as the SUBSYS_BEFORE_SHUTDOWN notifiers do on Linux. SMEM and the RMTFS region stay reserved.
+  void quiesce() {
+    if(simOn) sim.reset(now);
+    wlan.peerLost(); qrtr.stop(); glink.stop(PeerReset); routerStarted=wlanStarted=false;
+    rmtfs.stop(); tftp.stop(); servreg.stop();
+    if(stage!=Off) stage=Failed;
+  }
   // Call after PAS shutdown. This releases CPU buffers only, never powers off
   // or remaps an active peripheral behind the firmware's back.
   int release(bool pasStopped) {
@@ -247,9 +265,10 @@ private:
   static int serviceTx(void *p,uint32_t sp,uint32_t dn,uint32_t dp,const uint8_t *v,uint32_t n) {
     return static_cast<WifiControl *>(p)->qrtr.sendFrom(sp,dn,dp,v,n);
   }
+  // A bad or unsupported request to a local server is answered/logged by that server, never fatal for the link.
   static void serviceRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p);int e=c.servreg.receive(node,port,v,n);
-    if(e!=NotFound&&e!=Unsupported&&e!=Again)c.error=e;
+    if(e&&e!=Unsupported) c.trace("servreg request not answered: node/port/bytes",e,node,port,n);
   }
   // RMTFS answers every request itself (QMI failure results included); a bad request never fails the transport.
   static void rmtfsRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
@@ -262,8 +281,12 @@ private:
     auto &c=*static_cast<WifiControl *>(p);return c.ops.wlan.fileRead(c.ops.wlan.ctx,name,at,out,n);
   }
   static void qftpRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
-    auto &c=*static_cast<WifiControl *>(p);int e=c.tftp.receive(node,port,v,n,c.now);
-    if(e!=NotFound&&e!=Again&&e!=Protocol&&e!=Invalid&&e!=Unsupported)c.error=e;
+    auto &c=*static_cast<WifiControl *>(p);int e=c.tftp.receive(Qftp::Port,node,port,v,n,c.now);
+    if(e&&e!=Again) c.trace("tftp request not answered: node/port/bytes",e,node,port,n);
+  }
+  static void qftpSessionRx(void *p,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
+    auto &t=*static_cast<TftpPort *>(p);int e=t.control->tftp.receive(t.port,node,port,v,n,t.control->now);
+    if(e&&e!=Again&&e!=Protocol&&e!=NotFound) t.control->trace("tftp session packet not handled: port/node/bytes",e,t.port,node,n);
   }
   static int assign(void *p,const Wlfw::Region *r,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p); return c.ops.wlan.assignMsa(c.ops.wlan.ctx,r,n);

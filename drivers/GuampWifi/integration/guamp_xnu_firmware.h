@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 /* GuampWifiPrep.inc exports these read-only callbacks once its ext4 store is ready.
- * Accepted paths: /image/wlanmdsp.mbn and /image/bdwlan_guamp_ipa.bin only.
+ * Accepted paths: read-only files under /image of the modem firmware partition (no "..", no empty component).
  * Return values use GuampWifiWire.inc Error codes (0 success, negative failure).
  */
 int guamp_wifi_firmware_file_size(const char *path, uint32_t *bytes);
