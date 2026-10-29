@@ -41,7 +41,7 @@ constexpr uint32_t kTxPathCtl = 0x400, kTxPathCfg0 = 0x404, kTxVolCtl = 0x40C, k
 constexpr uint32_t kTxPathStride = 0x80;
 // bolero VA macro (offsets from kVa = logical 0x3000)
 constexpr uint32_t kVaMclkCtl = 0x000, kVaFsCnt = 0x004, kVaSwrControl = 0x008, kVaTopCfg0 = 0x080;
-constexpr uint32_t kVaDmicCfg = 0x094, kVaSwrCtrl = 0x0DC;
+constexpr uint32_t kVaDmicCfg = 0x094, kVaSwrMicCtl0 = 0x0D0, kVaSwrCtrl = 0x0DC;
 // SoundWire master (offsets from kSwrm)
 constexpr uint32_t kSwHwVersion = 0x000, kSwCompCfg = 0x004, kSwSwReset = 0x008, kSwCompStatus = 0x014;
 constexpr uint32_t kSwCompParams = 0x100, kSwIntStatus = 0x200, kSwIntMask = 0x204, kSwIntClear = 0x208;
@@ -278,6 +278,9 @@ struct Codec {
     txMclk = true;
     bus.upd(txp(kTxPathSec7), 0x3F, 0x0A);   // tx_macro_reg_init
     bus.upd(va(kVaSwrCtrl), 0x0F, 0x0A);     // tx_macro_init, bolero 2.1
+    // va_macro_init, bolero 2.1: SWR_MIC_CTL0..2 (the SoundWire mic lines into the TX decimators) 0xEE -> 0xCC.
+    // Missing in 828a81a: p5 captured only zeros.
+    for (uint32_t i = 0; i < 3; i++) bus.upd(va(kVaSwrMicCtl0 + 4 * i), 0xEE, 0xCC);
     // va_macro_tx_va_mclk_enable(TX_MCLK, first SWR user): pins active, SWR clock with the reset pulse of probe
     lpiPin(0, 0 /* bias-disable */, 0, true);
     lpiPin(1, 2 /* bus-hold */, 2, true);

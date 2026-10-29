@@ -106,6 +106,9 @@ struct MicPath {
   Shm shm;                                                                      // cpu == nullptr: no shared memory
   uint16_t session = 2, stream = 1, afePort = kPortTxCdcDma3;
   uint32_t cdcParamBytes = kPortConfigUnion;
+  // AFE_LPASS_CORE_HW_MACRO_BLOCK: the guamp DT has no lpass_core_hw_vote clock (only lpass_audio_hw_vote = DCODEC),
+  // so Linux never sends it on bengal; the ADSP answered 1 (ADSP_EFAILED) on p5. Off unless guamp-audio-mic-macro=1.
+  bool voteMacro = false;
   int step = VoteMacro;
   bool waiting = false, stopping = false, setupFailed = false;
   bool votedMacro = false, votedDcodec = false, clkCore = false, clkNpl = false, codecUp = false, portUp = false;
@@ -230,7 +233,10 @@ private:
     uint32_t n = 0;
     const uint32_t t = kMicToken | ((token + 1) & 0xFFFF);
     switch (step) {
-      case VoteMacro: n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockMacro, "GMICM"); break;
+      case VoteMacro:
+        if (!voteMacro) { step = VoteDcodec; return true; }
+        n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockMacro, "GMICM");
+        break;
       case VoteDcodec: n = afeHwVote(pkt, sizeof(pkt), t, kHwBlockDcodec, "GMICD"); break;
       case ClkCore: n = afeClock(pkt, sizeof(pkt), t, kClkTxCore, kClkTxHz, kClkAttrCoupleNo, 0, true); break;
       case ClkNpl: n = afeClock(pkt, sizeof(pkt), t, kClkTxNpl, kClkTxHz, kClkAttrCoupleNo, 0, true); break;
