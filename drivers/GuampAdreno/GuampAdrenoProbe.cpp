@@ -63,6 +63,9 @@ extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_pool_mi
     native_adreno_written_imports_owned;
 // patches/native-adreno/0003-wide-aperture-extension-windows.patch: the board asks for the 3 GiB aperture, the bring-up says whether it got it.
 extern volatile uint32_t native_adreno_wide_request, native_adreno_wide_active;
+// patches/native-adreno/0005-gpu-all-dynamic-windows.patch: guamp-gpu-all=1 gives every process that opens the accelerator a connection
+// (dynamic windows, deferred teardown, limits); the board sets these before publishing.
+extern volatile uint32_t native_adreno_gpu_all, native_adreno_gpu_all_cfg[7];
 // ArmCpu's SPI attach (also used by the touch service).
 int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
@@ -502,9 +505,23 @@ int naPublish(Session &s) {
   const IOReturn sub = gSubmit->attach(vm, gRing);
   gTimerIo = NativeAdrenoTimeIo{&s, naTimerRead};
   const IOReturn tim = gTimer->attach(&gTimerIo, NativeAdrenoTimeCp);
-  const IOReturn pub = sub ? sub : native_adreno_publish(vm, gSubmit, gRing, &gClock, tim ? nullptr : gTimer, &kDeviceInfo, 31,
+  // guamp-gpu-all=1 (default 0): every process that opens the accelerator gets a connection (patch 0005). Sizes in MiB, counts; 0 or
+  // absent keeps the patch's default: guamp-gpu-all-win 192, -minwin 64, -bo 384 (per process), -total 1024 (all but backboardd),
+  // -rate 6 (opens per name per minute), -max 16 (live connections besides backboardd), -perproc 2.
+  native_adreno_gpu_all = bootArg("guamp-gpu-all", 0) == 1;
+  static const char *const kGpuAllArgs[7] = {"guamp-gpu-all-win", "guamp-gpu-all-minwin", "guamp-gpu-all-bo", "guamp-gpu-all-total",
+                                             "guamp-gpu-all-rate", "guamp-gpu-all-max", "guamp-gpu-all-perproc"};
+  for (unsigned i = 0; i < 7; i = i + 1) native_adreno_gpu_all_cfg[i] = bootArg(kGpuAllArgs[i], 0);
+  // The client windows above 2 GiB (patch 0003's extension windows, guamp-gpu-all's dynamic ones) exist only for a core opened with 32
+  // input bits: with 31, setScope refused every window ending above 0x80000000 (kIOReturnBadArgument -> mount step 3 -> Busy -> nil
+  // device). 32 with the wide aperture and guamp-gpu-all=1, or with guamp-adreno-input-bits=32; 31 otherwise, as before.
+  const unsigned inputBits = native_adreno_wide_active && (native_adreno_gpu_all || bootArg("guamp-adreno-input-bits", 31) == 32) ? 32 : 31;
+  const IOReturn pub = sub ? sub : native_adreno_publish(vm, gSubmit, gRing, &gClock, tim ? nullptr : gTimer, &kDeviceInfo, inputBits,
                                                          s.report.output_bits);
-  IOLog("GuampAdreno: publish: submit attach %x timer %x publish %x\n", sub, tim, pub);
+  IOLog("GuampAdreno: publish: submit attach %x timer %x publish %x; input bits %u, gpu-all %u (win %u minwin %u bo %u total %u rate %u "
+        "max %u perproc %u)\n", sub, tim, pub, inputBits, native_adreno_gpu_all, native_adreno_gpu_all_cfg[0], native_adreno_gpu_all_cfg[1],
+        native_adreno_gpu_all_cfg[2], native_adreno_gpu_all_cfg[3], native_adreno_gpu_all_cfg[4], native_adreno_gpu_all_cfg[5],
+        native_adreno_gpu_all_cfg[6]);
   return sub || pub ? GuampAdrenoPublish : GuampAdrenoOk;
 }
 
@@ -668,9 +685,12 @@ int naAccelerator() {
   // ScreenshotServicesService: the screenshot editor (PaperKit/PencilKit) assumes Metal and aborts on a nil device (29/10, p3);
   // its opens are not capped at eight per boot (patches/native-adreno/0004-screenshot-opens-uncapped.patch).
   // Names are compared on their first 16 characters (the process name). Which processes run the plugin stays NativeAdrenoMetal.clients.
+  // guamp-gpu-all=1: "*", every process (patches/xnu/zzwd-native-sandbox-grant-all.patch), as every app and extension profile admits
+  // AGXDeviceUserClient on Apple hardware; the plugin's NativeAdrenoMetal.clients is then "*" too, and the driver's own limits apply.
   accelerator->setProperty("NativeSandboxGrantProcess",
-                           "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster,"
-                           "ScreenshotServicesService");
+                           native_adreno_gpu_all ? "*"
+                                                 : "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster,"
+                                                   "ScreenshotServicesService");
   accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
   accelerator->setProperty("NativeTurnipDebug", "nocb,noconform,sysmem");
   accelerator->setProperty("NativeMetalWithhold", "apple-families");

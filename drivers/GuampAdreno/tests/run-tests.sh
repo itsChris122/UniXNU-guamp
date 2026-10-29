@@ -5,6 +5,8 @@
 # (defaults: the device repository's drivers/NativeAdreno and kits/ArmSmmu4K, kits/AdrenoPM4 of the build tree or ~/moto/riferimenti).
 # The guamp-gpu-recover host test (recover_host.cpp) runs after the syntax check; then patches/native-adreno/*.patch are applied to a
 # copy of the pinned sources and dropViews' map loop runs, pinned and patched, over the XNU reference model (view_unmap_host.cpp).
+# The patched NativeAdrenoPublish.cpp gets the same -Werror syntax check, and guamp-gpu-all's NativeAdrenoGpuAll.h (patch 0005) its
+# host test (gpu_all_host.cpp: windows, open rate, limits).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -38,6 +40,17 @@ for p in "$REPO"/patches/native-adreno/*.patch; do
   [ -e "$p" ] || continue
   patch -s -p1 -N -t -d "$WORK/na" -i "$p" || { echo "$(basename "$p"): does not apply"; rc=1; }
 done
+echo "== patched NativeAdrenoPublish.cpp: arm64-apple-ios, -Werror (guamp-gpu-all, patch 0005)"
+clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -fsyntax-only \
+  -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -Wno-c99-designator -Wno-reorder-init-list \
+  -I "$WORK/shim" -I "$HERE" -I "$WORK/na" -I "$SMMU" -I "$PM4" "$WORK/na/NativeAdrenoPublish.cpp" && echo "publish: compiled" || rc=1
+echo "== guamp-gpu-all windows, open rate and limits (NativeAdrenoGpuAll.h): clang (ASan/UBSan) and gcc"
+if [ -e "$WORK/na/NativeAdrenoGpuAll.h" ]; then
+  clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/gpu_all_host.cpp" -o "$WORK/gpu_all" && "$WORK/gpu_all" || rc=1
+  g++ $FLAGS -Wvolatile -I "$WORK/na" "$HERE/gpu_all_host.cpp" -o "$WORK/gpu_all_gcc" && "$WORK/gpu_all_gcc" >/dev/null || rc=1
+else
+  echo "NativeAdrenoGpuAll.h missing (patch 0005 not applied)"; rc=1
+fi
 extract() {   # source output: the statements of dropViews between "if(!view)return;" and "view->release();"
   python3 -I - "$1" "$2" <<'PY' || return 1
 import sys

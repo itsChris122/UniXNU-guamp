@@ -84,9 +84,35 @@ static void importLog()
   lastChecked = checked;
 }
 
+// patches/native-adreno/0005-gpu-all-dynamic-windows.patch (guamp-gpu-all=1): [0] live connections, [1] peak, [2] teardowns deferred,
+// [3] deferred teardowns finished, [4..7] refused for the open rate, slot/window/connection limit, BO memory, the render server's table
+// reserve, [8] BO MiB of the processes other than the render server, [9] teardowns still deferred, [10] free window MiB, [11] largest
+// window given (MiB). native_adreno_mount_fail: why the latest mount failed (1 no slot, 2 core open, 3 window scope), status, slot, count.
+extern "C" volatile uint32_t native_adreno_gpu_all __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_gpu_all_stats[12] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import));
+
+static void gpuAllLog()
+{
+  if (!&native_adreno_gpu_all || !native_adreno_gpu_all || !&native_adreno_gpu_all_stats || !&native_adreno_mount_fail) return;
+  static uint32_t last[13];
+  uint32_t now[13];
+  for (unsigned i = 0; i < 12; i++) now[i] = native_adreno_gpu_all_stats[i];
+  now[12] = native_adreno_mount_fail[3];
+  bool same = true;
+  for (unsigned i = 0; i < 13; i++) same = same && now[i] == last[i];
+  if (same) return;
+  IOLog("GuampMetal: gpu-all live %u peak %u, deferred %u done %u pending %u; refused rate %u slot %u bo %u map %u; others BO %u MiB; "
+        "free window %u MiB, largest %u MiB; mount fail %u status %x slot %u n %u\n", now[0], now[1], now[2], now[3], now[9], now[4],
+        now[5], now[6], now[7], now[8], now[10], now[11], native_adreno_mount_fail[0], native_adreno_mount_fail[1],
+        native_adreno_mount_fail[2], now[12]);
+  for (unsigned i = 0; i < 13; i++) last[i] = now[i];
+}
+
 static void metalLog()
 {
   importLog();
+  gpuAllLog();
   static uint32_t lastCalls = 0, lastTunnel = 0, lastSeq = 0;
   const GuampMetalDiagHead &d = native_adreno_metal_diag;
   const uint32_t seq = native_adreno_metal_rows_seq;
