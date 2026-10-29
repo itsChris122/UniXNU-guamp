@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,615 @@
+@@ -7858,6 +7858,624 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -49,7 +49,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 + * verification, Tap to Pay, Shared with You. Never in it: Bluetooth, audio, GPU, Wallet (passd, nfcd, seld, seserviced),
 + * Photos, Safari (parsecd, WebKit), Wi-Fi, telephony/SIM (CommCenter helpers, callservicesd, imagent, apsd, safetyalertsd),
 + * dictation (assistantd, corespeechd), mobileassetd, chronod, PowerLog. guamp-slim-commcenter=1 (NOW list) leaves
-+ * CommCenter enabled for the SIM work (it is off in every other list). */
++ * CommCenter enabled for the SIM work (it is off in every other list). com.apple.biometrickitd.mesa (29/10, NOW list): launchd
++ * only loads it when the ADT has a "mesa" node (_LimitLoadToDeviceTree), i.e. with the Touch ID ADT; without AppleMesa/SEP it has
++ * no sensor, so it stays disabled and BiometricKit clients fail at once; guamp-biokit=1 enables it (scripts/make-guamp-siri-adt.py). */
 +#define GUAMP_SLIM_NOW 1
 +#define GUAMP_SLIM_LEGACY 2
 +#define GUAMP_SLIM_BT 4
@@ -58,6 +60,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +#define GUAMP_SLIM_FAIRPLAY 32	/* skipped by guamp-slim-fairplay=1 (NOW list only) */
 +#define GUAMP_SLIM_FAST 64	/* added by guamp-slim-fast=1 (NOW list only) */
 +#define GUAMP_SLIM_COMMCENTER 128	/* skipped by guamp-slim-commcenter=1 (NOW list only) */
++#define GUAMP_SLIM_BIOKIT 256	/* skipped by guamp-biokit=1 (NOW list only) */
 +#define GUAMP_SLIM_ALL (GUAMP_SLIM_NOW | GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT)
 +static const struct {
 +	const char *label;
@@ -67,6 +70,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	{"com.apple.CommCenter", GUAMP_SLIM_ALL | GUAMP_SLIM_COMMCENTER, 1},
 +	{"com.apple.accessoryupdaterd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.biomesyncd", GUAMP_SLIM_ALL, 1},
++	{"com.apple.biometrickitd.mesa", GUAMP_SLIM_NOW | GUAMP_SLIM_BIOKIT, 1},
 +	{"com.apple.bluetoothd", GUAMP_SLIM_BT, 1},
 +	{"com.apple.corespotlightservice", GUAMP_SLIM_ALL | GUAMP_SLIM_SPOTLIGHT, 1},
 +	{"com.apple.fairplayd.A2", GUAMP_SLIM_NOW | GUAMP_SLIM_FAIRPLAY, 1},
@@ -476,6 +480,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	unsigned int guamp_slim_fast = 0, guamp_slim_commcenter = 0;	/* 29/10, opt-in: GUAMP_SLIM_FAST jobs off, CommCenter on */
 +	PE_parse_boot_argn("guamp-slim-fast", &guamp_slim_fast, sizeof(guamp_slim_fast));
 +	PE_parse_boot_argn("guamp-slim-commcenter", &guamp_slim_commcenter, sizeof(guamp_slim_commcenter));
++	unsigned int guamp_biokit = 0;	/* 29/10: 1 leaves biometrickitd.mesa enabled (Touch ID ADT only) */
++	PE_parse_boot_argn("guamp-biokit", &guamp_biokit, sizeof(guamp_biokit));
 +	unsigned int guamp_kb_prefs = 1;	/* default 1: written only when absent (29/10); guamp-kb-prefs=2 rewrites them, =0 leaves them as is */
 +	PE_parse_boot_argn("guamp-kb-prefs", &guamp_kb_prefs, sizeof(guamp_kb_prefs));
 +	for (size_t i = 0; i < sizeof(native_guamp_setup_files) / sizeof(native_guamp_setup_files[0]); i++) {
@@ -489,11 +495,11 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			int list = guamp_slim == 2 ? GUAMP_SLIM_BT : guamp_slim_legacy == 1 ? GUAMP_SLIM_LEGACY : GUAMP_SLIM_NOW;
 +			int skip = list == GUAMP_SLIM_NOW ? (guamp_slim_spotlight == 1 ? GUAMP_SLIM_SPOTLIGHT : 0) |
 +			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) | (guamp_slim_fairplay == 1 ? GUAMP_SLIM_FAIRPLAY : 0) |
-+			    (guamp_slim_commcenter == 1 ? GUAMP_SLIM_COMMCENTER : 0) : 0;
++			    (guamp_slim_commcenter == 1 ? GUAMP_SLIM_COMMCENTER : 0) | (guamp_biokit == 1 ? GUAMP_SLIM_BIOKIT : 0) : 0;
 +			int fast = list == GUAMP_SLIM_NOW && guamp_slim_fast == 1;
 +			size_t built = native_guamp_slim_build(list | (fast ? GUAMP_SLIM_FAST : 0), skip);
-+			printf("guamp-slim-fast=%d, guamp-slim-commcenter=%d (CommCenter %s)\n", fast, (skip & GUAMP_SLIM_COMMCENTER) ? 1 : 0,
-+			    (skip & GUAMP_SLIM_COMMCENTER) ? "enabled" : "disabled");
++			printf("guamp-slim-fast=%d, guamp-slim-commcenter=%d (CommCenter %s), guamp-biokit=%d\n", fast, (skip & GUAMP_SLIM_COMMCENTER) ? 1 : 0,
++			    (skip & GUAMP_SLIM_COMMCENTER) ? "enabled" : "disabled", (skip & GUAMP_SLIM_BIOKIT) ? 1 : 0);
 +			if (built) {
 +				data = (const uint8_t *)native_guamp_slim_plist;
 +				size = built;
@@ -538,6 +544,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		static const char *const props[][2] = {
 +			{"/chosen", "mac-address-wifi0"}, {"/chosen", "mac-address-bluetooth0"}, {"/product", "product-id"},
 +			{"/product", "wifi-chipset"}, {"/product", "bluetooth-le"}, {"/arm-io/wlan", "local-mac-address"},
++			/* 29/10 (scripts/make-guamp-siri-adt.py): "touch-id" is cached from a "mesa" node; "assistant" (Siri) is read live, listed so a
++			 * Siri ADT also refreshes anything derived from it */
++			{"/product", "assistant"}, {"/arm-io/mesa", "name"},
 +		};
 +		uint32_t stamp = 2166136261u;           /* FNV-1a over name, size and bytes of each property */
 +		for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
@@ -617,7 +626,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8505,7 @@
+@@ -7983,6 +8514,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);

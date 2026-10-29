@@ -236,6 +236,9 @@ def main():
         node('product', [
             ('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if ipad else b'Moto G9 Play\0'),
             ('model', b'motorola,guamp\0'),
+            # MobileGestalt "assistant" (Siri row in Settings, Siri on the side button) is true iff /product has a property
+            # named "assistant" (J120: u32 1). Derived ADTs: scripts/make-guamp-siri-adt.py (also /arm-io/mesa for touch-id).
+            ('assistant', u32(1)),
             *([('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
                ('artwork-device-idiom', b'pad\0'),
                ('artwork-device-subtype', u32(2436)),   # iPhone X geometry (as Cowabunga does with ArtworkDeviceSubType); iPad Pro 12.9 is 2732
