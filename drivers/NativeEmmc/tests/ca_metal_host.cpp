@@ -34,6 +34,20 @@ int main() {
   expect(run(55, false, 0, 600, &at) == GCM_GOOD && at == 125, "no swap counter: restarts alone decide");
   expect(run(0, true, 10, 600, &at) == GCM_WAIT, "backboardd never seen: keep waiting");
   {
+    // 29/10: a one-shot boot (noFrameSec 300) tolerates a long silent start, then still trips the frame rule
+    gcm_state s = {};
+    s.noFrameSec = kGcmNoFrameOneShotSec;
+    gcm_verdict v = GCM_WAIT;
+    uint32_t t = 5;
+    for (; t <= 600 && v == GCM_WAIT; t += 5) v = gcm_step(&s, t, 55, true, 100);
+    expect(v == GCM_BAD_NOFRAMES && t - 5 == 305, "one-shot boot: no frame bad only after 300 s");
+    gcm_state g = {};
+    g.noFrameSec = kGcmNoFrameOneShotSec;
+    v = GCM_WAIT;
+    for (t = 5; t <= 600 && v == GCM_WAIT; t += 5) v = gcm_step(&g, t, 55, true, t >= 200 ? 101 : 100);
+    expect(v == GCM_GOOD && t - 5 == 200, "one-shot boot: first frame at 200 s, good at once (up 195 s)");
+  }
+  {
     // one crash (pid gone for one sample, then a new instance) is one restart, not two; the session never counts as good
     gcm_state s = {};
     gcm_verdict v = GCM_WAIT;
