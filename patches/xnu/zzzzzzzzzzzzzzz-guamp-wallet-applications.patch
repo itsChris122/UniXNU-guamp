@@ -1,0 +1,41 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 15eb13b..f91313d 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7576,6 +7576,15 @@ native_guamp_iphone_res_mount(proc_t p, user_addr_t scratch)
+ 	printf("guamp-iphone-res: addon files %d, written %d, same %d, failed %d (last error %d)\n", native_gpu_addon_files,
+ 	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error);
+ 	for (size_t i = 0; i < sizeof(native_guamp_iphone_res) / sizeof(native_guamp_iphone_res[0]); i++) {
++		/* A placeholder with the bundle identifier of an app in the /Applications view would compete with it in LaunchServices
++		 * (Wallet, owner 29/10): the AppPlaceholders view mounts only with guamp-iphone-placeholders=1. */
++		if (!strcmp(native_guamp_iphone_res[i].point, "/System/Library/AppPlaceholders")) {
++			uint32_t placeholders = 0;
++			if (!PE_parse_boot_argn("guamp-iphone-placeholders", &placeholders, sizeof(placeholders)) || placeholders != 1) {
++				printf("guamp-iphone-res: /System/Library/AppPlaceholders skipped (guamp-iphone-placeholders=1 mounts it)\n");
++				continue;
++			}
++		}
+ 		if (!strcmp(native_guamp_iphone_res[i].point, "/Applications")) {
+ 			uint32_t applications = 1;
+ 			if (PE_parse_boot_argn("guamp-iphone-applications", &applications, sizeof(applications)) && !applications) {
+@@ -9120,7 +9129,6 @@ static const uint8_t native_guamp_sad_force_install[] =
+     "\t<string>com.apple.podcasts</string>\n\t<string>com.apple.reminders</string>\n\t<string>com.apple.Translate</string>\n"
+     "\t<string>com.apple.shortcuts</string>\n\t<string>com.apple.stocks</string>\n\t<string>com.apple.tips</string>\n"
+     "\t<string>com.apple.VoiceMemos</string>\n\t<string>com.apple.weather</string>\n"
+-    "\t<string>com.apple.Passbook</string>\n"
+     "</array>\n</plist>\n";
+ uint32_t native_guamp_install_staged_cycle;
+ int native_guamp_install_staged_error = -1;
+@@ -9198,7 +9206,11 @@ native_guamp_install_staged_apps(proc_t p, user_addr_t scratch)
+ 		printf("guamp-install-staged-apps: cycle %u already done\n", cycle);
+ 		return;
+ 	}
+-	native_guamp_iphone_apps_error = native_guamp_install_iphone_apps(p, scratch, ctx);
++	/* Wallet moved to the /Applications view (owner 29/10): the staged copy runs only with guamp-iphone-apps=1. */
++	uint32_t iphone_apps = 0;
++	if (PE_parse_boot_argn("guamp-iphone-apps", &iphone_apps, sizeof(iphone_apps)) && iphone_apps == 1) {
++		native_guamp_iphone_apps_error = native_guamp_install_iphone_apps(p, scratch, ctx);
++	}
+ 	int error = vnode_lookup("/private/var/staged_system_apps", VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+ 	if (!error) {
+ 		error = vnode_vtype(vp) == VDIR ? 0 : ENOTDIR;
