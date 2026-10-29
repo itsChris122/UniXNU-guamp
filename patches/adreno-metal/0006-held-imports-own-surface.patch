@@ -1,0 +1,58 @@
+guamp: held surface imports record the import own IOSurface, not the caller one (UniXNU/AdrenoMetal 547312c)
+
+Patch 0002 (adc18c5 held imports) stored the caller IOSurfaceRef of an import hit, which the import never retained; a
+completion thread then read the retain count of a freed object in pruneHeldImports (upstream: backboardd died on the isa
+authentication inside CFGetRetainCount). The table now records the surface the import itself retains (NBBuffer.importedSurface).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 77325ff..0e5055e 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -758,6 +758,8 @@ static void waitForResource(id resource);
+ @property(nonatomic) void *wrapped;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
+ @property(nonatomic) NSUInteger heapOffset;
++// A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
++@property(nonatomic) IOSurfaceRef importedSurface;
+ @end
+ @interface NBTexture : NBObject
+ @property(nonatomic) NmbTexture *handle;
+@@ -866,10 +868,13 @@ static void watchImportPressure() {
+ // guamp (UniXNU-guamp patches/adreno-metal/0002): NMB_SURFACE_IMPORT_HOLD=0 keeps 2ff4be9's weak table only (an import lives while a
+ // texture or a pending command holds it), should held imports fill a gpu-all client's GPU window.
+ static bool holdImports() {static const bool on=[]{const char *v=getenv("NMB_SURFACE_IMPORT_HOLD");return !v || strtoul(v,nullptr,0)!=0;}();return on;}
+-static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,IOSurfaceRef surface,std::vector<NBBuffer *> &gone) {
++// The entry records the surface object the import itself retains, never the caller's (UniXNU/AdrenoMetal 547312c): a hit may come
++// with another object for the same surface, which nothing here retains, and a later prune read its retain count after the caller freed it.
++static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
+  pruneHeldImports(false,gone);
+  if(!holdImports())return;
+- gHeldImports[{identity,address,bytes}]={buffer,surface};
++ if(!buffer.importedSurface)return;
++ gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface};
+ }
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  struct Key {uint64_t identity,address,bytes;};
+@@ -880,11 +885,11 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);return buffer;}
++ if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
++ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
+   // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
+   if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+@@ -893,7 +898,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+    gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
+   }
+   [gSurfaceImports setObject:buffer forKey:key];
+-  holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);
++  holdImport(value.identity,value.address,value.bytes,buffer,gone);
+  }
+  return buffer;
+ }
