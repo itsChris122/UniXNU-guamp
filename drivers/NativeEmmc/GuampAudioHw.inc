@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp audio output hardware, included by NativeEmmc.cpp BEFORE GuampAdsp.inc (it provides GuampAudioHw.h strongly,
-// so GuampAudioHwWeak.inc leaves its stand-ins out). Speaker: LPASS LPI i2s1 pins + Awinic aw882xx on QUP0 SE1 I2C
-// (0x34, reset gpio97). Headphone: bolero RX macro (needs the DSP clock hook) + wcd937x. wcd937x registers (RX ones
-// too) are reached only through the VA SoundWire master of the capture side (guamp_wcd937x_read/write, GuampMicDev.inc);
-// the HPH audio itself also needs the RX SoundWire data port (rx_swr 0x0a610000): not written yet, the call says so.
+// so GuampAudioHwWeak.inc leaves its stand-ins out). Speaker (route 1): LPASS LPI i2s1 pins + Awinic aw882xx on QUP0
+// SE1 I2C (0x34, reset gpio97). Earpiece (route 2, wcd937x EAR, "handset" path) and headphones (route 3, wcd937x
+// HPHL/HPHR): bolero RX macro (needs the DSP clock hook) -> RX SoundWire link (GuampAudioRxSwr.h, rx_swr 0x0a610000,
+// wcd937x RX slave) -> wcd937x DACs/PAs. wcd937x registers (RX ones too) are reached only through the VA SoundWire
+// master of the capture side (guamp_wcd937x_read/write, GuampMicDev.inc): routes 2/3 need guamp-audio-mic=1.
+// The earpiece is NOT on the aw882xx: the guamp DT has one aw882xx (0x34) and Motorola's mixer_paths.xml "handset"
+// path drives wcd937x EAR; aw882xx_rcv_reg.bin (receiver mode of the same amplifier) ships with the generic Awinic
+// driver and is never selected (no aw882xx_receiver_switch in the HAL or the mixer paths).
 // This file also owns the wcd937x power (guamp_wcd937x_power: L9A + L14A RPM votes, reset gpio92, refcounted for the
 // RX and TX sides). The bolero fs-gen has one owner: guamp_bolero_fsgen (GuampMicDev.inc, refcounted).
 // Sequences in GuampAudioHwCore.h, I2C in GeniI2cCpp.inc; this file owns MMIO, GPIO, the lock and the "GuampAudioHw:"
@@ -17,25 +21,35 @@
 //   guamp-audio-hw-att=<dB>    attenuation at prepare (default 30 dB), guamp-audio-hw-floor=<dB> minimum attenuation
 //                              any volume call can reach (default 6 dB, 0 = full scale allowed)
 //   guamp-audio-hw-i2c=<kHz>   100, 400 (default, as Linux) or 1000
-//   guamp-audio-hw-rxm=1       headphone route: run the RX macro part + wcd937x power/chip id read even though the RX
-//                              SoundWire data port is missing (test of the DSP clock hook and the RX macro registers)
+//   guamp-audio-hw-hph=<dB>    headphone PA gain (HPHL/HPHR Volume), -30..0, default -12 (vendor default -6)
+//   guamp-audio-hw-ear=<dB>    earpiece PA gain ("EAR PA GAIN"), -18..6, default -12 (vendor default +6)
+//   The RX macro digital gain of routes 2/3 follows guamp-audio-hw-att / -floor like the speaker amplifier.
 #define GUAMP_AUDIO_HW_PROVIDED 1
 #define GUAMP_WCD937X_POWER_PROVIDED 1   // guamp_wcd937x_power below; GuampMicDev.inc leaves its stand-in out
 #include "GuampAudioHw.h"
 #include "GuampAudioHwExt.h"
 #include "GuampAudioMicHw.h"
 #include "GuampAudioHwCore.h"
+#include "GuampAudioRxSwr.h"
 #include "GuampTouchBoard.h"
 #include "GeniI2cCpp.inc"
 
 namespace audiohw {
-unsigned gMode, gAttDb = 30, gFloorDb = 6, gKhz = 400, gDelay, gRxm;
+unsigned gMode, gAttDb = 30, gFloorDb = 6, gKhz = 400, gDelay;
+int gHphDb = -12, gEarDb = -12;
 IOLock *gLock;
 volatile uint8_t *gGcc, *gTlmm, *gSe, *gWrap, *gLpi, *gRxmMap, *gVamMap;
 geni_i2c gI2c;
 int gBus;                       // 0 never tried, 1 up, <0 failed (error kept)
 unsigned gSpk;                  // 0 off, 1 prepared (PWDN 1), 2 running
-bool gMuted = true, gHph;
+bool gMuted = true;
+unsigned gCdc;                  // routes 2/3: 0 off, 1 prepared (RX macro muted, RX SoundWire up), 2 PA on
+uint32_t gCdcRoute;             // GUAMP_AUDIO_ROUTE_EARPIECE or _HEADPHONE while gCdc
+uint32_t gWcdChip;
+guamprx::RxLink gRx;
+struct RxWindow { uint64_t phys, bytes; volatile uint8_t *va; };
+RxWindow gRxWin[4] = {{guamprx::kRxSwrm, 0x2000, nullptr}, {guamprx::kRxSwrmHctl & ~0xFFFull, 0x1000, nullptr},
+                      {guampmic::kLpiSlew, 0x1000, nullptr}, {guamprx::kRxMacro, 0x1000, nullptr}};
 uint16_t gChip, gSysst;
 int32_t gLevelCb = INT32_MIN;   // last volume request; INT32_MIN = use guamp-audio-hw-att
 int32_t gLastRc;
@@ -101,7 +115,38 @@ void sleepMs(void *, unsigned ms) { IOSleep(ms ? ms : 1); }
 int wcdRd(void *, uint16_t reg, uint8_t *v) { return guamp_wcd937x_read(reg, v); }
 int wcdWr(void *, uint16_t reg, uint8_t v) { return guamp_wcd937x_write(reg, v); }
 
-gah_ops gOps = {nullptr, i2cW16, i2cR16, gpioOut, lpiRd, lpiWr, cdcRd, cdcWr, wcdRd, wcdWr, sleepMs, delayUs, note};
+int swrRx(void *, int on, uint8_t ch) { return gRx.datapath(on != 0, ch); }
+
+gah_ops gOps = {nullptr, i2cW16, i2cR16, gpioOut, lpiRd, lpiWr, cdcRd, cdcWr, wcdRd, wcdWr, sleepMs, delayUs, note, swrRx};
+
+// guampmic::Bus for the RX SoundWire link: the RX master, its hctl page, the LPI pins (gLpi) and slew register, the RX macro
+volatile uint32_t *rxReg(uint64_t phys) {
+  if (gLpi && phys >= GAH_LPI_BASE && phys + 4 <= GAH_LPI_BASE + GAH_LPI_SIZE)
+    return reinterpret_cast<volatile uint32_t *>(gLpi + (phys - GAH_LPI_BASE));
+  for (RxWindow &w : gRxWin)
+    if (w.va && phys >= w.phys && phys + 4 <= w.phys + w.bytes) return reinterpret_cast<volatile uint32_t *>(w.va + (phys - w.phys));
+  return nullptr;
+}
+unsigned gRxBad;
+uint32_t rxBusRd(void *, uint64_t phys) {
+  volatile uint32_t *r = rxReg(phys);
+  if (!r) { gRxBad++; return 0xFFFFFFFFu; }
+  const uint32_t v = *r;
+  __asm__ volatile("dsb sy" ::: "memory");
+  return v;
+}
+void rxBusWr(void *, uint64_t phys, uint32_t v) {
+  volatile uint32_t *r = rxReg(phys);
+  if (!r) { gRxBad++; return; }
+  __asm__ volatile("dsb sy" ::: "memory");
+  *r = v;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+void rxBusDelay(void *, uint32_t us) {
+  if (us >= 1000) IOSleep((us + 999) / 1000);
+  else IODelay(us);
+}
+void rxBusLog(void *, const char *what, uint32_t a, uint32_t b) { IOLog("GuampAudioHw: %s: 0x%x 0x%x\n", what, a, b); }
 
 uint32_t floorCb() { return gFloorDb * 100u; }
 uint32_t attNowCb() { return gah_att_from_level(gLevelCb == INT32_MIN ? -static_cast<int32_t>(gAttDb * 100u) : gLevelCb, floorCb()); }
@@ -183,42 +228,100 @@ int speakerPrepare(const guamp_audio_hw_format *fmt) {
   return 0;
 }
 
-int headphonePrepare() {
-  if (!gRxm) {
-    note(nullptr, "headphone: RX SoundWire data port (rx_swr 0x0a610000) not implemented yet, no HPH audio", -95, 0, 0);
-    return -95;
+bool isEar(uint32_t route) { return route == GUAMP_AUDIO_ROUTE_EARPIECE; }
+int32_t rxmLevelDb() { return -static_cast<int32_t>(attNowCb()) / 100; }
+
+// Routes 2/3, prepare (AFE port configured, NOT started yet; the DSP side holds the LPASS votes and has switched
+// rx_core/rx_npl on, the hook only confirms): wcd937x reachable, codec power ref, fs-gen, RX macro MCLK, RX SoundWire
+// link (pins, clock, master init, RX slave enumeration), interpolators set up and muted. Undone on any failure.
+void cdcUndo(unsigned stage) {
+  if (stage >= 4) gah_rxm_path(&gOps, 0, isEar(gCdcRoute), 0);
+  if (stage >= 3) gRx.bringDown();
+  if (stage >= 2) {
+    gah_rxm_mclk(&gOps, 0);
+    guamp_bolero_fsgen(0);
   }
-  if (!gClock) { note(nullptr, "headphone: no LPASS clock hook from the DSP side; RX macro left alone", GUAMP_AUDIO_HW_ABSENT, 0, 0); return GUAMP_AUDIO_HW_ABSENT; }
+  if (stage >= 1) guamp_wcd937x_power(0);
+}
+int codecPrepare(uint32_t route, const guamp_audio_hw_format *fmt) {
+  const char *name = isEar(route) ? "earpiece" : "headphone";
+  if (gCdc) { note(nullptr, "codec route already prepared (route, asked)", -16, gCdcRoute, route); return -16; }
+  const uint32_t want = isEar(route) ? 1u : 2u;
+  if (fmt && (fmt->rate != 48000 || fmt->channels != want)) {
+    note(nullptr, "codec route: 48 kHz, 1 ch (earpiece) / 2 ch (headphone) only (rate, channels)", -22, fmt->rate, fmt->channels);
+    return -22;
+  }
+  if (!gClock) {
+    note(nullptr, "codec route: no LPASS clock hook from the DSP side; RX macro left alone", GUAMP_AUDIO_HW_ABSENT, route, 0);
+    return GUAMP_AUDIO_HW_ABSENT;
+  }
   int r = gClock(GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_HZ, 1);
   if (!r) r = gClock(GAH_LPASS_CLK_RX_NPL, GAH_LPASS_CLK_RX_HZ, 1);
-  note(nullptr, "headphone: rx_core + rx_npl clock (22.5792 MHz)", r, GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_NPL);
-  if (r) { gClock(GAH_LPASS_CLK_RX_NPL, GAH_LPASS_CLK_RX_HZ, 0); gClock(GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_HZ, 0); return r; }
+  note(nullptr, "codec route: rx_core + rx_npl clock (22.5792 MHz)", r, GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_NPL);
+  if (r) return r;
+  uint8_t id = 0;
+  r = guamp_wcd937x_read(WCD_DIG_CHIP_ID0, &id);
+  if (r) {
+    IOLog("GuampAudioHw: %s: wcd937x registers unreachable (%d): the VA SoundWire link of the capture side is down; "
+          "boot with guamp-audio-mic=1 (hold 1)\n", name, r);
+    return r;
+  }
+  gWcdChip = id;
+  guamp_wcd937x_power(1);   // a reference only: the capture side brought the codec up and owns its reset
+  if (lpiUp()) { note(nullptr, "codec route: map lpi", -12, 0, 0); cdcUndo(1); return -12; }
   if (!gRxmMap) gRxmMap = mapPhysical(GAH_RXM_BASE, 0x1000);
   if (!gVamMap) gVamMap = mapPhysical(GAH_VAM_BASE, 0x1000);
-  if (!gRxmMap || !gVamMap) { note(nullptr, "headphone: map rx/va macro", -12, 0, 0); return -12; }
+  for (RxWindow &w : gRxWin)
+    if (!w.va) w.va = w.phys == guamprx::kRxMacro ? gRxmMap : mapPhysical(w.phys, w.bytes);
+  bool mapped = gRxmMap && gVamMap;
+  for (const RxWindow &w : gRxWin) mapped = mapped && w.va;
+  if (!mapped) { note(nullptr, "codec route: map rx/va macro, rx swr, slew", -12, 0, 0); cdcUndo(1); return -12; }
+  gCdcRoute = route;
   guamp_bolero_fsgen(1);
   gah_rxm_mclk(&gOps, 1);
-  const int32_t lvl = -static_cast<int32_t>(attNowCb());
-  gah_rxm_hph(&gOps, 1, lvl / 100);
-  gHph = true;
-  const int p = guamp_wcd937x_power(1);
-  uint8_t id = 0;
-  const int rd = p ? p : guamp_wcd937x_read(0x3401 /* CHIP_ID0 */, &id);
-  note(nullptr, "headphone: wcd937x power + chip id over the VA SoundWire (-19: capture link down)", rd, id, static_cast<uint32_t>(p));
-  // the RX macro stays on until release; HPH PA (gah_wcd_hph) waits for the RX SoundWire data port
-  note(nullptr, "headphone: RX SoundWire data port (rx_swr 0x0a610000) not implemented yet, no HPH audio", GAH_ERR_NOTSUP, 0, 0);
-  return GAH_ERR_NOTSUP;
+  gRx.bus = {nullptr, rxBusRd, rxBusWr, rxBusDelay, rxBusLog};
+  gRx.failedAt = 0;
+  r = gRx.bringUp();
+  if (r) {
+    IOLog("GuampAudioHw: %s: RX SoundWire link failed at step %d (1 master init: RX macro unclocked?, 2 RX slave "
+          "missing: wcd937x in reset?), %u accesses outside the windows\n", name, gRx.failedAt, gRxBad);
+    cdcUndo(3);
+    return r;
+  }
+  gah_rxm_path(&gOps, 1, isEar(route), rxmLevelDb());
+  gCdc = 1;
+  gMuted = true;
+  IOLog("GuampAudioHw: %s prepared: wcd937x chip id0 0x%02x, rx swr dev %u, digital gain %d dB, PA gain %d dB\n", name,
+        id, gRx.swr.devNum, rxmLevelDb(), isEar(route) ? gEarDb : gHphDb);
+  return 0;
 }
-
-void headphoneRelease() {
-  if (!gHph) return;
-  gah_rxm_hph(&gOps, 0, 0);
-  gah_rxm_mclk(&gOps, 0);
-  guamp_bolero_fsgen(0);
-  guamp_wcd937x_power(0);
-  if (gClock) { gClock(GAH_LPASS_CLK_RX_NPL, GAH_LPASS_CLK_RX_HZ, 0); gClock(GAH_LPASS_CLK_RX_CORE, GAH_LPASS_CLK_RX_HZ, 0); }
-  gHph = false;
-  note(nullptr, "headphone: released", 0, 0, 0);
+// amp on after AFE DEVICE_START (RX macro clocked by the codec DMA port): wcd937x PA sequence (SoundWire port +
+// datapath inside, at Linux's point), then the RX macro unmute. Off: mute first, PA sequence down, datapath off.
+int codecAmp(int on) {
+  if (!gCdc) return -22;
+  const bool ear = isEar(gCdcRoute);
+  int r = 0;
+  if (on && gCdc == 1) {
+    r = ear ? gah_wcd_ear(&gOps, 1, gah_wcd_ear_gain(gEarDb * 100)) : gah_wcd_hph(&gOps, 1, gah_wcd_gain_code(gHphDb * 100));
+    if (!r) {
+      gah_rxm_mute(&gOps, ear, 0);
+      gCdc = 2;
+      gMuted = false;
+    }
+  } else if (!on && gCdc == 2) {
+    gah_rxm_mute(&gOps, ear, 1);
+    r = ear ? gah_wcd_ear(&gOps, 0, 0) : gah_wcd_hph(&gOps, 0, 0);
+    gCdc = 1;
+    gMuted = true;
+  }
+  return r;
+}
+void codecRelease() {
+  if (!gCdc) return;
+  if (gCdc == 2) codecAmp(0);
+  cdcUndo(4);
+  gCdc = 0;
+  note(nullptr, "codec route released (route)", 0, gCdcRoute, 0);
 }
 
 void probeThread(void *, wait_result_t) {
@@ -241,13 +344,19 @@ void start() {
   PE_parse_boot_argn("guamp-audio-hw-floor", &gFloorDb, sizeof(gFloorDb));
   PE_parse_boot_argn("guamp-audio-hw-i2c", &gKhz, sizeof(gKhz));
   PE_parse_boot_argn("guamp-audio-hw-delay", &gDelay, sizeof(gDelay));
-  PE_parse_boot_argn("guamp-audio-hw-rxm", &gRxm, sizeof(gRxm));
+  PE_parse_boot_argn("guamp-audio-hw-hph", &gHphDb, sizeof(gHphDb));
+  PE_parse_boot_argn("guamp-audio-hw-ear", &gEarDb, sizeof(gEarDb));
+  if (gHphDb < -30) gHphDb = -30;
+  if (gHphDb > 0) gHphDb = 0;
+  if (gEarDb < -18) gEarDb = -18;
+  if (gEarDb > 6) gEarDb = 6;
   if (gAttDb > 95) gAttDb = 95;
   if (gFloorDb > 95) gFloorDb = 95;
   if (gKhz != 100 && gKhz != 1000) gKhz = 400;
   if (gDelay > 600) gDelay = 600;
   gLock = IOLockAlloc();
-  IOLog("GuampAudioHw: mode %u, att %u dB, floor %u dB, i2c %u kHz, rxm %u\n", gMode, gAttDb, gFloorDb, gKhz, gRxm);
+  IOLog("GuampAudioHw: mode %u, att %u dB, floor %u dB, i2c %u kHz, hph %d dB, ear %d dB\n", gMode, gAttDb, gFloorDb, gKhz,
+        gHphDb, gEarDb);
   if (!gLock) { gMode = 0; return; }
   if (gMode >= 2) {
     thread_t th;
@@ -261,7 +370,8 @@ extern "C" int guamp_audio_hw_prepare(uint32_t route, const struct guamp_audio_h
   if (!gMode || !gLock) return GUAMP_AUDIO_HW_ABSENT;
   IOLockLock(gLock);
   IOLog("GuampAudioHw: prepare route %u port 0x%x\n", route, fmt ? fmt->afe_port : 0);
-  int r = route == GUAMP_AUDIO_ROUTE_SPEAKER ? speakerPrepare(fmt) : route == GUAMP_AUDIO_ROUTE_HEADPHONE ? headphonePrepare() : -95;
+  int r = route == GUAMP_AUDIO_ROUTE_SPEAKER ? speakerPrepare(fmt)
+          : (route == GUAMP_AUDIO_ROUTE_HEADPHONE || route == GUAMP_AUDIO_ROUTE_EARPIECE) ? codecPrepare(route, fmt) : -95;
   if (r) gLastRc = r;
   IOLog("GuampAudioHw: prepare route %u: rc %d\n", route, r);
   IOLockUnlock(gLock);
@@ -271,9 +381,15 @@ extern "C" int guamp_audio_hw_prepare(uint32_t route, const struct guamp_audio_h
 extern "C" int guamp_audio_hw_amp(uint32_t route, int on) {
   using namespace audiohw;
   if (!gMode || !gLock) return GUAMP_AUDIO_HW_ABSENT;
-  if (route != GUAMP_AUDIO_ROUTE_SPEAKER) return route == GUAMP_AUDIO_ROUTE_HEADPHONE && gHph ? 0 : -95;
   IOLockLock(gLock);
   int r = 0;
+  if (route != GUAMP_AUDIO_ROUTE_SPEAKER) {
+    r = gCdc && route == gCdcRoute ? codecAmp(on) : -22;
+    IOLog("GuampAudioHw: codec amp %s route %u: rc %d (state %u)\n", on ? "on" : "off", route, r, gCdc);
+    if (r) gLastRc = r;
+    IOLockUnlock(gLock);
+    return r;
+  }
   if (on) {
     if (gSpk < 1) r = -22;
     else if (gSpk == 1) { r = gah_aw_start(&gOps, &gSysst); if (!r) { gSpk = 2; gMuted = false; } }
@@ -295,7 +411,7 @@ extern "C" int guamp_audio_hw_volume(uint32_t route, int32_t centibel) {
   gLevelCb = centibel;
   int r = 0;
   if (route == GUAMP_AUDIO_ROUTE_SPEAKER && gSpk) r = gah_aw_set_att(&gOps, gah_aw_att_code(attNowCb()));
-  else if (route == GUAMP_AUDIO_ROUTE_HEADPHONE && gHph) gah_rxm_volume(&gOps, -static_cast<int32_t>(attNowCb()) / 100);
+  else if (route != GUAMP_AUDIO_ROUTE_SPEAKER && gCdc && route == gCdcRoute) gah_rxm_volume(&gOps, isEar(route), rxmLevelDb());
   IOLog("GuampAudioHw: volume route %u request %d cb -> attenuation %u cb (floor %u): rc %d\n", route, centibel, attNowCb(), floorCb(), r);
   IOLockUnlock(gLock);
   return r;
@@ -311,8 +427,8 @@ extern "C" void guamp_audio_hw_release(uint32_t route) {
     gSpk = 0;
     gMuted = true;
     IOLog("GuampAudioHw: speaker released (amp PWDN 1, i2s1 pins sleep)\n");
-  } else if (route == GUAMP_AUDIO_ROUTE_HEADPHONE) {
-    headphoneRelease();
+  } else if (route != GUAMP_AUDIO_ROUTE_SPEAKER && route == gCdcRoute) {
+    codecRelease();
   }
   IOLockUnlock(gLock);
 }
@@ -323,8 +439,8 @@ extern "C" int guamp_audio_hw_mute(uint32_t route, int mute) {
   IOLockLock(gLock);
   int r = -22;
   if (route == GUAMP_AUDIO_ROUTE_SPEAKER && gSpk == 2) { r = gah_aw_mute(&gOps, mute); if (!r) gMuted = mute != 0; }
-  else if (route == GUAMP_AUDIO_ROUTE_HEADPHONE && gHph) {
-    for (unsigned n = 0; n < 2; ++n) gah_cdc_bits(&gOps, RXM_PATH_CTL(n), 0x10, mute ? 0x10 : 0);
+  else if (route != GUAMP_AUDIO_ROUTE_SPEAKER && gCdc == 2 && route == gCdcRoute) {
+    gah_rxm_mute(&gOps, isEar(route), mute);
     gMuted = mute != 0;
     r = 0;
   }
@@ -336,10 +452,11 @@ extern "C" int guamp_audio_hw_get_state(uint32_t route, struct guamp_audio_hw_st
   using namespace audiohw;
   if (!st) return -22;
   st->enabled = gMode;
-  st->prepared = route == GUAMP_AUDIO_ROUTE_SPEAKER ? gSpk >= 1 : gHph;
-  st->running = route == GUAMP_AUDIO_ROUTE_SPEAKER ? gSpk == 2 : 0;
+  const bool spk = route == GUAMP_AUDIO_ROUTE_SPEAKER, mine = !spk && gCdc && route == gCdcRoute;
+  st->prepared = spk ? gSpk >= 1 : mine;
+  st->running = spk ? gSpk == 2 : mine && gCdc == 2;
   st->muted = gMuted;
-  st->chip_id = gChip;
+  st->chip_id = spk ? gChip : gWcdChip;
   st->att_cb = attNowCb();
   st->sysst = gSysst;
   st->last_rc = gLastRc;
