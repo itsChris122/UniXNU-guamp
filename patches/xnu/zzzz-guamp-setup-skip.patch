@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,487 @@
+@@ -7858,6 +7858,528 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -440,6 +440,42 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	 * current ADT (e.g. the ringer switch). Counted in the periodic GuampUi line (deleted/absent). */
 +	unsigned int guamp_mg_reset = 0;
 +	PE_parse_boot_argn("guamp-mg-reset", &guamp_mg_reset, sizeof(guamp_mg_reset));
++	/* guamp-mg-adt-sync (default 1, =0 off; analisi/wifi/IMPOSTAZIONI-WIFI-20261029.md): MobileGestalt keeps the
++	 * capabilities it derives from the ADT in its cache (CacheData: "wifi" and "wi-fi" were cached false before
++	 * /chosen/mac-address-wifi0 existed, so Settings has no Wi-Fi row). The cache is invalidated once for each set of
++	 * those ADT properties: a stamp of them names a marker under /private/var/db; no marker, one reset. */
++	unsigned int guamp_mg_adt_sync = 1;
++	char mg_marker[64] = "";
++	PE_parse_boot_argn("guamp-mg-adt-sync", &guamp_mg_adt_sync, sizeof(guamp_mg_adt_sync));
++	if (guamp_mg_adt_sync && guamp_mg_reset != 1) {
++		static const char *const props[][2] = {
++			{"/chosen", "mac-address-wifi0"}, {"/chosen", "mac-address-bluetooth0"}, {"/product", "product-id"},
++			{"/product", "wifi-chipset"}, {"/product", "bluetooth-le"}, {"/arm-io/wlan", "local-mac-address"},
++		};
++		uint32_t stamp = 2166136261u;           /* FNV-1a over name, size and bytes of each property */
++		for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
++			DTEntry node;
++			const void *value = NULL;
++			unsigned size = 0;
++			const char *name = props[i][1];
++			if (SecureDTLookupEntry(NULL, props[i][0], &node) != kSuccess ||
++			    SecureDTGetProperty(node, name, &value, &size) != kSuccess) {
++				value = NULL;
++				size = 0;
++			}
++			for (const char *c = name; *c; c++) stamp = (stamp ^ (uint8_t)*c) * 16777619u;
++			stamp = (stamp ^ size) * 16777619u;
++			for (unsigned j = 0; j < size && j < 64; j++) stamp = (stamp ^ ((const uint8_t *)value)[j]) * 16777619u;
++		}
++		snprintf(mg_marker, sizeof(mg_marker), "/private/var/db/guamp-mg-adt-%08x.done", stamp);
++		int marked = native_guamp_ui_pc_done(p, scratch, mg_marker);
++		if (marked == ENOENT) {
++			printf("guamp-mg-adt-sync: ADT capabilities %08x are new: MobileGestalt cache reset once\n", stamp);
++			guamp_mg_reset = 1;
++		} else {
++			mg_marker[0] = 0;
++		}
++	}
 +	if (guamp_mg_reset == 1) {
 +		static const char *const mg[] = {
 +			"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
@@ -457,6 +493,11 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			else if (mg_error == ENOENT) native_guamp_ui_cache_absent++;
 +			else native_guamp_ui_cache_error = mg_error;
 +			printf("guamp-mg-reset: %s status %d\n", mg[i], mg_error);
++		}
++		if (mg_marker[0]) {
++			static const uint8_t note[] = "MobileGestalt cache reset for these ADT capabilities.\n";
++			int marker_error = native_guamp_write_file(p, scratch, mg_marker, note, sizeof(note) - 1, 0, 0600, 0);
++			printf("guamp-mg-adt-sync: marker %s status %d\n", mg_marker, marker_error);
 +		}
 +	}
 +	/* guamp-home-layout-reset=1 (owner request 27/10): SpringBoard rebuilds the default Home layout. */
@@ -489,7 +530,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8464,7 @@
+@@ -7983,6 +8505,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
