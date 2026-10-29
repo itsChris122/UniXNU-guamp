@@ -116,17 +116,19 @@ typedef struct { int unused; } wait_queue_head_t;
 extern void (*lx_log_tap)(int level, const char *line);   /* sees every line after it is logged */
 int lx_pump(void);               /* runs one round of ready work; returns nonzero if anything ran */
 void lx_idle(unsigned int ms);   /* nothing ready: let the clock advance and device events arrive */
-#define wait_event_timeout(w, cond, tmo_j) ({ \
-    unsigned long _end = jiffies + (tmo_j); long _r = 1; (void)(w); \
-    while (!(cond)) { if (!lx_pump()) { if (time_after(jiffies, _end) || jiffies == _end) { _r = 0; break; } lx_idle(1); } } \
-    (cond) ? (_r ? (long)((_end - jiffies) > 0 ? (_end - jiffies) : 1) : 1) : 0; })
 /* The condition may have side effects (a command is sent when it is evaluated): it is evaluated once per round, and never again after the wait ends. */
 #define wait_event_timeout_once(w, cond, tmo_j) ({ \
     unsigned long _end = jiffies + (tmo_j); long _r; (void)(w); \
     for (;;) { \
-      if (cond) { _r = (long)((_end - jiffies) > 0 ? (_end - jiffies) : 1); break; } \
+      if (cond) { unsigned long _now = jiffies; _r = time_before(_now, _end) ? (long)(_end - _now) : 1; break; } \
       if (!lx_pump()) { if (time_after(jiffies, _end) || jiffies == _end) { _r = (cond) ? 1 : 0; break; } lx_idle(1); } } \
     _r; })
+/* guamp 29/10: wait_event_timeout is that single-evaluation wait as well. It used to evaluate cond once more after its loop, so
+ * ath10k_wmi_cmd_send(), whose cond calls ath10k_wmi_cmd_send_nowait(), sent every WMI command twice: WMI INIT took the
+ * endpoint's credit, the extra send got -EAGAIN, the caller freed the skb still queued on CE3, warned "wmi command timeout,
+ * restarting hardware" and core_start failed ("could not send WMI init command"); the teardown then completed the freed skb
+ * (SoC freeze of 29/10 10:27, right after that warning and error). Linux evaluates cond once per wake-up and once at the timeout. */
+#define wait_event_timeout(w, cond, tmo_j) wait_event_timeout_once(w, cond, tmo_j)
 #define wait_event(w, cond) ({ (void)(w); while (!(cond)) { if (!lx_pump()) lx_idle(1); } })
 #define wait_event_interruptible(w, cond) ({ wait_event(w, cond); 0; })
 #define wait_event_interruptible_timeout(w, cond, t) wait_event_timeout(w, cond, t)
