@@ -160,7 +160,13 @@ void smemNote(void *, const qipc::SmemArena::Note &n) {
 void *heapAlloc(void *, uint32_t n) { return IOMallocZero(n); }
 void heapFree(void *, void *p, uint32_t n) { IOFree(p, n); }
 
+// Steady audio traffic (mic READ_DONE every ~21 ms) flooded msgbuf and hid the cause of the 31 s reset in fin3:
+// after the first 256 lines of a kind, keep one in 1024.
+bool chatty(uint32_t &count) { return ++count > 256 && (count & 1023) != 0; }
+uint32_t gTraceLines = 0, gAprRxLines = 0;
+
 void glinkTrace(void *, int event, const char *name, uint32_t a, uint32_t b) {
+  if (chatty(gTraceLines)) return;
   IOLog("GuampAdsp: glink %s%s%s %x %x at %u ms\n", qipc::Glink::traceName(event), name[0] ? " " : "", name, a, b, nowMs());
 }
 void aprLog(void *, const char *what, uint32_t a, uint32_t b) {
@@ -370,6 +376,7 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   const uint8_t *payload = nullptr;
   uint32_t bytes = 0;
   const bool ok = apr::parse(p, n, &h, &payload, &bytes);
+  if (!ok || !chatty(gAprRxLines))
   IOLog("GuampAdsp: apr rx ch %u %u bytes: %s src %x:%x port %x dst %x:%x port %x token %x opcode %x payload %u\n", channel,
         n, ok ? "ok" : "MALFORMED", ok ? h.srcDomain : 0, ok ? h.srcSvc : 0, ok ? h.srcPort : 0, ok ? h.destDomain : 0,
         ok ? h.destSvc : 0, ok ? h.destPort : 0, ok ? h.token : 0, ok ? h.opcode : 0, bytes);
