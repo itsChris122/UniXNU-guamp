@@ -1,0 +1,494 @@
+guamp: guamp-gpu-all=1, a GPU connection for every process that opens the accelerator (NativeAdreno 81a0b01 + 0001..0004)
+
+With native_adreno_gpu_all set by the board (GuampAdrenoProbe.cpp, boot-arg guamp-gpu-all=1; 0 = everything as before):
+- 32 connection slots; the render server keeps slot 0 and its 1 GiB, every other connection gets a window sized on demand
+  (192 MiB, else the largest free run of at least 64 MiB) from [0x60000000, end of the aperture), NativeAdrenoGpuAll.h;
+- a teardown that clientClose cannot finish in 20 ms (jobs of a killed process still on the GPU) is retried by a kernel thread
+  until it finishes; slot and window are reused only then (before, clientClose ran once and a failure kept them for the boot);
+- limits: opens per name per minute (6) instead of 8 per boot, live connections (16, 2 per process), BO bytes per process (384 MiB)
+  and of all of them (1024 MiB), a quarter of the shared GPU table kept for the render server; display hand-off and scanout stay
+  the render server's; refused connections are detached from the registry.
+
+diff --git a/NativeAdrenoGpuAll.h b/NativeAdrenoGpuAll.h
+new file mode 100644
+index 0000000..cccbd59
+--- /dev/null
++++ b/NativeAdrenoGpuAll.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: MIT */
++/* guamp (UniXNU-guamp patches/native-adreno/0005-gpu-all-dynamic-windows.patch): the bookkeeping of guamp-gpu-all=1, where every process
++ * that opens the accelerator gets a GPU connection (NativeAdrenoPublish.cpp). Plain logic without kernel calls, so the host test
++ * (drivers/GuampAdreno/tests/gpu_all_host.cpp) runs exactly this code.
++ *  - NagWindows: the GPU address windows of the processes other than the render server, taken from the part of the one GPU address
++ *    space above the render server's 1 GiB ([0x60000000, end of the aperture)) in 16 MiB granules, best fit, and given back when the
++ *    connection's teardown has finished. Replaces the fixed 170/256 MiB windows of slots 1..7.
++ *  - NagRates: opens per process name per minute, in place of the eight opens per name per boot: a process that crashes on every launch
++ *    cannot spin the GPU in a loop, while one that is opened again and again by the user (a screenshot, a gallery) keeps getting it.
++ *  - nagAllow*: the limits that keep the render server's memory and its share of the GPU table safe from the other processes. */
++#ifndef NATIVE_ADRENO_GPU_ALL_H
++#define NATIVE_ADRENO_GPU_ALL_H
++#include <stdint.h>
++#include <string.h>
++
++enum : uint64_t {NagGranule=0x1000000ull, NagBase=0x60000000ull, NagTop=0x100000000ull};
++enum : unsigned {NagMaxGranules=unsigned((NagTop-NagBase)/NagGranule)};
++
++struct NagWindows {
++    uint64_t end=NagBase;              /* exclusive end of the managed range (the aperture's end); empty before init */
++    uint8_t used[NagMaxGranules]{};    /* 1: granule belongs to a live (or still draining) connection */
++    void init(uint64_t aperture_end) {
++        end=aperture_end<NagBase?NagBase:(aperture_end>NagTop?NagTop:aperture_end);
++        memset(used,0,sizeof used);
++    }
++    unsigned granules() const {return unsigned((end-NagBase)/NagGranule);}
++    /* Best fit: the smallest free run that holds want; failing that the largest free run of at least min, whole (never more than want).
++     * Sizes are rounded up to granules. False (nothing changed) when no run of min exists. */
++    bool take(uint64_t want,uint64_t min,uint64_t *start,uint64_t *bytes) {
++        if(!start || !bytes || !want)return false;
++        if(min>want)min=want;
++        const unsigned need=unsigned((want+NagGranule-1)/NagGranule),least=unsigned((min+NagGranule-1)/NagGranule);
++        unsigned fit_at=0,fit_len=0,big_at=0,big_len=0;
++        for(unsigned i=0,n=granules();i<n;) {
++            if(used[i]) {++i;continue;}
++            unsigned run=0;
++            while(i+run<n && !used[i+run])++run;
++            if(run>=need && (!fit_len || run<fit_len)) {fit_at=i;fit_len=run;}
++            if(run>big_len) {big_at=i;big_len=run;}
++            i+=run;
++        }
++        unsigned at=0,len=0;
++        if(fit_len) {at=fit_at;len=need;}
++        else if(big_len && big_len>=least) {at=big_at;len=big_len;}
++        else return false;
++        for(unsigned i=0;i<len;++i)used[at+i]=1;
++        *start=NagBase+uint64_t(at)*NagGranule;*bytes=uint64_t(len)*NagGranule;
++        return true;
++    }
++    /* Gives back exactly what take() returned; anything else is ignored. */
++    void give(uint64_t start,uint64_t bytes) {
++        if(start<NagBase || (start-NagBase)%NagGranule || !bytes || bytes%NagGranule || start+bytes>end)return;
++        for(uint64_t at=(start-NagBase)/NagGranule,n=bytes/NagGranule;n;--n,++at)used[at]=0;
++    }
++    uint64_t freeBytes() const {
++        uint64_t total=0;
++        for(unsigned i=0,n=granules();i<n;++i)if(!used[i])total+=NagGranule;
++        return total;
++    }
++};
++
++struct NagRate {char name[20];uint64_t since_ms;uint32_t count;};
++struct NagRates {
++    NagRate rows[64]{};
++    /* One open of name at now_ms: true when it is within per_minute opens of the current minute of that name (0 = no limit). The table
++     * keeps the 64 most recently started names; a name pushed out starts afresh. */
++    bool admit(const char *name,uint64_t now_ms,uint32_t per_minute) {
++        NagRate *row=nullptr,*oldest=&rows[0];
++        for(auto &r:rows) {
++            if(r.name[0] && !strncmp(r.name,name,sizeof r.name)) {row=&r;break;}
++            if(!r.name[0]) {if(oldest->name[0])oldest=&r;}
++            else if(oldest->name[0] && r.since_ms<oldest->since_ms)oldest=&r;
++        }
++        if(!row) {
++            row=oldest;memset(row,0,sizeof *row);
++            strlcpy(row->name,name,sizeof row->name);row->since_ms=now_ms;
++        }
++        if(now_ms-row->since_ms>=60000) {row->since_ms=now_ms;row->count=0;}
++        if(per_minute && row->count>=per_minute)return false;
++        row->count=row->count+1;
++        return true;
++    }
++};
++
++/* The GPU table shared by every connection (NativeAdrenoVm: 16384 mappings, NativeAdrenoGpuContext attaches it with 131072 spans): the
++ * processes other than the render server stop at a quarter short of each, so the render server always finds room (it held about 4000
++ * mappings at most, i567). */
++enum : uint64_t {NagVmObjects=16384, NagVmSpans=131072, NagVmReservedObjects=4096, NagVmReservedSpans=32768};
++inline bool nagAllowMap(uint64_t objects,uint64_t spans,uint64_t new_spans) {
++    return objects<NagVmObjects-NagVmReservedObjects && spans+new_spans<=NagVmSpans-NagVmReservedSpans;
++}
++/* A BO allocation of bytes by a process other than the render server: within its own limit and within the limit of all of them together. */
++inline bool nagAllowBytes(uint64_t client_bytes,uint64_t others_bytes,uint64_t bytes,uint64_t per_client,uint64_t all_others) {
++    return bytes<=per_client && client_bytes<=per_client-bytes && bytes<=all_others && others_bytes<=all_others-bytes;
++}
++#endif
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 65318fd..aa7d422 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -75,6 +75,7 @@ class AGXDeviceUserClient;
+ /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
+ static AGXDeviceUserClient *gMailboxOwner=nullptr;
+ void nativeAdrenoMailboxPoller(void *,wait_result_t);
++void nativeAdrenoReaper(void *,wait_result_t);
+ static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
+ 
+ /* The two sandbox gates IOServiceOpen applies after newUserClient (XNU IOUserClient.cpp is_io_service_open_extended): the MACF open check on
+@@ -129,6 +130,34 @@ static bool extensionClient(const char *name)
+     for(unsigned i=0;i<20 && name[i];++i)if(!strncmp(name+i,"Poster",6))return true;
+     return false;
+ }
++/* guamp (patches/native-adreno/0005-gpu-all-dynamic-windows.patch), boot-arg guamp-gpu-all=1 (the board sets native_adreno_gpu_all before
++ * publishing; 0 keeps everything above unchanged): every process that opens the accelerator gets a connection.
++ *  - slots 1..NativeAdrenoAllClients-1 are only queue ranges; their GPU address windows come from NagWindows (NativeAdrenoGpuAll.h),
++ *    sized on demand, and go back once the connection's teardown has finished. The render server keeps slot 0 and its fixed 1 GiB.
++ *  - a teardown that cannot finish at once (jobs of a killed process still on the GPU: clientClose is called once, by IOServiceClose or
++ *    clientDied, and a failure used to keep the slot and the window for the rest of the boot) is retried by a kernel thread until it
++ *    finishes; the window is reused only then, when no job of that process can touch it any more.
++ *  - limits: opens per name per minute instead of eight per boot, live connections, BO bytes per process and for all of them together,
++ *    and a reserve of the shared GPU table for the render server. The display hand-off and its scanout stay the render server's. */
++enum : unsigned {NativeAdrenoAllClients=32};
++extern "C" {
++volatile uint32_t native_adreno_gpu_all;
++/* Set by the board (0 = default): [0] window MiB (192), [1] smallest window MiB (64), [2] BO MiB per process (384), [3] BO MiB of all
++ * processes but the render server (1024), [4] opens per name per minute (6), [5] live connections besides the render server's (16),
++ * [6] live connections per process (2). */
++volatile uint32_t native_adreno_gpu_all_cfg[7];
++/* [0] live connections, [1] their peak, [2] teardowns deferred, [3] deferred teardowns finished, [4] refused: rate, [5] refused: no slot,
++ * window or connection limit, [6] refused BoAllocs (memory limit), [7] refused BoMaps (render server's table reserve), [8] BO MiB of the
++ * other processes now, [9] teardowns still deferred, [10] free window MiB, [11] largest window granted MiB. */
++volatile uint32_t native_adreno_gpu_all_stats[12];
++}
++#include "NativeAdrenoGpuAll.h"
++static uint64_t gpuAllConfig(unsigned index,uint64_t fallback)
++{
++    const uint32_t value=index<sizeof native_adreno_gpu_all_cfg/sizeof *native_adreno_gpu_all_cfg?native_adreno_gpu_all_cfg[index]:0;
++    return value?value:fallback;
++}
++extern "C" int proc_selfpid(void);
+ 
+ namespace {
+ void shiftName(char names[3][17]) {
+@@ -146,10 +175,18 @@ struct Published {
+     const NativeAdrenoAbiDeviceInfo *info=nullptr;
+     IOLock *lock=nullptr;
+     IOService *service=nullptr;
+-    bool slots[NativeAdrenoMaxClients]{};
++    bool slots[NativeAdrenoAllClients]{};
+     bool kernel_client=false;
+     uint32_t input_bits=0,output_bits=0;
+     uint32_t opened=0,closed=0;
++    /* guamp-gpu-all: the other processes' windows, open rates, live connections and BO bytes; the deferred teardowns. */
++    NagWindows windows;
++    NagRates rates;
++    int slot_pid[NativeAdrenoAllClients]{};
++    uint32_t others_live=0;
++    uint64_t others_bytes=0;
++    AGXDeviceUserClient *deferred=nullptr;   /* linked through AGXDeviceUserClient::deferred_next_, each one retained */
++    bool reaper_started=false;
+ } g;
+ }
+ 
+@@ -167,8 +204,17 @@ class AGXDeviceUserClient : public IOUserClient {
+     bool handoffOnly_=false;
+     bool kernel_=false;
+     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
+-    unsigned slot_=NativeAdrenoMaxClients;
++    unsigned slot_=NativeAdrenoAllClients;
+     char name_[20]{};
++    /* guamp-gpu-all: a process other than the render server (limits apply), its pid, its window when it came from g.windows, its live BO
++     * bytes, and a teardown left to the reaper (retained while on g.deferred). */
++    bool other_=false,dynamic_=false,deferred_=false;
++    int pid_=0;
++    uint64_t win_start_=0,win_bytes_=0,win_peak_=0,bo_bytes_=0;
++    uint32_t deferred_tries_=0;
++    AGXDeviceUserClient *deferred_next_=nullptr;
++    void finishCloseLocked(uint64_t peak);
++    friend void nativeAdrenoReaper(void *,wait_result_t);
+     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
+      * the descriptor again and unmaps only a mapping that belongs to THAT descriptor (kIOMapReference); a fresh descriptor per call made the
+      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
+@@ -245,30 +291,67 @@ bool AGXDeviceUserClient::mount(bool kernel)
+     IOLockLock(g.lock);
+     bool ok=false;
+     /* The render server takes slot 0 (the large window) when free; every other process, or a second render-server connection, the next free one. */
+-    unsigned slot=NativeAdrenoMaxClients;
+-    if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
+-    else {
+-        if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
++    unsigned slot=NativeAdrenoAllClients;
++    const bool all=native_adreno_gpu_all!=0;
++    const bool render_server=!kernel && !strncmp(name_,"backboardd",sizeof name_);
++    uint64_t win_start=0,win_bytes=0;
++    bool dynamic=false;
++    if(kernel)slot=g.kernel_client?NativeAdrenoAllClients:0;
++    else if(all) {
++        pid_=proc_selfpid();
++        /* guamp-gpu-all: the render server's first connection keeps slot 0 and its 1 GiB; every other connection takes any free slot and a
++         * window from g.windows (192 MiB, or the largest free run of at least 64 MiB), within the connection limits. */
++        if(render_server && !g.slots[0]) {slot=0;win_start=kClientWindows[0].start;win_bytes=kClientWindows[0].bytes;}
++        else {
++            unsigned same_pid=0;
++            for(unsigned i=0;i<NativeAdrenoAllClients;++i)if(g.slots[i] && g.slot_pid[i]==pid_)++same_pid;
++            const bool limited=!render_server && (g.others_live>=gpuAllConfig(5,16) || same_pid>=gpuAllConfig(6,2));
++            for(unsigned i=1;!limited && slot==NativeAdrenoAllClients && i<NativeAdrenoAllClients;++i)if(!g.slots[i])slot=i;
++            if(slot<NativeAdrenoAllClients && !g.windows.take(gpuAllConfig(0,192)<<20,gpuAllConfig(1,64)<<20,&win_start,&win_bytes))
++                slot=NativeAdrenoAllClients;
++            dynamic=slot<NativeAdrenoAllClients;
++        }
++    } else {
++        if(render_server && !g.slots[0])slot=0;
+         const unsigned last=native_adreno_wide_active?NativeAdrenoMaxClients:NativeAdrenoNarrowClients;
+-        for(unsigned i=extensionClient(name_)?NativeAdrenoNarrowClients:1;slot==NativeAdrenoMaxClients && i<last;++i)if(!g.slots[i])slot=i;
++        for(unsigned i=extensionClient(name_)?NativeAdrenoNarrowClients:1;slot==NativeAdrenoAllClients && i<last;++i)if(!g.slots[i])slot=i;
++        if(slot<NativeAdrenoMaxClients) {win_start=kClientWindows[slot].start;win_bytes=kClientWindows[slot].bytes;}
+     }
+-    const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
+-    if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
++    const IOReturn opened=slot<NativeAdrenoAllClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
++    if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoAllClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
+     if(opened==kIOReturnSuccess) {
+         if(g.timer)core->attachTimer(g.timer);
+         if(g.info)core->attachDeviceInfo(g.info);
+         /* Queue ranges: the kernel client keeps range 0 alone (no user slot is live while the board's self-test runs); users get their slot's. */
+-        const IOReturn scoped=kernel?core->setScope(0,0,0):core->setScope(slot*NativeAdrenoAbiMaxQueues,kClientWindows[slot].start,kClientWindows[slot].bytes);
++        const IOReturn scoped=kernel?core->setScope(0,0,0):core->setScope(slot*NativeAdrenoAbiMaxQueues,win_start,win_bytes);
+         if(scoped==kIOReturnSuccess) {
+             core_=core;core=nullptr;slot_=slot;kernel_=kernel;live_=true;ok=true;
+             if(kernel)g.kernel_client=true;else g.slots[slot]=true;
+             ++g.opened;
+             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=slot;
++            if(all && !kernel) {
++                g.slot_pid[slot]=pid_;
++                other_=!render_server;dynamic_=dynamic;win_start_=win_start;win_bytes_=win_bytes;dynamic=false;
++                if(other_)g.others_live=g.others_live+1;
++                native_adreno_gpu_all_stats[0]=native_adreno_gpu_all_stats[0]+1;
++                if(native_adreno_gpu_all_stats[0]>native_adreno_gpu_all_stats[1])native_adreno_gpu_all_stats[1]=native_adreno_gpu_all_stats[0];
++                if(uint32_t(win_bytes>>20)>native_adreno_gpu_all_stats[11])native_adreno_gpu_all_stats[11]=uint32_t(win_bytes>>20);
++            }
+         } else {
+             native_adreno_mount_fail[0]=3;native_adreno_mount_fail[1]=uint32_t(scoped);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;
+             core->releaseAll(&g.clock,0);
+         }
+     }
++    /* A window taken for a mount that failed goes back at once (nothing was mapped in it). */
++    if(dynamic)g.windows.give(win_start,win_bytes);
++    if(all) {
++        native_adreno_gpu_all_stats[10]=uint32_t(g.windows.freeBytes()>>20);
++        if(!ok && !kernel) {
++            native_adreno_gpu_all_stats[5]=native_adreno_gpu_all_stats[5]+1;
++            IOLog("NativeAdreno: gpu-all: %s refused (slot %u, mount step %u status %x, others live %u, free window %u MiB)\n",name_,slot,
++                native_adreno_mount_fail[0],native_adreno_mount_fail[1],g.others_live,native_adreno_gpu_all_stats[10]);
++        }
++    }
+     /* The mailbox page and its poller serve the render server's connection only. */
+     if(ok && !kernel && slot==0 && !strncmp(name_,"backboardd",sizeof name_)) {
+         if(!gMailbox) {
+@@ -319,25 +402,92 @@ IOReturn AGXDeviceUserClient::clientClose()
+     IOReturn status=kIOReturnSuccess;
+     AGXDeviceUserClient *mailbox=nullptr;
+     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
+-    if(live_) {
++    bool deferred=false;
++    if(live_ && !deferred_) {
+         const uint64_t peak=core_->windowPeak();
+-        status=core_->releaseAll(&g.clock,2000000);
++        /* guamp-gpu-all: a user connection waits at most 20 ms here (under the GPU lock, which the render server's frames need), then
++         * the reaper takes over; the slot and the window stay taken until the teardown has finished. */
++        const bool reap=native_adreno_gpu_all && !kernel_;
++        status=core_->releaseAll(&g.clock,reap?20000:2000000);
+         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
+-        if(!status) {
+-            live_=false;
+-            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients)g.slots[slot_]=false;
+-            ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
+-            if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
+-                record->closes=record->closes+1;record->slot=0xff;
+-                if(peak>>20>record->peak_mib)record->peak_mib=uint32_t(peak>>20);
++        if(!status)finishCloseLocked(peak);
++        else if(reap) {
++            deferred_=true;deferred=true;deferred_tries_=0;win_peak_=peak;
++            retain();deferred_next_=g.deferred;g.deferred=this;
++            native_adreno_gpu_all_stats[2]=native_adreno_gpu_all_stats[2]+1;
++            native_adreno_gpu_all_stats[9]=native_adreno_gpu_all_stats[9]+1;
++            if(!g.reaper_started) {
++                thread_t thread=nullptr;
++                if(kernel_thread_start(nativeAdrenoReaper,nullptr,&thread)==KERN_SUCCESS) {thread_deallocate(thread);g.reaper_started=true;}
+             }
++            IOLockWakeup(g.lock,&g.deferred,false);
++            IOLog("NativeAdreno: gpu-all: teardown of %s (pid %d, slot %u) deferred: %x\n",name_,pid_,slot_,status);
++            status=kIOReturnSuccess;
+         }
+     }
+     IOLockUnlock(g.lock);
+     if(mailbox)mailbox->release();
+-    if(!status)terminate();
++    if(!status && !deferred)terminate();
+     return status;
+ }
++/* Under g.lock, after releaseAll succeeded: the connection's slot, window, limits and records are given back. */
++void AGXDeviceUserClient::finishCloseLocked(uint64_t peak)
++{
++    live_=false;
++    if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoAllClients)g.slots[slot_]=false;
++    if(slot_<NativeAdrenoAllClients)g.slot_pid[slot_]=0;
++    if(dynamic_) {g.windows.give(win_start_,win_bytes_);dynamic_=false;}
++    if(native_adreno_gpu_all && !kernel_) {
++        if(other_ && g.others_live)g.others_live=g.others_live-1;
++        g.others_bytes=g.others_bytes>bo_bytes_?g.others_bytes-bo_bytes_:0;bo_bytes_=0;
++        if(native_adreno_gpu_all_stats[0])native_adreno_gpu_all_stats[0]=native_adreno_gpu_all_stats[0]-1;
++        native_adreno_gpu_all_stats[8]=uint32_t(g.others_bytes>>20);
++        native_adreno_gpu_all_stats[10]=uint32_t(g.windows.freeBytes()>>20);
++    }
++    ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
++    if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
++        record->closes=record->closes+1;record->slot=0xff;
++        if(peak>>20>record->peak_mib)record->peak_mib=uint32_t(peak>>20);
++    }
++}
++/* guamp-gpu-all: finishes the teardowns clientClose could not (jobs of the connection still on the GPU, typically a process killed in
++ * the middle of a frame: the hang detector of guamp-gpu-recover retires them within about two seconds if the GPU is stuck). Each one
++ * is tried every 100 ms with a 1 ms wait under the GPU lock, and terminated and released once it has finished. Never gives up: what a
++ * connection still holds may be in use by the GPU, so it is never forced. */
++void nativeAdrenoReaper(void *,wait_result_t)
++{
++    thread_set_thread_name(current_thread(),"guamp-gpu-reaper");
++    for(;;) {
++        AGXDeviceUserClient *done=nullptr;
++        IOLockLock(g.lock);
++        while(!g.deferred)IOLockSleep(g.lock,&g.deferred,THREAD_UNINT);
++        for(AGXDeviceUserClient **at=&g.deferred;*at;) {
++            AGXDeviceUserClient *c=*at;
++            const IOReturn status=c->live_?c->core_->releaseAll(&g.clock,1000):kIOReturnSuccess;
++            c->deferred_tries_=c->deferred_tries_+1;
++            if(status) {
++                if(c->deferred_tries_==600)IOLog("NativeAdrenoReaper: %s (pid %d) still draining after 60 s: %x\n",c->name_,c->pid_,status);
++                at=&c->deferred_next_;
++                continue;
++            }
++            if(c->live_)c->finishCloseLocked(c->win_peak_);
++            *at=c->deferred_next_;
++            c->deferred_next_=done;done=c;
++            native_adreno_gpu_all_stats[3]=native_adreno_gpu_all_stats[3]+1;
++            if(native_adreno_gpu_all_stats[9])native_adreno_gpu_all_stats[9]=native_adreno_gpu_all_stats[9]-1;
++        }
++        const bool more=g.deferred!=nullptr;
++        IOLockUnlock(g.lock);
++        while(done) {
++            AGXDeviceUserClient *c=done;
++            done=c->deferred_next_;c->deferred_next_=nullptr;
++            IOLog("NativeAdreno: gpu-all: deferred teardown of %s (pid %d) finished after %u tries\n",c->name_,c->pid_,c->deferred_tries_);
++            c->terminate();
++            c->release();
++        }
++        if(more)IOSleep(100);
++    }
++}
+ void AGXDeviceUserClient::free()
+ {
+     dropViews(0);
+@@ -353,6 +503,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
+     IOReturn status=kIOReturnNotFound;
+     if(type==NativeAdrenoScanoutType) {
+         if(!live_ && !handoffOnly_)return kIOReturnNotReady;
++        if(native_adreno_gpu_all && other_)return kIOReturnNotPermitted;   /* guamp-gpu-all: the scanout stays the render server's */
+         IOMemoryDescriptor *scanout=native_gop_handoff_memory();
+         if(!scanout)return kIOReturnNotReady;
+         *memory=scanout;                        /* already retained for the caller */
+@@ -468,7 +619,39 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+     } else {
+         IOLockLock(g.lock);
+-        status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
++        /* guamp-gpu-all: the limits of a process other than the render server, checked and counted under the same lock as the call. */
++        const bool limited=native_adreno_gpu_all && connection->other_ && connection->live_;
++        uint64_t freed=0;
++        status=kIOReturnSuccess;
++        if(limited && method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)) {
++            const uint64_t bytes=static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes;
++            if(!nagAllowBytes(connection->bo_bytes_,g.others_bytes,bytes,gpuAllConfig(2,384)<<20,gpuAllConfig(3,1024)<<20)) {
++                status=kIOReturnNoMemory;
++                native_adreno_gpu_all_stats[6]=native_adreno_gpu_all_stats[6]+1;
++            }
++        } else if(limited && method==NativeAdrenoMethodBoMap && input && input_size==sizeof(NativeAdrenoAbiBoMap)) {
++            const NativeAdrenoMemory *memory=connection->core_->memoryOf(static_cast<const NativeAdrenoAbiBoMap *>(input)->handle);
++            if(memory && !nagAllowMap(g.vm->objectCount(),g.vm->spanCount(),memory->spanCount())) {
++                status=kIOReturnNoResources;
++                native_adreno_gpu_all_stats[7]=native_adreno_gpu_all_stats[7]+1;
++            }
++        } else if(limited && method==NativeAdrenoMethodBoFree && input && input_size==sizeof(NativeAdrenoAbiBoFree)) {
++            const NativeAdrenoMemory *memory=connection->core_->memoryOf(static_cast<const NativeAdrenoAbiBoFree *>(input)->handle);
++            if(memory && !memory->imported())freed=memory->bytes();
++        }
++        if(!status)status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
++        if(limited && !status) {
++            if(method==NativeAdrenoMethodBoAlloc && output && output_size==sizeof(NativeAdrenoAbiBoAllocReply)) {
++                /* The backing object's own size, the one BoFree gives back. */
++                const NativeAdrenoMemory *memory=connection->core_->memoryOf(static_cast<const NativeAdrenoAbiBoAllocReply *>(output)->handle);
++                const uint64_t bytes=memory?memory->bytes():static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes;
++                connection->bo_bytes_+=bytes;g.others_bytes+=bytes;
++            } else if(method==NativeAdrenoMethodBoFree && freed) {
++                connection->bo_bytes_=connection->bo_bytes_>freed?connection->bo_bytes_-freed:0;
++                g.others_bytes=g.others_bytes>freed?g.others_bytes-freed:0;
++            }
++            native_adreno_gpu_all_stats[8]=uint32_t(g.others_bytes>>20);
++        }
+         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
+             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
+                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
+@@ -482,6 +665,8 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+ }
+ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+ {
++    /* guamp-gpu-all: the display hand-off stays the render server's (any process can open this class now). */
++    if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast && native_adreno_gpu_all && other_)return kIOReturnNotPermitted;
+     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
+         return native_gop_handoff_call(method-NativeAdrenoHandoffBase,current_task(),input,input_size,output,output_size);
+     if(method==NativeAdrenoExportMethod) {
+@@ -683,6 +868,16 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+         record.type=type;record.macf=macf;record.res=resolver;record.attach=attach_state;record.foreign=type!=NativeAdrenoPluginOpenType;
+         native_adreno_open_log_count=native_adreno_open_log_count+1;
+     }
++    /* guamp-gpu-all: every refusal below also detaches the connection, which the registry would otherwise keep for the rest of the boot. */
++    if(native_adreno_gpu_all && type==NativeAdrenoHandoffOpenType) {
++        char who[20]={};
++        proc_selfname(who,sizeof who);
++        if(strncmp(who,"backboardd",sizeof who)) {
++            if(attach_state==1)connection->detach(provider);
++            connection->release();
++            return kIOReturnNotPermitted;   /* the display hand-off stays the render server's */
++        }
++    }
+     if(type==NativeAdrenoHandoffOpenType) {
+         connection->setHandoffOnly();
+         *handler=connection;
+@@ -691,6 +886,7 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+     /* Only the Adreno plugin's open (type NativeAdrenoPluginOpenType) is served. The original IOGPU library opens the accelerator with type 1
+      * (and an API value in the upper bits) for an IOGPUDeviceUserClient, which this driver is not; refuse it cleanly. */
+     if(type!=NativeAdrenoPluginOpenType) {
++        if(native_adreno_gpu_all && attach_state==1)connection->detach(provider);
+         connection->release();
+         native_adreno_metal_diag.foreign_opens=native_adreno_metal_diag.foreign_opens+1;
+         native_adreno_metal_diag.foreign_type=type;
+@@ -717,12 +913,21 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+     const unsigned cap=strncmp(opener,"backboardd",sizeof opener) && !screenshot?(limit && limit<8?limit:8):limit;
+     IOLockLock(g.lock);
+     NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
+-    const bool capped=cap && record && record->opens>=cap;
++    bool capped=cap && record && record->opens>=cap;
++    /* guamp-gpu-all: a process other than the render server is limited per minute (guamp-gpu-all-rate, default 6) instead of per boot. */
++    if(native_adreno_gpu_all && !kernel && strncmp(opener,"backboardd",sizeof opener)) {
++        capped=!g.rates.admit(opener,g.clock.now_us(g.clock.cookie)/1000,uint32_t(gpuAllConfig(4,6)));
++        if(capped) {
++            native_adreno_gpu_all_stats[4]=native_adreno_gpu_all_stats[4]+1;
++            IOLog("NativeAdreno: gpu-all: %s refused (more than %u opens this minute)\n",opener,uint32_t(gpuAllConfig(4,6)));
++        }
++    }
+     IOLockUnlock(g.lock);
+     IOReturn refusal=kIOReturnSuccess;
+     if(capped)refusal=kIOReturnBusy;
+     else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* every slot taken */
+     if(refusal) {
++        if(native_adreno_gpu_all && attach_state==1)connection->detach(provider);
+         connection->release();
+         native_adreno_metal_diag.busy=native_adreno_metal_diag.busy+1;
+         IOLockLock(g.lock);
+@@ -774,6 +979,9 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+     }
+     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+     g.service=service;g.published=true;
++    /* guamp-gpu-all: the windows of the other processes, above the render server's 1 GiB to the end of the aperture (3 GiB wide, else 2). */
++    g.windows.init(native_adreno_wide_active?0xC0000000ull:0x80000000ull);
++    native_adreno_gpu_all_stats[10]=uint32_t(g.windows.freeBytes()>>20);
+     service->setName("NativeAdrenoGpu");
+     service->registerService();
+     return kIOReturnSuccess;

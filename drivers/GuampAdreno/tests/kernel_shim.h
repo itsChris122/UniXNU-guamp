@@ -69,8 +69,17 @@ public:
   virtual ~OSObject() = default;
   void release() const;
   void retain() const;
+  virtual void free();
 };
 #define OSSafeReleaseNULL(p) do {if (p) (p)->release(); (p) = nullptr;} while (0)
+// NativeAdrenoPublish.cpp (patched; tests/run-tests.sh syntax check): the libkern/IOKit pieces it uses, as plain declarations.
+#define OSDeclareDefaultStructors(c)
+#define OSDefineMetaClassAndStructors(c, s)
+#define APPLE_KEXT_OVERRIDE override
+#define OSDynamicCast(type, inst) (static_cast<type *>(inst))
+class OSDictionary : public OSObject {};
+class OSBoolean : public OSObject {};
+extern OSBoolean *const kOSBooleanTrue;
 class OSSymbol : public OSObject {
 public:
   static const OSSymbol *withCString(const char *);
@@ -86,12 +95,19 @@ class IOMemoryMap : public OSObject {
 public:
   uint64_t getVirtualAddress();
 };
+struct IOAddressRange {uint64_t address, length;};
+enum : IOOptionBits {kIOMemoryTypePhysical64 = 0x50};
 class IOMemoryDescriptor : public OSObject {
 public:
   IOMemoryMap *map(IOOptionBits);
   IOMemoryMap *createMappingInTask(task_t, uint64_t, IOOptionBits);
+  static IOMemoryDescriptor *withAddressRanges(IOAddressRange *, UInt32, IOOptionBits, task_t);
 };
-class IOBufferMemoryDescriptor : public IOMemoryDescriptor {};
+class IOBufferMemoryDescriptor : public IOMemoryDescriptor {
+public:
+  static IOBufferMemoryDescriptor *inTaskWithOptions(task_t, IOOptionBits, size_t, size_t);
+  void *getBytesNoCopy();
+};
 class IODeviceMemory : public IOMemoryDescriptor {
 public:
   static IODeviceMemory *withRange(uint64_t, uint64_t);
@@ -100,10 +116,15 @@ class IOService : public OSObject {
 public:
   virtual bool init();
   bool setProperty(const char *, const char *);
+  bool setProperty(const char *, OSObject *);
   bool attach(IOService *);
+  void detach(IOService *);
+  virtual bool start(IOService *);
+  bool terminate(IOOptionBits = 0);
+  void setName(const char *);
   void registerService();
   static IOService *getPlatform();
-  virtual IOReturn newUserClient(task_t, void *, UInt32, void *, class IOUserClient **);
+  virtual IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, class IOUserClient **);
 };
 struct IOExternalMethodArguments {
   uint32_t version, selector;
@@ -113,11 +134,40 @@ struct IOExternalMethodArguments {
   uint32_t structureOutputSize;
 };
 enum {kIOExternalMethodArgumentsCurrentVersion = 2};
+typedef IOReturn (*IOExternalMethodAction)(OSObject *, void *, IOExternalMethodArguments *);
+struct IOExternalMethodDispatch {
+  IOExternalMethodAction function;
+  uint32_t checkScalarInputCount, checkStructureInputSize, checkScalarOutputCount, checkStructureOutputSize;
+};
 class IOUserClient : public IOService {
 public:
-  virtual IOReturn externalMethod(uint32_t, IOExternalMethodArguments *, void *, OSObject *, void *);
+  virtual bool initWithTask(task_t, void *, UInt32, OSDictionary *);
+  virtual IOReturn externalMethod(uint32_t, IOExternalMethodArguments *, IOExternalMethodDispatch *, OSObject *, void *);
   virtual IOReturn clientMemoryForType(UInt32, IOOptionBits *, IOMemoryDescriptor **);
   virtual IOReturn clientClose();
+  IOMemoryMap *removeMappingForDescriptor(IOMemoryDescriptor *);
 };
+typedef void *io_filter_policy_t;
+struct io_filter_callbacks {
+  IOReturn (*io_filter_resolver)(task_t, IOUserClient *, unsigned, io_filter_policy_t *);
+  void (*io_filter_release)(io_filter_policy_t);
+};
+typedef struct IOLock IOLock;
+extern "C" {
+IOLock *IOLockAlloc(void);
+void IOLockLock(IOLock *);
+void IOLockUnlock(IOLock *);
+int IOLockSleep(IOLock *, void *, UInt32);
+void IOLockWakeup(IOLock *, void *, bool);
+thread_t current_thread(void);
+void thread_set_thread_name(thread_t, const char *);
+task_t current_task(void);
+size_t strlcpy(char *, const char *, size_t);
+int strncmp(const char *, const char *, size_t);
+int strcmp(const char *, const char *);
+}
+#define IONewZero(type, count) static_cast<type *>(nullptr)
+#define IODelete(ptr, type, count) do {(ptr) = nullptr;} while (0)
+enum : IOReturn {kIOReturnNotPermitted = 0x2e2, kIOReturnNoSpace = 0x2c4 + 0x100};
 struct kmod_info_t {char name[64];};
 #endif

@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4343,6 +4343,13 @@
+ 	if (!list) {
+ 		return false;
+ 	}
++	/*
++	 * guamp-gpu-all=1 (UniXNU-guamp drivers/GuampAdreno): the list "*" names every process. The driver then grants every opener
++	 * a GPU connection with its own limits, as every app and extension profile admits AGXDeviceUserClient on Apple hardware.
++	 */
++	if (0 == strcmp(list->getCStringNoCopy(), "*")) {
++		return true;
++	}
+ 	proc_selfname(name, sizeof(name));
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {
+ 		size_t length = 0;
