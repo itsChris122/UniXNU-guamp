@@ -210,6 +210,11 @@ def main():
         # ...arm64.37,253796c makes +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] return PNG (0) instead
         # of KTX/ATX (Apple twiddled ASTC). ADT Codex/cpu-config-8-cattura-20261029 (52 entries, base sfondo-png),
         # analisi/gpu-ci/prepara-fixup-cattura.py, analisi/gpu-ci/CATTURA-SCHERMO-20261029.md.
+        # The screenshot editor (ScreenshotServicesService, not a Metal client: nil device) then aborted in PencilKit:
+        # +[PKMetalUtility isMetalAvailable] is a constant YES, so PKMetalResourceHandler built compute pipelines from nil
+        # functions (MTLReportFailure in setComputeFunction:). ...arm64.19,45beb58 makes it NO and ...arm64.19,45bb01c makes
+        # -[PKMetalResourceHandler initWithDevice:generatePipelineDescriptors:] return nil (no PencilKit ink anywhere).
+        # ADT Codex/cpu-config-8-cattura2-20261029 (prova2 + 2 = 58 entries).
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the
