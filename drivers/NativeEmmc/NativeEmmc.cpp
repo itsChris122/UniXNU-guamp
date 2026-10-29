@@ -1081,6 +1081,7 @@ static void usbProbe()
 }
 
 #include "GuampRpm.inc"
+#include "GuampSensors.inc"   // sensor hub (guamp-sensors=1: synthetic from the USB mirror), before UsbMirror.inc
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
@@ -1241,6 +1242,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   cpufreq::start();   // guamp-cpufreq=1|2: cpufreq-hw performance state (tables logged always)
   backlight::start(); // guamp-backlight=1: panel DCS 0x51 brightness as AppleARMBacklight for CoreBrightness
   rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
+  sensors::start();   // guamp-sensors=1: HID sensor devices fed by the USB mirror ("GSNS"); mode logged always
   pmic::start();
   touch::start();
   btnub::start();     // guamp-bt-nub=1: IOService on /arm-io/uart1/bluetooth (bluetoothd FindLocalMacAddress)

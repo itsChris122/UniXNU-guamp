@@ -250,6 +250,7 @@ struct Mirror {
   void receive() { startTransfer(kEp1Out, kEp1OutTrb, kOutBuf, kOutBytes, TRBCTL_NORMAL, ep1OutResource); }
 
   void touch(volatile const uint8_t *b, uint32_t n) {
+    if (sensors::fromMirror(b, n)) return;                       // "GSNS": synthetic sensor sample (GuampSensors.inc)
     if (n < 5 || b[0] != 'G' || b[1] != 'T' || b[2] != 'C' || b[3] != 'H') return;
     unsigned count = b[4];
     if (count > 12 || n < 5 + count * 5) return;
