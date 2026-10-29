@@ -2,14 +2,15 @@ guamp: client Metal devices get a writable cache directory and Turnip shader cac
 
 clientDevice checked the m2v directory with access() only (passes where the sandbox refuses writes) and never set
 MESA_SHADER_CACHE_DIR, so sandboxed clients (AegirPoster, widgets) compiled every pipeline again at each launch on the main
-thread (AegirPoster killed by the 5 s PosterBoard snapshot timeout inside libvulkan_freedreno). A probe file is now made, and
-MESA_SHADER_CACHE_DIR points at the same directory unless already set.
+thread (AegirPoster killed by the 5 s PosterBoard snapshot timeout inside libvulkan_freedreno). A probe file is now made in the
+process own cache directory (_CS_DARWIN_USER_CACHE_DIR, the container for sandboxed processes; then the temp directory), and
+MESA_SHADER_CACHE_DIR points at it with MESA_SHADER_CACHE_MAX_SIZE=64M, unless already set in the environment.
 
 diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
-index e03de5b..a5cc46d 100644
+index e03de5b..a38a1f6 100644
 --- a/NativeAdrenoMetalPlugin.mm
 +++ b/NativeAdrenoMetalPlugin.mm
-@@ -208,6 +208,20 @@ static id clientDevice(unsigned port) {
+@@ -208,6 +208,22 @@ static id clientDevice(unsigned port) {
          strlcat(candidates[i], "m2v", sizeof candidates[i]);
          mkdir(candidates[i], 0700);
          if (access(candidates[i], W_OK) != 0) continue;
@@ -27,6 +28,8 @@ index e03de5b..a5cc46d 100644
 +            unlink(probe);
 +        }
 +        setenv("MESA_SHADER_CACHE_DIR", candidates[i], 0);
++        // Bounded per process (Mesa's default is 1 GiB): the directory is the process's own (container) cache, kept across boots.
++        setenv("MESA_SHADER_CACHE_MAX_SIZE", "64M", 0);
          ++usable;
          @try {
              device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
