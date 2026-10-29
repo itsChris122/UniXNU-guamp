@@ -11,6 +11,10 @@ struct nw_wifi_stats nw_wifi_stats;
 static bool gw_polling;
 static bool gw_servicing_ce;
 static int gw_boot_error;
+/* CE registers (PA 0x0c800000+0x240000) are live only between a successful hif power_up (WLFW WLAN_CFG +
+ * WLAN_MODE mission, then CE init) and power_down, as Linux only touches them from its CE IRQs (enabled in
+ * hif_power_up). A CE access before that hangs the SoC bus (WLAN block not up). */
+static bool gw_ce_live;
 
 static int gw_firmware_preflight(const struct lx_platform *platform) {
   static const char *const firmware[] = {
@@ -78,12 +82,14 @@ static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
   e=ath10k_snoc_wlan_enable(ar,mode); if(e) return e;
   ath10k_ce_alloc_rri(ar);
   e=ath10k_snoc_init_pipes(ar); if(e) { lx_log(3,"ath10k: CE init failed %d",e); ath10k_ce_free_rri(ar); return e; }
+  gw_ce_live=true;
   { struct ath10k_ce *ce=ath10k_ce_priv(ar);
     lx_log(6,"ath10k: phase CE init: 12 pipes at PA 0x%llx+0x240000, RRI bus 0x%llx",
       (unsigned long long)ath10k_snoc_priv(ar)->mem_pa,(unsigned long long)ce->paddr_rri); }
   return 0;
 }
 static void gw_hif_power_down(struct ath10k *ar) {
+  gw_ce_live=false;
   int e=gw_board.wlan_disable(gw_board.ctx);
   if(e) { gw_boot_error=e; lx_log(3,"ath10k: WLAN stop unconfirmed; DMA retained"); return; }
   ath10k_ce_free_rri(ar);
@@ -105,7 +111,7 @@ static const struct ath10k_hif_ops gw_hif={
 static const struct ath10k_bus_ops gw_bus={.read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32};
 static int gw_napi_poll(struct napi_struct *n,int budget) {
   struct ath10k *ar=container_of(n,struct ath10k,napi);
-  for(unsigned i=0;i<12;i++) ath10k_ce_per_engine_service(ar,i);
+  if(gw_ce_live) for(unsigned i=0;i<12;i++) ath10k_ce_per_engine_service(ar,i);
   int done=ath10k_htt_txrx_compl_task(ar,budget);
   if(done<budget) napi_complete_done(n,done); return done;
 }
@@ -145,7 +151,7 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
   if(!board->ready(board->ctx)) return -ENODEV;
   int firmware_error=gw_firmware_preflight(platform);
   if(firmware_error)return firmware_error;
-  gw_board=*board; lx_plat=platform; gw_boot_error=0; memset(&nw_wifi_stats,0,sizeof(nw_wifi_stats));
+  gw_board=*board; lx_plat=platform; gw_boot_error=0; gw_ce_live=false; memset(&nw_wifi_stats,0,sizeof(nw_wifi_stats));
   memset(&gw_device,0,sizeof(gw_device)); gw_device.dev.name="guamp-wcn-snoc";
   nw_wifi_set_hooks(&gw_hooks);
   gw_ar=ath10k_core_create(sizeof(struct ath10k_snoc),&gw_device.dev,ATH10K_BUS_SNOC,ATH10K_HW_WCN3990,&gw_hif);
@@ -175,7 +181,7 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
   return 0; // enqueued probe, NOT associated/connected
 }
 void gw_snoc_poll_ce(void) {
-  if(!gw_ar||gw_boot_error||gw_servicing_ce)return;
+  if(!gw_ar||gw_boot_error||gw_servicing_ce||!gw_ce_live)return;
   gw_servicing_ce=true;
   for(unsigned i=0;i<12;i++) ath10k_ce_per_engine_service(gw_ar,i);
   napi_schedule(&gw_ar->napi);

@@ -304,6 +304,10 @@ struct Sm6115Runtime {
   void runStation() {
     if(!awaitFirmware()){transportOnly();return;}
     int e=configureStation();if(e){fail(e,"station config");transportOnly();return;}
+    // guamp-wifi-attach=0: stop before ath10k (no CE/MMIO access to the WLAN block, no iOS attach); the modem transport
+    // (QRTR, RMTFS, TFTP, SERVREG_LOC, SIM) keeps running as after any Wi-Fi outcome.
+    unsigned attach=1;PE_parse_boot_argn("guamp-wifi-attach",&attach,sizeof(attach));
+    if(!attach){IOLog("GuampWiFi: ath10k start/attach skipped (guamp-wifi-attach=0)\n");transition(TransportOnly);transportOnly();return;}
     transition(RadioProbe);
     if(workerMode==1){runScan();transportOnly();return;}
 #if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
