@@ -33,6 +33,9 @@ TIMEBASE = 19200000
 # XNU panic region: guampPkg RamLog.h PANIC_REGION_BASE/SIZE (firmware "RAM Log" map entry 0x13FC00000)
 PANIC_BASE = 0x13FD00000
 PANIC_SIZE = 0x100000
+# Kernel text-fixup table (patches/xnu/zzzzzz-guamp-text-fixup-128.patch, 29/10; 64 before): entries, bytes per entry
+TEXT_FIXUP_MAX = 128
+TEXT_FIXUP_ENTRY_BYTES = 160
 
 
 # Himax touch firmware, local only (gitignored local/ of the device repository; the build copies the tree without it)
@@ -115,9 +118,10 @@ def main():
     parser.add_argument('--text-fixup', action='append', default=[])
     args = parser.parse_args()
 
-    # cs_text_fixup_init() (native-text-fixup + zzzzz-guamp-text-fixup-64 patches) keeps 64 entries under 160 bytes
-    if len(args.text_fixup) > 64 or any(len(f.encode()) >= 160 or '\0' in f for f in args.text_fixup):
-        parser.error('--text-fixup: at most 64 entries, each under 160 bytes')
+    # cs_text_fixup_init() (native-text-fixup + zzzzzz-guamp-text-fixup-128 patches) keeps 128 entries under 160 bytes
+    if len(args.text_fixup) > TEXT_FIXUP_MAX or any(len(f.encode()) >= TEXT_FIXUP_ENTRY_BYTES or '\0' in f
+                                                    for f in args.text_fixup):
+        parser.error('--text-fixup: at most %d entries, each under %d bytes' % (TEXT_FIXUP_MAX, TEXT_FIXUP_ENTRY_BYTES))
 
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -187,7 +191,7 @@ def main():
         # data to a Skywalk os_channel, which this kernel lacks. cpu-config-8-bt6 adds bluetoothd,ddd20,a0050034,1f2003d5
         # (cbz w0 after the strcmp with the sk name -> nop): bluetoothd then uses the plain read()/write() path on the
         # control the Bluetooth shim registers (guamp-bt-ctl=1, drivers/NativeEmmc/GuampBtSerial.inc).
-        # The kernel table holds 64 fixups (zzzzz-guamp-text-fixup-64.patch, 28/10); this ADT uses 32.
+        # The kernel table holds 128 fixups (zzzzzz-guamp-text-fixup-128.patch, 29/10; 64 on 28/10); this ADT uses 32.
         # Apps that are not Metal clients get a nil device, so -[CIContext initWithOptions:] falls back to
         # +[CIContext(Internal) internalGLContextWithOptions:] and CI::GLContext::init calls through the empty GL macro
         # context table: PC 0 (MobileSMS icons via MobileIcons _LICGImageCreateCoreImageLanczosScaled, 29/10).
