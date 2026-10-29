@@ -1,0 +1,27 @@
+guamp: "nobocache" in the board's NativeTurnipDebug sets TU_DARWIN_BO_CACHE=0 (AdrenoMetal 2ff4be9 plugin)
+
+The newer Turnip Darwin backend (UniXNU feat/ipados27-gpu-parity c7353ea7..2c40ae9, guamp UniXNU branch guamp/turnip-ipados27-20261029)
+keeps freed BOs in a size-class cache, given back on OOM retry and memory pressure only; guamp's kernel never reports
+NativeAdrenoParamsPoolPressure. The board switch turns the cache off without a new Turnip: GuampAdrenoProbe.cpp NativeTurnipDebug
+"nocb,noconform,sysmem,nobocache" (kernel build). Without the word nothing changes.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 9a4f183..e03de5b 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -262,8 +262,14 @@ static void applyBoardTurnipDebug(unsigned port) {
+     CFTypeRef value = copyProperty ? copyProperty(port, CFSTR("NativeTurnipDebug"), kCFAllocatorDefault, 0) : nullptr;
+     if (!value) return;
+     char text[128];
+-    if (CFGetTypeID(value) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) value, text, sizeof text, kCFStringEncodingUTF8))
++    if (CFGetTypeID(value) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) value, text, sizeof text, kCFStringEncodingUTF8)) {
+         setenv("TU_DEBUG", text, 1);
++        // guamp (UniXNU-guamp patches/adreno-metal/0005): "nobocache" in the board's NativeTurnipDebug turns off the BO cache of the
++        // newer Turnip Darwin backend (UniXNU c7353ea7 and later, TU_DARWIN_BO_CACHE=0): every free goes back to the kernel at once,
++        // as with the older backend, should cached BOs crowd the gpu-all windows or the BO limit of all processes. TU_DEBUG ignores
++        // the unknown word; an older Turnip ignores the variable.
++        if (strstr(text, "nobocache")) setenv("TU_DARWIN_BO_CACHE", "0", 1);
++    }
+     CFRelease(value);
+ }
+ static id deviceForPort(unsigned port) {

@@ -1,0 +1,102 @@
+guamp: heap sizes from the runtime, and metal2vulkan runtime patch 0023 (UniXNU/AdrenoMetal adc18c5 bridge/patches/0023, aff537e)
+
+Adds bridge/patches/0023-heap-texture-size-a-multiple-of-its-alignment.patch: a heap texture's size is a multiple of its alignment
+(Turnip 4 KiB against Metal's 128 bytes), so a heap sized as the sum of its textures' sizes holds them (OutOfMemory(Heap) in
+SpringBoard and Core Image). 2ff4be9 does not answer heapTextureSizeAndAlignWithDescriptor:/heapBufferSizeAndAlignWithLength:options:
+itself (_MTLDevice's answers do not match the runtime's placements), so the frontend gets aff537e's two methods and the bridge its
+nmb_device_heap_texture_size_and_align / nmb_device_heap_buffer_size_and_align exports.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 28472d7..77325ff 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2314,6 +2314,20 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
+  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+ }
++// guamp (UniXNU-guamp patches/adreno-metal/0004, from UniXNU/AdrenoMetal aff537e/adc18c5): a heap's sizes are the runtime's, the ones
++// its placements take (bridge patch 0023 rounds a texture's size to its alignment), not _MTLDevice's. A descriptor the runtime refuses
++// answers {0, 0}, as Metal answers one it makes no texture of.
++- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
++ NmbTextureDescriptor descriptor;uint64_t answer[2]={0,0};
++ if(textureDescriptor(d,&descriptor)&&!nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer))
++  NBLOG(@"native-metal: heap texture size (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
++ return (MTLSizeAndAlign){answer[0],answer[1]};
++}
++- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
++ uint64_t answer[2]={0,0};
++ if(!nmb_device_heap_buffer_size_and_align(gDevice,length,(uint64_t)options,answer))NBLOG(@"native-metal: heap buffer size refused: %@",lastError());
++ return (MTLSizeAndAlign){answer[0],answer[1]};
++}
+ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
+  NBResourceGroup *group=[NBResourceGroup new];
+  NSMutableArray *held=[NSMutableArray arrayWithCapacity:count];
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 88e4cb7..38d01ce 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -90,6 +90,8 @@ struct NmbTextureDescriptor {
+ };
+ /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
+ NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
++bool nmb_device_heap_texture_size_and_align(const NmbDevice *, const struct NmbTextureDescriptor *, uint64_t out[2]); /* size, align */
++bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
+ void nmb_heap_release(NmbHeap *);
+ uint64_t nmb_heap_size(const NmbHeap *);
+ uint64_t nmb_heap_used_size(const NmbHeap *);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 93d2b18..21b49c8 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -849,6 +849,31 @@ pub extern "C" fn nmb_buffer_gpu_address(buffer: *const NmbBuffer) -> u64 {
+ pub struct NmbHeap(Heap);
+ 
+ /// `newHeapWithDescriptor:`: type (0 automatic, 1 placement), size, resource options. Sparse heaps are not made here.
++// guamp (UniXNU-guamp patches/adreno-metal/0004, from UniXNU/AdrenoMetal aff537e): the runtime's heap sizes, as the frontend answers them.
++/// `heapTextureSizeAndAlignWithDescriptor:`: the bytes the texture takes of a heap and the alignment of its offset, into `out[0]` and
++/// `out[1]`; false, with the reason, for a descriptor the runtime refuses.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
++    guard(false, || {
++        let answer = get(device)?.0.heap_texture_size_and_align(&texture_descriptor(descriptor)?).map_err(e("heap texture size"))?;
++        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
++        (out[0], out[1]) = (answer.size, answer.align);
++        Ok(true)
++    })
++}
++
++/// `heapBufferSizeAndAlignWithLength:options:`, as `nmb_device_heap_texture_size_and_align` answers a texture.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_heap_buffer_size_and_align(device: *const NmbDevice, length: u64, options_word: u64, out: *mut u64) -> bool {
++    guard(false, || {
++        let answer = get(device)?.0.heap_buffer_size_and_align(length, options(options_word)?);
++        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
++        (out[0], out[1]) = (answer.size, answer.align);
++        Ok(true)
++    })
++}
++
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_heap_new(device: *mut NmbDevice, heap_type: u64, size: u64, options_word: u64) -> *mut NmbHeap {
+     guard(std::ptr::null_mut(), || {
+diff --git a/bridge/patches/0023-heap-texture-size-a-multiple-of-its-alignment.patch b/bridge/patches/0023-heap-texture-size-a-multiple-of-its-alignment.patch
+new file mode 100644
+index 0000000..5025cb7
+--- /dev/null
++++ b/bridge/patches/0023-heap-texture-size-a-multiple-of-its-alignment.patch
+@@ -0,0 +1,14 @@
++--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
++@@ -1290,6 +1290,11 @@
++             }
++             size_and_align = metal;
++         }
+++        // Metal's size is a multiple of its alignment, so a heap sized as the sum of its textures'
+++        // sizes holds them in any order. Where the device's image needs a coarser alignment than
+++        // Metal's model (Turnip: 4 KiB against Metal's 128 bytes), the size grows to a multiple of
+++        // it too: otherwise each texture placed after one pads past what the heap was sized for.
+++        size_and_align.size = size_and_align.size.next_multiple_of(size_and_align.align.max(1));
++         check_heap_base(size_and_align.align)?;
++         // The size answered is the optimized texture's where the driver keeps the layout.
++         self.degrade_optimized_layout(descriptor, &layout);
