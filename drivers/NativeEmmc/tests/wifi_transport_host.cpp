@@ -387,12 +387,13 @@ static void qrtrTest() {
   incoming=qrtrPacket(4,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(4,0x45,1,7,900));
   CHECK(r.qrtr.receive(incoming.data(),incoming.size())==Ok&&r.ready&&r.qrtr.serverPort==900);
   CHECK(r.qrtr.receive(incoming.data(),incoming.size())==Ok&&r.changes==1);
-  r.busy=true; CHECK(r.qrtr.step()==Again); r.busy=false; CHECK(r.qrtr.step()==Ok);
-  CHECK(le32(r.sent.back().data()+32)==Qrtr::NewLookup&&le32(r.sent.back().data()+40)==1);
+  // Linux: the remote HELLO is answered by announce_servers only (HELLO already sent); no NEW_LOOKUP to the remote
+  CHECK(r.qrtr.helloReceived&&r.qrtr.remoteNode==7&&r.qrtr.count==0&&r.sent.size()==1);
   for(unsigned i=0;i<10;i++) CHECK(r.qrtr.send(reinterpret_cast<const uint8_t *>("abc"),3)==Ok);
   CHECK(r.qrtr.send(reinterpret_cast<const uint8_t *>("abc"),3)==Again);
-  CHECK(r.qrtr.step(16)==Ok); CHECK(r.sent.size()==12);
-  CHECK(le32(r.sent[6].data()+16)==1); // fifth DATA requests resume confirmation
+  r.busy=true; CHECK(r.qrtr.step()==Again&&r.qrtr.txAgain==1); r.busy=false;
+  CHECK(r.qrtr.step(16)==Ok); CHECK(r.sent.size()==11);
+  CHECK(le32(r.sent[5].data()+16)==1); // fifth DATA requests resume confirmation
   incoming=qrtrPacket(7,Qrtr::Ctrl,Qrtr::LocalPort,ctrl(7,7,900));
   CHECK(r.qrtr.receive(incoming.data(),incoming.size())==Ok&&r.qrtr.flow==0);
   incoming=qrtrPacket(1,900,Qrtr::LocalPort,{2,3,4},true,true);
@@ -404,10 +405,14 @@ static void qrtrTest() {
   CHECK(r.qrtr.receive(incoming.data(),incoming.size())==Ok&&!r.ready&&r.qrtr.count==0);
 
   RouterPeer local;CHECK(local.qrtr.step()==Ok);
-  CHECK(local.qrtr.addLocalService(4096,0,4096,&local,RouterPeer::localRx)==Ok);
-  CHECK(local.qrtr.step()==Ok);const auto &announcement=local.sent.back();
+  // the initial HELLO is the only packet before the remote HELLO (qrtr_node_enqueue/qrtr_bcast_enqueue)
+  CHECK(local.sent.size()==1&&le32(local.sent[0].data()+4)==Qrtr::Hello&&le32(local.sent[0].data()+24)==Qrtr::Broadcast);
+  CHECK(local.qrtr.addLocalService(4096,0,4096,&local,RouterPeer::localRx)==Ok&&local.qrtr.count==0);
+  incoming=qrtrPacket(Qrtr::Hello,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(Qrtr::Hello));
+  CHECK(local.qrtr.receive(incoming.data(),incoming.size())==Ok);
+  CHECK(local.qrtr.step()==Ok&&local.sent.size()==2);const auto &announcement=local.sent.back();
   CHECK(le32(announcement.data()+4)==Qrtr::NewServer&&le32(announcement.data()+12)==Qrtr::Ctrl);
-  CHECK(le32(announcement.data()+24)==Qrtr::Broadcast&&le32(announcement.data()+28)==Qrtr::Ctrl);
+  CHECK(le32(announcement.data()+24)==7&&le32(announcement.data()+28)==Qrtr::Ctrl);   // unicast to the remote ns
   CHECK(le32(announcement.data()+36)==4096&&le32(announcement.data()+40)==0&&
         le32(announcement.data()+44)==Qrtr::LocalNode&&le32(announcement.data()+48)==4096);
   CHECK(local.qrtr.addLocalService(4096,0,4096,&local,RouterPeer::localRx)==Ok&&local.qrtr.count==0);
@@ -435,8 +440,11 @@ static void qrtrTest() {
   RouterPeer prepared;prepared.qrtr.stop();
   CHECK(prepared.qrtr.addLocalService(4096,1,4096,&prepared,RouterPeer::localRx)==Ok);
   CHECK(prepared.qrtr.start(prepared.f.allocator(),&prepared,RouterPeer::tx,RouterPeer::event,RouterPeer::rx)==Ok);
-  CHECK(prepared.qrtr.step()==Ok&&prepared.sent.size()==2);
-  CHECK(le32(prepared.sent.back().data()+32)==Qrtr::NewServer&&
+  // registered before start: announced right after the remote HELLO, not before (only HELLO goes out first)
+  CHECK(prepared.qrtr.step()==Ok&&prepared.sent.size()==1);
+  incoming=qrtrPacket(Qrtr::Hello,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(Qrtr::Hello));
+  CHECK(prepared.qrtr.receive(incoming.data(),incoming.size())==Ok&&prepared.qrtr.step()==Ok&&prepared.sent.size()==2);
+  CHECK(le32(prepared.sent.back().data()+24)==7&&le32(prepared.sent.back().data()+32)==Qrtr::NewServer&&
         le32(prepared.sent.back().data()+36)==4096&&le32(prepared.sent.back().data()+40)==1);
 }
 
