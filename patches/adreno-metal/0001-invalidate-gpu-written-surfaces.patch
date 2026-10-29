@@ -1,0 +1,99 @@
+guamp: invalidate the CPU view of surfaces the GPU wrote (AdrenoMetal 2ff4be9, NativeBridgeMetalFrontend.mm)
+
+flushSurfaces only cleans (DC CVAC) and skips surfaces whose seed did not move, so a process reading a GPU-written
+IOSurface (screenshot, app snapshot) could see stale cache lines. Render-pass targets are cleaned+invalidated (DC CIVAC)
+at commit and after completion, for their first NMB_SURFACE_INVALIDATE (default 4) completed writes. Applied by the
+guamp-kernel-build GPU user-space workflow (device/patches/adreno-metal/*.patch) when adreno_metal_ref is 2ff4be9.
+
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -963,6 +963,46 @@
+   gSurfaceFlushBytes+=it->bytes;gTimeSurfaceFlush.add(began);
+  }
+ }
++// guamp (UniXNU-guamp patches/adreno-metal/0001): the CPU's view of the surfaces a command buffer's render passes write. flushSurfaces only
++// cleans (DC CVAC) and skips a surface whose seed did not move, so lines the CPU still holds (the kernel's zero fill of a new surface, an
++// earlier CPU read) stayed valid after the GPU wrote DRAM: another process reading the surface (a screenshot, an app snapshot, its
++// downscaled copy) could see those stale lines instead of the GPU's pixels. A written surface is cleaned and invalidated (DC CIVAC, to the
++// point of coherency, so the lines go for every process that maps the pages) at commit, whatever its seed, and again once the GPU has
++// completed. Only its first NMB_SURFACE_INVALIDATE completed writes (default 4, 0 = off) are walked: a capture surface is written once,
++// while the render server's own framebuffers (about 5 MB, ~2 ms per MB here) are rewritten every frame and are read by the display
++// driver's copy, which keeps its own cache maintenance.
++static std::unordered_map<uint64_t,uint32_t> gSurfaceWrites;   // (IOSurfaceID, mapping page): completed writes walked (gSurfaceSeedLock)
++static std::atomic<uint64_t> gSurfaceInvalidations,gSurfaceInvalidateBytes;
++static unsigned surfaceInvalidateLimit() {
++ static const unsigned limit=[]{const char *v=getenv("NMB_SURFACE_INVALIDATE");return v?(unsigned)strtoul(v,nullptr,0):4u;}();
++ return limit;
++}
++static void cleanInvalidateToCoherency(uintptr_t start,size_t bytes) {
++ for(uintptr_t at=start&~(uintptr_t)63,end=start+bytes;at<end;at+=64)__asm__ volatile("dc civac, %0"::"r"(at):"memory");
++ __asm__ volatile("dsb sy":::"memory");
++}
++static void invalidateWrittenSurfaces(NSMutableSet *written,bool completed) {
++ const unsigned limit=surfaceInvalidateLimit();
++ if(!limit || !written.count)return;
++ std::vector<std::pair<uintptr_t,size_t>> ranges;
++ for(NBTexture *texture in written)if(IOSurfaceRef surface=texture.surface) {
++  const uintptr_t base=reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(surface));
++  const uint64_t key=((uint64_t)IOSurfaceGetID(surface)<<32)^(uint64_t)(base>>12);
++  {
++   std::lock_guard<std::mutex> lock(gSurfaceSeedLock);
++   uint32_t &walked=gSurfaceWrites[key];
++   if(walked>=limit)continue;
++   if(completed)walked++;
++  }
++  ranges.push_back({base,IOSurfaceGetAllocSize(surface)});
++ }
++ std::sort(ranges.begin(),ranges.end());
++ ranges.erase(std::unique(ranges.begin(),ranges.end(),[](const std::pair<uintptr_t,size_t> &a,const std::pair<uintptr_t,size_t> &b){return a.first==b.first;}),ranges.end());
++ for(const std::pair<uintptr_t,size_t> &r:ranges) {
++  cleanInvalidateToCoherency(r.first,r.second);
++  gSurfaceInvalidations++;gSurfaceInvalidateBytes+=r.second;
++ }
++}
+ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
+@@ -1214,6 +1254,7 @@
+ @property(nonatomic) uint32_t commitIndex;
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
++@property(nonatomic,strong) NSMutableSet *writtenSurfaces;   // surfaces a render pass of this command buffer stores to (guamp 0001)
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+ // a no-copy deallocator, its memory owner and texture/heap ancestry.
+ @property(nonatomic,strong) NSMutableSet *resourceOwners;
+@@ -1614,7 +1655,7 @@
+ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+ @implementation NBCommandBuffer
+ - (instancetype)init {
+- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
+  return self;
+ }
+@@ -1686,7 +1727,7 @@
+  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
+   if(!a.texture)return true;
+   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
+-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
++  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];if(a.storeAction!=MTLStoreActionDontCare)[_writtenSurfaces addObject:texture];}
+   [_resourceOwners addObject:texture];
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+   return true;
+@@ -1747,6 +1788,8 @@
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish {
+  flushSurfaces(_surfaces);
++ invalidateWrittenSurfaces(_writtenSurfaces,true);
++ [_writtenSurfaces removeAllObjects];
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+@@ -1785,6 +1828,7 @@
+   // The commit as a whole: the surfaces' flush, then the submission itself (the CPU's cost per commit, which the A1 row reports).
+   const uint64_t began=nowUs();
+   flushSurfaces(_surfaces);
++  invalidateWrittenSurfaces(_writtenSurfaces,false);
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
+   const bool submitted=nmb_command_buffer_on_completed(_handle,completed,context) &&

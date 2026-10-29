@@ -1,0 +1,15 @@
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -710,7 +710,11 @@
+     }
+     /* limit caps the connections granted to each process name, so one process that crashes on every launch cannot loop forever, and cannot use
+      * up the others' opens; a process other than the render server gets at most eight per boot. */
+-    const unsigned cap=strncmp(opener,"backboardd",sizeof opener)?(limit && limit<8?limit:8):limit;
++    /* guamp (patches/native-adreno/0004-screenshot-opens-uncapped.patch): ScreenshotServicesService starts once per screenshot (a user
++     * action, never a launchd crash loop), and its editor (PaperKit/PencilKit) aborts on a nil device: like the render server it takes
++     * the general limit (sheng-gpu-metal-opens, default 40), not eight. 16 characters: the process name is truncated there. */
++    const bool screenshot=!strncmp(opener,"ScreenshotServic",16);
++    const unsigned cap=strncmp(opener,"backboardd",sizeof opener) && !screenshot?(limit && limit<8?limit:8):limit;
+     IOLockLock(g.lock);
+     NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
+     const bool capped=cap && record && record->opens>=cap;

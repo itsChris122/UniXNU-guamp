@@ -211,6 +211,19 @@ def main():
         # Codex/cpu-config-8-cattura-safari adds dyld_shared_cache_arm64.15,6312488/6312498/63124a8 (11 instructions): a nil
         # URL skips the NSData call and yields nil data, which _loadBuiltInSnapshotIfNeeded already handles
         # (analisi/gpu-ci/prepara-fixup-safari-url.py).
+        # Screenshot and app-switcher snapshots (29/10): -[CADisplay supportsExtendedColors] said YES, so the display mode
+        # gamut was P3 and _UIRenderDisplay/_FBSSnapshot asked for two-plane b3a8 (30RGB+A8) surfaces. QuartzCore maps b3a8
+        # to a Metal format only with MTLGPUFamilyApple3 (MetalLimits 0x100); the Adreno plugin says Apple2, so backboardd
+        # got pixel format 0, the texture was refused and SpringBoard logged "Render server returned error.".
+        # ...arm64.03,27ace68 (mov w0,#0; ret) reports sRGB (the Himax panel is sRGB): BGRA surfaces, as the framebuffer.
+        # ...arm64.37,253796c makes +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] return PNG (0) instead
+        # of KTX/ATX (Apple twiddled ASTC). ADT Codex/cpu-config-8-cattura-20261029 (52 entries, base sfondo-png),
+        # analisi/gpu-ci/prepara-fixup-cattura.py, analisi/gpu-ci/CATTURA-SCHERMO-20261029.md.
+        # The screenshot editor (ScreenshotServicesService, not a Metal client: nil device) then aborted in PencilKit:
+        # +[PKMetalUtility isMetalAvailable] is a constant YES, so PKMetalResourceHandler built compute pipelines from nil
+        # functions (MTLReportFailure in setComputeFunction:). ...arm64.19,45beb58 makes it NO and ...arm64.19,45bb01c makes
+        # -[PKMetalResourceHandler initWithDevice:generatePipelineDescriptors:] return nil (no PencilKit ink anywhere).
+        # ADT Codex/cpu-config-8-cattura2-20261029 (prova2 + 2 = 58 entries).
         node('defaults', [('sleep-disabled', u32(1)), ('kern.maxvnodes', u32(66560)), ('vmm-present', u32(1))]),
         node('options'),
         # APFS (apfs_vfsops.c:2276) panics "unencrypted data volume is not allowed" on a plain Data volume unless the

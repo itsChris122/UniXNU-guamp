@@ -665,9 +665,12 @@ int naAccelerator() {
   // The grant also covers PosterBoard and the wallpaper extensions that need a Metal device (AegirPoster: NanoUniverse aborts on the nil
   // pipeline of a nil device; KaleidoscopePoster faults in ClockKitUI addQuad), and their reads of the Native* properties below
   // (patches/xnu/zzwc-native-sandbox-grant-get-properties.patch: without NativeTurnipDebug "noconform" the A610 gives no device).
+  // ScreenshotServicesService: the screenshot editor (PaperKit/PencilKit) assumes Metal and aborts on a nil device (29/10, p3);
+  // its opens are not capped at eight per boot (patches/native-adreno/0004-screenshot-opens-uncapped.patch).
   // Names are compared on their first 16 characters (the process name). Which processes run the plugin stays NativeAdrenoMetal.clients.
   accelerator->setProperty("NativeSandboxGrantProcess",
-                           "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster");
+                           "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster,"
+                           "ScreenshotServicesService");
   accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
   accelerator->setProperty("NativeTurnipDebug", "nocb,noconform,sysmem");
   accelerator->setProperty("NativeMetalWithhold", "apple-families");
