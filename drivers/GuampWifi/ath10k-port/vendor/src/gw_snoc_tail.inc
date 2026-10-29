@@ -61,7 +61,7 @@ static int gw_poll_hif_start(struct ath10k *ar) {
  * RX buffers still on the rings are freed (the error path of core_start runs this with the firmware up). */
 static void gw_poll_hif_stop(struct ath10k *ar) {
   gw_ce_live=false;
-  timer_delete(&ath10k_snoc_priv(ar)->rx_post_retry);
+  timer_delete_sync(&ath10k_snoc_priv(ar)->rx_post_retry);
   ath10k_core_napi_sync_disable(ar);
   ath10k_snoc_buffer_cleanup(ar);
 }
@@ -99,7 +99,7 @@ static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
 static void gw_hif_power_down(struct ath10k *ar) {
   // Nothing may reach the block once WLAN_MODE off is asked for: stop CE servicing and close the register window first.
   gw_ce_live=false; gw_regs_live=false;
-  timer_delete(&ath10k_snoc_priv(ar)->rx_post_retry);
+  timer_delete_sync(&ath10k_snoc_priv(ar)->rx_post_retry);
   int e=gw_board.wlan_disable(gw_board.ctx);
   if(e) { gw_boot_error=e; lx_log(3,"ath10k: WLAN stop unconfirmed; DMA retained"); return; }
   ath10k_ce_free_rri(ar);
