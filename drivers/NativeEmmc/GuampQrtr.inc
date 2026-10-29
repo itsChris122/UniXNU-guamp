@@ -14,7 +14,7 @@ struct Qrtr {
   enum Type : uint32_t { Data=1,Hello=2,Bye=3,NewServer=4,DelServer=5,DelClient=6,
     Resume=7,Exit=8,Ping=9,NewLookup=10,DelLookup=11,DelProc=13 };
   struct Datagram { uint8_t *data; uint32_t bytes,type; };
-  struct LocalService { uint32_t service,instance,port; void *ctx; void (*receive)(void *,uint32_t,uint32_t,const uint8_t *,uint32_t); bool used; };
+  struct LocalService { uint32_t service,instance,port; void *ctx; void (*receive)(void *,uint32_t,uint32_t,const uint8_t *,uint32_t); bool used; bool client; };
   struct Header { uint32_t type,sn,sp,dn,dp,size,header; bool confirm; };
   Allocator allocator={};
   void *ctx=nullptr;
@@ -22,7 +22,11 @@ struct Qrtr {
   void (*serviceEvent)(void *,bool)=nullptr;
   void (*received)(void *,const uint8_t *,uint32_t)=nullptr;
   Datagram queue[16]={};
-  LocalService local[4]={};
+  LocalService local[8]={};
+  // Optional directory of every remote server (NEW/DEL_SERVER of any service).
+  // up=false with service 0 means the whole remote node went away (BYE/DEL_PROC).
+  void *directoryCtx=nullptr;
+  void (*directory)(void *,bool up,uint32_t service,uint32_t instance,uint32_t node,uint32_t port)=nullptr;
   uint32_t read=0,write=0,count=0,remoteNode=0,serverNode=0,serverPort=0;
   uint32_t flow=0;
   bool running=false,helloSent=false,remoteKnown=false;
@@ -37,7 +41,7 @@ struct Qrtr {
     // WifiControl registers QFTP/SERVREG before this transport is opened.
     // Publish those endpoints as soon as QRTR starts, as well as answering
     // explicit NEW_LOOKUP requests from the remote namespace.
-    for(const auto &s:local)if(s.used) {e=announce(s,true);if(e)return e;}
+    for(const auto &s:local)if(s.used&&!s.client) {e=announce(s,true);if(e)return e;}
     return Ok;
   }
   void stop() {
@@ -53,13 +57,23 @@ struct Qrtr {
     for(auto &s:local)if(s.used&&s.port==port)
       return s.service==service&&s.instance==instance&&s.ctx==opaque&&s.receive==handler?Ok:Busy;
     for(auto &s:local)if(!s.used) {
-      LocalService candidate={service,instance,port,opaque,handler,true};
+      LocalService candidate={service,instance,port,opaque,handler,true,false};
       int e=running?announce(candidate,true):Ok;
       // A full transport queue must not leave a silent registration behind:
       // the caller can retry and still publish NEW_SERVER to the remote.
       if(e)return e;
       s=candidate;return Ok;
     }
+    return NoMemory;
+  }
+  // Local QMI client endpoint (UIM/NAS/DMS...): receives DATA on its own port,
+  // never announced and never returned to a NEW_LOOKUP.
+  int addLocalClient(uint32_t port,void *opaque,
+                     void (*handler)(void *,uint32_t,uint32_t,const uint8_t *,uint32_t)) {
+    if(!port||port>=Ctrl||port==LocalPort||!handler)return Invalid;
+    for(auto &s:local)if(s.used&&s.port==port)
+      return s.client&&s.ctx==opaque&&s.receive==handler?Ok:Busy;
+    for(auto &s:local)if(!s.used) { s={0,0,port,opaque,handler,true,true}; return Ok; }
     return NoMemory;
   }
   int sendFrom(uint32_t sourcePort,uint32_t node,uint32_t port,const uint8_t *p,uint32_t n) {
@@ -141,6 +155,8 @@ struct Qrtr {
       case NewServer: case DelServer: {
         if(h.size!=20) return Protocol;
         uint32_t service=le32(p+4),instance=le32(p+8),node=le32(p+12),port=le32(p+16);
+        if(directory&&port&&port<Ctrl&&node!=LocalNode&&node!=Broadcast)
+          directory(directoryCtx,cmd==NewServer,service,instance,node,port);
         if(service!=Service||instance!=ServiceInstance) return Ok;
         if(!node&&!port)return Ok; // namespace lookup EOF, not a service
         if(node==LocalNode||node==Broadcast||!port||port>=Ctrl) return Protocol;
@@ -160,17 +176,19 @@ struct Qrtr {
         if(le32(p+4)==serverNode&&le32(p+8)==serverPort) lost();
         return Ok;
       case Bye: case Exit:
+        if(directory) directory(directoryCtx,false,0,0,h.sn,0);
         if(h.sn==serverNode) lost();
         return Ok;
       case DelProc:
         if(h.size<12) return Protocol;
+        if(directory) directory(directoryCtx,false,0,0,le32(p+8),0);
         if(le32(p+8)==serverNode) lost();
         return Ok;
       case NewLookup: {
         if(h.size!=20)return Protocol;
         uint32_t service=le32(p+4),instance=le32(p+8);
         for(const auto &s:local) {
-          if(!s.used||s.service!=service||(instance&&s.instance!=instance))continue;
+          if(!s.used||s.client||s.service!=service||(instance&&s.instance!=instance))continue;
           // Act as the remote QRTR namespace for local endpoints: answer the
           // modem's lookup with the service's real local port. This is needed
           // before it can open service 4096 and request wlanmdsp.mbn by TFTP.

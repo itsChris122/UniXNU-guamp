@@ -93,6 +93,9 @@ struct Sm6115Runtime {
     ops.wlan={this,nullptr,assignMsa,wlanPower,fileSize,fileRead,wlfwEvent};
     ops.event=controlEvent;ops.trace=controlTrace;
     rmtfsReady=setupRmtfs(base,bytes);ops.rmtfs=rmtfsReady?&rmtfsIo:nullptr;
+    unsigned sim=0;PE_parse_boot_argn("guamp-sim",&sim,sizeof(sim));
+    ops.sim=sim==1;ops.simSnapshot=simSnapshot;
+    if(ops.sim)IOLog("GuampSim: read-only SIM reader on: QMI UIM/DMS/NAS clients on QRTR (no operating mode, PIN or write request)\n");
     e=control.prepare(&owner.arena,owner.allocator,ops,true);
     if(e)return fail(e,"APPS SMP2P/GLINK prepare");
     transition(Prepared);return Ok;
@@ -371,6 +374,17 @@ struct Sm6115Runtime {
   static void rmtfsTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
     IOLog("GuampRmtfs: %s%s%s: %llu/%llu/%llu (0x%llx/0x%llx/0x%llx) result %d %s at %llu ms\n",
       name?name:"",name?" ":"",what,a,b,c,a,b,c,e,errorName(e),nowMs());
+  }
+  // Identifiers stay in the registry (GuampSim service); the log shows only their last 4 digits.
+  static const char *tail4(const char *s) { size_t n=strlen(s); return n>4?s+n-4:s; }
+  static void simSnapshot(void *,const guampsim::SimProbe &s) {
+    GuampSimInfo info;guampsim::fillInfo(s,&info);
+    IOLog("GuampSim: snapshot %u: SIM state %u app %u PIN/PUK retries %u/%u, modem mode %u, registration %u radio %u "
+          "PLMN %u/%u \"%s\", ICCID ..%s IMSI ..%s IMEI ..%s MSISDN %s SPN \"%s\" revision \"%s\"\n",
+          info.snapshots,info.state,info.appType,info.pin1Retries,info.puk1Retries,info.operatingMode,info.registration,
+          info.radio,info.mcc,info.mnc,info.plmn,tail4(info.iccid),tail4(info.imsi),tail4(info.imei),
+          info.msisdn[0]?"read":"none",info.spn,info.revision);
+    guamp_sim_publish(&info);
   }
   static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
