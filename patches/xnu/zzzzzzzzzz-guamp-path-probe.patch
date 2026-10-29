@@ -12,7 +12,7 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
  {
  	struct vnode *dp;       /* the directory we are searching */
  	struct vnode *usedvp = ndp->ni_dvp;  /* store pointer to vp in case we must loop due to
-@@ -2209,3 +2209,87 @@
+@@ -2209,3 +2209,104 @@
  		kdebug_lookup(vp ? vp : dvp, &ndp->ni_cnd);
  	}
  }
@@ -23,6 +23,7 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
 + * mount. */
 +#include <pexpert/pexpert.h>
 +#include <libkern/OSAtomic.h>
++#include <sys/persona.h>
 +static volatile SInt32 guamp_path_probe_limit = -1;
 +static volatile SInt32 guamp_path_probe_used = 0;
 +int guamp_path_probe_active(void);
@@ -58,8 +59,22 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
 +	} else {
 +		strlcpy(buf, CAST_DOWN(const char *, path), size);
 +	}
-+	return strnstr(buf, "MobileSafari.framework", size) != NULL || strnstr(buf, "SafariCore.framework", size) != NULL ||
-+	       strnstr(buf, "/Cryptexes/", size) != NULL || strnstr(buf, "WebContentExtension.appex", size) != NULL;
++	/* 30/10 (app-rotte): boot-time noise that used up the budget before Safari ran (MSUEarlyBootTask/usermanagerd logging
++	 * plists, lsd's empty App cryptex) is skipped; app group containers and the ExtensionKit directory are logged on failure
++	 * only (2), with the persona of the caller (sandbox keys group containers as PERSONA_ID_<persona>:<group>); the Info.plist
++	 * of Notes/TV/Podcasts/Safari (read by the app itself at launch) gives the persona each app runs in. */
++	if (strnstr(buf, "/Cryptexes/App/", size) != NULL || strnstr(buf, "/Logging/Subsystems/", size) != NULL) {
++		return 0;
++	}
++	if (strnstr(buf, "MobileSafari.framework", size) != NULL || strnstr(buf, "SafariCore.framework", size) != NULL ||
++	    strnstr(buf, "/Cryptexes/", size) != NULL || strnstr(buf, "WebContentExtension.appex", size) != NULL ||
++	    strnstr(buf, "NetworkingExtension.appex", size) != NULL || strnstr(buf, "WebKit.framework", size) != NULL ||
++	    strnstr(buf, "MobileNotes.app/Info.plist", size) != NULL || strnstr(buf, "AppleTV.app/Info.plist", size) != NULL ||
++	    strnstr(buf, "Podcasts.app/Info.plist", size) != NULL || strnstr(buf, "MobileSafari.app/Info.plist", size) != NULL) {
++		return 1;
++	}
++	return strnstr(buf, "/Containers/Shared/AppGroup/", size) != NULL || strnstr(buf, "/ExtensionKit/Extensions", size) != NULL ?
++	       2 : 0;
 +}
 +void
 +guamp_path_probe_log(const char *what, const char *path, int error, vnode_t vp, long extra)
@@ -86,18 +101,20 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
 +		}
 +	}
 +	proc_t p = current_proc();
-+	printf("guamp-path: %s[%d] %s %ld err %d %s -> %s type %d fs %s flags 0x%llx fsid 0x%x\n", p ? proc_best_name(p) : "?",
-+	    p ? proc_pid(p) : -1, what, extra, error, path, real, type, fs, flags, fsid);
++	printf("guamp-path: %s[%d] %s %ld err %d %s -> %s type %d fs %s flags 0x%llx fsid 0x%x persona %d uid %d\n",
++	    p ? proc_best_name(p) : "?", p ? proc_pid(p) : -1, what, extra, error, path, real, type, fs, flags, fsid,
++	    p ? (int)persona_id_from_proc(p) : -2, (int)kauth_cred_getuid(kauth_cred_get()));
 +}
 +int
 +namei(struct nameidata *ndp)
 +{
 +	char path[160];
-+	if (!guamp_path_probe_active() || !guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path))) {
++	int match = 0;
++	if (!guamp_path_probe_active() || !(match = guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path)))) {
 +		return namei_guamp_inner(ndp);
 +	}
 +	int error = namei_guamp_inner(ndp);
-+	guamp_path_probe_log("namei", path, error, error ? NULLVP : ndp->ni_vp, (long)ndp->ni_cnd.cn_nameiop);
++	if (match == 1 || error) guamp_path_probe_log("namei", path, error, error ? NULLVP : ndp->ni_vp, (long)ndp->ni_cnd.cn_nameiop);
 +	return error;
 +}
 diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
@@ -114,7 +131,7 @@ diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
  {
  	struct vnode *vp;
  	struct vnode *dvp;
-@@ -2332,3 +2332,18 @@
+@@ -2332,3 +2332,19 @@
  
  	return error == 0 ? 1 : 0;
  }
@@ -126,11 +143,12 @@ diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
 +vn_open_auth(struct nameidata *ndp, int *fmodep, struct vnode_attr *vap, vnode_t authvp)
 +{
 +	char path[160];
-+	if (!guamp_path_probe_active() || !guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path))) {
++	int match = 0;
++	if (!guamp_path_probe_active() || !(match = guamp_path_probe_copy(ndp->ni_dirp, ndp->ni_segflg, path, sizeof(path)))) {
 +		return vn_open_auth_guamp_inner(ndp, fmodep, vap, authvp);
 +	}
 +	int error = vn_open_auth_guamp_inner(ndp, fmodep, vap, authvp);
-+	guamp_path_probe_log("open", path, error, error ? NULLVP : ndp->ni_vp, fmodep ? (long)*fmodep : 0);
++	if (match == 1 || error) guamp_path_probe_log("open", path, error, error ? NULLVP : ndp->ni_vp, fmodep ? (long)*fmodep : 0);
 +	return error;
 +}
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
@@ -147,7 +165,7 @@ diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
  {
  	enum uio_seg segflg;
  	struct attrlist al;
-@@ -4942,3 +4942,19 @@
+@@ -4942,3 +4942,20 @@
  
  	return error;
  }
@@ -159,11 +177,12 @@ diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
 +getattrlist(proc_t p, struct getattrlist_args *uap, int32_t *retval)
 +{
 +	char path[160];
-+	if (!guamp_path_probe_active() || !guamp_path_probe_copy(uap->path,
-+	    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32, path, sizeof(path))) {
++	int match = 0;
++	if (!guamp_path_probe_active() || !(match = guamp_path_probe_copy(uap->path,
++	    IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32, path, sizeof(path)))) {
 +		return getattrlist_guamp_inner(p, uap, retval);
 +	}
 +	int error = getattrlist_guamp_inner(p, uap, retval);
-+	guamp_path_probe_log("getattrlist", path, error, NULLVP, 0);
++	if (match == 1 || error) guamp_path_probe_log("getattrlist", path, error, NULLVP, 0);
 +	return error;
 +}
