@@ -1,0 +1,132 @@
+guamp: contiguous-first back-off and wired accounting (NativeAdrenoMemory, NativeAdrenoUserClient; NativeAdreno 81a0b01 + 0001..0006)
+
+fin6b/fin8: vm_page_find_contiguous(num=16384) "found 0 pages", each followed by "zone_gc called" (1038 lines in one boot). A user BO of
+64 KiB or more tries one contiguous run first; once memory is fragmented the Metal runtime's 64 MiB blocks never get one, and every
+failed attempt costs three scans of all of RAM, a buffer cache flush and a zone trim and drain before the scattered allocation it ends
+in anyway. Now:
+- after a contiguous failure of N bytes, contiguous-first attempts of N bytes or more are skipped for 15 s (smaller ones still try,
+  the first one after the window tries again): the BO is the same scattered one, without the scans;
+- native_adreno_bo_mem: live bytes of whole/scattered objects, pooled objects and imported (wired) user ranges, and the contiguous
+  attempts tried / got / failed / skipped with the size the back-off holds; GuampDisplayExt.inc logs them.
+
+diff --git a/NativeAdrenoMemory.cpp b/NativeAdrenoMemory.cpp
+index 023003e..b8c717e 100644
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -2,6 +2,18 @@
+ #include "NativeAdrenoMemory.h"
+ /* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
+ extern "C" {volatile uint32_t native_adreno_trace_stage;}
++/* guamp (patches/native-adreno/0007-contiguous-backoff-wired-account.patch): the wired memory NativeAdreno holds, in bytes: [0] objects
++ * allocated whole or scattered (the kernel's own tables, ring and fence pages included), [1] objects cut from the BO pool (inside the
++ * pool's block), [2] imported user ranges (the owner's pages, wired by prepare() until release()). Then the contiguous-first attempts of
++ * user BOs (NativeAdrenoUserClient.cpp): [3] tried, [4] got, [5] failed, [6] skipped by the back-off, [7] the size in KiB the back-off
++ * holds (0 = none). GuampDisplayExt.inc logs them with the board's memory line. */
++extern "C" {volatile uint64_t native_adreno_bo_mem[8];}
++static void accountBytes(uint8_t counted,size_t bytes,bool add)
++{
++    if(!counted || counted>3 || !bytes)return;
++    if(add)__atomic_fetch_add(&native_adreno_bo_mem[counted-1],uint64_t(bytes),__ATOMIC_RELAXED);
++    else __atomic_fetch_sub(&native_adreno_bo_mem[counted-1],uint64_t(bytes),__ATOMIC_RELAXED);
++}
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <kern/task.h>
+@@ -120,6 +132,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+                 else status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
+                 if(status!=kIOReturnSuccess) {(void)release();return status;}
+                 native_adreno_pool_stats[1]=native_adreno_pool_stats[1]+1;
++                counted_=2;accountBytes(counted_,bytes_,true);
+                 return kIOReturnSuccess;
+             }
+         }
+@@ -153,6 +166,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+     status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
+     if(status!=kIOReturnSuccess)goto failed;
+     native_adreno_pool_stats[5]=native_adreno_pool_stats[5]+1;native_adreno_pool_stats[6]=native_adreno_pool_stats[6]+(uint32_t)span_count_;
++    counted_=1;accountBytes(counted_,bytes_,true);
+     return kIOReturnSuccess;
+ failed:
+     /* release() deliberately retains descriptor/metadata if complete fails.
+@@ -286,6 +300,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
+     if(status!=kIOReturnSuccess) {native_adreno_import_stage=18;goto failed;}
+     native_adreno_import_stage=19;
+     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)span_count_;
++    counted_=3;accountBytes(counted_,bytes_,true);
+     return kIOReturnSuccess;
+ failed:
+     (void)release();return status;
+@@ -334,6 +349,7 @@ IOReturn NativeAdrenoMemory::release()
+     }
+     if(pooled_) {poolGive(pool_offset_,bytes_);pooled_=false;prepared_=false;pool_offset_=0;}
+     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
++    accountBytes(counted_,bytes_,false);counted_=0;
+     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
+     return kIOReturnSuccess;
+ }
+diff --git a/NativeAdrenoMemory.h b/NativeAdrenoMemory.h
+index 0b1791c..b71598d 100644
+--- a/NativeAdrenoMemory.h
++++ b/NativeAdrenoMemory.h
+@@ -41,6 +41,7 @@ class NativeAdrenoMemory final {
+     uint32_t device_references_=0;
+     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
+     size_t pool_offset_=0;
++    uint8_t counted_=0;   /* guamp (patch 0007): native_adreno_bo_mem bucket + 1 this object is counted in, 0 none */
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:
+     NativeAdrenoMemory()=default;
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index b27b05a..7bc3946 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -13,6 +13,34 @@ extern "C" volatile uint32_t native_adreno_import_stage;
+ extern "C" {volatile uint64_t native_adreno_import_live[3+8*4];}
+ extern "C" int proc_selfpid(void);
+ static unsigned gImportNext;
++/* guamp (patch 0007): a contiguous attempt that fails is not cheap in XNU: vm_page_find_contiguous scans every page of RAM three times and,
++ * between the scans, flushes the buffer cache and trims, then drains, the zone caches (zone_gc). Once memory is fragmented every 64 MiB
++ * block of the Metal runtime failed that way (fin6b: 519 failures in one boot, fin8: 14 in four minutes) and then took the scattered
++ * path anyway. After a failure of N bytes the contiguous-first attempts of N bytes or more are skipped for kContigBackoffNs (smaller ones
++ * still try, and the first attempt after the window tries again): the BO is the same scattered one, without the scans and cache flushes.
++ * native_adreno_bo_mem (NativeAdrenoMemory.cpp) [3..7] counts them. */
++extern "C" {extern volatile uint64_t native_adreno_bo_mem[8];}
++static const uint64_t kContigBackoffNs=15ull*1000*1000*1000;
++static uint64_t gContigFailBytes,gContigFailAt;
++static bool contigWorthTrying(uint64_t bytes)
++{
++    const uint64_t failed=__atomic_load_n(&gContigFailBytes,__ATOMIC_RELAXED);
++    if(!failed || bytes<failed)return true;
++    uint64_t window=0;
++    nanoseconds_to_absolutetime(kContigBackoffNs,&window);
++    if(mach_absolute_time()-__atomic_load_n(&gContigFailAt,__ATOMIC_RELAXED)>=window) {
++        __atomic_store_n(&gContigFailBytes,uint64_t(0),__ATOMIC_RELAXED);native_adreno_bo_mem[7]=0;
++        return true;
++    }
++    return false;
++}
++static void contigFailed(uint64_t bytes)
++{
++    const uint64_t failed=__atomic_load_n(&gContigFailBytes,__ATOMIC_RELAXED);
++    if(!failed || bytes<failed)__atomic_store_n(&gContigFailBytes,bytes,__ATOMIC_RELAXED);
++    __atomic_store_n(&gContigFailAt,mach_absolute_time(),__ATOMIC_RELAXED);
++    native_adreno_bo_mem[7]=__atomic_load_n(&gContigFailBytes,__ATOMIC_RELAXED)>>10;
++}
+ static void noteImportState(uint64_t handle,uint64_t state)
+ {
+     for(unsigned i=0;i<8;++i)if(native_adreno_import_live[3+i*4+2]==handle) {native_adreno_import_live[3+i*4+3]=state;return;}
+@@ -196,8 +224,13 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
+      * caller demanded contiguity. */
+     IOReturn status=kIOReturnUnsupported;
+     const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
+-    if(prefer_contiguous) {
++    if(prefer_contiguous && !contigWorthTrying(request->bytes))native_adreno_bo_mem[6]=native_adreno_bo_mem[6]+1;
++    else if(prefer_contiguous) {
++        native_adreno_bo_mem[3]=native_adreno_bo_mem[3]+1;
+         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
++        /* A pooled BO is no contiguity test of the VM: only a real contiguous allocation that failed starts the back-off. */
++        if(!status)native_adreno_bo_mem[4]=native_adreno_bo_mem[4]+1;
++        else if(status==kIOReturnNoMemory) {native_adreno_bo_mem[5]=native_adreno_bo_mem[5]+1;contigFailed(request->bytes);}
+         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
+     }
+     if(status)

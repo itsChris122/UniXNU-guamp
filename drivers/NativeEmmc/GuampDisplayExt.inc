@@ -18,6 +18,10 @@ extern "C" __attribute__((weak)) unsigned int guamp_fb_wc_enabled = 0;
 namespace dispext {
 static volatile uint32_t gSeen = 0, gExternalBefore = 0, gBuiltIn = 0, gForced = 0;
 static bool gForce = true;
+// guamp-metal-rows=N: the Metal plugin's 48 telemetry rows ("GuampMetal: row") are logged at their first change and then at most every
+// N-th report (10 s each) in which they changed; 1 = every such report (the behaviour before 29/10: 48 lines every 10 s, 1344 of the 3125
+// lines of fin8's live log), 0 = never. Default 60: one dump per 10 minutes of activity.
+static unsigned gRowsEvery = 60;
 
 static bool published(void *, void *, IOService *service, IONotifier *)
 {
@@ -39,6 +43,7 @@ static void start()
   unsigned force = 1;
   PE_parse_boot_argn("guamp-display-internal", &force, sizeof(force));
   gForce = force != 0;
+  PE_parse_boot_argn("guamp-metal-rows", &gRowsEvery, sizeof(gRowsEvery));
   OSDictionary *matching = IOService::serviceMatching("IOMobileFramebuffer");
   if (!matching) return;
   IONotifier *notifier = IOService::addMatchingNotification(gIOFirstPublishNotification, matching, published, nullptr);
@@ -116,19 +121,45 @@ static void gpuAllLog()
           native_adreno_gpu_all_stats2[3], native_adreno_gpu_all_stats2[4], native_adreno_gpu_all_stats2[5]);
 }
 
+// patches/native-adreno/0007-contiguous-backoff-wired-account.patch: [0] whole/scattered objects, [1] pooled objects, [2] imported (wired)
+// user ranges, live bytes; contiguous-first attempts of user BOs [3] tried, [4] got, [5] failed, [6] skipped by the back-off, [7] the size
+// in KiB the back-off holds. Logged when a byte total moved by 1 MiB or more, or an attempt counter changed.
+extern "C" volatile uint64_t native_adreno_bo_mem[8];
+
+static void boMemLog()
+{
+  static uint64_t last[8];
+  uint64_t now[8];
+  for (unsigned i = 0; i < 8; i++) now[i] = native_adreno_bo_mem[i];
+  bool moved = false;
+  for (unsigned i = 0; i < 3; i++) moved = moved || (now[i] > last[i] ? now[i] - last[i] : last[i] - now[i]) >= (1ull << 20);
+  for (unsigned i = 3; i < 8; i++) moved = moved || now[i] != last[i];
+  if (!moved) return;
+  IOLog("GuampMetal: wired by the GPU MiB: objects %llu pooled %llu imported %llu (total %llu); contiguous first: tried %llu got %llu "
+        "failed %llu skipped %llu, back-off at %llu KiB\n", now[0] >> 20, now[1] >> 20, now[2] >> 20, (now[0] + now[2]) >> 20, now[3], now[4],
+        now[5], now[6], now[7]);
+  for (unsigned i = 0; i < 8; i++) last[i] = now[i];
+}
+
 static void metalLog()
 {
   importLog();
   gpuAllLog();
-  static uint32_t lastCalls = 0, lastTunnel = 0, lastSeq = 0;
+  boMemLog();
+  static uint32_t lastCalls = 0, lastTunnel = 0, lastSeq = 0, lastRowsSeq = 0;
+  static unsigned sinceRows = 0;
+  static bool rowsShown = false;
+  sinceRows = sinceRows + 1;
   const GuampMetalDiagHead &d = native_adreno_metal_diag;
   const uint32_t seq = native_adreno_metal_rows_seq;
   if (d.calls == lastCalls && d.tunnel_calls == lastTunnel && seq == lastSeq) return;
   IOLog("GuampMetal: opens %u busy %u bad %u closes %u calls %u last sel %x status %x; ext %u sel %x status %x; tunnel %u\n", d.opens,
         d.busy, d.bad, d.closes, d.calls, d.last_selector, d.last_status, d.ext_entries, d.ext_selector, d.ext_status, d.tunnel_calls);
-  if (seq != lastSeq)
+  if (seq != lastRowsSeq && gRowsEvery && (!rowsShown || sinceRows >= gRowsEvery)) {
     for (unsigned i = 0; i < 48; i++)
       if (native_adreno_metal_rows[i][0]) IOLog("GuampMetal: row %u %.96s\n", i, native_adreno_metal_rows[i]);
+    lastRowsSeq = seq; rowsShown = true; sinceRows = 0;
+  }
   lastCalls = d.calls; lastTunnel = d.tunnel_calls; lastSeq = seq;
 }
 
