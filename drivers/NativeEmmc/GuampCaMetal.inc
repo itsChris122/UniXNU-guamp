@@ -8,6 +8,9 @@
 //   bad session:  "attempts <max>" (the next boots use the software renderer), marker parked and guamp_ca_metal_enabled = 0;
 //                 unless guamp-ca-metal-recover=0, backboardd is restarted once more so it composites in software now.
 //   device not published within kReadyWaitSec: marker parked, the raised count stays (a hang there counts as a bad boot).
+// The device can be ready before the gate is decided (29/10, fin6b: probe done at 2.44 s, launchd's exec at 2.45 s): the ready signal
+// was then dropped as "gate closed", the watchdog waited 600 s for it and parked a working device. Now the signal is kept whatever the
+// gate says, the thread (modes 1 and 2) waits for the gate too, and a device ready before the gate needs no backboardd restart.
 // Mode 0: the patch parked the marker at boot, nothing runs here.
 #ifndef GUAMP_CA_METAL_HOST_CHECK
 #include <sys/vnode.h>
@@ -22,6 +25,7 @@
 extern "C" unsigned int guamp_ca_metal_mode;
 extern "C" volatile int guamp_ca_metal_enabled;
 extern "C" volatile int guamp_ca_metal_attempts;
+extern "C" volatile int guamp_ca_metal_status;   // -1 until the patch decided the gate at launchd's exec
 extern "C" int guamp_kernel_rename(const char *from, const char *to);   // zzzzzz-guamp-ca-metal.patch (vfs_syscalls.c)
 extern "C" volatile uint32_t native_legacy_swap_accepted_count;
 extern "C" void proc_iterate(unsigned int, int (*)(struct proc *, void *), void *, int (*)(struct proc *, void *), void *);
@@ -68,6 +72,7 @@ static int writeState(unsigned attempts) {
 static const char kActive[] = "/private/var/ngpu/addons/NativeAdrenoMetal.publish";
 static const char kParked[] = "/private/var/ngpu/addons/NativeAdrenoMetal.publish.off";
 static volatile int gReady = 0;   // GuampAdreno: 1 Metal device published and self-tested, 2 not usable
+static volatile int gBeforeGate = 0;   // 1: that signal came before the gate was decided (backboardd not started yet)
 static const unsigned kReadyWaitSec = 600;
 
 // The plugin returns no device without its marker: parked, a backboardd started afterwards composites in software.
@@ -92,10 +97,28 @@ static void thread(void *, wait_result_t) {
     IOSleep(1000);
     waited = waited + 1;
   }
-  // The kern_exec patch decides at launchd's exec, long before the device (guamp-gpu-delay): the gate is final by now.
-  if (guamp_ca_metal_mode != 2 || !guamp_ca_metal_enabled) {
-    IOLog("GuampCaMetal: watchdog off after %u s: gate closed (mode %u, attempts %d)\n", waited, guamp_ca_metal_mode,
-          guamp_ca_metal_attempts);
+  // The kern_exec patch decides at launchd's exec, usually long before the device (guamp-gpu-delay), but a fast probe can finish first.
+  uint32_t gate = 0;
+  while (guamp_ca_metal_status == -1 && gate < kReadyWaitSec) {
+    IOSleep(1000);
+    gate = gate + 1;
+  }
+  if (!guamp_ca_metal_enabled) {
+    IOLog("GuampCaMetal: watchdog off after %u s: gate closed (mode %u, attempts %d, gate %s)\n", waited + gate, guamp_ca_metal_mode,
+          guamp_ca_metal_attempts, guamp_ca_metal_status == -1 ? "never decided" : "decided");
+    return;
+  }
+  if (guamp_ca_metal_mode == 1) {   // guamp_ca_metal_gpu_ready acted itself unless the device came before the gate
+    if (!gBeforeGate) return;
+    if (gReady == 1) {
+      IOLog("GuampCaMetal: Metal device ready before the gate: backboardd starts on it (guamp-ca-metal=1)\n");
+      return;
+    }
+    const int parked = park();
+    guamp_ca_metal_enabled = 0;
+    IOLog("GuampCaMetal: Metal device %s before the gate: marker parked (%d), the render server stays in software\n",
+          gReady == 2 ? "not usable" : "not published", parked);
+    if (gReady == 2 && recover && !parked) restartBackboardd("the Metal device is not usable");
     return;
   }
   IOLog("GuampCaMetal: Metal boot %d of %u before the software fallback\n", guamp_ca_metal_attempts + 1, kMaxAttempts);
@@ -106,9 +129,13 @@ static void thread(void *, wait_result_t) {
     IOLog("GuampCaMetal: Metal device %s after %u s: marker parked (%d), software renderer%s, status %d\n",
           gReady == 2 ? "not usable" : "not published", waited, parked,
           gReady == 2 ? " from the next boot too" : " (boot count kept raised)", e);
+    // Signalled before the gate, backboardd may have started on the unusable device since: back to software now.
+    if (gReady == 2 && gBeforeGate && recover && !parked) restartBackboardd("the Metal device is not usable");
     return;
   }
-  restartBackboardd("the Metal device is published");
+  // Ready before the gate: launchd had not run, so backboardd started on the published device and needs no restart.
+  if (gBeforeGate) IOLog("GuampCaMetal: Metal device ready before the gate: backboardd started on it, no restart\n");
+  else restartBackboardd("the Metal device is published");
   const bool haveFrames = true;
   gcm_state s = {};
   // 29/10: saf1 tripped the frame rule (60 s) while lsd rebuilt its database, and the next boots stayed in software. One-shot
@@ -150,8 +177,8 @@ static void thread(void *, wait_result_t) {
 void start() {
   unsigned mode = 2;   // default 2 (verified 28/10), as zzzzzzzzz-guamp-default-args.patch; guamp-ca-metal=0 keeps software
   PE_parse_boot_argn("guamp-ca-metal", &mode, sizeof(mode));
-  if (mode != 2) return;
-  IOLog("GuampCaMetal: watchdog on, waiting for the Metal device\n");
+  if (mode != 1 && mode != 2) return;   // mode 1: only for a device ready before the gate
+  IOLog("GuampCaMetal: watchdog on (mode %u), waiting for the Metal device\n", mode);
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
@@ -159,15 +186,19 @@ void start() {
 
 // GuampAdrenoProbe.cpp, after its level 2 stages: ok = accelerator published and the user-client self test passed.
 extern "C" void guamp_ca_metal_gpu_ready(int ok) {
+  camtl::gReady = ok ? 1 : 2;   // kept for the watchdog thread whatever the gate says now
+  if (guamp_ca_metal_status == -1) {   // launchd's exec has not decided the gate yet: the thread acts once it has
+    camtl::gBeforeGate = 1;
+    IOLog("GuampCaMetal: Metal device %s before the gate (guamp-ca-metal=%u decided at launchd's exec): kept for the watchdog\n",
+          ok ? "ready" : "not usable", guamp_ca_metal_mode);
+    return;
+  }
   if (!guamp_ca_metal_enabled) {
     IOLog("GuampCaMetal: Metal device %s; gate closed (guamp-ca-metal=%u): the render server stays in software\n",
           ok ? "ready" : "not usable", guamp_ca_metal_mode);
     return;
   }
-  if (guamp_ca_metal_mode == 2) {   // the watchdog thread restarts backboardd and judges the session
-    camtl::gReady = ok ? 1 : 2;
-    return;
-  }
+  if (guamp_ca_metal_mode == 2) return;   // the watchdog thread restarts backboardd and judges the session
   if (!ok) {
     const int parked = camtl::park();
     guamp_ca_metal_enabled = 0;
