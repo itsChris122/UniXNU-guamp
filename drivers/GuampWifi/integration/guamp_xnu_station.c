@@ -14,6 +14,7 @@
 #include <net/if_ether.h>
 #include <sys/errno.h>
 #include <sys/kpi_mbuf.h>
+#include <pexpert/pexpert.h>
 #if __has_include(<sys/redwood_net.h>) && __has_include(<sys/redwood_sta.h>)
 #include <sys/redwood_net.h>
 #include <sys/redwood_sta.h>
@@ -136,6 +137,10 @@ static void public_state_copy(struct redwood_sta_state *state)
   state->bss.ssid_length = g_public_state.bss.ssid_length;
   state->bss.frequency = g_public_state.bss.frequency;
   state->bss.rssi = g_public_state.bss.rssi;
+  state->bss.capability = g_public_state.bss.capability;
+  state->bss.beacon_interval = g_public_state.bss.beacon_interval;
+  state->bss.elements_length = g_public_state.bss.elements_length;
+  memcpy(state->bss.elements, g_public_state.bss.elements, g_public_state.bss.elements_length);
   lck_spin_unlock(guamp_wifi_state_lock);
 }
 
@@ -169,6 +174,17 @@ static bool public_state_from_driver(int error)
   else if (status.state == NW_STA_UP) phase = REDWOOD_STA_JOINED;
   else if (status.state >= NW_STA_AUTH) phase = REDWOOD_STA_JOINING;
   else if (status.state == NW_STA_SCANNING) phase = REDWOOD_STA_SCANNING;
+  /* guamp 29/10: the joined network's elements, capability and beacon interval from the scan list, so that
+   * CURRENT_NETWORK (Apple80211 103) carries the RSN element and wifid sees the same security it asked for.
+   * Looked up before the spin lock: nw_wifi_bss_get takes the station's own lock. */
+  static struct nw_bss_info joined;
+  bool have_joined = false;
+  if (status.state >= NW_STA_AUTH) {
+    int count = nw_wifi_bss_count();
+    for (int i = 0; i < count && !have_joined; ++i)
+      if (nw_wifi_bss_get(i, &joined) == 0 && memcmp(joined.bssid, status.bssid, 6) == 0 &&
+          joined.freq_mhz == status.freq_mhz) have_joined = true;
+  }
   lck_spin_lock(guamp_wifi_state_lock);
   g_public_state.phase = phase; g_public_state.last_error = error;
   bzero(&g_public_state.bss, sizeof(g_public_state.bss));
@@ -180,6 +196,14 @@ static bool public_state_from_driver(int error)
     g_public_state.bss.ssid_length = (uint8_t)ssid_length;
     g_public_state.bss.frequency = (uint16_t)status.freq_mhz;
     g_public_state.bss.rssi = status.signal_dbm;
+    if (have_joined) {
+      size_t n = joined.ie_len < sizeof(g_public_state.bss.elements) ? joined.ie_len : sizeof(g_public_state.bss.elements);
+      if (n > sizeof(joined.ie)) n = sizeof(joined.ie);
+      memcpy(g_public_state.bss.elements, joined.ie, n);
+      g_public_state.bss.elements_length = (uint16_t)n;
+      g_public_state.bss.capability = joined.caps;
+      g_public_state.bss.beacon_interval = joined.beacon_int;
+    }
   }
   lck_spin_unlock(guamp_wifi_state_lock);
   return status.state == NW_STA_UP;
@@ -360,7 +384,56 @@ static int station_scan(const struct redwood_sta_scan *request)
   error = wait_event(&g_scan_done, 35000);
   if (!error) error = result_to_errno(g_scan_result);
   if (error) request_failed(REDWOOD_STA_SCANNING, previous, error);
+  /* guamp 29/10: scans asked by iOS, said in the log (the first 20) */
+  static unsigned said;
+  if (said < 20) {
+    said++;
+    printf("GuampWiFi: scan %u for iOS %s: %d BSS entries, %u channels asked, errno %d\n", said, error ? "FAILED" : "done",
+        nw_wifi_bss_count(), (unsigned)scan.frequency_count, error);
+  }
   return error;
+}
+
+/* guamp 29/10: mode 2 does the scan of mode 1 by itself before iOS gets the station (guamp-wifi-selfscan, default 1),
+ * with the same lines, so one boot shows both the radio (SCAN COMPLETE, BSS) and the iOS path. */
+static void station_self_scan(void)
+{
+  unsigned selfscan = 1;
+  PE_parse_boot_argn("guamp-wifi-selfscan", &selfscan, sizeof(selfscan));
+  if (!selfscan) { printf("GuampWiFi: mode 2 kernel scan skipped (guamp-wifi-selfscan=0)\n"); return; }
+  struct redwood_sta_scan all;
+  bzero(&all, sizeof(all));
+  int error = station_scan(&all);
+  if (error) {
+    printf("GuampWiFi: mode 2 kernel scan FAILED, errno %d (iOS may still scan)\n", error);
+    return;
+  }
+  int count = nw_wifi_bss_count();
+  printf("GuampWiFi: SCAN COMPLETE: %d BSS entries (mode 2 kernel scan; zero is a valid completed scan)\n", count);
+  static struct nw_bss_info bss;
+  for (int i = 0; i < count; ++i) {
+    if (nw_wifi_bss_get(i, &bss) != 0) continue;
+    const uint8_t *rsn = NULL;
+    for (unsigned at = 0; at + 2 <= bss.ie_len && at + 2 + bss.ie[at + 1] <= bss.ie_len; at += 2 + bss.ie[at + 1])
+      if (bss.ie[at] == 48) { rsn = bss.ie + at; break; }
+    /* the RSN element says what the network needs: WPA2-PSK (AKM 2), SAE (8), 802.1X (1); the SSID stays out of the log */
+    unsigned akms = 0;   /* bit n: AKM suite 00-0f-ac:n offered */
+    if (rsn && rsn[1] >= 8) {
+      const unsigned end = 2u + rsn[1];
+      unsigned pairwise = rsn[8] | rsn[9] << 8, at = 10 + 4 * pairwise;
+      unsigned n = at + 2 <= end ? (rsn[at] | rsn[at + 1] << 8) : 0;
+      for (unsigned k = 0; k < n && at + 2 + 4 * k + 4 <= end; ++k)
+        if (rsn[at + 2 + 4 * k] == 0x00 && rsn[at + 3 + 4 * k] == 0x0f && rsn[at + 4 + 4 * k] == 0xac && rsn[at + 5 + 4 * k] < 32)
+          akms |= 1u << rsn[at + 5 + 4 * k];
+    }
+    printf("GuampWiFi: BSS %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm IE %u bytes, %s\n",
+        bss.bssid[0], bss.bssid[1], bss.bssid[2], bss.bssid[3], bss.bssid[4], bss.bssid[5],
+        bss.freq_mhz, (int)bss.signal_dbm, (unsigned)bss.ie_len,
+        !rsn ? (bss.caps & 0x10 ? "WEP/WPA1 (not supported)" : "open") :
+        (akms & (1u << 2)) && (akms & (1u << 8)) ? "WPA2-PSK + SAE transition (joined as WPA2-PSK)" :
+        (akms & (1u << 2)) ? "WPA2-PSK" : (akms & (1u << 8)) ? "SAE only (WPA3, not supported yet)" :
+        (akms & (1u << 1)) ? "802.1X (not supported)" : "RSN other (not supported)");
+  }
 }
 
 static void station_heard(void (*each)(const struct redwood_sta_bss *, void *), void *context)
@@ -406,8 +479,7 @@ static int station_join(const struct redwood_sta_join *request)
   } else if (request->security != REDWOOD_STA_OPEN) return EOPNOTSUPP;
   if (memcmp(request->bssid, zero, sizeof(zero)) != 0) bssid = request->bssid;
   lck_spin_lock(guamp_wifi_state_lock);
-  bzero(g_public_state.bss.bssid, sizeof(g_public_state.bss.bssid));
-  bzero(g_public_state.bss.ssid, sizeof(g_public_state.bss.ssid));
+  bzero(&g_public_state.bss, sizeof(g_public_state.bss));
   memcpy(g_public_state.bss.ssid, request->ssid, request->ssid_length);
   g_public_state.bss.ssid_length = request->ssid_length;
   if (bssid) memcpy(g_public_state.bss.bssid, bssid, sizeof(g_public_state.bss.bssid));
@@ -424,8 +496,13 @@ static int station_join(const struct redwood_sta_join *request)
     return error;
   }
   error = wait_event(&g_join_done, 30000);
+  int driver_result = error ? -1 : g_join_result;
   if (!error) error = result_to_errno(g_join_result);
   if (error) request_failed(REDWOOD_STA_JOINING, previous, error);
+  /* guamp 29/10: one line per join for leggi-wifi.sh (never the name or the key) */
+  printf("GuampWiFi: join %s: %s, %s access point, driver result %d, errno %d\n", error ? "FAILED" : "done",
+      request->security == REDWOOD_STA_WPA2_PSK ? (request->passphrase_length ? "WPA2-PSK passphrase" : "WPA2-PSK PMK") : "open",
+      bssid ? "a given" : "any", driver_result, error);
   return error;
 }
 
@@ -540,6 +617,11 @@ int guamp_xnu_wifi_attach(const struct lx_platform *platform, const struct gw_sn
   if (online) { g_public_state.phase = REDWOOD_STA_IDLE; g_public_state.last_error = 0; }
   lck_spin_unlock(guamp_wifi_state_lock);
   if (!online) return ENETDOWN;
+  /* the same checkpoint line as mode 1 (leggi-wifi.sh); the address is the radio's, as in mode 1 */
+  printf("GuampWiFi: ath10k ready, MAC %02x:%02x:%02x:%02x:%02x:%02x, %u channels (mode 2)\n", status.mac[0], status.mac[1],
+      status.mac[2], status.mac[3], status.mac[4], status.mac[5], status.channels);
+  station_self_scan();
   redwood_sta_attach(&g_station);
+  printf("GuampWiFi: mode 2 station handed to iOS (wifid: POWER, SCAN_REQ, ASSOCIATE)\n");
   return worker_online() ? 0 : ENETDOWN;
 }

@@ -277,7 +277,18 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	result->ssid_length = bss->ssid_length;
 	memcpy(result->ssid, bss->ssid, bss->ssid_length);
 	result->age_ms = bss->age_ms;
-	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
+	/*
+	 * guamp 29/10: elements that do not all fit are cut after the last whole element, never dropped. With 0 elements
+	 * wifid saw no RSN element and offered a WPA2 network as open (no passphrase asked, join refused by the station).
+	 */
+	{
+		unsigned whole = 0, have = bss->elements_length < room ? bss->elements_length : room;
+
+		while (whole + 2 <= have && whole + 2 + bss->elements[whole + 1] <= have) {
+			whole += 2 + bss->elements[whole + 1];
+		}
+		result->elements_length = (uint16_t)whole;
+	}
 	memcpy(result->elements, bss->elements, result->elements_length);
 	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
 	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
@@ -376,9 +387,10 @@ get(struct apple80211req *request)
 		IOFreeData(answer, sizeof(*answer));
 		return error;
 	}
-	case 21:                                /* how the last join went (0: not over yet) */
+	case 21:                                /* how the last join went */
+		/* guamp 29/10: iOS 17.7.11 reads 0xffff as "still running" (retries up to 40 times) and 0 as error -3902 */
 		lck_mtx_lock(&apple80211_lock);
-		request->req_val = (int32_t)join_result;
+		request->req_val = join_result == 0 ? 0xffff : (int32_t)join_result;
 		lck_mtx_unlock(&apple80211_lock);
 		return 0;
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
@@ -474,7 +486,11 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	unsigned unknown = 0;
 	int error;
 
-	if (request->req_len != sizeof(*asked)) {
+	/*
+	 * guamp 29/10: iOS 17.7.11 sends 5520 bytes (16.5: 5456): the same offsets, then rssi_threshold@0x1310 and a 64-byte
+	 * scan UUID string @0x154c (IO80211.framework 1dfd8e948). The first 5456 bytes are all that is read here.
+	 */
+	if (request->req_len < sizeof(*asked)) {
 		return EINVAL;
 	}
 	if (!hakios_sta_present()) {

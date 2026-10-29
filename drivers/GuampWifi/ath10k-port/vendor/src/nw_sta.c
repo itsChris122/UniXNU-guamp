@@ -10,7 +10,8 @@
 #include "nw_sta.h"
 
 #define MAX_BSS 48
-#define IE_MAX 384
+#define IE_MAX 768   /* guamp 29/10: 384 cut the RSN element out of long beacons; nw_bss_info.ie follows */
+#define M4_STATUS_WAIT_MS 1500   /* no transmit status at all for message 4 in this time: install the keys anyway */
 #define EAPOL_RETRY_MS 1500
 #define STEP_TIMEOUT_MS 300
 
@@ -82,9 +83,10 @@ static struct {
 static u32 g_next_m4_cookie;
 static volatile u64 g_m4_wait_replay;
 static volatile u32 g_m4_wait_cookie;
-static volatile int g_m4_wait_active, g_m4_ack_received;
+static volatile int g_m4_wait_active, g_m4_ack_received, g_m4_status_seen;
 static void m4_wait_begin(u64 replay,u32 cookie) {
   __atomic_store_n(&g_m4_ack_received,0,__ATOMIC_RELAXED);
+  __atomic_store_n(&g_m4_status_seen,0,__ATOMIC_RELAXED);
   __atomic_store_n(&g_m4_wait_replay,replay,__ATOMIC_RELAXED);
   __atomic_store_n(&g_m4_wait_cookie,cookie,__ATOMIC_RELAXED);
   __atomic_store_n(&g_m4_wait_active,1,__ATOMIC_RELEASE);
@@ -109,6 +111,9 @@ static void note_bss(struct sk_buff *skb) {
   if ((fc & 0xfc) != 0x80 && (fc & 0xfc) != 0x50) return;
   if (skb->len < hdr) return;
   const u8 *ie = skb->data + hdr; unsigned len = skb->len - hdr; if (len > IE_MAX) len = IE_MAX;
+  /* guamp 29/10: keep whole elements only. A list cut in the middle of an element made iOS (SCAN_RESULT) and the
+   * RSN parser read a broken tail; long beacons (vendor/WPS elements) exceed the room. */
+  { unsigned whole = 0; while (whole + 2 <= len && whole + 2 + ie[whole + 1] <= len) whole += 2 + ie[whole + 1]; len = whole; }
   const struct element *ssid = cfg80211_find_elem_match(WLAN_EID_SSID, ie, len, 0, 0, 0);
   struct bss b; memset(&b, 0, sizeof b); memcpy(b.bssid, m->bssid, 6);
   if (ssid && ssid->datalen <= 32) { b.ssid_len = ssid->datalen; memcpy(b.ssid, ssid->data, ssid->datalen); }
@@ -530,6 +535,7 @@ void nw_sta_eapol_status(u64 replay, u32 cookie, bool acked) {
       replay != __atomic_load_n(&g_m4_wait_replay,__ATOMIC_RELAXED) ||
       cookie != __atomic_load_n(&g_m4_wait_cookie,__ATOMIC_RELAXED)) return;
   lx_log(6, "wifi: handshake message 4 %s", acked ? "acknowledged" : "not acknowledged");
+  __atomic_store_n(&g_m4_status_seen,1,__ATOMIC_RELEASE);
   if(acked) __atomic_store_n(&g_m4_ack_received,1,__ATOMIC_RELEASE); }
 static void finish_authorized(void) {
   if (set_sta_state(IEEE80211_STA_AUTHORIZED)) { connect_done(NW_RES_FAILED); return; }
@@ -608,7 +614,8 @@ static void handle_eapol(const u8 *p, unsigned len) {
     if (!again && gtk && gtklen != 16) return;
     C.m4_replay = be64(k->replay);
     if (!again) { C.gtk_len = gtk ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);
-      C.hs_stage = 3; C.m4_at = lx_now_ms(); }
+      C.hs_stage = 3; }
+    C.m4_at = lx_now_ms();   /* each message 4 sent starts its own wait for a transmit status */
     /* Set the stage before tx(): completion can be synchronous. */
     if(++g_next_m4_cookie==0) ++g_next_m4_cookie; C.m4_cookie=g_next_m4_cookie; m4_wait_begin(C.m4_replay,C.m4_cookie);
     send_eapol(o, sizeof *o,C.m4_cookie); lx_log(6, "wifi: handshake message 4 sent%s (tx acked %u, not acked %u, dropped %u; %s)", again ? " again" : "", nw_eapol_tx[0], nw_eapol_tx[1], nw_eapol_tx[2], tx_reasons());
@@ -738,6 +745,17 @@ static void timer_fn(struct work_struct *w) {
     lx_log(6,"wifi: keys installed after message 4 completed (tx acked %u, not acked %u, dropped %u; %s)",
            nw_eapol_tx[0],nw_eapol_tx[1],nw_eapol_tx[2],tx_reasons());
     nw_wifi_htt_stats(8); install_keys();
+  }
+  /* guamp 29/10: the keys wait for message 4's acknowledgement. A firmware that reports no transmit status at all for it
+   * (neither acknowledged nor not) would hold the handshake until its 8 s timeout and fail every join; after
+   * M4_STATUS_WAIT_MS without any status the keys go in, as wpa_supplicant installs them right after message 4.
+   * A "not acknowledged" status keeps waiting: the access point repeats message 3. Only the first handshake: a rekey
+   * keeps the working keys until it is acknowledged (and is abandoned after 8 s). */
+  else if (C.state == NW_STA_KEYS && !C.rekey && C.hs_stage == 3 && !m4_ack_received() &&
+           !__atomic_load_n(&g_m4_status_seen,__ATOMIC_ACQUIRE) && now - C.m4_at >= M4_STATUS_WAIT_MS) {
+    lx_log(4,"wifi: no transmit status for message 4 in %u ms: keys installed anyway (tx acked %u, not acked %u, dropped %u; %s)",
+           M4_STATUS_WAIT_MS,nw_eapol_tx[0],nw_eapol_tx[1],nw_eapol_tx[2],tx_reasons());
+    install_keys();
   }
   if ((C.state == NW_STA_KEYS || C.rekey) && now - C.started >= 8000) {
     if (C.rekey) abort_rekey("handshake timed out");
