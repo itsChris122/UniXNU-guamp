@@ -164,13 +164,130 @@ void request(uint32_t permille) {
 }
 
 // PMIC thread, every 25 ms poll: applies the newest request, the auto-off timer, and every second the fault check.
+// ---- photo flash (camera 3A, 29/10) ----------------------------------------------------------------------------------
+// guamp_flash_request(kind, mA, ms) from any thread (the camera service): kind 1 = pre-flash (metering, at most the torch
+// cap), 2 = main flash (default 500 mA, cap 750 mA, see GuampTorchCore.h), 0 = off now. The PMIC thread is woken at once
+// (nap() below instead of a plain 25 ms sleep), programs TGR_CURRENT and SAFETY_TMR = the flash length, and the PMIC
+// switches the LED off by itself when that timer runs out; flashPoll() then clears the enables. A torch that is on is
+// switched off first (the camera owns the LED during a capture). State for the caller: guamp_flash_state() = 0 idle,
+// 1 pre-flash on, 2 main flash on, 3 refused (fault, budget, gap, guamp-flash=0), plus the LED-on time in ns.
+// Boot arguments: guamp-flash=0 refuses every flash; guamp-flash-ma = main flash current (25..750, default 500).
+volatile uint32_t gFlashKind, gFlashMa, gFlashMs, gFlashSeq, gFlashState, gFlashCount, gFlashRefused;
+volatile uint64_t gFlashOnNs;
+uint32_t gFlashSeen;
+unsigned gFlashEnabled = 1, gFlashMainMa = guamp_torch::kFlashDefaultMa;
+uint64_t gFlashOnMs, gFlashEndMs;
+unsigned gFlashLitMa;
+guamp_torch::FlashBudget gBudget;
+volatile uint32_t gWake;
+
+void flashRequest(uint32_t kind, uint32_t ma, uint32_t ms) {
+  gFlashKind = kind; gFlashMa = ma; gFlashMs = ms;
+  __asm__ volatile("dmb ish" ::: "memory");
+  gFlashSeq = gFlashSeq + 1;
+  thread_wakeup((event_t)&gWake);
+}
+
+// PMIC thread: the 25 ms sleep of its loop, cut short by a flash request.
+void nap(unsigned ms) {
+  const uint32_t seen = gFlashSeq;
+  assert_wait_timeout((event_t)&gWake, THREAD_UNINT, ms, 1000 * 1000);
+  if (gFlashSeq != seen) clear_wait(current_thread(), THREAD_AWAKENED);
+  else thread_block(THREAD_CONTINUE_NULL);
+}
+
+bool flashLit() { return gFlashState == 1 || gFlashState == 2; }
+
+void flashOff(const char *why) {
+  if (!flashLit()) return;
+  const bool main = gFlashState == 2;
+  switchOff();
+  const uint64_t now = nowMs();
+  if (main) gBudget.record(now, gFlashLitMa, static_cast<unsigned>(now - gFlashOnMs));
+  IOLog("GuampTorch: flash %s off (%s) after %llu ms at %u mA\n", main ? "main" : "pre", why,
+        static_cast<unsigned long long>(now - gFlashOnMs), gFlashLitMa);
+  gFlashState = 0;
+}
+
+void flashRefuse(const char *why, uint32_t a, uint32_t b) {
+  gFlashState = 3;
+  gFlashRefused = gFlashRefused + 1;
+  IOLog("GuampTorch: flash refused (%s) %u %u\n", why, a, b);
+}
+
+void flashFire(uint32_t kind, uint32_t ma, uint32_t ms) {
+  if (flashLit()) flashOff("replaced");
+  if (kind != guamp_torch::kFlashPre && kind != guamp_torch::kFlashMain) { gFlashState = 0; return; }
+  if (!gFlashEnabled) { flashRefuse("guamp-flash=0", kind, ma); return; }
+  if (gOn) off("flash");
+  uint8_t s1 = 0, s2 = 0;
+  if (rd(kStatus1, &s1) || rd(kStatus2, &s2)) { flashRefuse("status read", 0, 0); return; }
+  unsigned cap = guamp_torch::flashCapFor(s1, s2);
+  if (!cap) { flashRefuse("vph droop fault (status1, status2)", s1, s2); return; }
+  const bool main = kind == guamp_torch::kFlashMain;
+  if (!main && cap > guamp_torch::kCapMa) cap = guamp_torch::kCapMa;            // pre-flash: torch levels only
+  if (main && cap > gFlashMainMa) cap = gFlashMainMa;
+  if (main && !ma) ma = gFlashMainMa;
+  const uint8_t code = guamp_torch::flashCode(ma, cap);
+  const unsigned real = guamp_torch::maForCode(code);
+  const unsigned len = guamp_torch::clampFlashMs(ms ? ms : guamp_torch::kFlashDefaultMs,
+                                                 main ? guamp_torch::kFlashMaxMs : guamp_torch::kPreflashMaxMs);
+  if (main && !gBudget.allow(nowMs(), real, len)) { flashRefuse("cool-down / budget (mA, ms)", real, len); return; }
+  int e = wr(kHdrmPrgm, kHdrm);
+  if (!e) e = update(kIres, 0x03, 0);
+  if (!e) e = update(kStrobeCtrl, 0x04, 0);
+  if (!e) e = update(kTgrCurrent, 0x7f, code);
+  if (!e) e = wr(kSafetyTmr, guamp_torch::safetyTimer(len));
+  if (!e) e = update(kModCtrl, 0x80, 0x80);
+  uint8_t vreg = 0, state = 0;
+  bool ok = false;
+  unsigned waited = 0;
+  for (; !e && waited < 300; ++waited) {          // VREG_OK of the charger's flash regulator, as for the torch (1 ms steps)
+    e = read8(kPmi632, kSchgmStatus2, &vreg);
+    if (!e && (vreg & 0x10u)) { ok = true; break; }
+    if (!e) e = read8(kPmi632, kSchgmStatus3, &state);
+    if (!e && (state & 7u) == 7u) break;
+    IODelay(1000);
+  }
+  if (ok) e = update(kEnLedCtrl, 0x03, 0x01);
+  if (!ok || e) {
+    switchOff();
+    flashRefuse(ok ? "switch on error" : "no VREG_OK (error, status2)", static_cast<uint32_t>(e), vreg);
+    return;
+  }
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  gFlashOnNs = ns;
+  gFlashOnMs = ns / 1000000u;
+  gFlashEndMs = gFlashOnMs + len;
+  gFlashLitMa = real;
+  gFlashCount = gFlashCount + 1;
+  gFlashState = main ? 2 : 1;
+  IOLog("GuampTorch: flash %s on %u mA (code %u) for %u ms (safety timer %02x), VREG_OK after %u ms, status %02x %02x\n",
+        main ? "main" : "pre", real, code, len, guamp_torch::safetyTimer(len), waited, s1, s2);
+}
+
+// PMIC thread, from poll(): the newest flash request, then the end of a running flash (the PMIC timer has already
+// switched the LED off; this clears the enables and books the energy).
+void flashPoll() {
+  const uint32_t seq = gFlashSeq;
+  if (seq != gFlashSeen) {
+    gFlashSeen = seq;
+    __asm__ volatile("dmb ish" ::: "memory");
+    flashFire(gFlashKind, gFlashMa, gFlashMs);
+  }
+  if (flashLit() && nowMs() >= gFlashEndMs) flashOff("timer");
+}
+
 void poll(unsigned tick) {
   if (!gReady) return;
+  flashPoll();
   const uint32_t seq = gRequestSeq;
   if (seq != gSeenSeq) {
     gSeenSeq = seq;
     __asm__ volatile("dmb ish" ::: "memory");
     const unsigned ma = guamp_torch::maForPermille(gRequest, gMaxMa);
+    if (ma && flashLit()) flashOff("torch request");
     if (ma) on(ma, "request");
     else off("request");
   }
