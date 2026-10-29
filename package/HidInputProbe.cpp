@@ -193,11 +193,11 @@ void native_hid_input_probe(void) {
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
                     }
-                    // guamp-sensors >= 1: accelerometer, gyro, device orientation and proximity as four Built-In HID devices
-                    // (NativeHidInput step 4 of scripts/guamp-hid-variant.py), fed by the NativeEmmc sensor hub.
+                    // guamp-sensors >= 1: accelerometer, gyro, device orientation, proximity and ambient light as five Built-In
+                    // HID devices (NativeHidInput steps 4 and 5 of scripts/guamp-hid-variant.py), fed by the NativeEmmc sensor hub.
                     unsigned sensors=0;
                     PE_parse_boot_argn("guamp-sensors",&sensors,sizeof(sensors));
-                    for(unsigned kind=1;started && sensors>=1 && kind<=4;++kind) {
+                    for(unsigned kind=1;started && sensors>=1 && kind<=5;++kind) {
                         IOService *sensor=native_hid_sensor_allocate(kind);
                         bool sensorStarted=sensor && sensor->metaCast("IOHIDDevice") && sensor->init() && sensor->attach(resource) && sensor->start(resource);
                         IOLog("GuampSensors: HID device %u %s\n",kind,sensorStarted?"started":"FAILED");

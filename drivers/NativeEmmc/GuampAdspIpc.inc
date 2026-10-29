@@ -29,7 +29,10 @@
 // (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here), except
 // IPCRTR with guamp-sensors=2 (GuampAdsp.inc sets gSns; needs guamp-adsp-ipc>=2): the channel gets its DT intents and
 // carries the QRTR/QMI client of GuampSnsCore.h, which lists the ADSP services and looks up the SEE sensors
-// (SUID lookup + attributes, log prefix "GuampSns:"), analisi/sensori/SENSORI-20261029.md step 6.
+// (SUID lookup + attributes, log prefix "GuampSns:"), analisi/sensori/SENSORI-20261029.md step 6, then streams accel,
+// gyro, proximity and light into the HID devices (guamp_sensor_see, GuampSensors.inc; SENSORI-VERI-20261029.md). With
+// gSns the channel fastrpcglink-apps-dsp is opened too and carries the FastRPC listener of the sensors PD
+// (GuampFastRpcCore.h; the kernel side registers gRpcGlue: GuampSnsRpc.inc, guamp-sensors-rpc, log prefix "GuampRpc:").
 // Facts (guamp DT ~/moto/guamp.dts and kernel): SMEM 0x46000000 + 2 MiB, hwlocks = <&tcsr_mutex 3>, tcsr_mutex syscon
 // 0x340000 stride 0x1000 (lock 3 = 0x343000, apps owner id 1, qcom_hwspinlock.c); APCS IPC 0x0f111000 + 8
 // (qcom,bengal-apcs-hmss-global), write BIT(n): smp2p-adsp n = 10, glink adsp edge n = 8; glink adsp edge
@@ -46,6 +49,14 @@
 #include "GuampAudioHwWeak.inc"
 #include "GuampAsm.inc"
 #include "GuampSnsCore.h"
+#include "GuampFastRpcCore.h"
+// The sensor hub (GuampSensors.inc, included before this file by NativeEmmc.cpp): one converted SEE sample. The host
+// tests of this file build without the hub.
+#ifdef GUAMP_SENSORS_HUB
+inline void snsDeliver(unsigned kind, const int32_t *v) { guamp_sensor_see(kind, v); }
+#else
+inline void snsDeliver(unsigned, const int32_t *) {}
+#endif
 #ifndef GUAMP_MIC_DEV_INC   // without the microphone glue (host tests of this file): no mic
 namespace micglue {
 inline bool configure() { return false; }
@@ -65,8 +76,10 @@ constexpr uint32_t kApcsIpc = 8, kBitSmp2p = 10, kBitGlink = 8, kAwake = 1u << 1
 constexpr unsigned kRxWaitMs = 10000, kOpenWaitMs = 10000, kLoopMs = 20;
 const char *const kOutNames[3] = {"master-kernel", "rdbg", "sleepstate"};
 const uint32_t kOutValues[3] = {0, 0, kAwake};
-const qipc::GlinkChannelSpec kChannels[2] = {{"apr_audio_svc", 1, {{0x200, 20}, {0, 0}, {0, 0}}},
-                                             {"IPCRTR", 3, {{0x800, 5}, {0x2000, 3}, {0x4400, 2}}}};
+// fastrpcglink-apps-dsp: DT qcom,intents <0x64 0x40>; 16 of them (responses are 16-24 bytes, one call at a time)
+const qipc::GlinkChannelSpec kChannels[3] = {{"apr_audio_svc", 1, {{0x200, 20}, {0, 0}, {0, 0}}},
+                                             {"IPCRTR", 3, {{0x800, 5}, {0x2000, 3}, {0x4400, 2}}},
+                                             {"fastrpcglink-apps-dsp", 1, {{0x64, 16}, {0, 0}, {0, 0}}}};
 // guamp-sensors=2: QRTR on IPCRTR and the SEE lookup of these data types (GuampSnsCore.h)
 constinit unsigned gSns = 0;
 constinit uint16_t gIpcrtr = 0;
@@ -75,6 +88,19 @@ constinit bool gSnsFailed = false;
 const char *const kSnsTypes[] = {"accel", "gyro", "mag", "proximity", "ambient_light", "pressure", "sensor_temperature",
                                  "gravity", "game_rv", "pedometer", "device_orient", "sig_motion"};
 constexpr uint32_t kSnsTypeCount = sizeof(kSnsTypes) / sizeof(kSnsTypes[0]);
+constinit uint32_t gSnsHz = 25;        // guamp-sensors-hz: accel/gyro sample rate
+constinit bool gSnsGyroOff = false;    // guamp-sensors-gyro=0: no gyro stream
+// FastRPC listener of the sensors PD (guamp-sensors-rpc, default 1 with guamp-sensors=2): the kernel part prepares the
+// files and the ADSP-visible buffer (GuampSnsRpc.inc registers gRpcGlue before adsp::start; nullptr = not available)
+struct RpcGlue {
+  guamp_rpc::Listener *(*prepare)() = nullptr;
+  void (*report)(const char *when) = nullptr;   // SMMU fault registers of the listener's context bank
+};
+constinit RpcGlue gRpcGlue = {};
+constinit unsigned gRpc = 0;
+constinit uint16_t gRpcLcid = 0;
+constinit guamp_rpc::Listener *gRpcListener = nullptr;
+constinit bool gRpcFailed = false;
 
 constinit unsigned gLevel = 0;
 constinit volatile uint8_t *gSmem = nullptr, *gApcs = nullptr;
@@ -261,6 +287,48 @@ int snsSend(void *, const uint8_t *p, uint32_t n) {
 void snsLog(void *, const char *what, const char *text, uint64_t a, uint64_t b) {
   IOLog("GuampSns: %s%s%s %llx %llx at %u ms\n", what, text[0] ? " " : "", text, a, b, nowMs());
 }
+void snsSample(void *, unsigned kind, const int32_t v[3]) {
+  snsDeliver(kind, v);
+}
+int rpcSend(void *, const uint8_t *p, uint32_t n) {
+  if (!gGlink || !gRpcLcid) return -1;
+  const int e = gGlink->send(gRpcLcid, p, n);
+  return e == qipc::Ok ? 0 : e == qipc::Again ? 1 : -1;
+}
+void rpcLog(void *, const char *what, const char *text, uint64_t a, uint64_t b) {
+  IOLog("GuampRpc: %s%s%s %llx %llx at %u ms\n", what, text[0] ? " " : "", text, a, b, nowMs());
+}
+// fastrpcglink-apps-dsp (gSns and gRpc): open, then the listener once the kernel glue has its files and buffer
+void serviceRpc() {
+  if (!gSns || !gRpc || gRpcFailed || !gGlink->negotiated) return;
+  if (!gRpcLcid) {
+    const int o = gGlink->open(kChannels[2].name, &gRpcLcid);
+    if (o) { IOLog("GuampRpc: glink open %s: %s\n", kChannels[2].name, qipc::errorName(o)); gRpcFailed = true; }
+    return;
+  }
+  if (!gGlink->ready(gRpcLcid)) return;
+  if (!gRpcListener) {
+    gRpcListener = gRpcGlue.prepare ? gRpcGlue.prepare() : nullptr;
+    if (!gRpcListener) {
+      IOLog("GuampRpc: %s: listener off\n", gRpcGlue.prepare ? "files or ADSP buffer not available" : "kernel glue not registered");
+      gRpcFailed = true;
+      return;
+    }
+    gRpcListener->hooks.send = rpcSend;
+    gRpcListener->hooks.log = rpcLog;
+    gRpcListener->server.hooks.log = rpcLog;
+    IOLog("GuampRpc: %s ready at %u ms (lcid %u): attach to the sensors PD\n", kChannels[2].name, nowMs(), gRpcLcid);
+    gRpcListener->start();
+  }
+  const uint32_t before = gRpcListener->errors;
+  if (gRpcListener->step(nowMs()) < 0) gRpcFailed = true;
+  if (gRpcGlue.report && (gRpcListener->errors != before || gRpcListener->state == guamp_rpc::Listener::Failed))
+    gRpcGlue.report("after a listener error");
+  if (gRpcListener->state == guamp_rpc::Listener::Failed && !gRpcFailed) {
+    gRpcFailed = true;
+    IOLog("GuampRpc: listener stopped (%u reverse calls served, %u errors)\n", gRpcListener->served, gRpcListener->errors);
+  }
+}
 // IPCRTR (guamp-sensors=2): open, then the QRTR client once the channel is ready; called from service()
 void serviceSns() {
   if (!gSns || gSnsFailed || !gGlink->negotiated) return;
@@ -275,6 +343,10 @@ void serviceSns() {
     if (!gSnsClient) { IOLog("GuampSns: no memory for the client\n"); gSnsFailed = true; return; }
     gSnsClient->hooks.send = snsSend;
     gSnsClient->hooks.log = snsLog;
+    gSnsClient->hooks.sample = snsSample;
+    gSnsClient->rateHz = gSnsHz;
+    gSnsClient->gyroOff = gSnsGyroOff;
+    gSnsClient->streaming = true;
     gSnsClient->start(kSnsTypes, kSnsTypeCount);
     IOLog("GuampSns: IPCRTR ready at %u ms (lcid %u): QRTR hello, then lookup of %u data types\n", nowMs(),
           gIpcrtr, kSnsTypeCount);
@@ -286,6 +358,11 @@ void serviceSns() {
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   if (gSns && gIpcrtr && channel == gIpcrtr) {   // QRTR (guamp-sensors=2)
     if (gSnsClient) gSnsClient->receive(p, n);
+    return;
+  }
+  if (gSns && gRpcLcid && channel == gRpcLcid) {   // FastRPC (guamp-sensors=2, guamp-sensors-rpc)
+    if (gRpcListener) gRpcListener->receive(p, n, nowMs());
+    else IOLog("GuampRpc: %u bytes before the listener started: dropped\n", n);
     return;
   }
   apr::Header h;
@@ -356,7 +433,7 @@ void startGlink() {
     rx.tail = gDesc + 8;
     rx.head = gDesc + 12;
     const qipc::Allocator heap = {nullptr, heapAlloc, heapFree};
-    e = gGlink->start(tx, rx, heap, kChannels, gLevel >= 2 ? (gSns ? 2 : 1) : 0, nullptr, kickGlink, glinkTrace,
+    e = gGlink->start(tx, rx, heap, kChannels, gLevel >= 2 ? (gSns ? (gRpc ? 3 : 2) : 1) : 0, nullptr, kickGlink, glinkTrace,
                        glinkData);
     if (!e) e = gGlink->step();
   }
@@ -400,6 +477,7 @@ void service() {
     return;
   }
   serviceSns();
+  serviceRpc();
   if (gLevel >= 2 && gGlink->negotiated && !gApr) {
     const int o = gGlink->open(kChannels[0].name, &gApr);
     if (o) IOLog("GuampAdsp: ipc glink open %s: %s\n", kChannels[0].name, qipc::errorName(o));

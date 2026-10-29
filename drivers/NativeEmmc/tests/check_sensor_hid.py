@@ -77,5 +77,19 @@ for name, (pair, rid, usages, size) in expect.items():
         g = inputs[0][2]
         check(g['exp'] == 0xD and g['lmin'] == -32768 and g['lmax'] == 32767 and g['size'] == 32, f'{name}: axis format')
         check([u for (_, us, _) in features for u in us] == [0x20030E], f'{name}: Report Interval feature')
+# Step 5: the ambient light device. Two application collections: the Apple vendor ALS pair first (the service's primary
+# usage), then Consumer Control with Consumer 0x109 (IOHIDEventDriver parseProximityElement); report 8 is 2 bytes and
+# the vendor collection has no input (nothing for the event driver to parse there).
+als_block = src[src.index("ALS_CODE=r"):src.index("ALS_EDITS=")]
+m = re.search(r'static const unsigned char alsDescriptor\[\]=\{(.*?)\};', als_block, re.S)
+check(m is not None, 'alsDescriptor present')
+if m:
+    cols, inputs, features, bits = parse(bytes(int(x, 16) for x in re.findall(r'0x[0-9a-fA-F]{2}', m.group(1))))
+    apps = [(c[0], c[1]) for c in cols if c[2] == 1]
+    check(apps == [(0xFF00, 0x04), (0x0C, 0x01)], f'alsDescriptor: collections {apps}')
+    check([u for (r, us, _) in inputs for u in us] == [0x0C0109] and all(r == 8 for (r, _, _) in inputs), 'alsDescriptor: input')
+    check(1 + bits.get(8, 0) // 8 == 2 and 9 not in bits, f'alsDescriptor: report 8 two bytes, no input in report 9 ({bits})')
+    check(inputs[0][2]['lmax'] == 255, 'alsDescriptor: counter 0..255')
+    check('report[0]=8;report[1]=counter;' in src and 'kSetType=19' in src and 'kLevel=0xC0000' in src, 'ALS report and wrapper')
 print('check_sensor_hid:', 'FAIL' if fails else 'PASS')
 sys.exit(1 if fails else 0)

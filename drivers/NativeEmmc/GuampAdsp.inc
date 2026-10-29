@@ -328,9 +328,20 @@ void start() {
   if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 6) adspipc::gLevel = ipc;
   unsigned sensors = 0;   // guamp-sensors=2: QRTR on IPCRTR + SEE sensor lookup (GuampAdspIpc.inc, GuampSnsCore.h)
   if (PE_parse_boot_argn("guamp-sensors", &sensors, sizeof(sensors)) && sensors == 2) {
+    if (mode == 1 && adspipc::gLevel < 2) {   // the sensors need GLINK (IPCRTR, fastrpcglink-apps-dsp): level 2
+      IOLog("GuampAdsp: guamp-sensors=2: ipc level %u raised to 2\n", adspipc::gLevel);
+      adspipc::gLevel = 2;
+    }
     adspipc::gSns = adspipc::gLevel >= 2 ? 1 : 0;
-    IOLog("GuampAdsp: guamp-sensors=2: SEE lookup on IPCRTR %s\n",
-          adspipc::gSns ? "on" : "OFF (needs guamp-adsp=1 guamp-adsp-ipc>=2)");
+    unsigned rpc = 1, hz = 0, gyro = 1;   // guamp-sensors-rpc=0: no FastRPC listener for the sensors PD
+    PE_parse_boot_argn("guamp-sensors-rpc", &rpc, sizeof(rpc));
+    if (PE_parse_boot_argn("guamp-sensors-hz", &hz, sizeof(hz)) && hz >= 1 && hz <= 400) adspipc::gSnsHz = hz;
+    PE_parse_boot_argn("guamp-sensors-gyro", &gyro, sizeof(gyro));
+    adspipc::gSnsGyroOff = gyro == 0;
+    adspipc::gRpc = adspipc::gSns && rpc ? 1 : 0;
+    IOLog("GuampAdsp: guamp-sensors=2: SEE lookup and streams on IPCRTR %s, FastRPC listener %s, %u Hz, gyro %s\n",
+          adspipc::gSns ? "on" : "OFF (needs guamp-adsp=1 guamp-adsp-ipc>=2)", adspipc::gRpc ? "on" : "off",
+          adspipc::gSnsHz, adspipc::gSnsGyroOff ? "off" : "on");
   }
   unsigned route = 0, bits = 0;
   if (PE_parse_boot_argn("guamp-adsp-route", &route, sizeof(route)) && route >= 1 && route <= 3) adspipc::gPcmRoute = route;

@@ -1,11 +1,13 @@
-// Sensor hub (analisi/sensori/SENSORI-20261029.md, step 3): one sink per HID sensor device of NativeHidInput (step 4 of
-// scripts/guamp-hid-variant.py: 1 accelerometer, 2 gyro, 3 device orientation, 4 proximity). Producers call
-// guamp_sensor_push from any thread; the sink runs the report on the device's work loop (synchronous runAction).
-// guamp-sensors: 0 off (default, no HID sensor devices either), 1 synthetic source = the USB mirror ("GSNS" packets from
-// strumenti/specchio-ios.py), 2 reserved for the ADSP SEE client. Ambient light (kind 5) is kept for the log and for
-// guamp_sensor_last only: IOHIDEventDriver has no ambient light element, the HID path for it is still open.
+// Sensor hub (analisi/sensori/SENSORI-20261029.md, step 3): one sink per HID sensor device of NativeHidInput (steps 4
+// and 5 of scripts/guamp-hid-variant.py: 1 accelerometer, 2 gyro, 3 device orientation, 4 proximity, 5 ambient light).
+// Producers call guamp_sensor_push from any thread; the sink runs the report on the device's work loop (synchronous
+// runAction). guamp-sensors: 0 off (default, no HID sensor devices either), 1 synthetic source = the USB mirror ("GSNS"
+// packets from strumenti/specchio-ios.py), 2 the ADSP SEE streams (GuampSnsCore.h through GuampAdspIpc.inc call
+// guamp_sensor_see; SENSORI-VERI-20261029.md). Ambient light: the kind 5 device turns each report into an
+// ambient light sensor event (its own dispatchEvent wrapper, step 5), so CoreBrightness gets lux.
 // Included before UsbMirror.inc (the mirror hands its OUT packets to sensors::fromMirror first).
 #include "GuampSensorsCore.h"
+#define GUAMP_SENSORS_HUB 1   // GuampAdspIpc.inc hands the ADSP samples to guamp_sensor_see when this is set
 
 namespace sensors {
 using namespace guamp_sensors;
@@ -16,6 +18,10 @@ struct Sink {
 };
 static Sink gSink[kKinds];
 static unsigned gMode = 0;
+static unsigned gFlip = 0;           // guamp-sensors-flip (GuampSensorsCore.h flipAxes), ADSP samples only
+static OrientFilter gOrient;         // device orientation from the ADSP accelerometer (single producer: guamp-adsp)
+static uint32_t gSeeCount[kKinds];
+static int32_t gLastProx = -1;
 }  // namespace sensors
 
 extern "C" {
@@ -48,6 +54,31 @@ void guamp_sensor_push(unsigned kind, int32_t x, int32_t y, int32_t z) {
   fn(ctx, v);
   guamp_sensor_delivered[kind] = guamp_sensor_delivered[kind] + 1;
 }
+
+// One sample of the ADSP SEE (guamp-sensors=2), already in hub units (GuampSnsCore.h + GuampSensorsCore.h fromSee):
+// accel also drives the orientation device through a debounce; proximity is sent on change only.
+void guamp_sensor_see(unsigned kind, const int32_t *v) {
+  using namespace sensors;
+  if (gMode != 2 || !v || kind < kAccel || kind >= kKinds) return;
+  int32_t s[3] = {v[0], v[1], v[2]};
+  if (kind == kAccel || kind == kGyro) flipAxes(s, gFlip);
+  const uint32_t n = ++gSeeCount[kind];
+  if (kind == kProx) {
+    if (s[0] == gLastProx) return;
+    gLastProx = s[0];
+    IOLog("GuampSensors: ADSP proximity %s (raw %d)\n", s[0] ? "near" : "far", s[1]);
+  }
+  if (kind == kAls && (n <= 3 || n % 200 == 0)) IOLog("GuampSensors: ADSP light %d lux (sample %u)\n", s[0], n);
+  if (kind == kAccel && (n == 1 || n % 3000 == 0))
+    IOLog("GuampSensors: ADSP accel %d %d %d mg (sample %u, sink %s)\n", s[0], s[1], s[2], n, gSink[kAccel].fn ? "on" : "off");
+  if (kind == kGyro && (n == 1 || n % 3000 == 0)) IOLog("GuampSensors: ADSP gyro %d %d %d mrad/s (sample %u)\n", s[0], s[1], s[2], n);
+  guamp_sensor_push(kind, s[0], s[1], s[2]);
+  int32_t o = 0;
+  if (kind == kAccel && gOrient.update(s, &o)) {
+    guamp_sensor_push(kOrient, o, 0, 0);
+    IOLog("GuampSensors: ADSP orientation %d (accel %d %d %d mg)\n", o, s[0], s[1], s[2]);
+  }
+}
 }  // extern "C"
 
 namespace sensors {
@@ -76,8 +107,9 @@ static bool fromMirror(const volatile uint8_t *b, uint32_t n) {
 
 void start() {
   PE_parse_boot_argn("guamp-sensors", &gMode, sizeof(gMode));
-  IOLog("GuampSensors: mode %u (%s)\n", gMode,
-        gMode == 1 ? "synthetic from the USB mirror" : gMode == 2 ? "ADSP SEE (not yet)" : "off");
+  PE_parse_boot_argn("guamp-sensors-flip", &gFlip, sizeof(gFlip));
+  IOLog("GuampSensors: mode %u (%s), flip %x\n", gMode,
+        gMode == 1 ? "synthetic from the USB mirror" : gMode == 2 ? "ADSP SEE streams" : "off", gFlip);
 }
 
 }  // namespace sensors

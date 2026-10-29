@@ -105,6 +105,131 @@ static bool decodeRequest(const std::vector<uint8_t> &p, Request *r) {
   return !top.bad;
 }
 
+// The std_request payload of a request (field 4 -> field 2) and its message id / SUID
+static bool requestPayload(const std::vector<uint8_t> &p, uint32_t *msg, uint64_t *lo, std::vector<uint8_t> *payload) {
+  const uint8_t *q = p.data() + 32;
+  uint32_t l = 0;
+  const uint8_t *d = tlv(q + 7, rd16(q + 5), 0x01, &l);
+  if (!d) return false;
+  PbReader top{d + 2, rd16(d)};
+  PbField f;
+  payload->clear();
+  while (top.next(&f)) {
+    if (f.field == 1) { Suid s; parseSuid(f.data, f.len, &s); *lo = s.low; }
+    else if (f.field == 2) *msg = (uint32_t)f.value;
+    else if (f.field == 4) { PbReader rq{f.data, f.len}; PbField x; while (rq.next(&x)) if (x.field == 2) payload->assign(x.data, x.data + x.len); }
+  }
+  return !top.bad;
+}
+static std::vector<unsigned> sampleKinds;
+static std::vector<std::vector<int32_t>> sampleValues;
+static void sampleHook(void *, unsigned kind, const int32_t v[3]) {
+  sampleKinds.push_back(kind);
+  sampleValues.push_back({v[0], v[1], v[2]});
+}
+static uint32_t fbits(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
+
+// Step 8: enable requests after the lookup, events decoded into samples, a sensor that appears late
+static void testStreams() {
+  static Client c;
+  sent.clear();
+  c.hooks.send = sendHook;
+  c.hooks.log = logHook;
+  c.hooks.sample = sampleHook;
+  c.streaming = true;
+  c.rateHz = 50;
+  static const char *const types[] = {"accel", "gyro", "proximity", "ambient_light"};
+  c.start(types, 4);
+  c.receive(ctrl(kQrtrHello, 0, 0, 0, 0).data(), 52);
+  c.receive(ctrl(kQrtrNewServer, kService, 1, kAdsp, kSnsPort).data(), 52);
+  uint64_t now = 0;
+  auto answerLookup = [&](const char *type, std::vector<std::pair<uint64_t, uint64_t>> suids) {
+    c.step(now += 10);
+    c.flush();
+    std::vector<uint8_t> ev;
+    pbStr(ev, 1, type);
+    for (auto &s : suids) pbBytes(ev, 2, suid(s.first, s.second));
+    auto ind = indication(kQmiReport, clientEvent(kLookupSuid, kLookupSuid, kMsgSuidEvent, ev));
+    c.receive(ind.data(), (uint32_t)ind.size());
+  };
+  answerLookup("accel", {{0xa1, 0xa2}});
+  answerLookup("gyro", {});                       // not there yet
+  answerLookup("proximity", {{0xb1, 0xb2}});
+  answerLookup("ambient_light", {{0xc1, 0xc2}});
+  // attributes: accel and proximity say streaming (16 = 0), light says on-change (1)
+  for (int i = 0; i < 3; ++i) {
+    c.step(now += 10);
+    c.flush();
+    Request r;
+    CHECK(decodeRequest(sent.back(), &r) && r.msg == kMsgAttrReq);
+    std::vector<uint8_t> attrs, a, v, d;
+    pbKey(d, 4, 0); pbVar(d, r.lo == 0xc1 ? 2 : 0);   // zigzag: 0 streaming, 2 = on-change (1)
+    pbBytes(v, 1, d); pbKey(a, 1, 0); pbVar(a, kAttrStreamType); pbBytes(a, 2, v); pbBytes(attrs, 1, a);
+    auto ind = indication(kQmiReport, clientEvent(r.lo, r.lo + 1, kMsgAttrEvent, attrs));
+    c.receive(ind.data(), (uint32_t)ind.size());
+  }
+  c.step(now += 10);
+  CHECK(c.done);
+  // enable requests, one per answered response: accel 513 at 50 Hz, proximity 513 (attribute), light 514
+  uint32_t msg = 0; uint64_t lo = 0; std::vector<uint8_t> pl;
+  c.step(now += 10); c.flush();
+  CHECK(requestPayload(sent.back(), &msg, &lo, &pl) && msg == kMsgConfig && lo == 0xa1 && pl.size() == 5 && pl[0] == 0x0d &&
+        rd32(&pl[1]) == fbits(50.0f));
+  Request r;
+  decodeRequest(sent.back(), &r);
+  const size_t n1 = sent.size();
+  c.step(now += 10); c.flush();
+  CHECK(sent.size() == n1);   // waits for the response
+  c.receive(response(r.txn, 0).data(), (uint32_t)response(r.txn, 0).size());
+  c.step(now += 10); c.flush();
+  CHECK(requestPayload(sent.back(), &msg, &lo, &pl) && msg == kMsgConfig && lo == 0xb1);
+  CHECK(logged("stream|gyro|0|0"));   // no gyro SUID
+  decodeRequest(sent.back(), &r);
+  c.receive(response(r.txn, 0).data(), (uint32_t)response(r.txn, 0).size());
+  c.step(now += 10); c.flush();
+  CHECK(requestPayload(sent.back(), &msg, &lo, &pl) && msg == kMsgOnChange && lo == 0xc1 && pl.empty());
+  c.step(now += Client::kWaitMs); c.flush();
+  CHECK(c.streamsDone && logged("streams-done||3"));
+  // events: accel packed floats, proximity near, light unreliable (dropped) then valid, an error event
+  std::vector<uint8_t> e, packed;
+  for (float f : {0.0f, 9.80665f, 0.0f}) { uint32_t b = fbits(f); for (int i = 0; i < 4; ++i) packed.push_back(b >> 8 * i); }
+  pbBytes(e, 1, packed); pbKey(e, 2, 0); pbVar(e, 3);
+  auto ind = indication(kQmiJumbo, clientEvent(0xa1, 0xa2, kMsgStdEvent, e));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(sampleKinds.size() == 1 && sampleKinds[0] == guamp_sensors::kAccel && sampleValues[0][1] == -1000);
+  std::vector<uint8_t> px;
+  pbKey(px, 1, 0); pbVar(px, 1); pbKey(px, 2, 0); pbVar(px, 812); pbKey(px, 3, 0); pbVar(px, 3);
+  ind = indication(kQmiReport, clientEvent(0xb1, 0xb2, kMsgProxEvent, px));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(sampleKinds.size() == 2 && sampleKinds[1] == guamp_sensors::kProx && sampleValues[1][0] == 1 && sampleValues[1][1] == 812);
+  std::vector<uint8_t> l0, l1;
+  pbF32(l0, 1, fbits(55.0f)); pbF32(l0, 1, fbits(900.0f)); pbKey(l0, 2, 0); pbVar(l0, 0);
+  ind = indication(kQmiReport, clientEvent(0xc1, 0xc2, kMsgStdEvent, l0));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(sampleKinds.size() == 2);
+  pbF32(l1, 1, fbits(55.4f)); pbF32(l1, 1, fbits(900.0f)); pbKey(l1, 2, 0); pbVar(l1, 3);
+  ind = indication(kQmiReport, clientEvent(0xc1, 0xc2, kMsgStdEvent, l1));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(sampleKinds.size() == 3 && sampleKinds[2] == guamp_sensors::kAls && sampleValues[2][0] == 55);
+  std::vector<uint8_t> err;
+  pbKey(err, 1, 0); pbVar(err, 1);
+  ind = indication(kQmiReport, clientEvent(0xa1, 0xa2, kMsgErrorEvent, err));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(logged("event|stream error event|82|1"));
+  CHECK(logged("first-sample|accel") && logged("first-sample|ambient_light|37"));
+  // the gyro shows up later (register_updates): its stream is enabled then
+  std::vector<uint8_t> ev;
+  pbStr(ev, 1, "gyro"); pbBytes(ev, 2, suid(0xd1, 0xd2));
+  ind = indication(kQmiReport, clientEvent(kLookupSuid, kLookupSuid, kMsgSuidEvent, ev));
+  c.receive(ind.data(), (uint32_t)ind.size());
+  CHECK(logged("stream-late|gyro") && !c.streamsDone);
+  const size_t n2 = sent.size();
+  c.step(now += 10); c.flush();
+  CHECK(sent.size() == n2 + 1 && requestPayload(sent.back(), &msg, &lo, &pl) && msg == kMsgConfig && lo == 0xd1);
+  c.step(now += Client::kWaitMs); c.flush();
+  CHECK(c.streamsDone && sent.size() == n2 + 1);   // the other streams are not enabled twice
+}
+
 int main() {
   static Client c;
   c.hooks.send = sendHook;
@@ -188,6 +313,7 @@ int main() {
   uint8_t small[16];
   CHECK(!suidLookup(small, sizeof(small), "accel"));
   CHECK(!qmiRequest(small, sizeof(small), 1, small, 0));
+  testStreams();
   printf("sns_host: %s (%zu packets, %zu log lines)\n", fails ? "FAIL" : "PASS", sent.size(), logs.size());
   return fails ? 1 : 0;
 }

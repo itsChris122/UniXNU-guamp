@@ -11,10 +11,18 @@
 //   Indications 0x21 (report) and 0x22 (jumbo report): TLV 0x01 client id (u64), TLV 0x02 payload (u16 length +
 //   sns_client_event_msg). Message ids and field numbers from the public SEE protos (sns_client.proto,
 //   sns_std.proto, sns_suid.proto, sns_std_sensor.proto); the firmware carries sns_client.proto and
-//   SNS_CLIENT_SVC_..._v01.
+//   SNS_CLIENT_SVC_..._v01. Checked against the protos shipped in guamp's vendor (/vendor/etc/sensors/proto, backup
+//   vendor-completo-20261029): attr req 1, attr event 128, error event 130 (sns_std.proto), suid req 512 / event 768
+//   (sns_suid.proto), sensor config 513, on-change config 514, physical config event 768, sensor event 1025
+//   (sns_std_sensor.proto: repeated float data 1, status 2), proximity event 769 (sns_proximity.proto: event type 1
+//   near/far, raw adc 2, status 3), disable 10 (sns_client.proto).
+// Streaming (step 8, after the lookup): the first SUID of accel and gyro gets sns_std_sensor_config (513, sample_rate as
+//   float, guamp-sensors-hz), proximity and ambient light the on-change request (514) unless their stream-type
+//   attribute (16) says streaming; events 1025/769 become samples in the units of GuampSensorsCore.h (hooks.sample).
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include "GuampSensorsCore.h"
 
 namespace guamp_sns {
 
@@ -23,7 +31,9 @@ enum : uint32_t {
   kQrtrData = 1, kQrtrHello = 2, kQrtrBye = 3, kQrtrNewServer = 4, kQrtrDelServer = 5, kQrtrDelClient = 6,
   kQrtrResume = 7, kQrtrNewLookup = 10,
   kQmiReq = 0x20, kQmiReport = 0x21, kQmiJumbo = 0x22, kMaxPayload = 1000,
-  kMsgAttrReq = 1, kMsgAttrEvent = 128, kMsgSuidReq = 512, kMsgSuidEvent = 768, kMsgErrorEvent = 6,
+  kMsgAttrReq = 1, kMsgAttrEvent = 128, kMsgSuidReq = 512, kMsgSuidEvent = 768, kMsgErrorEvent = 130,
+  kMsgDisable = 10, kMsgConfig = 513, kMsgOnChange = 514, kMsgPhysConfig = 768, kMsgProxEvent = 769, kMsgStdEvent = 1025,
+  kAttrStreamType = 16,
   kProcApss = 1, kDeliveryWakeup = 0
 };
 static constexpr uint64_t kLookupSuid = 0xababababababababull;   // the SUID lookup sensor (low and high)
@@ -207,13 +217,22 @@ struct Client {
     int (*send)(void *, const uint8_t *, uint32_t) = nullptr;   // 0 sent, >0 try again, <0 error
     // what: "server", "server-gone", "suid", "attr", "event", "lookup-done", "error"; text may be empty
     void (*log)(void *, const char *what, const char *text, uint64_t a, uint64_t b) = nullptr;
+    // one converted sample (guamp_sensors kinds 1 accel, 2 gyro, 4 proximity, 5 light; units of GuampSensorsCore.h)
+    void (*sample)(void *, unsigned kind, const int32_t v[3]) = nullptr;
   } hooks;
   struct Packet { uint8_t data[kPacket]; uint32_t n; };
   Packet queue[kQueue];
   uint32_t qr = 0, qw = 0, qn = 0;
   const char *const *types = nullptr;
   uint32_t typeCount = 0, typeAt = 0, attrAt = 0;
-  struct Found { Suid suid; uint32_t type; bool attrs; };
+  struct Found { Suid suid; uint32_t type; bool attrs; int32_t streamType = -1; };
+  // Streams: accel, gyro, proximity, ambient light (step 8). The kernel allocates the client zeroed (IOMallocZero, no
+  // constructor), so every member must be valid at zero: start() fills the stream table.
+  struct Stream { const char *type; unsigned kind; int32_t found; uint32_t msg, events, dropped; bool sent; };
+  Stream streams[4];
+  uint32_t rateHz, streamAt;   // rateHz 0 = 25 Hz
+  bool streaming, gyroOff, streamsDone;
+  uint16_t streamTxn;
   Found found[kSuids];
   uint32_t foundCount = 0, servers = 0, events = 0, dropped = 0;
   uint32_t snsNode = 0, snsPort = 0, remoteNode = 0;
@@ -233,6 +252,11 @@ struct Client {
   }
   void start(const char *const *list, uint32_t count) {
     types = list; typeCount = count > kTypes ? kTypes : count;
+    static const char *const kStreamTypes[4] = {"accel", "gyro", "proximity", "ambient_light"};
+    static const unsigned kStreamKinds[4] = {guamp_sensors::kAccel, guamp_sensors::kGyro, guamp_sensors::kProx,
+                                             guamp_sensors::kAls};
+    for (unsigned i = 0; i < 4; ++i) streams[i] = {kStreamTypes[i], kStreamKinds[i], -1, 0, 0, 0, false};
+    streamAt = 0; streamsDone = false;
     uint8_t b[64];
     push(b, qrtrControl(b, sizeof(b), kQrtrHello, kBroadcast, 0, 0, 0, 0));
     started = true;
@@ -255,9 +279,10 @@ struct Client {
   }
   // Lookups first (one at a time), then one attribute request per SUID found
   void step(uint64_t nowMs) {
-    if (!started || done || !snsPort) return;
+    if (!started || !snsPort) return;
     if (waiting && nowMs - waitSince < kWaitMs) return;
     waiting = false;
+    if (done) { streamStep(nowMs); return; }
     uint8_t pb[kMaxPayload];
     if (typeAt < typeCount) {
       const uint32_t n = suidLookup(pb, sizeof(pb), types[typeAt]);
@@ -274,6 +299,86 @@ struct Client {
     }
     done = true;
     note("lookup-done", "", foundCount, servers);
+  }
+  // sns_std_sensor_config { required float sample_rate = 1 }: the rate as float bits (integer Hz, exact below 2^24)
+  static uint32_t floatBits(uint32_t v) {
+    if (!v) return 0;
+    uint32_t e = 31;
+    while (!(v >> e)) --e;
+    const uint32_t frac = e > 23 ? (v >> (e - 23)) : (v << (23 - e));
+    return (127 + e) << 23 | (frac & 0x7fffff);
+  }
+  static bool sameType(const char *a, const char *b) {
+    uint32_t i = 0;
+    while (a[i] && a[i] == b[i]) ++i;
+    return !a[i] && !b[i];
+  }
+  // One enable request per wanted stream with a SUID, each waiting for its QMI response (or kWaitMs)
+  void streamStep(uint64_t nowMs) {
+    if (!streaming || streamsDone) return;
+    while (streamAt < 4) {
+      Stream &s = streams[streamAt++];
+      if (s.sent || (s.kind == guamp_sensors::kGyro && gyroOff)) continue;
+      for (uint32_t k = 0; k < foundCount && s.found < 0; ++k)
+        if (found[k].type < typeCount && sameType(types[found[k].type], s.type)) s.found = (int32_t)k;
+      if (s.found < 0) { note("stream", s.type, 0, 0); continue; }
+      const Found &f = found[s.found];
+      const bool motion = s.kind == guamp_sensors::kAccel || s.kind == guamp_sensors::kGyro;
+      const bool onChange = f.streamType >= 0 ? f.streamType == 1 : !motion;
+      s.msg = onChange ? kMsgOnChange : kMsgConfig;
+      uint8_t cfg[8], pb[kMaxPayload];
+      PbWriter w{cfg, sizeof(cfg)};
+      const uint32_t hz = rateHz ? rateHz : 25;
+      if (!onChange) w.fixed32(1, floatBits(hz));
+      const uint32_t n = clientRequest(pb, sizeof(pb), f.suid, s.msg, cfg, onChange ? 0 : w.n);
+      if (n && sendQmi(pb, n)) {
+        s.sent = true;
+        streamTxn = txn;
+        waiting = true;
+        waitSince = nowMs;
+        note("stream", s.type, s.msg, onChange ? 0 : hz);
+        return;
+      }
+      note("error", "stream request not sent", s.kind, 0);
+    }
+    streamsDone = true;
+    note("streams-done", "", streams[0].sent + streams[1].sent + streams[2].sent + streams[3].sent, 0);
+  }
+  Stream *streamFor(const Suid &s) {
+    for (auto &st : streams)
+      if (st.found >= 0 && found[st.found].suid.low == s.low && found[st.found].suid.high == s.high) return &st;
+    return nullptr;
+  }
+  // sns_std_sensor_event { repeated float data = 1 (packed or not); status = 2 } and sns_proximity_event
+  // { type 1 (0 far, 1 near); raw_adc 2; status 3 }: one sample to hooks.sample
+  void streamEvent(Stream &st, uint32_t msg, const uint8_t *p, uint32_t n) {
+    PbReader r{p, n};
+    PbField f;
+    uint32_t data[8], count = 0;
+    int64_t status = -1, near = -1, raw = 0;
+    while (r.next(&f)) {
+      if (msg == kMsgStdEvent && f.field == 1 && f.type == 5 && count < 8) data[count++] = (uint32_t)f.value;
+      else if (msg == kMsgStdEvent && f.field == 1 && f.type == 2) {
+        for (uint32_t i = 0; i + 4 <= f.len && count < 8; i += 4) data[count++] = rd32(f.data + i);
+      } else if (msg == kMsgStdEvent && f.field == 2 && f.type == 0) status = (int64_t)f.value;
+      else if (msg == kMsgProxEvent && f.field == 1 && f.type == 0) near = (int64_t)f.value;
+      else if (msg == kMsgProxEvent && f.field == 2 && f.type == 0) raw = (int64_t)f.value;
+      else if (msg == kMsgProxEvent && f.field == 3 && f.type == 0) status = (int64_t)f.value;
+    }
+    if (r.bad) { ++st.dropped; note("error", "malformed sensor event", st.kind, n); return; }
+    int32_t v[3] = {0, 0, 0};
+    bool ok = false;
+    if (msg == kMsgProxEvent && near >= 0) {
+      v[0] = near == 1 ? 1 : 0; v[1] = (int32_t)raw; ok = true;
+    } else if (msg == kMsgStdEvent && st.kind == guamp_sensors::kProx && count) {   // a streaming proximity: data[0] near
+      v[0] = (data[0] & 0x7fffffffu) ? 1 : 0; ok = true;
+    } else if (msg == kMsgStdEvent) {
+      ok = guamp_sensors::fromSee(st.kind, data, count, v);
+    }
+    // light and proximity: SNS_STD_SENSOR_SAMPLE_STATUS_UNRELIABLE (0) marks samples taken while the part settles
+    if (!ok || (status == 0 && (st.kind == guamp_sensors::kAls || st.kind == guamp_sensors::kProx))) { ++st.dropped; return; }
+    if (!st.events++) note("first-sample", st.type, (uint64_t)(uint32_t)v[0], (uint64_t)(uint32_t)v[1]);
+    if (hooks.sample) hooks.sample(hooks.ctx, st.kind, v);
   }
   void suidEvent(const uint8_t *p, uint32_t n) {
     PbReader r{p, n};
@@ -305,6 +410,16 @@ struct Client {
       if (!known && foundCount < kSuids) found[foundCount++] = {list[i], typeIndex, false};
     }
     if (waiting && typeAt && typeIndex == typeAt - 1) waiting = false;   // answer to the current lookup: go on
+    // A sensor that shows up after the streams were set up (register_updates: the sensors PD publishes its drivers
+    // once the FastRPC listener has served the registry): enable its stream now
+    if (streaming && streamsDone && count && typeIndex < typeCount)
+      for (uint32_t i = 0; i < 4; ++i)
+        if (streams[i].found < 0 && !streams[i].sent && sameType(streams[i].type, types[typeIndex])) {
+          streamAt = i;
+          streamsDone = false;
+          note("stream-late", streams[i].type, 0, 0);
+          break;
+        }
   }
   // sns_std_attr_event { repeated attr 1 { attr_id 1, value 2 { repeated data 1 { str 2, flt 3, sint 4, boolean 5 }}}}:
   // strings of name (0), vendor (1), type (2) and the first value of version (4) and hw id (18)
@@ -322,7 +437,7 @@ struct Client {
         if (f.field == 1 && f.type == 0) id = (int64_t)f.value;
         else if (f.field == 2 && f.type == 2) { value = f.data; valueLen = f.len; }
       }
-      if (id != 0 && id != 1 && id != 2 && id != 4 && id != 18) continue;
+      if (id != 0 && id != 1 && id != 2 && id != 4 && id != 18 && id != kAttrStreamType) continue;
       if (!value) continue;
       PbReader rv{value, valueLen};
       PbField d;
@@ -337,7 +452,11 @@ struct Client {
             for (uint32_t i = 0; i < l; ++i) text[i] = (char)x.data[i];
             note("attr", text, (uint64_t)id, s.low);
           } else if (x.field == 4 && x.type == 0) {
-            note("attr", "", (uint64_t)id, x.value >> 1 ^ (0 - (x.value & 1)));   // zigzag
+            const uint64_t value = x.value >> 1 ^ (0 - (x.value & 1));   // zigzag
+            if (id == kAttrStreamType)
+              for (uint32_t k = 0; k < foundCount; ++k)
+                if (found[k].suid.low == s.low && found[k].suid.high == s.high) found[k].streamType = (int32_t)value;
+            note("attr", "", (uint64_t)id, value);
           } else if (x.field == 5 && x.type == 0) {
             note("attr", x.value ? "true" : "false", (uint64_t)id, s.low);
           }
@@ -368,7 +487,11 @@ struct Client {
       if (!haveSuid) continue;
       if (msg == kMsgSuidEvent && s.low == kLookupSuid && s.high == kLookupSuid) suidEvent(payload, payloadLen);
       else if (msg == kMsgAttrEvent) { attrEvent(s, payload, payloadLen); if (waiting && typeAt >= typeCount) waiting = false; }
-      else note("event", msg == kMsgErrorEvent ? "error event" : "", msg, s.low);
+      else if (Stream *st = streamFor(s)) {
+        if (msg == kMsgStdEvent || msg == kMsgProxEvent) streamEvent(*st, msg, payload, payloadLen);
+        else note("event", msg == kMsgErrorEvent ? "stream error event" : msg == kMsgPhysConfig ? "physical config" : st->type,
+                  msg, st->kind);
+      } else note("event", msg == kMsgErrorEvent ? "error event" : "", msg, s.low);
     }
     if (r.bad) note("error", "malformed client event", n, 0);
   }
@@ -382,6 +505,7 @@ struct Client {
       const uint8_t *r = tlv(body, len, 0x02, &l);
       if (!r || l < 4) { note("error", "response without result", msg, 0); return; }
       if (rd16(r)) note("error", "request refused", rd16(r), rd16(r + 2));
+      if (done && waiting && rd16(p + 1) == streamTxn) waiting = false;   // the enable request was answered: next one
       return;
     }
     if (p[0] == 4 && (msg == kQmiReport || msg == kQmiJumbo)) {

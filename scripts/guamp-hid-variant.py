@@ -8,6 +8,17 @@ bits. backboardd (BKButtonHIDEventProcessor, page 0x0B usage 0x2E -> _processRin
 stores Telephony elements as keyboard elements and dispatches them on value change. The button sink keeps bit 4.
 Step 3 (28/10): sheng-touch-hid defaults to 1 (the touch screen collection the USB mirror's touches use, verified on every
 guamp boot line); sheng-touch-hid=0 turns it off.
+Step 5 (29/10): ambient light, sensor kind 5 (analisi/sensori/SENSORI-VERI-20261029.md). IOHIDEventDriver has no ambient
+light element, and the IOHIDEvent factories are static IOHIDFamily functions this source cannot bind. The kind 5 device
+therefore has two application collections: first the Apple vendor pair 0xFF00/0x04 (the ALS pair AppleSPUALS*Driver
+publishes, so the event service's PrimaryUsagePage/PrimaryUsage, the first DeviceUsagePairs entry, say ambient light),
+then a Consumer Control collection with Consumer 0x109 Proximity, which matches the "HID Pointing/Consumer/System
+Control Driver" personality and makes IOHIDEventDriver::handleProximityReport create one event per report (the value is
+a counter that changes on every report). This device's own driver gets a copy of its vtable whose dispatchEvent (slot
+198, as the edge wrapper) turns that event into an ambient light event with only virtual IOHIDEvent calls of
+IOHIDFamily-2031.120.4: setType (slot 19, right after getType 18: it calls initWithType, which sizes the event data
+for the new type), setIntegerValue (24) of kIOHIDEventFieldAmbientLightSensorLevel 0xC0000 and RawChannel0 0xC0001 =
+lux. Any other event of that driver is dropped, so nothing of it ever reaches the system as proximity.
 """
 from pathlib import Path
 import hashlib
@@ -19,6 +30,7 @@ FINAL=None
 RINGER='f5fa8fa8d63f498d648435957e0e2f5fa3dabba09d59cff930a34fc4e9bc58d0'
 FINAL_RECORDED='08eff226eb1aad34be27b5aab1e21129ca5eed32faed072e20f30c98ec2a03f5'
 SENSORS_RECORDED='7432dbacae81b5568d5c72befa444a708205278c1664aa0fc462dd709b2c86ae'
+ALS_RECORDED='19b3b32f0571b61bdd552850ce9969daf5bc640180f3f1f2a663ef3db2fba7f8'
 # Step 4 edits. Axes: logical/physical -32768..32767 in 32-bit fields, unit exponent -3 (milli-g, mrad/s), as
 # IOHIDFamily's IOHIDGyroDescriptor.h; feature Report Interval (us) so the driver publishes the ReportInterval property.
 SENSOR_DESCRIPTORS=r'''#define TOUCH_FINGERS 10
@@ -118,6 +130,72 @@ SENSOR_EDITS=[
      '    NativeHidInput *device=new NativeHidInput;if(device)device->setSensorKind(kind);return device;\n'
      '}\n'),
 ]
+# Step 5 edits (ambient light, kind 5): descriptor and dispatch wrapper after the edge namespace
+ALS_CODE=r'''}  // namespace edge
+// Ambient light device (sensor kind 5, step 5 of scripts/guamp-hid-variant.py). Report 8: Consumer 0x109 counter. Collection 1 is the
+// Apple vendor ALS pair 0xFF00/0x04 (primary usage of the service), collection 2 the Consumer Control the event driver matches.
+static const unsigned char alsDescriptor[]={
+    0x06,0x00,0xff,0x09,0x04,0xa1,0x01,0x85,0x09,0x75,0x08,0x95,0x01,0xb1,0x03,0xc0,
+    0x05,0x0c,0x09,0x01,0xa1,0x01,0x85,0x08,
+    0x0a,0x09,0x01,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x01,0x81,0x02,
+    0xc0
+};
+namespace alsx {
+enum {kSlots=256,kDispatch=198,kGetType=18,kSetType=19,kSetInteger=24};
+enum : uint32_t {kProximity=14,kAmbientLight=12,kLevel=0xC0000,kChannel0=0xC0001};
+static uintptr_t originalDispatch;
+// lux of the report being sent (set by sensorAction on the device work loop before handleReport); [0] wrapper installed,
+// [1] events turned into ambient light, [2] other events of this driver dropped
+extern "C" {volatile int32_t native_hid_als_lux;volatile uint32_t native_hid_als_stats[3];}
+static void dispatch(IOService *self,OSObject *event,IOOptionBits options) {
+    if(!event)return;
+    if(edge::call<uint32_t,IOOptionBits>(event,kGetType,0)!=kProximity){native_hid_als_stats[2]=native_hid_als_stats[2]+1;return;}
+    edge::call<void,uint32_t>(event,kSetType,kAmbientLight);
+    if(edge::call<uint32_t,IOOptionBits>(event,kGetType,0)!=kAmbientLight){native_hid_als_stats[2]=native_hid_als_stats[2]+1;return;}
+    const int32_t lux=native_hid_als_lux<0?0:native_hid_als_lux;
+    edge::call<void,uint32_t,int32_t,IOOptionBits>(event,kSetInteger,kLevel,lux,0);
+    edge::call<void,uint32_t,int32_t,IOOptionBits>(event,kSetInteger,kChannel0,lux,0);
+    native_hid_als_stats[1]=native_hid_als_stats[1]+1;
+    reinterpret_cast<void (*)(IOService *,OSObject *,IOOptionBits)>(originalDispatch)(self,event,options);
+}
+static void install(IORegistryEntry *driver) {
+    if(originalDispatch || !driver)return;
+    uintptr_t *table=*reinterpret_cast<uintptr_t **>(driver);
+    uintptr_t *copy=static_cast<uintptr_t *>(IOMalloc(kSlots*sizeof(uintptr_t)));
+    if(!copy)return;
+    memcpy(copy,table,kSlots*sizeof(uintptr_t));
+    originalDispatch=copy[kDispatch];copy[kDispatch]=(uintptr_t)&dispatch;
+    __asm__ volatile("dmb ish":::"memory");
+    *reinterpret_cast<uintptr_t **>(driver)=copy;
+    native_hid_als_stats[0]=1;
+}
+}  // namespace alsx
+'''
+ALS_EDITS=[
+    ('}  // namespace edge\n',ALS_CODE),
+    ('extern "C" {volatile uint32_t native_hid_sensor_reports[5];volatile int native_hid_sensor_results[5];}',
+     'extern "C" {volatile uint32_t native_hid_sensor_reports[6];volatile int native_hid_sensor_results[6];}   // [5] ambient light'),
+    ('        if(kind<1 || kind>4 || !self->hasEventDriverCached())return kIOReturnSuccess;',
+     '        if(kind<1 || kind>5 || !self->hasEventDriverCached())return kIOReturnSuccess;'),
+    ('        else {report[0]=7;report[1]=v[0]?1:0;}\n',
+     '        else if(kind==4) {report[0]=7;report[1]=v[0]?1:0;}\n'
+     '        else {   // ambient light: the counter changes on every report, the wrapper reads the lux\n'
+     '            static unsigned char counter=0;counter=(unsigned char)(counter%255+1);\n'
+     '            alsx::native_hid_als_lux=v[0];__asm__ volatile("dmb ish":::"memory");\n'
+     '            report[0]=8;report[1]=counter;\n'
+     '        }\n'),
+    ('            if(driver && (touchEnabled || touchOnly))edge::install(driver);',
+     '            if(driver && (touchEnabled || touchOnly))edge::install(driver);\n'
+     '            if(driver && sensorKind==5)alsx::install(driver);'),
+    ('        if(sensorKind>=1 && sensorKind<=4) {',
+     '        if(sensorKind==5){static_assert(sizeof(alsDescriptor)<=sizeof(combined),"als descriptor fits");size=sizeof(alsDescriptor);memcpy(combined,alsDescriptor,size);}\n'
+     '        else if(sensorKind>=1 && sensorKind<=4) {'),
+    ('sensorKind==4?"Guamp proximity":',
+     'sensorKind==4?"Guamp proximity":sensorKind==5?"Guamp ambient light":'),
+    ('    if(kind<1 || kind>4)return nullptr;\n','    if(kind<1 || kind>5)return nullptr;\n'),
+    ('    unsigned sensorKind=0;   // 1 accel, 2 gyro, 3 orientation, 4 proximity; 0 = keyboard/touch device\n',
+     '    unsigned sensorKind=0;   // 1 accel, 2 gyro, 3 orientation, 4 proximity, 5 ambient light; 0 = keyboard/touch device\n'),
+]
 raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
 text=raw.decode()
 if digest==PRISTINE:
@@ -163,9 +241,17 @@ if digest==FINAL_RECORDED:
         text=text.replace(old,new)
     digest=hashlib.sha256(text.encode()).hexdigest()
     assert digest==SENSORS_RECORDED,'HID sensor variant result differs from the recorded source: '+digest
-    path.write_text(text)
     print('GuampHid: sensor devices (accel 4, gyro 5, orientation 6, proximity 7) behind guamp-sensors')
-elif digest==SENSORS_RECORDED:
-    print('GuampHid: pinned Consumer-only opt-in, ring/silent switch and sensor devices already prepared')
+if digest==SENSORS_RECORDED:
+    # Step 5 (29/10): ambient light device (report 8) with its dispatch wrapper, see the docstring
+    for old,new in ALS_EDITS:
+        assert text.count(old)==1,'HID ambient light variant: anchor not unique: '+old[:60]
+        text=text.replace(old,new)
+    digest=hashlib.sha256(text.encode()).hexdigest()
+    assert ALS_RECORDED is None or digest==ALS_RECORDED,'HID ambient light variant result differs from the recorded source: '+digest
+    path.write_text(text)
+    print('GuampHid: ambient light device (report 8, light events through its own dispatch wrapper) behind guamp-sensors')
+elif digest==ALS_RECORDED:
+    print('GuampHid: pinned Consumer-only opt-in, ring/silent switch, sensor and ambient light devices already prepared')
 else:
     raise SystemExit('Pinned NativeHidInput source differs; do not guess an ABI or source layout')

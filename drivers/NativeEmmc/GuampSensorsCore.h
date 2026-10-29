@@ -4,6 +4,10 @@
 // proximity 0 far / 1 near, ambient light lux.
 #pragma once
 #include <stdint.h>
+#ifndef INT32_MIN
+#define INT32_MIN (-2147483647 - 1)
+#define INT32_MAX 2147483647
+#endif
 
 namespace guamp_sensors {
 
@@ -62,5 +66,79 @@ static inline int32_t orientationOf(const int32_t g[3]) {
   if (m == 1) return g[1] < 0 ? kOrientPortrait : kOrientUpsideDown;
   return g[2] < 0 ? kOrientFaceUp : kOrientFaceDown;
 }
+
+// ---- real samples from the ADSP SEE (GuampSnsCore.h, guamp-sensors=2) ----
+// SEE reports IEEE-754 floats in the Android device frame (sns_accel.proto: x right, y up the portrait screen, z out of
+// the screen; the driver already applies the registry axis map lsm6dso_0_platform.orient), accel in m/s2 with +g up at
+// rest, gyro in rad/s (right hand), light in lux. The kernel has no floating point: the bits are scaled with integers.
+// round(f * mul / div), saturated to int32; NaN and infinities give 0. |mul| <= 2^27.
+static inline int32_t f32Scaled(uint32_t bits, int64_t mul, int64_t div) {
+  const uint32_t e = bits >> 23 & 0xff, frac = bits & 0x7fffff;
+  if (e == 0xff || !div) return 0;
+  const bool neg = (bits >> 31) != 0;
+  const uint64_t m = e ? (frac | 0x800000u) : frac;   // value = m * 2^(e - 150) (subnormal: e = 1)
+  int shift = (int)(e ? e : 1) - 150;
+  const bool negMul = (mul < 0) != (div < 0);
+  const uint64_t um = (uint64_t)(mul < 0 ? -mul : mul), ud = (uint64_t)(div < 0 ? -div : div);
+  if (um > (1u << 27)) return 0;
+  uint64_t q = (m * um << 8) / ud;   // m * mul * 2^8 / div: m < 2^24, mul <= 2^27
+  shift -= 8;
+  uint64_t r;
+  if (shift >= 0) {
+    if (shift > 30 || q > (0x7fffffffull >> shift)) r = 0x80000000ull;
+    else r = q << shift;
+  } else if (shift <= -63) {
+    r = 0;
+  } else {
+    r = (q + (1ull << (-shift - 1))) >> -shift;
+  }
+  const bool minus = neg != negMul;
+  if (r > 0x7fffffffull) return minus ? INT32_MIN : INT32_MAX;
+  return minus ? -(int32_t)r : (int32_t)r;
+}
+// guamp-sensors-flip bits, applied to accel and gyro after the unit conversion: 1 negate x, 2 negate y, 4 negate z,
+// 8 swap x and y (first). Default 0: the SEE frame already is the screen frame.
+static inline void flipAxes(int32_t v[3], unsigned flip) {
+  if (flip & 8) { const int32_t t = v[0]; v[0] = v[1]; v[1] = t; }
+  for (unsigned i = 0; i < 3; ++i) if (flip >> i & 1) v[i] = -v[i];
+}
+// One SEE sample (float bits, n values) in the units of the HID devices. Accel: milli-g with the iOS sign (at rest
+// portrait upright reads y = -1000: Android reports the reaction to gravity, iOS gravity itself); gyro: mrad/s;
+// light: lux (data[0] = lux, data[1] = raw ADC). False when the sample is too short or the kind has no float form.
+static inline bool fromSee(unsigned kind, const uint32_t *bits, unsigned n, int32_t out[3]) {
+  if (!bits || !out) return false;
+  out[0] = out[1] = out[2] = 0;
+  if (kind == kAccel || kind == kGyro) {
+    if (n < 3) return false;
+    for (unsigned i = 0; i < 3; ++i)
+      out[i] = kind == kAccel ? f32Scaled(bits[i], -101971621, 1000000) : f32Scaled(bits[i], 1000, 1);
+    return true;
+  }
+  if (kind == kAls) {
+    if (n < 1) return false;
+    const int32_t lux = f32Scaled(bits[0], 1, 1);
+    out[0] = lux < 0 ? 0 : lux;
+    out[1] = n > 1 ? f32Scaled(bits[1], 1, 1) : 0;
+    return true;
+  }
+  return false;
+}
+// Device orientation from a stream of accelerometer samples: a new value only after kStable consecutive samples agree
+// and differ from the last one sent; ambiguous samples (tilted, shaken, free fall) restart the count and are never sent.
+struct OrientFilter {
+  static constexpr unsigned kStable = 4;
+  int32_t sent = 0, candidate = 0;
+  unsigned count = 0;
+  // true with *orientation set when a new orientation is due
+  bool update(const int32_t g[3], int32_t *orientation) {
+    const int32_t o = orientationOf(g);
+    if (o == kOrientAmbiguous) { count = 0; candidate = 0; return false; }
+    if (o != candidate) { candidate = o; count = 1; } else if (count < kStable) ++count;
+    if (count < kStable || o == sent) return false;
+    sent = o;
+    *orientation = o;
+    return true;
+  }
+};
 
 }  // namespace guamp_sensors
