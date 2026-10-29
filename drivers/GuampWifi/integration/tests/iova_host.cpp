@@ -5,8 +5,11 @@
 #include "guamp_xnu_iova.h"
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <map>
 #include <vector>
 using guampwifi::GuampIovaPages;
+using guampwifi::GuampVaIndex;
 static int failures=0;
 #define CHECK(c) do{if(!(c)){std::printf("FAIL %s:%d %s\n",__FILE__,__LINE__,#c);failures++;}}while(0)
 
@@ -48,6 +51,36 @@ int main() {
   for(uint32_t p=0;p<pages;p++)if(t.at(p)==3)t.release(p,1,3);
   CHECK(t.used==0&&t.reserve(256,5,&f));                             // 1 MiB span still fits
   CHECK(!t.reserve(0,1,&f)&&!t.reserve(1,0,&f)&&!t.reserve(pages+1,1,&f));
+  // CPU-page index of coherent allocations (zero-copy dma_map of skb data):
+  // ~4850 one-page skbs + churn against a reference map, then empty.
+  {
+    const uint32_t cap=32768;
+    std::vector<uint64_t> keys(cap,~0ull);std::vector<uint16_t> tags(cap,0xffff);
+    GuampVaIndex x;CHECK(!x.init(keys.data(),tags.data(),3000));CHECK(x.init(keys.data(),tags.data(),cap));
+    std::map<uint64_t,uint16_t> ref;
+    uint64_t seed=88172645463325252ull;
+    auto rnd=[&](){seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;return seed;};
+    // kernel VA pages, clustered like zone/kmem allocations so probe chains collide
+    auto page=[&](){return 0xfffffff000000ull+(rnd()%60000)*((rnd()&1)?1:64);};
+    for(int step=0;step<400000;step++) {
+      if(ref.size()<4850||(rnd()&1)) {
+        uint64_t p=page();uint16_t tg=uint16_t(rnd()%16384+1);
+        bool ok=x.insert(p,tg);CHECK(ok==!ref.count(p));if(ok)ref[p]=tg;
+      } else {
+        auto it=ref.begin();std::advance(it,rnd()%ref.size());
+        x.erase(it->first,uint16_t(it->second+1));CHECK(x.lookup(it->first)==it->second); // wrong tag: kept
+        x.erase(it->first,it->second);CHECK(!x.lookup(it->first));ref.erase(it);
+      }
+      if(!(step%20000))for(auto &e:ref)CHECK(x.lookup(e.first)==e.second);
+    }
+    CHECK(x.count==ref.size());
+    for(auto &e:ref)CHECK(x.lookup(e.first)==e.second);
+    for(auto &e:ref)x.erase(e.first,e.second);
+    CHECK(x.count==0);for(uint32_t i=0;i<cap;i++)CHECK(!keys[i]);
+    // 3/4 load limit, then refusal (caller bounces instead)
+    uint32_t n=0;while(x.insert(0x1000+n,1))n++;CHECK(n==cap-cap/4);
+    CHECK(!x.insert(0,1)&&!x.insert(5,0)&&!x.lookup(0));
+  }
   std::printf(failures?"iova_host: %d FAILURES\n":"PASS: iova_host (%d failures, peak %u pages)\n",failures,t.peak);
   return failures?1:0;
 }

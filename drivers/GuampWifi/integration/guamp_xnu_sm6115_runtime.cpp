@@ -81,8 +81,18 @@ struct Sm6115Runtime {
     error=e?e:Io;guamp_wifi_provider_error=error;
     // control: 0 Off 1 Prepared 2 AwaitModem 3 AwaitFifo 4 Running 5 Failed; WLFW 15 = Failed (set by peerLost()
     // whenever the control layer fails, so it is a consequence, not a WLFW error); gate = the step that failed.
-    IOLog("GuampWiFi: %s failed %d %s (control %u gate \"%s\" WLFW %u SMMU fault %x); resources retained while remote may run\n",
-      where,error,errorName(error),unsigned(control.stage),control.where(),unsigned(control.wlan.state),smmu.faultStatus());
+    // SMMUv2 FSR: FORMAT [10:9] is read-only (2 = AArch64), so 0x400 alone is NOT a fault; the fault bits are
+    // MULTI 31, SS 30, UUT 8, ASF 7, TLBLKF 6, TLBMCF 5, EF 4, PF 3, AFF 2, TF 1 (as GuampAudioPlay report()).
+    const uint32_t fsr=smmu.faultStatus(),faults=fsr&0xc00001feu;
+    IOLog("GuampWiFi: %s failed %d %s (control %u gate \"%s\" WLFW %u SMMU FSR %x: %s); resources retained while remote may run\n",
+      where,error,errorName(error),unsigned(control.stage),control.where(),unsigned(control.wlan.state),fsr,
+      faults?"FAULT":"no fault");
+    if(faults)
+      IOLog("GuampWiFi: SMMU SID %x FAULT FSR %x (%s%s%s%s%s) FAR %x%08x FSYNR0 %x (IOVA window %llx-%llx)\n",
+        WlanSmmu::Stream,fsr,fsr&2?"translation ":"",fsr&4?"access-flag ":"",fsr&8?"permission ":"",
+        fsr&16?"external ":"",fsr&0x80000000u?"multi":"",smmu.faultAddressHigh(),smmu.faultAddressLow(),
+        smmu.faultSyndrome(),WlanSmmu::IovaBase,WlanSmmu::IovaEnd);
+    dmaReport("at failure");
     transition(Failed);return error;
   }
 
