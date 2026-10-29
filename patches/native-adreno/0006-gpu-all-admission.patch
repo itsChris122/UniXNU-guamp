@@ -1,0 +1,134 @@
+guamp: guamp-gpu-all, limits at open instead of on a live connection's calls; deny list (NativeAdreno 81a0b01 + 0001..0005)
+
+fin1 (kernel 66f47f0, resa10): SpringBoard faulted in libvulkan_freedreno with X0 = -2 right after two BoMaps refused by 0005's
+table reserve: Turnip turns a refused map or allocation into VK_ERROR_OUT_OF_DEVICE_MEMORY (-2) and its callers use it. Now:
+- a live connection is refused only a BoAlloc over its own ceiling (guamp-gpu-all-bo, 768 MiB by default: a runaway process);
+- the shared GPU table reserve and the other processes' BO total are checked when a connection is opened (a refused open is a
+  nil device, the behaviour of every process before gpu-all);
+- native_adreno_gpu_all_deny (board: guamp-gpu-all-deny, default "SpringBoard,mediaserverd"): those processes are refused at open;
+- native_adreno_gpu_all_stats2: table objects/spans, opens refused (deny, table, total), BoAllocs refused.
+
+diff --git a/NativeAdrenoGpuAll.h b/NativeAdrenoGpuAll.h
+index cccbd59..ed3c614 100644
+--- a/NativeAdrenoGpuAll.h
++++ b/NativeAdrenoGpuAll.h
+@@ -89,6 +89,35 @@ enum : uint64_t {NagVmObjects=16384, NagVmSpans=131072, NagVmReservedObjects=409
+ inline bool nagAllowMap(uint64_t objects,uint64_t spans,uint64_t new_spans) {
+     return objects<NagVmObjects-NagVmReservedObjects && spans+new_spans<=NagVmSpans-NagVmReservedSpans;
+ }
++/* guamp (patch 0006): a refused BoMap or BoAlloc of a LIVE connection is VK_ERROR_OUT_OF_DEVICE_MEMORY (-2) inside Turnip, which its
++ * callers do not check: the process then faults on the value -2 (fin1: SpringBoard SIGSEGV, X0 fffffffe, in libvulkan_freedreno, right
++ * after two BoMaps refused by nagAllowMap). So the table reserve and the limit of all processes together are applied when a connection
++ * is OPENED (a refused open is a nil device, which every client handles as before gpu-all), never to a live connection's calls. */
++inline bool nagTablePressure(uint64_t objects,uint64_t spans) {
++    return objects>=NagVmObjects-NagVmReservedObjects || spans>=NagVmSpans-NagVmReservedSpans;
++}
++/* name is in list: comma-separated process names compared on their first 16 characters (the process name), "Name*" a prefix, "*" every
++ * name, blanks around a name ignored. Null or empty list: none. */
++inline bool nagListed(const char *list,const char *name) {
++    if(!list || !name)return false;
++    for(const char *at=list;*at;) {
++        size_t length=0;
++        while(at[length] && at[length]!=',')++length;
++        const char *item=at;
++        size_t n=length;
++        while(n && *item==' ') {++item;--n;}
++        while(n && item[n-1]==' ')--n;
++        if(n) {
++            const bool prefix=item[n-1]=='*';
++            const size_t cmp=prefix?n-1:n;
++            if(prefix && !cmp)return true;
++            const size_t limit=cmp<16?cmp:16;
++            if(!strncmp(name,item,limit) && (prefix || limit==16 || name[limit]==0))return true;
++        }
++        at+=length+(at[length]==','?1:0);
++    }
++    return false;
++}
+ /* A BO allocation of bytes by a process other than the render server: within its own limit and within the limit of all of them together. */
+ inline bool nagAllowBytes(uint64_t client_bytes,uint64_t others_bytes,uint64_t bytes,uint64_t per_client,uint64_t all_others) {
+     return bytes<=per_client && client_bytes<=per_client-bytes && bytes<=all_others && others_bytes<=all_others-bytes;
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index aa7d422..d2158af 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -142,14 +142,21 @@ static bool extensionClient(const char *name)
+ enum : unsigned {NativeAdrenoAllClients=32};
+ extern "C" {
+ volatile uint32_t native_adreno_gpu_all;
+-/* Set by the board (0 = default): [0] window MiB (192), [1] smallest window MiB (64), [2] BO MiB per process (384), [3] BO MiB of all
++/* Set by the board (0 = default): [0] window MiB (192), [1] smallest window MiB (64), [2] BO MiB per process (768 since patch 0006), [3] BO MiB of all
+  * processes but the render server (1024), [4] opens per name per minute (6), [5] live connections besides the render server's (16),
+  * [6] live connections per process (2). */
+ volatile uint32_t native_adreno_gpu_all_cfg[7];
+ /* [0] live connections, [1] their peak, [2] teardowns deferred, [3] deferred teardowns finished, [4] refused: rate, [5] refused: no slot,
+- * window or connection limit, [6] refused BoAllocs (memory limit), [7] refused BoMaps (render server's table reserve), [8] BO MiB of the
++ * window or connection limit, [6] [7] unused since patch 0006 (refused BoAllocs/BoMaps of 0005; see native_adreno_gpu_all_stats2), [8] BO MiB of the
+  * other processes now, [9] teardowns still deferred, [10] free window MiB, [11] largest window granted MiB. */
+ volatile uint32_t native_adreno_gpu_all_stats[12];
++/* guamp (patch 0006): [0] objects and [1] spans of the shared GPU table after the latest map or free, [2] opens refused by the deny list,
++ * [3] opens refused for table pressure, [4] opens refused because the other processes' BOs reached the total, [5] BoAllocs refused by
++ * the per-process limit (the only refusal left for a live connection). */
++volatile uint32_t native_adreno_gpu_all_stats2[6];
++/* Comma-separated process names that never get a connection with guamp-gpu-all (nagListed; the board sets it, default
++ * "SpringBoard,mediaserverd"): their open is refused, so the plugin returns nil and they keep the software paths of before gpu-all. */
++char native_adreno_gpu_all_deny[192];
+ }
+ #include "NativeAdrenoGpuAll.h"
+ static uint64_t gpuAllConfig(unsigned index,uint64_t fallback)
+@@ -623,17 +630,16 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+         const bool limited=native_adreno_gpu_all && connection->other_ && connection->live_;
+         uint64_t freed=0;
+         status=kIOReturnSuccess;
++        /* guamp (patch 0006): a live connection is refused nothing but a BoAlloc over its own ceiling (guamp-gpu-all-bo, now 768 MiB by
++         * default: a runaway process, which then faults in Turnip, as jetsam would have ended it). The table reserve and the total of all
++         * processes are applied at open (native_adreno_new_user_client): a refused map made Turnip fault on -2 (fin1, SpringBoard). */
+         if(limited && method==NativeAdrenoMethodBoAlloc && input && input_size==sizeof(NativeAdrenoAbiBoAlloc)) {
+             const uint64_t bytes=static_cast<const NativeAdrenoAbiBoAlloc *>(input)->bytes;
+-            if(!nagAllowBytes(connection->bo_bytes_,g.others_bytes,bytes,gpuAllConfig(2,384)<<20,gpuAllConfig(3,1024)<<20)) {
++            if(!nagAllowBytes(connection->bo_bytes_,0,bytes,gpuAllConfig(2,768)<<20,UINT64_MAX)) {
+                 status=kIOReturnNoMemory;
+-                native_adreno_gpu_all_stats[6]=native_adreno_gpu_all_stats[6]+1;
+-            }
+-        } else if(limited && method==NativeAdrenoMethodBoMap && input && input_size==sizeof(NativeAdrenoAbiBoMap)) {
+-            const NativeAdrenoMemory *memory=connection->core_->memoryOf(static_cast<const NativeAdrenoAbiBoMap *>(input)->handle);
+-            if(memory && !nagAllowMap(g.vm->objectCount(),g.vm->spanCount(),memory->spanCount())) {
+-                status=kIOReturnNoResources;
+-                native_adreno_gpu_all_stats[7]=native_adreno_gpu_all_stats[7]+1;
++                native_adreno_gpu_all_stats2[5]=native_adreno_gpu_all_stats2[5]+1;
++                IOLog("NativeAdreno: gpu-all: %s BoAlloc of %llu KiB refused (own BOs %llu MiB)\n",connection->name_,
++                    (unsigned long long)(bytes>>10),(unsigned long long)(connection->bo_bytes_>>20));
+             }
+         } else if(limited && method==NativeAdrenoMethodBoFree && input && input_size==sizeof(NativeAdrenoAbiBoFree)) {
+             const NativeAdrenoMemory *memory=connection->core_->memoryOf(static_cast<const NativeAdrenoAbiBoFree *>(input)->handle);
+@@ -652,6 +658,10 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+             }
+             native_adreno_gpu_all_stats[8]=uint32_t(g.others_bytes>>20);
+         }
++        if(native_adreno_gpu_all && !status && (method==NativeAdrenoMethodBoMap || method==NativeAdrenoMethodBoFree)) {
++            native_adreno_gpu_all_stats2[0]=uint32_t(g.vm->objectCount());
++            native_adreno_gpu_all_stats2[1]=uint32_t(g.vm->spanCount());
++        }
+         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
+             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
+                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
+@@ -916,8 +926,17 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+     bool capped=cap && record && record->opens>=cap;
+     /* guamp-gpu-all: a process other than the render server is limited per minute (guamp-gpu-all-rate, default 6) instead of per boot. */
+     if(native_adreno_gpu_all && !kernel && strncmp(opener,"backboardd",sizeof opener)) {
+-        capped=!g.rates.admit(opener,g.clock.now_us(g.clock.cookie)/1000,uint32_t(gpuAllConfig(4,6)));
+-        if(capped) {
++        /* guamp (patch 0006): admission. The deny list (processes that stay on their software paths), then the shared GPU table and the
++         * other processes' BO total: a connection is refused here, as a nil device, instead of a live one being refused a map or an
++         * allocation later (which Turnip turns into a fault). */
++        const char *why=nullptr;
++        if(nagListed(native_adreno_gpu_all_deny,opener)) {why="deny list";native_adreno_gpu_all_stats2[2]=native_adreno_gpu_all_stats2[2]+1;}
++        else if(nagTablePressure(g.vm->objectCount(),g.vm->spanCount())) {why="GPU table";native_adreno_gpu_all_stats2[3]=native_adreno_gpu_all_stats2[3]+1;}
++        else if(g.others_bytes>=gpuAllConfig(3,1024)<<20) {why="BO total";native_adreno_gpu_all_stats2[4]=native_adreno_gpu_all_stats2[4]+1;}
++        capped=why || !g.rates.admit(opener,g.clock.now_us(g.clock.cookie)/1000,uint32_t(gpuAllConfig(4,6)));
++        if(why)IOLog("NativeAdreno: gpu-all: %s refused (%s; table %u objects %u spans, others BO %u MiB)\n",opener,why,
++            uint32_t(g.vm->objectCount()),uint32_t(g.vm->spanCount()),uint32_t(g.others_bytes>>20));
++        else if(capped) {
+             native_adreno_gpu_all_stats[4]=native_adreno_gpu_all_stats[4]+1;
+             IOLog("NativeAdreno: gpu-all: %s refused (more than %u opens this minute)\n",opener,uint32_t(gpuAllConfig(4,6)));
+         }

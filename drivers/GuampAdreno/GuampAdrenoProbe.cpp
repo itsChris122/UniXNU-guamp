@@ -66,6 +66,8 @@ extern volatile uint32_t native_adreno_wide_request, native_adreno_wide_active;
 // patches/native-adreno/0005-gpu-all-dynamic-windows.patch: guamp-gpu-all=1 gives every process that opens the accelerator a connection
 // (dynamic windows, deferred teardown, limits); the board sets these before publishing.
 extern volatile uint32_t native_adreno_gpu_all, native_adreno_gpu_all_cfg[7];
+// patch 0006: processes that never get a connection with gpu-all (their open is refused: nil device, software paths as before).
+extern char native_adreno_gpu_all_deny[192];
 // ArmCpu's SPI attach (also used by the touch service).
 int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
@@ -506,12 +508,23 @@ int naPublish(Session &s) {
   gTimerIo = NativeAdrenoTimeIo{&s, naTimerRead};
   const IOReturn tim = gTimer->attach(&gTimerIo, NativeAdrenoTimeCp);
   // guamp-gpu-all=1 (default 0): every process that opens the accelerator gets a connection (patch 0005). Sizes in MiB, counts; 0 or
-  // absent keeps the patch's default: guamp-gpu-all-win 192, -minwin 64, -bo 384 (per process), -total 1024 (all but backboardd),
-  // -rate 6 (opens per name per minute), -max 16 (live connections besides backboardd), -perproc 2.
+  // absent keeps the patch's default: guamp-gpu-all-win 192, -minwin 64, -bo 768 (per process, patch 0006), -total 1024 (all but
+  // backboardd, checked at open since 0006), -rate 6 (opens per name per minute), -max 16 (live connections besides backboardd),
+  // -perproc 2. guamp-gpu-all-deny=<names> (comma-separated, "Name*" a prefix, "none" = nobody): default
+  // "SpringBoard,mediaserverd", which ran without Metal before gpu-all and fault or abort with it (fin1: SpringBoard SIGSEGV on -2
+  // in Turnip after a refused map, under CA::OGL::MetalContext; mediaserverd an uncaught exception at every launch). Photos' fin1
+  // crash (objc_msgSend in -[LAContext canEvaluatePolicy:error:]) came with every jump of the refused-map count: a heap the -2 had
+  // already corrupted, most likely; patch 0006 no longer refuses a live connection's maps, so Photos is not on the list.
   native_adreno_gpu_all = bootArg("guamp-gpu-all", 0) == 1;
   static const char *const kGpuAllArgs[7] = {"guamp-gpu-all-win", "guamp-gpu-all-minwin", "guamp-gpu-all-bo", "guamp-gpu-all-total",
                                              "guamp-gpu-all-rate", "guamp-gpu-all-max", "guamp-gpu-all-perproc"};
   for (unsigned i = 0; i < 7; i = i + 1) native_adreno_gpu_all_cfg[i] = bootArg(kGpuAllArgs[i], 0);
+  {
+    char deny[sizeof native_adreno_gpu_all_deny] = {};
+    if (!PE_parse_boot_argn("guamp-gpu-all-deny", deny, sizeof deny)) strlcpy(deny, "SpringBoard,mediaserverd", sizeof deny);
+    if (!strcmp(deny, "none")) deny[0] = 0;
+    memcpy(native_adreno_gpu_all_deny, deny, sizeof deny);
+  }
   // The client windows above 2 GiB (patch 0003's extension windows, guamp-gpu-all's dynamic ones) exist only for a core opened with 32
   // input bits: with 31, setScope refused every window ending above 0x80000000 (kIOReturnBadArgument -> mount step 3 -> Busy -> nil
   // device). 32 with the wide aperture and guamp-gpu-all=1, or with guamp-adreno-input-bits=32; 31 otherwise, as before.
@@ -519,9 +532,9 @@ int naPublish(Session &s) {
   const IOReturn pub = sub ? sub : native_adreno_publish(vm, gSubmit, gRing, &gClock, tim ? nullptr : gTimer, &kDeviceInfo, inputBits,
                                                          s.report.output_bits);
   IOLog("GuampAdreno: publish: submit attach %x timer %x publish %x; input bits %u, gpu-all %u (win %u minwin %u bo %u total %u rate %u "
-        "max %u perproc %u)\n", sub, tim, pub, inputBits, native_adreno_gpu_all, native_adreno_gpu_all_cfg[0], native_adreno_gpu_all_cfg[1],
+        "max %u perproc %u, deny '%s')\n", sub, tim, pub, inputBits, native_adreno_gpu_all, native_adreno_gpu_all_cfg[0], native_adreno_gpu_all_cfg[1],
         native_adreno_gpu_all_cfg[2], native_adreno_gpu_all_cfg[3], native_adreno_gpu_all_cfg[4], native_adreno_gpu_all_cfg[5],
-        native_adreno_gpu_all_cfg[6]);
+        native_adreno_gpu_all_cfg[6], native_adreno_gpu_all_deny);
   return sub || pub ? GuampAdrenoPublish : GuampAdrenoOk;
 }
 
