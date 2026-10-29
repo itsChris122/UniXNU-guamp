@@ -189,7 +189,9 @@ uint32_t source(void *, uint8_t *dst, uint32_t frames, uint32_t bits) {
 bool wanted(void *, uint32_t *route) {
   if (!audiodev::gLock) return false;
   IOLockLock(audiodev::gLock);
-  const bool w = audiodev::gOpen && audiodev::gStream.running;
+  const uint64_t now = mach_absolute_time();
+  audiodev::gStream.consume(now);   // ends a hold the path never took
+  const bool w = audiodev::gStream.wantAdsp(now);
   *route = audiodev::gStream.route;
   IOLockUnlock(audiodev::gLock);
   return w;

@@ -171,6 +171,86 @@ constexpr uint32_t kLogFirstBlock = 1, kLogMaxBlocks = 1023, kFbFirstBlock = 102
 constexpr uint32_t kPanicFirstBlock = 12288, kPanicBytes = 64 * 1024;   // panic region copy in kpan
 constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for the DMA write self test
 
+// Read pattern and read-ahead (29/10, analisi/kernel-build/AVVIO-VELOCE-20261029.md). The boot reads ~1.6 GB in requests
+// of 10-14 blocks (5-7 KiB) on average, with the card busy ~76% of the time: the per-command cost dominates, not the bus.
+// guamp-emmc-hist (default 1, =0 off): one line per 10 s report with the request sizes of the period and the share of
+// requests that start where one of the last 8 ended (sequential streams), to size the read-ahead from data.
+// guamp-emmc-ra=K (KiB, default 0 = off; 8..64, the DMA buffer): a read smaller than K on a READ-ONLY window becomes one
+// K KiB command whose blocks are kept in a small slot cache (32 slots, at most 2 MiB); later reads entirely inside a slot
+// are served from memory. Card gate held for every access. Writes invalidate overlapping slots (Card::writeBlocks and
+// writeLogBlock), so even a range written later through another device is never served stale.
+namespace emmcra {
+constexpr unsigned kSlots = 32, kStreams = 8;
+struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint8_t *data; };
+static Slot gSlot[kSlots];
+static uint32_t gBlocks = 0, gClock = 0, gHistOn = 1;
+static uint64_t gHits = 0, gFills = 0, gHitBlocks = 0, gExtraBlocks = 0, gBypass = 0;
+static uint64_t gHist[6] = {}, gSeq = 0, gReqs = 0, gEnds[kStreams] = {};
+static unsigned gEndAt = 0;
+static void configure() {
+  uint32_t hist = 1, kib = 0;
+  PE_parse_boot_argn("guamp-emmc-hist", &hist, sizeof(hist));
+  gHistOn = hist ? 1 : 0;
+  PE_parse_boot_argn("guamp-emmc-ra", &kib, sizeof(kib));
+  if (kib && (kib < 8 || kib > kBounceBlocks * kBlock / 1024)) kib = 0;
+  uint32_t blocks = kib * 1024 / kBlock;
+  for (unsigned i = 0; blocks && i < kSlots; i = i + 1) {
+    gSlot[i].data = static_cast<uint8_t *>(IOMallocZero(blocks * kBlock));
+    if (!gSlot[i].data) {
+      for (unsigned j = 0; j < i; j = j + 1) { IOFree(gSlot[j].data, blocks * kBlock); gSlot[j].data = nullptr; }
+      blocks = 0;
+    }
+  }
+  gBlocks = blocks;
+  IOLog("NativeEmmc: request histogram %s, read-ahead %s (%u KiB x %u slots on read-only windows; guamp-emmc-ra=K)\n",
+        gHistOn ? "on" : "off", gBlocks ? "on" : "off", gBlocks * kBlock / 1024, gBlocks ? kSlots : 0);
+}
+// Card gate held: one read request of count blocks at the card's lba.
+static void note(uint64_t lba, uint64_t count) {
+  if (!gHistOn) return;
+  gReqs = gReqs + 1;
+  gHist[count <= 1 ? 0 : count <= 8 ? 1 : count <= 16 ? 2 : count <= 32 ? 3 : count <= 128 ? 4 : 5] += 1;
+  for (unsigned i = 0; i < kStreams; i = i + 1)
+    if (gEnds[i] == lba) { gSeq = gSeq + 1; gEnds[i] = lba + count; return; }
+  gEnds[gEndAt] = lba + count;
+  gEndAt = (gEndAt + 1) % kStreams;
+}
+// Card gate held: drops every slot overlapping [lba, lba + count).
+static void invalidate(uint64_t lba, uint64_t count) {
+  if (!gBlocks) return;
+  for (unsigned i = 0; i < kSlots; i = i + 1)
+    if (gSlot[i].count && lba < gSlot[i].lba + gSlot[i].count && gSlot[i].lba < lba + count) gSlot[i].count = 0;
+}
+static Slot *find(uint64_t lba, uint32_t count) {
+  for (unsigned i = 0; i < kSlots; i = i + 1)
+    if (gSlot[i].count && lba >= gSlot[i].lba && lba + count <= gSlot[i].lba + gSlot[i].count) return &gSlot[i];
+  return nullptr;
+}
+static Slot *victim() {
+  unsigned best = 0;
+  for (unsigned i = 0; i < kSlots; i = i + 1) {
+    if (!gSlot[i].count) return &gSlot[i];
+    if (gSlot[i].age < gSlot[best].age) best = i;
+  }
+  return &gSlot[best];
+}
+static void report() {
+  static uint64_t lHits, lFills, lHitBlocks, lExtra, lBypass, lHist[6], lSeq, lReqs;
+  if (gHistOn && gReqs != lReqs) {   // nothing printed for a period without reads
+    uint64_t reqs = gReqs - lReqs, h[6];
+    for (unsigned i = 0; i < 6; i = i + 1) { h[i] = gHist[i] - lHist[i]; lHist[i] = gHist[i]; }
+    IOLog("NativeEmmc sizes: %llu requests, <=512B %llu, <=4K %llu, <=8K %llu, <=16K %llu, <=64K %llu, more %llu; sequential %llu%%\n",
+          reqs, h[0], h[1], h[2], h[3], h[4], h[5], reqs ? (gSeq - lSeq) * 100 / reqs : 0);
+    lSeq = gSeq; lReqs = gReqs;
+  }
+  if (gBlocks) {
+    IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead), bypass %llu\n", gHits - lHits,
+          (gHitBlocks - lHitBlocks) * kBlock / 1024, gFills - lFills, (gExtraBlocks - lExtra) * kBlock / 1024, gBypass - lBypass);
+    lHits = gHits; lFills = gFills; lHitBlocks = gHitBlocks; lExtra = gExtraBlocks; lBypass = gBypass;
+  }
+}
+}  // namespace emmcra
+
 // SDHCI registers
 enum : uint32_t {
   rArg = 0x08, rXfer = 0x0C, rCmd = 0x0E, rResp = 0x10, rData = 0x20, rPresent = 0x24, rHostCtl = 0x28,
@@ -595,6 +675,7 @@ struct Card {
   bool multiOk = true;
   // Writes of a writable window (its device checks the range)
   bool writeBlocks(uint64_t lba, uint32_t count, const uint8_t *in) {
+    emmcra::invalidate(lba, count);
     if (native_emmc_dma_write) {
       native_emmc_dma_write_runs++;
       if (host.writeDma(lba, count, in)) { native_emmc_window_writes += count; return true; }
@@ -611,6 +692,7 @@ struct Card {
   // Log writes, confined to the log partition
   bool writeLogBlock(uint64_t index, const uint8_t *in) {
     if (!logBlocks || index >= logBlocks) return false;
+    emmcra::invalidate(logFirst + index, 1);
     bool ok = host.writeBlock(logFirst + index, in);
     if (ok) guamp_emmc_log_bytes += kBlock;
     return ok;
@@ -649,6 +731,32 @@ struct Card {
 
 Card gCard;
 IOService *gPlatform = nullptr;
+
+// guamp-emmc-ra (see emmcra above), card gate held: 1 when the run [lba, lba + count) of a read-only window ending at end was
+// served (from a slot, or by one read-ahead command into a slot), 0 when the caller reads it as usual, -1 on a copy error.
+static int readAhead(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescriptor *buffer, uint64_t offset)
+{
+  using namespace emmcra;
+  if (!gBlocks || count >= gBlocks || lba >= end) return 0;
+  Slot *slot = find(lba, count);
+  if (slot) {
+    gHits = gHits + 1;
+    gHitBlocks += count;
+    slot->age = ++gClock;
+    return buffer->writeBytes(offset, slot->data + (lba - slot->lba) * kBlock, count * kBlock) == count * kBlock ? 1 : -1;
+  }
+  uint64_t blocks = end - lba < gBlocks ? end - lba : gBlocks;
+  if (blocks <= count) { gBypass = gBypass + 1; return 0; }
+  slot = victim();
+  slot->count = 0;
+  if (!gCard.readBlocks(lba, static_cast<uint32_t>(blocks), slot->data)) { gBypass = gBypass + 1; return 0; }
+  slot->lba = lba;
+  slot->count = static_cast<uint32_t>(blocks);
+  slot->age = ++gClock;
+  gFills = gFills + 1;
+  gExtraBlocks += blocks - count;
+  return buffer->writeBytes(offset, slot->data, count * kBlock) == count * kBlock ? 1 : -1;
+}
 
 bool Card::findPartitions()
 {
@@ -800,6 +908,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
     }
     lastLock = native_emmc_t_lock; lastCmd = native_emmc_t_cmd; lastData = native_emmc_t_data; lastCopy = native_emmc_t_copy;
     lastRuns = native_emmc_t_runs;
+    emmcra::report();
     if (native_emmc_errors)
       IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes, DMA write runs %llu (failed %llu)\n",
             native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes,
@@ -938,7 +1047,10 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     uint8_t *readBuffer = card.bounce;
     if (!write && card.directRead && native_emmc_dma && card.host.dmaCached && card.host.dmaData && bytes <= Host::kDmaBytes)
       readBuffer = const_cast<uint8_t *>(card.host.dmaData);
-    bool ok = write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
+    if (!write && !done) emmcra::note(first + block, count);
+    const int ahead = write || writable ? 0 : readAhead(first + block + done, n, first + blocks, buffer, done * kBlock);
+    bool ok = ahead ? ahead > 0
+              : write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
                     : card.readBlocks(first + block + done, n, readBuffer) &&
                           buffer->writeBytes(done * kBlock, readBuffer, bytes) == bytes;
@@ -1105,8 +1217,10 @@ static void usbProbe()
 #include "GuampAsm.inc"        // q6asm/q6adm PCM chain (apr::Playback, guamp-adsp-ipc=5|6), after GuampAdsp.inc
 #include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
 #include "GuampAudioPlay.inc"  // shared PCM buffer + SMMU probe + ring hooks of the ADSP chain (ipc 5|6)
+#include "GuampJackDev.inc"    // 3.5 mm jack: wcd937x MBHC poll + /dev/guamp-jack (guamp-audio-jack=1), after GuampAudioDev.inc
 #include "GuampSnsRpc.inc"     // FastRPC listener of the ADSP sensors PD (guamp-sensors=2): persist registry, SMMU 0x1c3
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
+#include "GuampCamera.inc"     // camera step 1 (guamp-camera=1): PM8008 + MCLK + CCI chip id of the 4 sensors, own thread; after GuampAudioHw.inc (shared SE1 I2C)
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1209,6 +1323,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     card.directRead = direct == 1;
     IOLog("NativeEmmc: direct cached read buffer %s (default on, writes unchanged)\n", card.directRead ? "enabled" : "disabled");
   }
+  emmcra::configure();   // guamp-emmc-hist (default 1), guamp-emmc-ra=K KiB (default 0 = off)
   card.online = true;
   if (!guamp_panic_base) {
     void *region = IOMallocZero(kPanicBytes);
@@ -1257,7 +1372,9 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   audiohw::start();   // guamp-audio-hw=1|2: speaker amplifier side of the ADSP tone/PCM path (=2: boot probe thread)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
   micglue::configure();  // guamp-audio-mic=1: /dev/guamp-mic (null source until the ADSP capture runs)
+  jackdev::start();      // guamp-audio-jack=1: MBHC thread (waits for the wcd937x register link) + /dev/guamp-jack
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
+  camera::start();    // guamp-camera=1: chip id probe of the four sensors (PM8008, CCI), then all off; after audiohw::start (bus lock)
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start

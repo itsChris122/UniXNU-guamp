@@ -43,3 +43,13 @@ video mode, every wait is bounded, 4 failed transfers in a row stop DSI access. 
 CoreBrightness sets `brightness`/`FadePeriod`; display off (Power key, auto-lock) arrives as brightness 0.
 `guamp-backlight-control=0` publishes without conformance, `guamp-backlight-test=1` dims to 1/8 for 3 s at start.
 Host tests: `tests/run-backlight-tests.sh` (WSL).
+
+Boot argument `guamp-camera=1` (GuampCamera.inc, default off): camera step 1, chip id only. After `guamp-camera-delay`
+(default 15 s) a thread powers the PM8008 (QUP0 SE1 I2C, shared with the speaker amplifier under the audio lock),
+turns on the CAMSS top GDSC and the CCI clock, then for each sensor in `guamp-camera-mask` (bit = DT cell, default
+0xf) runs the power-up order of its sensormodule blob (L1P-L7P, MCLK 24 MHz from GPLL9 or 19.2 MHz TCXO with
+`guamp-camera-mclk=19`, reset/pwdn GPIO), reads the chip id over CCI and powers it down; everything is off at the end.
+One line per sensor: `GuampCamera: <sensor> chip id 0x.... (expected 0x....): OK|NACK|WRONG ID|FAILED`.
+`guamp-camera-cci=100|400|1000` timing set, `guamp-camera-pmgpio=1` programs PM8008 GPIO1 like the DT.
+GuampCameraRdi.h is the unused skeleton of the TPG -> CSID -> TFE RDI test frame. Sensor register tables are vendor
+data and stay out of this repo (GCAM v1 file, parser `gcam::gcamFind`). Host tests: `tests/run-camera-tests.sh` (WSL).

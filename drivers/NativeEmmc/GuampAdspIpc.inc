@@ -24,7 +24,8 @@
 //                     3 headphone), stream width guamp-adsp-pcm-bits (16|24), buffer address mode guamp-adsp-pcm-mem
 //                     (GuampAudioPlay.inc: 0 auto from the SMMU probe, 1 physical msw 0, 2 physical msw 1)
 //   guamp-adsp-ipc=6  the same chain as the sink of /dev/guamp-audio (with guamp-audio-dev=1): up while the plug-in
-//                     plays, down 2 s after STOP/close, route from GUAMP_AUDIO_SET_ROUTE
+//                     plays real sound (GuampAudioRing.inc: hold while it comes up, drain after STOP, silence gate
+//                     guamp-audio-idle-ms=4000), down guamp-audio-linger-ms (2000) after, route from GUAMP_AUDIO_SET_ROUTE
 // Default 0: GuampAdsp.inc behaves exactly as in phase 1 (SMEM read-only). Other GLINK channels the ADSP opens
 // (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here), except
 // IPCRTR with guamp-sensors=2 (GuampAdsp.inc sets gSns; needs guamp-adsp-ipc>=2): the channel gets its DT intents and
@@ -535,6 +536,9 @@ void startPlay() {
   gPlay.route = gPcmRoute;
   gPlay.bits = gPcmBits;
   gPlay.testMs = gToneMs;
+  unsigned lingerMs = 0;   // guamp-audio-linger-ms: how long the sink path stays up after the last wanted moment (200..60000)
+  if (PE_parse_boot_argn("guamp-audio-linger-ms", &lingerMs, sizeof(lingerMs)) && lingerMs >= 200 && lingerMs <= 60000)
+    gPlay.lingerMs = lingerMs;
   gPlay.shm = shm;
   gPlay.hooks.ctx = nullptr;
   gPlay.hooks.send = aprSend;

@@ -36,7 +36,16 @@ int of_property_read_u8_array(const struct device_node *n,const char *key,u8 *ou
 int of_property_read_u8(const struct device_node *n,const char *key,u8 *out) {
   (void)n; (void)key; (void)out; return -ENOENT;
 }
-int device_get_mac_address(struct device *d,u8 *out) { (void)d; (void)out; return -ENOENT; }
+/* guamp 29/10: the board's Wi-Fi address (ADT /chosen/mac-address-wifi0, set by the runtime before the probe), as Linux
+ * gives ath10k a DT local-mac-address. Without it the vdev used whatever the firmware reported (WMI service ready),
+ * which can be zero or differ from the address en0 and MobileGestalt already show. */
+unsigned char gw_board_mac[6];
+volatile int gw_board_mac_valid;
+int device_get_mac_address(struct device *d,u8 *out) {
+  (void)d;
+  if (!gw_board_mac_valid || !out) return -ENOENT;
+  memcpy(out, gw_board_mac, 6); return 0;
+}
 struct nvmem_cell *devm_nvmem_cell_get(struct device *d,const char *name) { (void)d; (void)name; return ERR_PTR(-ENOENT); }
 struct nvmem_cell *nvmem_cell_get(struct device *d,const char *name) { return devm_nvmem_cell_get(d,name); }
 void *nvmem_cell_read(struct nvmem_cell *cell,size_t *n) { (void)cell; (void)n; return ERR_PTR(-ENOENT); }

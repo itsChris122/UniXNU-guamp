@@ -1,0 +1,43 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2282c96..4696841 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7510,8 +7510,13 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+  * iPhone device class it logs "no apple logo found" and draws the bar alone in the middle of the screen. The iPhone XS 17.7 files
+  * apple-logo@2x~iphone.png and apple-logo-black@2x~iphone.png (iphone-res/ProgressUI.framework, local files) restore the logo above
+  * the bar, the same artwork and size as the kernel's boot logo (/chosen/guamp-logo). */
+-volatile int native_guamp_iphone_res_stage[7] = {0, 0, 0, 0, 0, 0, 0};
+-volatile int native_guamp_iphone_res_status[7] = {-1, -1, -1, -1, -1, -1, -1};
++/* The eighth view (owner 29/10, Phone from the iPhone XS 17.7) adds iPhone-only built-in apps to /Applications
++ * (iphone-res/Applications/<App>.app, local files: MobilePhone.app converted to arm64 and signed ad hoc, its CDHashes in the owner
++ * trust module). On the iPhone they live on the system volume, not among the staged deletable apps, so no migration installs them:
++ * LaunchServices registers them as system apps when it seeds its database (guamp-ls-rebuild=N in the same boot).
++ * guamp-iphone-applications=0 skips this view. */
++volatile int native_guamp_iphone_res_stage[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++volatile int native_guamp_iphone_res_status[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+ static const struct {
+ 	const char *source;
+ 	const char *point;
+@@ -7535,6 +7540,8 @@ static const struct {
+ 	{"/private/var/ngpu/iphone-res/ProgressUI.framework", "/System/Library/PrivateFrameworks/ProgressUI.framework",
+ 	 "/System/Library/PrivateFrameworks/ProgressUI.framework/apple-logo@2x~ipad.png",
+ 	 "/System/Library/PrivateFrameworks/ProgressUI.framework/apple-logo@2x~iphone.png"},
++	{"/private/var/ngpu/iphone-res/Applications", "/Applications",
++	 "/Applications/Preferences.app", "/Applications/MobilePhone.app"},
+ };
+ static int
+ native_guamp_iphone_res_enabled(void)
+@@ -7569,6 +7576,13 @@ native_guamp_iphone_res_mount(proc_t p, user_addr_t scratch)
+ 	printf("guamp-iphone-res: addon files %d, written %d, same %d, failed %d (last error %d)\n", native_gpu_addon_files,
+ 	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error);
+ 	for (size_t i = 0; i < sizeof(native_guamp_iphone_res) / sizeof(native_guamp_iphone_res[0]); i++) {
++		if (!strcmp(native_guamp_iphone_res[i].point, "/Applications")) {
++			uint32_t applications = 1;
++			if (PE_parse_boot_argn("guamp-iphone-applications", &applications, sizeof(applications)) && !applications) {
++				printf("guamp-iphone-res: /Applications skipped (guamp-iphone-applications=0)\n");
++				continue;
++			}
++		}
+ 		if (!strcmp(native_guamp_iphone_res[i].point, "/System/Library/ThermalMonitor") && !native_guamp_thermal_profile_enabled()) {
+ 			printf("guamp-iphone-res: %s skipped (guamp-thermal-profile=0)\n", native_guamp_iphone_res[i].point);
+ 			continue;

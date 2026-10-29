@@ -40,6 +40,7 @@ static size_t heapBytes;
 static void *IOMallocZero(size_t n) { heapBytes += n; return calloc(1, n); }
 static void IOFree(void *p, size_t n) { heapBytes -= n; free(p); }
 static uint64_t mach_absolute_time() { return gNowNs; }
+static bool PE_parse_boot_argn(const char *, void *, int) { return false; }   // no boot arguments in the host test
 static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = t; }
 struct IOLock { bool held; unsigned takes; };
 static bool gRemoteHolds;

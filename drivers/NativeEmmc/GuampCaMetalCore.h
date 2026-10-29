@@ -5,10 +5,12 @@
 //   good: backboardd up for kGcmGoodSec without any restart, and at least one frame presented since it started (when the counter exists)
 //   bad:  kGcmMaxRestarts restarts of backboardd, or no frame within kGcmNoFrameSec of its start (boot UI always presents frames)
 // A quiet screen presents no frames, so only the start of a backboardd instance is held to the frame rule.
+// noFrameSec (29/10): the frame rule limit for this boot, 0 = kGcmNoFrameSec. Boots with one-shot work (guamp-ls-rebuild,
+// guamp-install-staged-apps) keep the boot UI busy for minutes: GuampCaMetal.inc raises it to kGcmNoFrameOneShotSec there.
 #pragma once
 #include <stdint.h>
 
-static const uint32_t kGcmGoodSec = 120, kGcmNoFrameSec = 60, kGcmMaxRestarts = 2;
+static const uint32_t kGcmGoodSec = 120, kGcmNoFrameSec = 60, kGcmNoFrameOneShotSec = 300, kGcmMaxRestarts = 2;
 
 enum gcm_verdict { GCM_WAIT = 0, GCM_GOOD = 1, GCM_BAD_CRASH = 2, GCM_BAD_NOFRAMES = 3 };
 
@@ -19,6 +21,7 @@ struct gcm_state {
   uint32_t restarts;  // instances after the first one
   bool framesSeen;    // the watched instance presented at least one frame
   bool started;       // a backboardd instance was seen at least once
+  uint32_t noFrameSec;  // frame rule limit, 0 = kGcmNoFrameSec
 };
 
 static inline const char *gcm_name(gcm_verdict v) {
@@ -39,7 +42,7 @@ static inline gcm_verdict gcm_step(gcm_state *s, uint32_t now, int pid, bool hav
   if (!s->pid) return GCM_WAIT;
   if (haveFrames && frames != s->frames0) s->framesSeen = true;
   const uint32_t up = now - s->since;
-  if (haveFrames && !s->framesSeen && up >= kGcmNoFrameSec) return GCM_BAD_NOFRAMES;
+  if (haveFrames && !s->framesSeen && up >= (s->noFrameSec ? s->noFrameSec : kGcmNoFrameSec)) return GCM_BAD_NOFRAMES;
   if (!s->restarts && up >= kGcmGoodSec && (s->framesSeen || !haveFrames)) return GCM_GOOD;
   return GCM_WAIT;
 }

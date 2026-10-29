@@ -122,6 +122,81 @@ static void ring() {
          "silence padding, s24 container + gain, volume/route/info flags/stop: ok\n");
 }
 
+// ---- on-demand ADSP sink: hold while the path comes up, drain after STOP, idle gate, trim, live edge ----------------
+static void ondemand() {
+  static uint8_t mem[guampaudio::kRingBytes];
+  const uint64_t T = 24000000, ms = T / 1000;   // 24 MHz host clock
+  guampaudio::Stream s;
+  s.buf = mem;
+  s.bytes = sizeof(mem);
+  s.ticksPerSec = T;
+  s.adspEnabled = true;
+  s.idleTicks = 4000 * ms;
+  std::vector<uint8_t> quiet(4800 * 4, 0), click(14400 * 4);   // 100 ms of silence, 300 ms of sound
+  for (size_t i = 0; i < click.size(); i += 2) { click[i] = 0x00; click[i + 1] = (i / 2) & 1 ? 0x10 : 0xf0; }
+  std::vector<uint8_t> out(480 * 4);
+  // START + silence: not wanted, the null sink consumes
+  uint64_t now = T;
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, now, 0) == 0 && !s.wantAdsp(now));
+  CHECK(s.push(quiet.data(), static_cast<uint32_t>(quiet.size()), now) == quiet.size() && !s.hold && !s.wantAdsp(now));
+  now += 200 * ms;
+  s.consume(now);
+  CHECK(s.used() == 0);
+  // a click: hold (kept in the ring), wanted
+  CHECK(s.push(click.data(), static_cast<uint32_t>(click.size()), now) == click.size() && s.hold && s.holds == 1);
+  CHECK(s.wantAdsp(now));
+  now += 300 * ms;
+  s.consume(now);
+  CHECK(s.used() == click.size());
+  // STOP before the path is up (iOS stops IO when the sound ends): draining, still wanted; close/open keep it
+  CHECK(s.ioctl(GUAMP_AUDIO_STOP, nullptr, now, 0) == 0 && s.draining && s.drains == 1 && s.used() == click.size());
+  guamp_audio_volume v = {0x4000, -1200, 0, 0};
+  s.gainQ16 = v.gain_q16;
+  s.reset();
+  CHECK(s.used() == click.size() && s.draining && s.hold && s.gainQ16 == 0x4000 && s.wantAdsp(now));
+  // path up 150 ms later: the whole click plays (no live-edge cut: the client stopped), then drained
+  now += 150 * ms;
+  s.setSink(guampaudio::SinkAdsp, now);
+  CHECK(!s.hold && s.draining && s.used() == click.size());
+  uint32_t got = 0;
+  while (s.used()) got += s.pull(out.data(), 480, 16, now);
+  CHECK(got == 14400 && !s.draining && !s.wantAdsp(now));
+  s.setSink(guampaudio::SinkNull, now);
+  // a hold the path never takes is dropped after 2 s and the ring flows again
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, now, 0) == 0);
+  CHECK(s.push(click.data(), 4800 * 4, now) == 4800 * 4 && s.hold);
+  s.consume(now + 1900 * ms);
+  CHECK(s.hold && s.used() == 4800 * 4);
+  s.consume(now + 2001 * ms);
+  CHECK(!s.hold && s.holdDrops == 1 && s.used() == 0);
+  // music started cold: path up while the client still writes -> live edge (2 x 40 ms kept)
+  now += 3 * T;
+  CHECK(s.push(click.data(), static_cast<uint32_t>(click.size()), now) == click.size() && s.hold);
+  s.setSink(guampaudio::SinkAdsp, now);
+  CHECK(s.used() == 2 * 1920 * 4 && s.trimmedFrames == 14400 - 3840);
+  // idle gate: only silence for 4 s -> not wanted while still running
+  CHECK(s.wantAdsp(now + 3999 * ms) && !s.wantAdsp(now + 4001 * ms) && s.running);
+  // trim: head silence beyond 40 ms is skipped once the ring has more than that
+  while (s.used()) s.pull(out.data(), 480, 16, now);
+  const uint64_t before = s.trimmedFrames;
+  CHECK(s.push(quiet.data(), static_cast<uint32_t>(quiet.size()), now) == quiet.size());
+  CHECK(s.push(click.data(), 960 * 4, now) == 960 * 4);
+  CHECK(s.pull(out.data(), 480, 16, now) == 480 && s.trimmedFrames - before == 4800 + 960 - 1920);
+  // STOP with the path streaming silence only queued: still drains (at most the ring), then not wanted
+  CHECK(s.ioctl(GUAMP_AUDIO_STOP, nullptr, now, 0) == 0 && s.draining);
+  while (s.used()) s.pull(out.data(), 480, 16, now);
+  CHECK(!s.wantAdsp(now));
+  // null sink only (guamp-adsp-ipc != 6): no hold, STOP discards as before
+  guampaudio::Stream n;
+  n.buf = mem;
+  n.bytes = sizeof(mem);
+  n.ticksPerSec = T;
+  CHECK(n.ioctl(GUAMP_AUDIO_START, nullptr, now, 0) == 0 && n.push(click.data(), 4800 * 4, now) == 4800 * 4 && !n.hold);
+  CHECK(!n.wantAdsp(now) && n.ioctl(GUAMP_AUDIO_STOP, nullptr, now, 0) == 0 && n.used() == 0 && !n.draining);
+  printf("on-demand sink: silence not wanted, hold while the path comes up, drain after STOP across close/open with its "
+         "volume, hold dropped after 2 s, live edge when still writing, idle gate 4 s, head-silence trim: ok\n");
+}
+
 // ---- ASM/ADM builders ----------------------------------------------------------------------------------------------
 static std::vector<uint8_t> pkt(uint32_t n, const uint8_t *b) { return std::vector<uint8_t>(b, b + n); }
 static void hdr(const std::vector<uint8_t> &p, uint8_t svc, uint16_t src, uint16_t dst, uint32_t opcode) {
@@ -569,6 +644,7 @@ int main() {
   sendBlocked();
   abi();
   ring();
+  ondemand();
   builders();
   pcmPath();
   holdMode();

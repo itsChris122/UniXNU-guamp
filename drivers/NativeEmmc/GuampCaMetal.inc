@@ -111,6 +111,15 @@ static void thread(void *, wait_result_t) {
   restartBackboardd("the Metal device is published");
   const bool haveFrames = true;
   gcm_state s = {};
+  // 29/10: saf1 tripped the frame rule (60 s) while lsd rebuilt its database, and the next boots stayed in software. One-shot
+  // boots (guamp-ls-rebuild / guamp-install-staged-apps) get kGcmNoFrameOneShotSec; guamp-ca-metal-noframe=N sets it (N >= 30 s).
+  unsigned lsRebuild = 0, staged = 0, noFrame = 0;
+  PE_parse_boot_argn("guamp-ls-rebuild", &lsRebuild, sizeof(lsRebuild));
+  PE_parse_boot_argn("guamp-install-staged-apps", &staged, sizeof(staged));
+  if (lsRebuild || staged) noFrame = kGcmNoFrameOneShotSec;
+  if (PE_parse_boot_argn("guamp-ca-metal-noframe", &noFrame, sizeof(noFrame)) && noFrame < 30) noFrame = 30;
+  s.noFrameSec = noFrame;
+  IOLog("GuampCaMetal: frame rule %u s (ls-rebuild %u, staged apps %u)\n", noFrame ? noFrame : kGcmNoFrameSec, lsRebuild, staged);
   uint32_t now = 0;
   for (;;) {
     IOSleep(5000);

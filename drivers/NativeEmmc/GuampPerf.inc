@@ -62,8 +62,51 @@ static void guampCpuTopInsert(GuampMemTop *top, struct proc *p, int pid, uint64_
   const char *name = proc_best_name(p);
   strlcpy(top->cpuName[slot], name ? name : "?", sizeof(top->cpuName[slot]));
 }
+// guamp-abort-proc=<name> (owner 29/10, Spazio iPhone that never stops loading): once a process with this name has been alive
+// guamp-abort-after seconds (default 150, at least 10), the GuampCpu walk sends it SIGABRT, so ReportCrash writes
+// <name>-<date>.ips with the user stack of every thread: the thread that waits forever (dispatch_group_wait in AirTrafficDevice,
+// an XPC reply from Photos or the media library...) and the client it waits on. One signal per pid, at most 3 per boot, nothing
+// without the argument. strumenti/simboli-ips.py resolves the shared cache frames.
+#include <sys/time.h>
+extern "C" int proc_starttime(struct proc *, struct timeval *);
+extern "C" void psignal(struct proc *, int);
+extern "C" void microtime(struct timeval *);
+namespace guampabort {
+constexpr unsigned kMax = 3;
+constexpr int kSigAbrt = 6;   // SIGABRT
+static char gName[32];
+static unsigned gAfter = 150, gSent;
+static int gPids[kMax] = {-1, -1, -1};
+static int gEnabled = -1;
+static bool enabled() {
+  if (gEnabled < 0) {
+    bzero(gName, sizeof(gName));
+    gEnabled = PE_parse_boot_argn("guamp-abort-proc", gName, sizeof(gName) - 1) && gName[0] && gName[0] != '0';
+    unsigned after = 0;
+    if (PE_parse_boot_argn("guamp-abort-after", &after, sizeof(after)) && after >= 10) gAfter = after;
+    if (gEnabled) IOLog("GuampAbort: SIGABRT to %s after %u s alive (crash report with every thread stack)\n", gName, gAfter);
+  }
+  return gEnabled > 0;
+}
+static void visit(struct proc *p, int pid) {
+  if (gSent >= kMax || pid <= 1 || !enabled()) return;
+  const char *name = proc_best_name(p);
+  if (!name || strncmp(name, gName, sizeof(gName))) return;
+  for (unsigned i = 0; i < gSent; ++i)
+    if (gPids[i] == pid) return;
+  struct timeval start = {}, now = {};
+  proc_starttime(p, &start);
+  microtime(&now);
+  if (!start.tv_sec || now.tv_sec < start.tv_sec || static_cast<unsigned long>(now.tv_sec - start.tv_sec) < gAfter) return;
+  gPids[gSent] = pid;
+  gSent = gSent + 1;
+  IOLog("GuampAbort: %s[%d] alive %ld s: SIGABRT %u/%u\n", name, pid, static_cast<long>(now.tv_sec - start.tv_sec), gSent, kMax);
+  psignal(p, kSigAbrt);
+}
+}  // namespace guampabort
 static int guampMemTopVisit(struct proc *p, void *arg) {
   GuampMemTop *top = static_cast<GuampMemTop *>(arg);
+  guampabort::visit(p, proc_pid(p));
   task_t task = proc_task(p);
   if (!task) return 0;
   const uint64_t bytes = get_task_phys_footprint(task);

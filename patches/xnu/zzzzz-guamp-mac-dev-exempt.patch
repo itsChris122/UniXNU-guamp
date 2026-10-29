@@ -1,0 +1,95 @@
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -89,6 +89,41 @@
+ 
+ #include <security/mac_internal.h>
+ 
++/*
++ * guamp (UniXNU-guamp drivers/NativeEmmc GuampAudioDev.inc / GuampMicDev.inc): the PCM nodes /dev/guamp-audio and /dev/guamp-mic
++ * are opened by the AudioServerPlugIn GuampAudio.driver inside audiomxd, whose sandbox profile (temporary-sandbox) names only Apple
++ * audio nodes. The driver registers each node's cdevsw major here after cdevsw_add (-1 = none, the default: nothing changes
++ * without guamp-audio-dev=1 / guamp-audio-mic=1). Lookup, open, read, write and ioctl of those character devices skip the MAC
++ * policies; the node's own owner and mode (root:mobile 0660) still apply.
++ */
++int guamp_mac_exempt_major[2] = { -1, -1 };
++static const char *const guamp_mac_exempt_name[2] = { "guamp-audio", "guamp-mic" };
++
++static int
++guamp_mac_exempt_vnode(struct vnode *vp)
++{
++	if (vp == NULLVP || vp->v_type != VCHR) {
++		return 0;
++	}
++	int m = major(vnode_specrdev(vp));
++	return m >= 0 && (m == guamp_mac_exempt_major[0] || m == guamp_mac_exempt_major[1]);
++}
++
++static int
++guamp_mac_exempt_name_in(struct vnode *dvp, const char *name, size_t len)
++{
++	if (dvp == NULLVP || dvp->v_tag != VT_DEVFS || name == NULL) {
++		return 0;
++	}
++	for (int i = 0; i < 2; i++) {
++		size_t n = strlen(guamp_mac_exempt_name[i]);
++		if (guamp_mac_exempt_major[i] >= 0 && len == n && strncmp(name, guamp_mac_exempt_name[i], n) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ /* convert {R,W,X}_OK values to V{READ,WRITE,EXEC} */
+ #define ACCESS_MODE_TO_VNODE_MASK(m)    (m << 6)
+ 
+@@ -1515,6 +1550,9 @@
+ 		return 0;
+ 	}
+ #endif
++	if (guamp_mac_exempt_vnode(vp)) {
++		return 0;
++	}
+ 	cred = vfs_context_ucred(ctx);
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+@@ -1632,6 +1670,9 @@
+ 		return 0;
+ 	}
+ #endif
++	if (cnp != NULL && guamp_mac_exempt_name_in(dvp, cnp->cn_nameptr, (size_t)cnp->cn_namelen)) {
++		return 0;
++	}
+ 	cred = vfs_context_ucred(ctx);
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+@@ -1654,6 +1695,9 @@
+ 		return 0;
+ 	}
+ #endif
++	if (guamp_mac_exempt_vnode(vp)) {
++		return 0;
++	}
+ 	cred = vfs_context_ucred(ctx);
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+@@ -1677,6 +1721,9 @@
+ 		return 0;
+ 	}
+ #endif
++	if (guamp_mac_exempt_vnode(vp)) {
++		return 0;
++	}
+ 	cred = vfs_context_ucred(ctx);
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+@@ -2111,6 +2158,9 @@
+ 		return 0;
+ 	}
+ #endif
++	if (guamp_mac_exempt_vnode(vp)) {
++		return 0;
++	}
+ 	cred = vfs_context_ucred(ctx);
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;

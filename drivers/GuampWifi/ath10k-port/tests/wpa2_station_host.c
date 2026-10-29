@@ -258,5 +258,6 @@ int main(void) {
   nw_wifi_power(1); spin(3); nw_wifi_status_get(&st);
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
   control_regression_cases();
+  m4_status_missing_case();
   ready_regression_cases(hw);
   printf("%s\n", fails ? "FAILED" : "all passed"); return fails ? 1 : 0; }
