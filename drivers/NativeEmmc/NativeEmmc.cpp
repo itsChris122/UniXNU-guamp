@@ -1218,6 +1218,7 @@ static void usbProbe()
 #include "GuampAudioDev.inc"   // /dev/guamp-audio (guamp-audio-dev=1), PCM ring for the AudioServerPlugIn
 #include "GuampAudioPlay.inc"  // shared PCM buffer + SMMU probe + ring hooks of the ADSP chain (ipc 5|6)
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
+#include "GuampCamera.inc"     // camera step 1 (guamp-camera=1): PM8008 + MCLK + CCI chip id of the 4 sensors, own thread; after GuampAudioHw.inc (shared SE1 I2C)
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1369,6 +1370,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   adsp::start();      // guamp-adsp=1|2: ADSP start through TrustZone PAS (2: queries/integrity only), own thread
   micglue::configure();  // guamp-audio-mic=1: /dev/guamp-mic (null source until the ADSP capture runs)
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
+  camera::start();    // guamp-camera=1: chip id probe of the four sensors (PM8008, CCI), then all off; after audiohw::start (bus lock)
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
