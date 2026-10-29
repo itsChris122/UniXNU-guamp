@@ -449,9 +449,9 @@ static void qrtrTest() {
 }
 
 struct FirmwareServicePeer {
-  std::vector<uint8_t> reply;uint32_t destination=99;
-  static int tx(void *p,uint32_t,uint32_t node,uint32_t,const uint8_t *v,uint32_t n) {
-    auto &f=*static_cast<FirmwareServicePeer *>(p);f.destination=node;f.reply.assign(v,v+n);return Ok;
+  std::vector<uint8_t> reply;uint32_t destination=99,source=0;
+  static int tx(void *p,uint32_t from,uint32_t node,uint32_t,const uint8_t *v,uint32_t n) {
+    auto &f=*static_cast<FirmwareServicePeer *>(p);f.source=from;f.destination=node;f.reply.assign(v,v+n);return Ok;
   }
   static int size(void *,const char *path,uint32_t *bytes) {
     CHECK(!strcmp(path,"/image/wlanmdsp.mbn"));*bytes=3;return Ok;
@@ -460,17 +460,18 @@ struct FirmwareServicePeer {
     CHECK(at==0&&n==3);memcpy(out,"abc",3);return Ok;
   }
 };
+// Smoke test of the QFTP/SERVREG wiring; the protocol cases are in qftp_servreg_host.cpp.
 static void firmwareServiceTest() {
-  CHECK(QftpReadOnly::ServiceInstance==1); // version1, instance0 on the wire
-  FirmwareServicePeer f;QftpReadOnly q;
+  CHECK(Qftp::ServiceInstance==1); // version1, instance0 on the wire
+  FirmwareServicePeer f;Qftp q;
   CHECK(q.start(&f,FirmwareServicePeer::tx,FirmwareServicePeer::size,FirmwareServicePeer::read)==Ok);
   std::vector<uint8_t> request={0,1};
   const char name[]="/readonly/firmware/image/wlanmdsp.mbn";
   request.insert(request.end(),name,name+sizeof(name));
   const char mode[]="octet";request.insert(request.end(),mode,mode+sizeof(mode));
-  CHECK(q.receive(0,700,request.data(),request.size())==Ok&&f.destination==0);
+  CHECK(q.receive(Qftp::Port,0,700,request.data(),request.size())==Ok&&f.destination==0&&f.source==Qftp::sessionPort(0));
   CHECK(f.reply.size()==7&&f.reply[1]==3&&f.reply[3]==1&&!memcmp(f.reply.data()+4,"abc",3));
-  const uint8_t ack[]={0,4,0,1};CHECK(q.receive(0,700,ack,sizeof(ack))==Ok&&!q.active);
+  const uint8_t ack[]={0,4,0,1};CHECK(q.receive(Qftp::sessionPort(0),0,700,ack,sizeof(ack))==Ok&&!q.active());
   GuampServreg registry;CHECK(registry.start(&f,FirmwareServicePeer::tx)==Ok);
   uint8_t query[64]={};TlvWriter writer={query+7,sizeof(query)-7};
   CHECK(writer.add(1,"wlan/fw",7));put16(query+1,42);put16(query+3,0x21);put16(query+5,writer.size);
@@ -621,6 +622,14 @@ static void controlTest() {
     CHECK(found&&r.f.live>0);
     CHECK(r.c->modemStarted(0)==Ok&&r.c->step(WifiControl::ReadyMs)==Timeout&&!r.c->rmtfs.ready);
     CHECK(r.c->release(true)==Ok);
+  }
+  { // QFTP: one local port per transfer session (tqftpserv socket per transfer); quiesce before a PAS shutdown
+    ControlRig r(512); CHECK(r.prepare()==Ok);
+    uint32_t sessions=0; for(auto &l:r.c->qrtr.local) if(l.used&&l.client&&l.port>=Qftp::FirstSessionPort&&l.port<Qftp::FirstSessionPort+Qftp::Sessions) sessions++;
+    CHECK(sessions==Qftp::Sessions&&r.c->tftp.send!=nullptr&&r.c->servreg.ready);
+    CHECK(r.c->modemStarted(0)==Ok&&r.c->step(1)==Ok&&r.c->stage==WifiControl::AwaitModem);
+    r.c->quiesce(); CHECK(r.c->stage==WifiControl::Failed&&!r.c->servreg.ready&&r.c->tftp.send==nullptr&&!r.c->qrtr.running);
+    CHECK(r.c->release(true)==Ok&&r.c->stage==WifiControl::Off);
   }
   { ControlRig r(400);   // Linux semantics: item ids >= num_items are refused
     CHECK(r.prepare()==Range&&!strcmp(r.c->where(),"smem 428 smp2p out")&&r.saw("FAILED"));

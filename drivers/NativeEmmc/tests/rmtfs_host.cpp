@@ -272,7 +272,8 @@ static void qrtrTest() {
   pkt=v1(Qrtr::Data,0,0x5002,1,0x4300,open.b);
   size_t before=seen.size();
   CHECK(r.q.receive(pkt.data(),uint32_t(pkt.size()))==Ok&&r.q.step()==Ok&&r.out.size()==1);
-  CHECK(seen.size()==before+1&&!seen.back().tx&&seen.back().type==Qrtr::Data&&seen.back().dp==0x4300);  // first DATA traced
+  CHECK(seen.size()==before+2&&!seen[before].tx&&seen[before].type==Qrtr::Data&&seen[before].dp==0x4300);  // first DATA traced
+  CHECK(seen.back().tx&&seen.back().type==Qrtr::Data&&seen.back().sp==0x4300&&seen.back().dn==0);   // and its reply
   const auto &o=r.out[0];
   CHECK(le32(&o[4])==Qrtr::Data&&le32(&o[8])==1&&le32(&o[12])==0x4300&&le32(&o[24])==0&&le32(&o[28])==0x5002);
   Packet p={0x4300,0,0x5002,std::vector<uint8_t>(o.begin()+32,o.begin()+32+le32(&o[20]))};

@@ -22,7 +22,7 @@ struct Qrtr {
   void (*serviceEvent)(void *,bool)=nullptr;
   void (*received)(void *,const uint8_t *,uint32_t)=nullptr;
   Datagram queue[16]={};
-  LocalService local[8]={};
+  LocalService local[16]={};   // services (QFTP, SERVREG, RMTFS), QFTP session ports, SIM clients
   // Optional directory of every remote server (NEW/DEL_SERVER of any service).
   // up=false with service 0 means the whole remote node went away (BYE/DEL_PROC).
   void *directoryCtx=nullptr;
@@ -32,7 +32,7 @@ struct Qrtr {
   void *traceCtx=nullptr;
   void (*trace)(void *,bool tx,const Header &h,const uint8_t *body,uint32_t bytes,int e)=nullptr;
   uint32_t read=0,write=0,count=0,remoteNode=0,serverNode=0,serverPort=0;
-  uint32_t flow=0,txControl=0,rxControl=0,txAgain=0,dataTraced=0;
+  uint32_t flow=0,txControl=0,rxControl=0,txAgain=0,dataTraced=0,dataTxTraced=0;
   bool running=false,helloSent=false,remoteKnown=false,helloReceived=false;
   int start(const Allocator &a,void *opaque,int (*send)(void *,const uint8_t *,uint32_t),
             void (*event)(void *,bool),void (*data)(void *,const uint8_t *,uint32_t)) {
@@ -41,7 +41,7 @@ struct Qrtr {
     allocator=a; ctx=opaque; transmit=send; serviceEvent=event; received=data;
     memset(queue,0,sizeof(queue)); read=write=count=remoteNode=serverNode=serverPort=flow=0;
     running=true; helloSent=true;remoteKnown=false;helloReceived=false;
-    txControl=rxControl=txAgain=dataTraced=0;
+    txControl=rxControl=txAgain=dataTraced=dataTxTraced=0;
     // Linux qrtr_endpoint_register -> qrtr_hello_work: HELLO first, to node QRTR_EP_NID_AUTO (= broadcast) port CTRL.
     // qrtr_node_enqueue drops everything but HELLO until it has been sent, and qrtr_bcast_enqueue skips nodes whose
     // id is not known yet: local servers (QFTP/SERVREG/RMTFS) are announced only once the remote HELLO arrives,
@@ -97,6 +97,11 @@ struct Qrtr {
     for(uint32_t k=0;k<budget&&count;k++) {
       auto &p=queue[read]; int e=transmit(ctx,p.data,p.bytes);
       if(e==Again||e==NotReady) { txAgain++; return Again; }
+      if(p.type==Data&&trace&&dataTxTraced<32&&le32(p.data+12)!=LocalPort) {   // first replies of local services
+        dataTxTraced++;
+        Header h={Data,le32(p.data+8),le32(p.data+12),le32(p.data+24),le32(p.data+28),le32(p.data+20),32,false};
+        trace(traceCtx,true,h,p.data+32,h.size,e);
+      }
       if(p.type!=Data) {
         txControl++;
         if(trace) {

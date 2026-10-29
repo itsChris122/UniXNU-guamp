@@ -15,8 +15,17 @@ struct Ext4FirmwareSource {
     while(*a&&*b&&*a==*b) { ++a; ++b; }
     return *a==*b;
   }
+  // Any file under /image of the read-only modem firmware partition (what tqftpserv's translate_readonly serves from
+  // the firmware directory): no "..", no empty component, nothing outside /image.
   static bool allowed(const char *path) {
-    return equals(path,"/image/bdwlan_guamp_ipa.bin") || equals(path,"/image/wlanmdsp.mbn");
+    if(!path) return false;
+    const char *p="/image/"; for(uint32_t i=0;p[i];i++) if(path[i]!=p[i]) return false;
+    if(!path[7]) return false;
+    for(const char *c=path+6;*c;) {
+      if(*c=='/') { c++; if(*c=='/'||!*c) return false; if(c[0]=='.'&&c[1]=='.'&&(c[2]=='/'||!c[2])) return false; }
+      else c++;
+    }
+    return true;
   }
 
   int size(const char *path,uint32_t *bytes) {

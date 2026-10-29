@@ -194,7 +194,7 @@ static void qrtrClients() {
   CHECK(q.addLocalClient(Qrtr::LocalPort,nullptr,h)==Invalid);
   CHECK(q.addLocalService(14,1,0x4300,nullptr,h)==Ok);
   CHECK(q.addLocalClient(0x4300,nullptr,h)==Busy);
-  for(uint32_t i=0;i<7;i++) CHECK(q.addLocalClient(0x4400+i,nullptr,h)==Ok);
+  for(uint32_t i=0;i<15;i++) CHECK(q.addLocalClient(0x4400+i,nullptr,h)==Ok);   // 16 local endpoints
   CHECK(q.addLocalClient(0x4500,nullptr,h)==NoMemory);
   CHECK(q.addLocalClient(0x4400,nullptr,h)==Ok);   // idempotent
 }
