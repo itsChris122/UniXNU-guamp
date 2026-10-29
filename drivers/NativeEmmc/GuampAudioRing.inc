@@ -44,10 +44,25 @@ struct Stream {
   static constexpr int32_t kSilence = 2;                   // |sample| <= this counts as silence
   static constexpr uint32_t kTargetFrames = 4 * GUAMP_AUDIO_PERIOD_FRAMES, kMinSilentRun = 48;
   static constexpr uint64_t kHoldSec = 2;
+  // Live-edge cut only when more than this is queued at attach: the path now comes up in ~100-130 ms, and cutting a held
+  // system sound (lock, key click: 50-300 ms, written while IO keeps running) to its last 80 ms removed its attack.
+  static constexpr uint32_t kLiveEdgeFrames = 9600;   // 200 ms
   uint64_t idleTicks = 0, lastSoundTicks = 0, holdSince = 0;
   bool hold = false, draining = false;
   uint32_t holds = 0, holdDrops = 0, drains = 0;
   uint64_t trimmedFrames = 0;
+  // Pre-roll (ADSP sink, prerollFrames > 0; the device glue sets it from guamp-audio-preroll-ms, 0 = the old behaviour).
+  // The ADSP takes one 10 ms period per WRITE_DONE (8 in flight) while the plug-in writes one HAL buffer (1024 frames,
+  // 21 ms) per IO cycle, just in time: without a margin most periods found less than 480 frames and went out as the frames
+  // there plus zeros, i.e. a gap inside the sound every 10-20 ms (the crackle; fin8 logs: 400 underruns in 7 s). Now a
+  // running stream only plays whole periods: when a period cannot be filled, a period of silence goes out, nothing is taken
+  // from the ring, and playback restarts once prerollFrames are queued again (a single clean gap instead of a buzz).
+  // A stopped stream (draining) plays its tail to the end, zero-padded.
+  uint32_t prerollFrames = 0;
+  bool primed = false;
+  // per session (beginSession() at open): periods of pre-roll silence, the deepest queue seen by the ADSP, write sizes
+  uint32_t prerollWaits = 0, maxQueued = 0;
+  uint64_t sessionBase = 0;   // framesPlayed() at open (a draining tail of the previous sound may precede it)
 
   uint32_t used() const { return static_cast<uint32_t>(wr - rd); }
   uint32_t space() const { return bytes - used(); }
@@ -55,10 +70,9 @@ struct Stream {
   // open/close: a draining sound keeps its queue and its volume (the next open appends after it)
   void reset() {
     running = false;
-    underruns = 0;
     if (draining && used()) return;
     wr = rd = 0;
-    clockRunning = hold = draining = false;
+    clockRunning = hold = draining = primed = false;
     gainQ16 = GUAMP_AUDIO_GAIN_UNITY;
     mute = 0;
     centiDb = 0;
@@ -70,6 +84,15 @@ struct Stream {
     }
     return false;
   }
+  // Session counters (open): underruns, pre-roll, deepest queue, hold/drain/trim totals of this sound only
+  void beginSession() {
+    underruns = prerollWaits = maxQueued = 0;
+    holds = holdDrops = drains = 0;
+    routeChanges = volumeChanges = 0;
+    trimmedFrames = 0;
+    sessionBase = framesPlayed();
+  }
+  uint64_t sessionPlayed() const { return framesPlayed() - sessionBase; }
   bool silentFrameAt(uint64_t at) const {
     for (uint32_t b = 0; b < GUAMP_AUDIO_BYTES_PER_FRAME; b += 2) {
       const int32_t v = static_cast<int16_t>(
@@ -114,7 +137,20 @@ struct Stream {
   // underrun while running). Returns the frames taken from the ring.
   uint32_t pull(uint8_t *dst, uint32_t frames, uint32_t bits, uint64_t now) {
     trim();
-    const uint32_t avail = used() / GUAMP_AUDIO_BYTES_PER_FRAME, have = avail < frames ? avail : frames;
+    const uint32_t avail = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
+    if (avail > maxQueued) maxQueued = avail;
+    uint32_t have = avail < frames ? avail : frames;
+    if (prerollFrames && running) {
+      if (!primed && avail >= prerollFrames) primed = true;
+      if (primed && avail < frames) {   // ran dry while playing: one clean gap, then pre-roll again
+        primed = false;
+        underruns++;
+      }
+      if (!primed) {
+        if (avail) prerollWaits++;
+        have = 0;
+      }
+    }
     const uint32_t width = bits == 24 ? 4 : 2, samples = frames * GUAMP_AUDIO_CHANNELS;
     for (uint32_t i = 0; i < samples; i++) {
       int32_t v = 0;
@@ -127,7 +163,7 @@ struct Stream {
       for (uint32_t b = 0; b < width; b++) dst[i * width + b] = static_cast<uint8_t>(out >> (8 * b));
     }
     rd += static_cast<uint64_t>(have) * GUAMP_AUDIO_BYTES_PER_FRAME;
-    if (have < frames && running) underruns++;
+    if (have < frames && running && !prerollFrames) underruns++;
     if (draining && !used()) draining = false;
     anchorTicks = now;          // position: frames handed to the ADSP so far, at the time they were taken
     anchorFrame = framesPlayed();
@@ -181,10 +217,11 @@ struct Stream {
     hwReady = s == SinkAdsp;
     clockRunning = false;
     hold = false;
+    primed = false;   // pre-roll again on the new consumer
     if (s == SinkNull) draining = false;
     // Path up while the client still writes (music, video): start near the live edge, so the picture is not followed by the
     // path's start-up delay for the whole stream. A sound that already ended (draining) plays whole, late.
-    if (s == SinkAdsp && running && !draining && used() > 2 * kTargetFrames * GUAMP_AUDIO_BYTES_PER_FRAME) {
+    if (s == SinkAdsp && running && !draining && used() > kLiveEdgeFrames * GUAMP_AUDIO_BYTES_PER_FRAME) {
       const uint64_t keep = 2ull * kTargetFrames * GUAMP_AUDIO_BYTES_PER_FRAME;
       trimmedFrames += (used() - keep) / GUAMP_AUDIO_BYTES_PER_FRAME;
       rd = wr - keep;
@@ -210,6 +247,7 @@ struct Stream {
       case GUAMP_AUDIO_START:
         if (!running) {
           running = true;
+          if (!(draining && used())) primed = false;   // a fresh stream pre-rolls; one following a tail carries on
           draining = false;   // the new stream carries on after what is queued (hold, if any, stays)
           clockRunning = false;
           if (used() && sink == SinkNull) anchor(now);

@@ -35,7 +35,23 @@ bool gOpen = false;
 int gMajor = -1;
 void *gNode = nullptr;
 uint64_t gWrittenFrames = 0;
-uint32_t gOpens = 0, gWrites = 0, gIoctls = 0, gBlocked = 0;
+uint32_t gOpens = 0, gWrites = 0, gIoctls = 0, gBlocked = 0;   // gWrites/gIoctls/gBlocked: this session (reset at open)
+uint32_t gBusy = 0;                                            // opens refused (EBUSY) since boot
+int gOwnerPid = -1;
+char gOwner[32];
+// guamp-audio-log (default 1): one line per session (sound); 0 = only the first 8 and then one in 64, as before
+unsigned gLogAll = 1;
+// The session line. A sound that ended with frames still queued (STOP -> draining) is logged when its tail has been
+// played (pollPending(), from the wanted() hook of the ADSP sink) or when the next open comes first, so "played" is final.
+struct SessionLine {
+  bool pending = false, cut = false;
+  uint32_t n = 0, writes = 0, blocked = 0, ioctls = 0, underruns = 0, prerollWaits = 0, maxQueued = 0, routes = 0;
+  uint32_t volumes = 0, holds = 0, holdDrops = 0, drains = 0, gain = 0;
+  uint64_t written = 0, played = 0, trimmed = 0;
+  int pid = -1;
+  char who[32] = {};
+};
+SessionLine gPending;
 
 int adOpen(dev_t dev, int flags, int devtype, struct proc *p);
 int adClose(dev_t dev, int flags, int devtype, struct proc *p);
@@ -53,40 +69,116 @@ const struct cdevsw kSw = {
   adOpen, adClose, adRead, adWrite, adIoctl, adStop, adReset, nullptr, adSelect, adMmap, adStrategy, nullptr, nullptr, 0,
 };
 
+bool logged(uint32_t n) { return gLogAll || n <= 8 || !(n % 64); }
+
+// Fills the played/trimmed/deepest-queue part of a session line (device lock held)
+void sessionTail(SessionLine *l) {
+  l->played = gStream.sessionPlayed();
+  l->trimmed = gStream.trimmedFrames;
+  l->maxQueued = gStream.maxQueued;
+}
+
+void logSession(const SessionLine &l) {
+  if (!logged(l.n)) return;
+  // One line per sound: frames written/played, underruns (ADSP sink: periods that ran dry while playing), pre-roll
+  // periods, deepest queue the ADSP saw (ms of latency), writes and their average size, final gain (Q16)
+  IOLog("GuampAudioDev: session %u %s[%d]: %llu frames written, %llu played, %u underruns, %u pre-roll, max queue %u ms, "
+        "%u writes (avg %llu frames, %u blocked), %u ioctls, %u route / %u volume changes, gain %x, holds %u (dropped %u), "
+        "drains %u, trimmed %llu%s\n", l.n, l.who, l.pid, static_cast<unsigned long long>(l.written),
+        static_cast<unsigned long long>(l.played), l.underruns, l.prerollWaits, l.maxQueued / (GUAMP_AUDIO_RATE / 1000),
+        l.writes, static_cast<unsigned long long>(l.writes ? l.written / l.writes : 0), l.blocked, l.ioctls, l.routes,
+        l.volumes, l.gain, l.holds, l.holdDrops, l.drains, static_cast<unsigned long long>(l.trimmed),
+        l.cut ? " (tail cut short by the next open)" : "");
+}
+
+// The pending session line once its tail has been played (or dropped); called without the device lock
+void pollPending() {
+  if (!gLock) return;
+  SessionLine l;
+  IOLockLock(gLock);
+  if (gPending.pending && !(gStream.draining && gStream.used())) {
+    sessionTail(&gPending);
+    l = gPending;
+    gPending.pending = false;
+  }
+  IOLockUnlock(gLock);
+  if (l.pending) logSession(l);
+}
+
 int adOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   if (minor(dev) != 0 || !gLock) return ENXIO;
+  char who[32] = {};
+  proc_selfname(who, sizeof(who));
+  const int pid = proc_selfpid();
+  SessionLine prev;
   IOLockLock(gLock);
   if (gOpen) {
+    gBusy = gBusy + 1;
+    const uint32_t busy = gBusy;
+    char owner[32];
+    memcpy(owner, gOwner, sizeof(owner));
+    const int ownerPid = gOwnerPid;
     IOLockUnlock(gLock);
+    // A refused opener plays nothing for its whole IO session (the plug-in falls back to the null device): always say so
+    if (busy <= 32 || !(busy % 64))
+      IOLog("GuampAudioDev: open by %s[%d] refused (EBUSY, %u so far): held by %s[%d]\n", who, pid, busy, owner, ownerPid);
     return EBUSY;
+  }
+  if (gPending.pending) {   // the previous sound is still draining: its line now, with what has been played so far
+    sessionTail(&gPending);
+    gPending.cut = gStream.draining && gStream.used();
+    prev = gPending;
+    gPending.pending = false;
   }
   gOpen = true;
   gOpens = gOpens + 1;
   gStream.reset();
+  gStream.beginSession();
   gWrittenFrames = 0;
+  gWrites = gIoctls = gBlocked = 0;
+  gOwnerPid = pid;
+  memcpy(gOwner, who, sizeof(gOwner));
   const bool adsp = gStream.adspEnabled;
+  const uint32_t n = gOpens, preroll = gStream.prerollFrames;
   IOLockUnlock(gLock);
-  if (gOpens <= 8 || !(gOpens % 64))
-    IOLog("GuampAudioDev: open (%u), sink %s, ABI %u\n", gOpens, adsp ? "adsp (on sound)" : "null", GUAMP_AUDIO_ABI_VERSION);
+  if (prev.pending) logSession(prev);
+  if (n <= 8 || !(n % 64))
+    IOLog("GuampAudioDev: open (%u) by %s[%d], sink %s, ABI %u, pre-roll %u frames\n", n, who, pid,
+          adsp ? "adsp (on sound)" : "null", GUAMP_AUDIO_ABI_VERSION, preroll);
   return 0;
 }
 
 int adClose(dev_t dev, int flags, int devtype, struct proc *p) {
+  SessionLine l;
   IOLockLock(gLock);
   gStream.consume(mach_absolute_time());
-  const uint64_t written = gWrittenFrames, played = gStream.framesPlayed();
-  const uint32_t underruns = gStream.underruns, routeChanges = gStream.routeChanges, volumes = gStream.volumeChanges;
-  const uint32_t holds = gStream.holds, holdDrops = gStream.holdDrops, drains = gStream.drains;
-  const unsigned long long trimmed = gStream.trimmedFrames;
-  const bool draining = gStream.draining;
+  l.n = gOpens;
+  l.pid = gOwnerPid;
+  memcpy(l.who, gOwner, sizeof(l.who));
+  l.written = gWrittenFrames;
+  l.writes = gWrites;
+  l.blocked = gBlocked;
+  l.ioctls = gIoctls;
+  l.underruns = gStream.underruns;
+  l.prerollWaits = gStream.prerollWaits;
+  l.routes = gStream.routeChanges;
+  l.volumes = gStream.volumeChanges;
+  l.holds = gStream.holds;
+  l.holdDrops = gStream.holdDrops;
+  l.drains = gStream.drains;
+  l.gain = gStream.gainQ16;
+  sessionTail(&l);
+  // The tail of the sound (STOP with frames queued) keeps playing after close: its line waits for it (pollPending)
+  const bool tail = gStream.draining && gStream.used();
+  if (tail) {
+    l.pending = true;
+    gPending = l;
+  }
   gStream.reset();
   gOpen = false;
+  gOwnerPid = -1;
   IOLockUnlock(gLock);
-  if (gOpens <= 8 || !(gOpens % 64))   // iOS opens/closes for every sound: the first ones, then one in 64
-    IOLog("GuampAudioDev: close (%u); %llu frames written, %llu played, %u underruns, %u writes (%u blocked), %u ioctls, "
-          "%u route / %u volume changes; holds %u (dropped %u), drains %u%s, trimmed %llu frames\n", gOpens,
-          static_cast<unsigned long long>(written), static_cast<unsigned long long>(played), underruns, gWrites, gBlocked,
-          gIoctls, routeChanges, volumes, holds, holdDrops, drains, draining ? " (draining)" : "", trimmed);
+  if (!tail) logSession(l);
   return 0;
 }
 
@@ -191,6 +283,13 @@ void start() {
   nanoseconds_to_absolutetime(static_cast<uint64_t>(idleMs) * 1000000ull, &idle);
   gStream.idleTicks = idle;
   gStream.dspBits = adspipc::gPcmBits;
+  // guamp-audio-preroll-ms (default 40, 0 = off, at most 200): audio the ADSP sink waits for before it plays a running
+  // stream, and again after the stream ran dry (GuampAudioRing.inc Stream::prerollFrames)
+  unsigned prerollMs = 40;
+  PE_parse_boot_argn("guamp-audio-preroll-ms", &prerollMs, sizeof(prerollMs));
+  if (prerollMs > 200) prerollMs = 40;
+  gStream.prerollFrames = prerollMs * (GUAMP_AUDIO_RATE / 1000);
+  PE_parse_boot_argn("guamp-audio-log", &gLogAll, sizeof(gLogAll));
   if (PE_parse_boot_argn("guamp-audio-cdc", &cdc, sizeof(cdc)) && cdc == 1)
     gStream.routes |= (1u << GUAMP_AUDIO_DEV_ROUTE_EARPIECE) | (1u << GUAMP_AUDIO_DEV_ROUTE_HEADPHONE);
   uint64_t second = 0;

@@ -194,6 +194,7 @@ bool wanted(void *, uint32_t *route) {
   const bool w = audiodev::gStream.wantAdsp(now);
   *route = audiodev::gStream.route;
   IOLockUnlock(audiodev::gLock);
+  audiodev::pollPending();   // the line of a sound whose tail has now been played
   return w;
 }
 void attach(void *, bool on) {
