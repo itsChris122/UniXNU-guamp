@@ -13,10 +13,8 @@ struct nw_wifi_stats nw_wifi_stats;
 static bool gw_polling;
 static bool gw_servicing_ce;
 static int gw_boot_error;
-/* CE registers (PA 0x0c800000+0x240000) are live only between a successful hif power_up (WLFW WLAN_CFG +
- * WLAN_MODE mission, then CE init) and power_down, as Linux only touches them from its CE IRQs (enabled in
- * hif_power_up). A CE access before that hangs the SoC bus (WLAN block not up). */
-static bool gw_ce_live;
+/* gw_regs_live / gw_ce_live (declared in gw_snoc.c, before the register accessors): a register access outside a confirmed
+ * wlan_enable .. wlan_disable hangs the SoC bus; CE servicing runs only from a successful hif power_up to hif_stop. */
 
 static int gw_firmware_preflight(const struct lx_platform *platform) {
   static const char *const firmware[] = {
@@ -46,6 +44,8 @@ static int gw_firmware_preflight(const struct lx_platform *platform) {
  * handlers are registered yet, so keep the upstream IRQ path disabled. */
 static int gw_poll_hif_start(struct ath10k *ar) {
   struct ath10k_snoc *s = ath10k_snoc_priv(ar);
+  if(!gw_regs_live) return -ESHUTDOWN;
+  gw_ce_live=true;
   bitmap_clear(s->pending_ce_irqs, 0, CE_COUNT_MAX);
   ath10k_core_napi_enable(ar);
   ath10k_snoc_rx_post(ar);
@@ -57,7 +57,11 @@ static int gw_poll_hif_start(struct ath10k *ar) {
     lx_log(6,"ath10k: phase HIF start (CE polling, no CE IRQ): %u RX buffers posted:%s",total,line); }
   return 0;
 }
+/* As Linux's hif_stop disables the CE interrupts first: no poll, NAPI pass, RX refill or TX after this point, before the
+ * RX buffers still on the rings are freed (the error path of core_start runs this with the firmware up). */
 static void gw_poll_hif_stop(struct ath10k *ar) {
+  gw_ce_live=false;
+  timer_delete(&ath10k_snoc_priv(ar)->rx_post_retry);
   ath10k_core_napi_sync_disable(ar);
   ath10k_snoc_buffer_cleanup(ar);
 }
@@ -82,8 +86,10 @@ static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
   if(!gw_board.ready(gw_board.ctx)) return -ENODEV;
   int e=gw_board.power(gw_board.ctx,1); if(e) return e;
   e=ath10k_snoc_wlan_enable(ar,mode); if(e) return e;
+  gw_regs_live=true;   // WLFW confirmed mission mode: the block answers from here to wlan_disable
   ath10k_ce_alloc_rri(ar);
-  e=ath10k_snoc_init_pipes(ar); if(e) { lx_log(3,"ath10k: CE init failed %d",e); ath10k_ce_free_rri(ar); return e; }
+  e=ath10k_snoc_init_pipes(ar);
+  if(e) { gw_regs_live=false; lx_log(3,"ath10k: CE init failed %d",e); ath10k_ce_free_rri(ar); return e; }
   gw_ce_live=true;
   { struct ath10k_ce *ce=ath10k_ce_priv(ar);
     lx_log(6,"ath10k: phase CE init: 12 pipes at PA 0x%llx+0x240000, RRI bus 0x%llx",
@@ -91,7 +97,9 @@ static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
   return 0;
 }
 static void gw_hif_power_down(struct ath10k *ar) {
-  gw_ce_live=false;
+  // Nothing may reach the block once WLAN_MODE off is asked for: stop CE servicing and close the register window first.
+  gw_ce_live=false; gw_regs_live=false;
+  timer_delete(&ath10k_snoc_priv(ar)->rx_post_retry);
   int e=gw_board.wlan_disable(gw_board.ctx);
   if(e) { gw_boot_error=e; lx_log(3,"ath10k: WLAN stop unconfirmed; DMA retained"); return; }
   ath10k_ce_free_rri(ar);
@@ -156,7 +164,7 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
   int firmware_error=gw_firmware_preflight(platform);
   GW_TRACE("start: firmware preflight result %d",firmware_error);
   if(firmware_error)return firmware_error;
-  gw_board=*board; lx_plat=platform; gw_boot_error=0; gw_ce_live=false; memset(&nw_wifi_stats,0,sizeof(nw_wifi_stats));
+  gw_board=*board; lx_plat=platform; gw_boot_error=0; gw_ce_live=false; gw_regs_live=false; memset(&nw_wifi_stats,0,sizeof(nw_wifi_stats));
   memset(&gw_device,0,sizeof(gw_device)); gw_device.dev.name="guamp-wcn-snoc";
   nw_wifi_set_hooks(&gw_hooks);
   GW_TRACE("start: ath10k_core_create");

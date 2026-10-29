@@ -6,7 +6,9 @@
 #define trace_ath10k_log_dbg(...) ((void)0)
 #define trace_ath10k_log_dbg_dump(...) ((void)0)
 #define trace_ath10k_log_dbg_enabled(...) 0
-#define trace_ath10k_log_err(...) ((void)0)
+/* guamp: an ath10k_err() hands its format to the trace (gw_snoc.c), which extends the register trace after an error */
+void nw_wifi_trace_error(int level, const char *what);
+#define trace_ath10k_log_err(ar, vaf) nw_wifi_trace_error(3, (vaf)->fmt)
 #define trace_ath10k_log_info(...) ((void)0)
 #define trace_ath10k_log_warn(...) ((void)0)
 #define trace_ath10k_rx_hdr(...) ((void)0)

@@ -475,13 +475,69 @@ static struct ce_service_to_pipe target_service_to_ce_map_wlan[] = {
 extern volatile unsigned nw_wifi_trace_budget;
 int nw_wifi_trace_take(volatile unsigned *count);
 void nw_wifi_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+extern void (*volatile nw_wifi_trace_sink)(const char *line);
 static volatile unsigned gw_trace_mmio;
+
+/* After an ath10k error (level <= 3, debug.c via trace.h, or a blocked access below) the register trace gets 64 more lines,
+ * at most 4 times, so the next boot names the last register touched by the error path. Nothing happens while the trace is off. */
+#define GW_TRACE_BOOST 64u
+#define GW_TRACE_BOOSTS 4u
+static volatile unsigned gw_trace_boost;
+static bool gw_trace_mmio_take(void)
+{
+	if (!nw_wifi_trace_budget || !nw_wifi_trace_sink ||
+	    gw_trace_mmio >= nw_wifi_trace_budget + gw_trace_boost)
+		return false;
+	gw_trace_mmio++;
+	return true;
+}
+void nw_wifi_trace_error(int level, const char *what)
+{
+	char line[96];
+	size_t n;
+
+	if (!nw_wifi_trace_budget || !nw_wifi_trace_sink || level > 3)
+		return;
+	/* the format of the message (its arguments are not expanded here), without the trailing newline */
+	snprintf(line, sizeof(line), "%s", what ? what : "?");
+	n = strlen(line);
+	while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+		line[--n] = 0;
+	if (gw_trace_boost < GW_TRACE_BOOST * GW_TRACE_BOOSTS)
+		gw_trace_boost += GW_TRACE_BOOST;
+	nw_wifi_trace("error (level %d) \"%s\": register trace now %u lines (%u used)", level, line,
+		      nw_wifi_trace_budget + gw_trace_boost, gw_trace_mmio);
+}
+
+/* The WLAN block's registers answer only between a confirmed WLFW wlan_enable and the wlan_disable of hif power_down (an access
+ * outside that window hangs the SoC bus). gw_ce_live is narrower: CE servicing (polls, NAPI, RX refill timer, TX) between a
+ * successful hif power_up and hif_stop, as Linux's CE interrupts are on only in that window (ath10k_snoc_hif_stop disables them
+ * before the RX buffers are freed). Both are set and cleared in gw_snoc_tail.inc. */
+static bool gw_regs_live;
+static bool gw_ce_live;
+static unsigned gw_blocked_mmio;
+
+/* An access while the block is off is dropped (reads return 0) and named for the first 4: offset and caller (lx_now_ms+offset,
+ * resolve with the kernel's symbol map). */
+static bool gw_mmio_allowed(u32 offset, bool write, const void *caller)
+{
+	if (gw_regs_live)
+		return true;
+	if (gw_blocked_mmio++ < 4) {
+		lx_log(3, "ath10k: %s +0x%x blocked, WLAN block off (caller lx_now_ms+0x%llx)", write ? "write32" : "read32",
+		       offset, (unsigned long long)((uintptr_t)caller - (uintptr_t)lx_now_ms));
+		nw_wifi_trace_error(3, "register access while the WLAN block is off");
+	}
+	return false;
+}
 
 static void ath10k_snoc_write32(struct ath10k *ar, u32 offset, u32 value)
 {
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 
-	if (nw_wifi_trace_budget && nw_wifi_trace_take(&gw_trace_mmio))
+	if (!gw_mmio_allowed(offset, true, __builtin_return_address(0)))
+		return;
+	if (gw_trace_mmio_take())
 		nw_wifi_trace("mmio %u: write32 PA 0x%llx (+0x%x) = 0x%08x", gw_trace_mmio,
 			      (unsigned long long)ar_snoc->mem_pa + offset, offset, value);
 	iowrite32(value, ar_snoc->mem + offset);
@@ -492,7 +548,9 @@ static u32 ath10k_snoc_read32(struct ath10k *ar, u32 offset)
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 	u32 val;
 
-	if (nw_wifi_trace_budget && nw_wifi_trace_take(&gw_trace_mmio))
+	if (!gw_mmio_allowed(offset, false, __builtin_return_address(0)))
+		return 0;
+	if (gw_trace_mmio_take())
 		nw_wifi_trace("mmio %u: read32 PA 0x%llx (+0x%x)", gw_trace_mmio,
 			      (unsigned long long)ar_snoc->mem_pa + offset, offset);
 	val = ioread32(ar_snoc->mem + offset);
@@ -660,6 +718,8 @@ static void ath10k_snoc_rx_replenish_retry(struct timer_list *t)
 							 rx_post_retry);
 	struct ath10k *ar = ar_snoc->ar;
 
+	if (!gw_ce_live)	/* guamp: armed before hif_stop, fired after it (CE refill is a register write) */
+		return;
 	ath10k_snoc_rx_post(ar);
 }
 
@@ -705,6 +765,8 @@ static int ath10k_snoc_hif_tx_sg(struct ath10k *ar, u8 pipe_id,
 	struct ath10k_ce_pipe *ce_pipe;
 	int err, i = 0;
 
+	if (!gw_ce_live)	/* guamp: no CE TX after hif_stop / before power_up */
+		return -ESHUTDOWN;
 	snoc_pipe = &ar_snoc->pipe_info[pipe_id];
 	ce_pipe = snoc_pipe->ce_hdl;
 	spin_lock_bh(&ce->ce_lock);
@@ -774,6 +836,8 @@ static void ath10k_snoc_hif_send_complete_check(struct ath10k *ar, u8 pipe,
 
 	ath10k_dbg(ar, ATH10K_DBG_SNOC, "snoc hif send complete check\n");
 
+	if (!gw_ce_live)	/* guamp: also reached from WMI/HTT waits after an error */
+		return;
 	if (!force) {
 		resources = ath10k_snoc_hif_get_free_queue_number(ar, pipe);
 
