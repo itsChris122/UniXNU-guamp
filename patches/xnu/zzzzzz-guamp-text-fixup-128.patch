@@ -1,0 +1,17 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -6104,8 +6104,11 @@ cs_validate_hash(
+  * the original bytes match, so a different file or build is left alone.
+  */
+ #include <pexpert/device_tree.h>
+-/* 64 entries (28/10/2026): the board table holds 33 (29 GPU/UI, 3 Bluetooth, the UIKitCore emoji size) and grows. */
+-#define CS_TEXT_FIXUP_MAX 64
++/*
++ * 128 entries (29/10/2026): the board table reached 64/64. The table is static (128 x 112 bytes); /chosen/text-fixups is read
++ * in place with no size cap (DarwinBoot takes an ADT up to 16 MiB), so a table of 64 or fewer entries loads unchanged.
++ */
++#define CS_TEXT_FIXUP_MAX 128
+ #define CS_TEXT_FIXUP_BYTES 16
+ struct cs_text_fixup {
+ 	char            name[64];

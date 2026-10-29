@@ -26,7 +26,10 @@
 //   guamp-adsp-ipc=6  the same chain as the sink of /dev/guamp-audio (with guamp-audio-dev=1): up while the plug-in
 //                     plays, down 2 s after STOP/close, route from GUAMP_AUDIO_SET_ROUTE
 // Default 0: GuampAdsp.inc behaves exactly as in phase 1 (SMEM read-only). Other GLINK channels the ADSP opens
-// (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here).
+// (IPCRTR, fastrpcglink-apps-dsp, glink_ssr) are logged and left unanswered (no QRTR/QMI/FastRPC here), except
+// IPCRTR with guamp-sensors=2 (GuampAdsp.inc sets gSns; needs guamp-adsp-ipc>=2): the channel gets its DT intents and
+// carries the QRTR/QMI client of GuampSnsCore.h, which lists the ADSP services and looks up the SEE sensors
+// (SUID lookup + attributes, log prefix "GuampSns:"), analisi/sensori/SENSORI-20261029.md step 6.
 // Facts (guamp DT ~/moto/guamp.dts and kernel): SMEM 0x46000000 + 2 MiB, hwlocks = <&tcsr_mutex 3>, tcsr_mutex syscon
 // 0x340000 stride 0x1000 (lock 3 = 0x343000, apps owner id 1, qcom_hwspinlock.c); APCS IPC 0x0f111000 + 8
 // (qcom,bengal-apcs-hmss-global), write BIT(n): smp2p-adsp n = 10, glink adsp edge n = 8; glink adsp edge
@@ -42,6 +45,7 @@
 #include "GuampAfe.inc"
 #include "GuampAudioHwWeak.inc"
 #include "GuampAsm.inc"
+#include "GuampSnsCore.h"
 #ifndef GUAMP_MIC_DEV_INC   // without the microphone glue (host tests of this file): no mic
 namespace micglue {
 inline bool configure() { return false; }
@@ -61,7 +65,16 @@ constexpr uint32_t kApcsIpc = 8, kBitSmp2p = 10, kBitGlink = 8, kAwake = 1u << 1
 constexpr unsigned kRxWaitMs = 10000, kOpenWaitMs = 10000, kLoopMs = 20;
 const char *const kOutNames[3] = {"master-kernel", "rdbg", "sleepstate"};
 const uint32_t kOutValues[3] = {0, 0, kAwake};
-const qipc::GlinkChannelSpec kChannels[1] = {{"apr_audio_svc", 1, {{0x200, 20}, {0, 0}, {0, 0}}}};
+const qipc::GlinkChannelSpec kChannels[2] = {{"apr_audio_svc", 1, {{0x200, 20}, {0, 0}, {0, 0}}},
+                                             {"IPCRTR", 3, {{0x800, 5}, {0x2000, 3}, {0x4400, 2}}}};
+// guamp-sensors=2: QRTR on IPCRTR and the SEE lookup of these data types (GuampSnsCore.h)
+constinit unsigned gSns = 0;
+constinit uint16_t gIpcrtr = 0;
+constinit guamp_sns::Client *gSnsClient = nullptr;
+constinit bool gSnsFailed = false;
+const char *const kSnsTypes[] = {"accel", "gyro", "mag", "proximity", "ambient_light", "pressure", "sensor_temperature",
+                                 "gravity", "game_rv", "pedometer", "device_orient", "sig_motion"};
+constexpr uint32_t kSnsTypeCount = sizeof(kSnsTypes) / sizeof(kSnsTypes[0]);
 
 constinit unsigned gLevel = 0;
 constinit volatile uint8_t *gSmem = nullptr, *gApcs = nullptr;
@@ -240,7 +253,41 @@ int aprSend(void *, const uint8_t *p, uint32_t n) {
   aprTrack(p, n);
   return 0;
 }
+int snsSend(void *, const uint8_t *p, uint32_t n) {
+  if (!gGlink || !gIpcrtr) return -1;
+  const int e = gGlink->send(gIpcrtr, p, n);
+  return e == qipc::Ok ? 0 : e == qipc::Again ? 1 : -1;
+}
+void snsLog(void *, const char *what, const char *text, uint64_t a, uint64_t b) {
+  IOLog("GuampSns: %s%s%s %llx %llx at %u ms\n", what, text[0] ? " " : "", text, a, b, nowMs());
+}
+// IPCRTR (guamp-sensors=2): open, then the QRTR client once the channel is ready; called from service()
+void serviceSns() {
+  if (!gSns || gSnsFailed || !gGlink->negotiated) return;
+  if (!gIpcrtr) {
+    const int o = gGlink->open(kChannels[1].name, &gIpcrtr);
+    if (o) { IOLog("GuampSns: glink open IPCRTR: %s\n", qipc::errorName(o)); gSnsFailed = true; }
+    return;
+  }
+  if (!gGlink->ready(gIpcrtr)) return;
+  if (!gSnsClient) {
+    gSnsClient = static_cast<guamp_sns::Client *>(IOMallocZero(sizeof(guamp_sns::Client)));
+    if (!gSnsClient) { IOLog("GuampSns: no memory for the client\n"); gSnsFailed = true; return; }
+    gSnsClient->hooks.send = snsSend;
+    gSnsClient->hooks.log = snsLog;
+    gSnsClient->start(kSnsTypes, kSnsTypeCount);
+    IOLog("GuampSns: IPCRTR ready at %u ms (lcid %u): QRTR hello, then lookup of %u data types\n", nowMs(),
+          gIpcrtr, kSnsTypeCount);
+  }
+  gSnsClient->step(nowMs());
+  const int e = gSnsClient->flush();
+  if (e) { IOLog("GuampSns: IPCRTR send failed (%d): client stopped\n", e); gSnsFailed = true; }
+}
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
+  if (gSns && gIpcrtr && channel == gIpcrtr) {   // QRTR (guamp-sensors=2)
+    if (gSnsClient) gSnsClient->receive(p, n);
+    return;
+  }
   apr::Header h;
   const uint8_t *payload = nullptr;
   uint32_t bytes = 0;
@@ -309,7 +356,8 @@ void startGlink() {
     rx.tail = gDesc + 8;
     rx.head = gDesc + 12;
     const qipc::Allocator heap = {nullptr, heapAlloc, heapFree};
-    e = gGlink->start(tx, rx, heap, kChannels, gLevel >= 2 ? 1 : 0, nullptr, kickGlink, glinkTrace, glinkData);
+    e = gGlink->start(tx, rx, heap, kChannels, gLevel >= 2 ? (gSns ? 2 : 1) : 0, nullptr, kickGlink, glinkTrace,
+                       glinkData);
     if (!e) e = gGlink->step();
   }
   IOLog("GuampAdsp: ipc glink: desc %u %s at +%x, tx fifo %u %s at +%x (%u bytes): %s at %u ms\n", kGlinkDesc,
@@ -351,6 +399,7 @@ void service() {
     IOLog("GuampAdsp: ipc glink link error %s after %u commands: stopped\n", qipc::errorName(s), gGlink->rxCommands);
     return;
   }
+  serviceSns();
   if (gLevel >= 2 && gGlink->negotiated && !gApr) {
     const int o = gGlink->open(kChannels[0].name, &gApr);
     if (o) IOLog("GuampAdsp: ipc glink open %s: %s\n", kChannels[0].name, qipc::errorName(o));

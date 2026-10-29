@@ -91,7 +91,7 @@ struct Sm6115Runtime {
     transition(ProxyVotes);e=applyVotes(false);if(e)return fail(e,"proxy votes");
     WifiControl::Ops ops{};ops.ctx=this;ops.smpKick=smpKick;ops.glinkKick=glinkKick;
     ops.wlan={this,nullptr,assignMsa,wlanPower,fileSize,fileRead,wlfwEvent};
-    ops.event=controlEvent;ops.trace=controlTrace;
+    ops.event=controlEvent;ops.trace=controlTrace;ops.qrtrTrace=qrtrTrace;
     rmtfsReady=setupRmtfs(base,bytes);ops.rmtfs=rmtfsReady?&rmtfsIo:nullptr;
     unsigned sim=0;PE_parse_boot_argn("guamp-sim",&sim,sizeof(sim));
     ops.sim=sim==1;ops.simSnapshot=simSnapshot;
@@ -370,6 +370,41 @@ struct Sm6115Runtime {
   }
   static int rmtfsWrite(void *,uint32_t index,uint64_t at,const uint8_t *in,uint32_t bytes) {
     return guamp_rmtfs_partition_write(index,at,in,bytes);
+  }
+  static const char *qrtrType(uint32_t t) {
+    switch(t) {
+      case Qrtr::Data: return "DATA"; case Qrtr::Hello: return "HELLO"; case Qrtr::Bye: return "BYE";
+      case Qrtr::NewServer: return "NEW_SERVER"; case Qrtr::DelServer: return "DEL_SERVER"; case Qrtr::DelClient: return "DEL_CLIENT";
+      case Qrtr::Resume: return "RESUME_TX"; case Qrtr::Exit: return "EXIT"; case Qrtr::Ping: return "PING";
+      case Qrtr::NewLookup: return "NEW_LOOKUP"; case Qrtr::DelLookup: return "DEL_LOOKUP"; case Qrtr::DelProc: return "DEL_PROC";
+      default: return "?";
+    }
+  }
+  // One line per QRTR control packet received or handed to GLINK (IPCRTR), per refused packet, and for the first
+  // DATA packets to local service ports (QFTP/SERVREG/RMTFS/SIM clients). Addresses are node:port in hex.
+  static void qrtrTrace(void *,bool tx,const Qrtr::Header &h,const uint8_t *b,uint32_t n,int e) {
+    const char *dir=tx?"tx":"rx";
+    if(!b) {
+      IOLog("GuampQrtr: %s REFUSED type %u %x:%x -> %x:%x %u bytes: %d %s\n",dir,h.type,h.sn,h.sp,h.dn,h.dp,h.size,e,errorName(e));
+      return;
+    }
+    if(h.type==Qrtr::Data&&h.dp!=Qrtr::Ctrl) {
+      IOLog("GuampQrtr: %s DATA %x:%x -> %x:%x %u bytes, QMI type %u txn %u msg 0x%x\n",dir,h.sn,h.sp,h.dn,h.dp,n,
+            n>=7?b[0]:0u,n>=7?unsigned(le16(b+1)):0u,n>=7?unsigned(le16(b+3)):0u);
+      return;
+    }
+    uint32_t w[5]={};
+    for(uint32_t i=0;i<5;i++) if(n>=4*(i+1)) w[i]=le32(b+4*i);
+    const char *cmd=qrtrType(w[0]);
+    if(w[0]==Qrtr::NewServer||w[0]==Qrtr::DelServer)
+      IOLog("GuampQrtr: %s %s %x:%x -> %x:%x service %u (0x%x) version %u instance %u node %u port 0x%x: %d %s\n",
+            dir,cmd,h.sn,h.sp,h.dn,h.dp,w[1],w[1],w[2]&0xffu,w[2]>>8,w[3],w[4],e,errorName(e));
+    else if(w[0]==Qrtr::NewLookup||w[0]==Qrtr::DelLookup)
+      IOLog("GuampQrtr: %s %s %x:%x -> %x:%x service %u (0x%x) version %u instance %u: %d %s\n",
+            dir,cmd,h.sn,h.sp,h.dn,h.dp,w[1],w[1],w[2]&0xffu,w[2]>>8,e,errorName(e));
+    else
+      IOLog("GuampQrtr: %s %s %x:%x -> %x:%x (header type %u, %u bytes) node %u port 0x%x: %d %s\n",
+            dir,cmd,h.sn,h.sp,h.dn,h.dp,h.type,n,w[1],w[2],e,errorName(e));
   }
   static void rmtfsTrace(void *,const char *what,const char *name,int e,uint64_t a,uint64_t b,uint64_t c) {
     IOLog("GuampRmtfs: %s%s%s: %llu/%llu/%llu (0x%llx/0x%llx/0x%llx) result %d %s at %llu ms\n",

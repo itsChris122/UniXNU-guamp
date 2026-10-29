@@ -27,22 +27,26 @@ struct Qrtr {
   // up=false with service 0 means the whole remote node went away (BYE/DEL_PROC).
   void *directoryCtx=nullptr;
   void (*directory)(void *,bool up,uint32_t service,uint32_t instance,uint32_t node,uint32_t port)=nullptr;
+  // Optional diagnostics: every control packet received or handed to the link, every refused packet, and the first
+  // DATA packets to local service ports. body/bytes is the payload after the QRTR header (nullptr on a refusal).
+  void *traceCtx=nullptr;
+  void (*trace)(void *,bool tx,const Header &h,const uint8_t *body,uint32_t bytes,int e)=nullptr;
   uint32_t read=0,write=0,count=0,remoteNode=0,serverNode=0,serverPort=0;
-  uint32_t flow=0;
-  bool running=false,helloSent=false,remoteKnown=false;
+  uint32_t flow=0,txControl=0,rxControl=0,txAgain=0,dataTraced=0;
+  bool running=false,helloSent=false,remoteKnown=false,helloReceived=false;
   int start(const Allocator &a,void *opaque,int (*send)(void *,const uint8_t *,uint32_t),
             void (*event)(void *,bool),void (*data)(void *,const uint8_t *,uint32_t)) {
     if(running) return Busy;
     if(!a.alloc||!a.free||!send||!data) return Invalid;
     allocator=a; ctx=opaque; transmit=send; serviceEvent=event; received=data;
     memset(queue,0,sizeof(queue)); read=write=count=remoteNode=serverNode=serverPort=flow=0;
-    running=true; helloSent=true;remoteKnown=false;
-    int e=control(Hello,Broadcast,Ctrl,0,0,0,0);if(e)return e;
-    // WifiControl registers QFTP/SERVREG before this transport is opened.
-    // Publish those endpoints as soon as QRTR starts, as well as answering
-    // explicit NEW_LOOKUP requests from the remote namespace.
-    for(const auto &s:local)if(s.used&&!s.client) {e=announce(s,true);if(e)return e;}
-    return Ok;
+    running=true; helloSent=true;remoteKnown=false;helloReceived=false;
+    txControl=rxControl=txAgain=dataTraced=0;
+    // Linux qrtr_endpoint_register -> qrtr_hello_work: HELLO first, to node QRTR_EP_NID_AUTO (= broadcast) port CTRL.
+    // qrtr_node_enqueue drops everything but HELLO until it has been sent, and qrtr_bcast_enqueue skips nodes whose
+    // id is not known yet: local servers (QFTP/SERVREG/RMTFS) are announced only once the remote HELLO arrives,
+    // unicast to (remote node, CTRL), as the name service's ctrl_cmd_hello -> announce_servers does.
+    return control(Hello,Broadcast,Ctrl,0,0,0,0);
   }
   void stop() {
     if(serverPort&&serviceEvent) serviceEvent(ctx,false);
@@ -58,7 +62,7 @@ struct Qrtr {
       return s.service==service&&s.instance==instance&&s.ctx==opaque&&s.receive==handler?Ok:Busy;
     for(auto &s:local)if(!s.used) {
       LocalService candidate={service,instance,port,opaque,handler,true,false};
-      int e=running?announce(candidate,true):Ok;
+      int e=running&&helloReceived?announce(candidate,true,remoteNode):Ok;
       // A full transport queue must not leave a silent registration behind:
       // the caller can retry and still publish NEW_SERVER to the remote.
       if(e)return e;
@@ -92,7 +96,14 @@ struct Qrtr {
     if(!running) return NotReady;
     for(uint32_t k=0;k<budget&&count;k++) {
       auto &p=queue[read]; int e=transmit(ctx,p.data,p.bytes);
-      if(e==Again||e==NotReady) return Again;
+      if(e==Again||e==NotReady) { txAgain++; return Again; }
+      if(p.type!=Data) {
+        txControl++;
+        if(trace) {
+          Header h={le32(p.data+4),le32(p.data+8),le32(p.data+12),le32(p.data+24),le32(p.data+28),le32(p.data+20),32,false};
+          trace(traceCtx,true,h,p.data+32,h.size,e);
+        }
+      }
       if(e) return e;
       allocator.free(allocator.ctx,p.data,p.bytes); p={}; read=(read+1)%16; count--;
     }
@@ -125,11 +136,14 @@ struct Qrtr {
   }
   int receive(const uint8_t *packet,uint32_t n) {
     if(!running) return NotReady;
-    Header h={}; int e=decode(packet,n,&h); if(e) return e;
+    Header h={}; int e=decode(packet,n,&h);
+    if(e) { if(trace) trace(traceCtx,false,h,nullptr,0,e); return e; }
     const uint8_t *p=packet+h.header;
     if(!remoteKnown) {remoteNode=h.sn;remoteKnown=true;}
+    if(h.type!=Data||h.dp==Ctrl) { rxControl++; if(trace) trace(traceCtx,false,h,p,h.size,Ok); }
     if(h.type==Data) {
       for(auto &s:local)if(s.used&&h.dp==s.port) {
+        if(trace&&dataTraced<32) { dataTraced++; trace(traceCtx,false,h,p,h.size,Ok); }
         if(h.confirm) {
           e=control(Resume,h.sn,h.sp,LocalNode,s.port,0,0);if(e)return e;
         }
@@ -149,9 +163,13 @@ struct Qrtr {
     if(h.type==Data&&h.dp!=Ctrl) return NotFound;
     switch(cmd) {
       case Hello:
-        // One HELLO per link; echoing every HELLO would cause an endless loop.
+        // ns ctrl_cmd_hello: say_hello (the core drops it when HELLO was already sent: hello_sent), then
+        // announce_servers to the sender (node, CTRL). No NEW_LOOKUP goes to the remote: Linux keeps lookups local
+        // and the remote router pushes its whole server list (WLFW 0x45, UIM/DMS/NAS...) after our HELLO.
         if(!helloSent) { e=control(Hello,h.sn,Ctrl,0,0,0,0); if(e) return e; helloSent=true; }
-        return control(NewLookup,h.sn,Ctrl,Service,ServiceInstance,0,0);
+        helloReceived=true; remoteNode=h.sn;
+        for(const auto &s:local)if(s.used&&!s.client) { e=announce(s,true,h.sn); if(e) return e; }
+        return Ok;
       case NewServer: case DelServer: {
         if(h.size!=20) return Protocol;
         uint32_t service=le32(p+4),instance=le32(p+8),node=le32(p+12),port=le32(p+16);
@@ -202,10 +220,10 @@ struct Qrtr {
     }
   }
 private:
-  int announce(const LocalService &s,bool up) {
-    // QRTR namespace announcements use the control port and broadcast node.
-    // The payload carries the actual local node/port used by this endpoint.
-    return control(up?NewServer:DelServer,Broadcast,Ctrl,s.service,s.instance,LocalNode,s.port);
+  int announce(const LocalService &s,bool up,uint32_t node) {
+    // Unicast to the remote name service (node, CTRL), from our CTRL port; the payload carries the real local
+    // node/port of the endpoint (Linux qrtr_bcast_enqueue writes the peer's node id as destination, never 0xffffffff).
+    return control(up?NewServer:DelServer,node,Ctrl,s.service,s.instance,LocalNode,s.port);
   }
   void lost() {
     if(serviceEvent) serviceEvent(ctx,false);

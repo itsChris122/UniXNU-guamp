@@ -326,6 +326,12 @@ void start() {
   gMode = mode;
   unsigned ipc = 0;
   if (mode == 1 && PE_parse_boot_argn("guamp-adsp-ipc", &ipc, sizeof(ipc)) && ipc <= 6) adspipc::gLevel = ipc;
+  unsigned sensors = 0;   // guamp-sensors=2: QRTR on IPCRTR + SEE sensor lookup (GuampAdspIpc.inc, GuampSnsCore.h)
+  if (PE_parse_boot_argn("guamp-sensors", &sensors, sizeof(sensors)) && sensors == 2) {
+    adspipc::gSns = adspipc::gLevel >= 2 ? 1 : 0;
+    IOLog("GuampAdsp: guamp-sensors=2: SEE lookup on IPCRTR %s\n",
+          adspipc::gSns ? "on" : "OFF (needs guamp-adsp=1 guamp-adsp-ipc>=2)");
+  }
   unsigned route = 0, bits = 0;
   if (PE_parse_boot_argn("guamp-adsp-route", &route, sizeof(route)) && route >= 1 && route <= 3) adspipc::gPcmRoute = route;
   if (PE_parse_boot_argn("guamp-adsp-pcm-bits", &bits, sizeof(bits)) && (bits == 16 || bits == 24)) adspipc::gPcmBits = bits;

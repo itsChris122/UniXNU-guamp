@@ -13,6 +13,7 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
+extern "C" IOService *native_hid_sensor_allocate(unsigned);
 extern "C" {
 extern kern_return_t OSKextLoadKextWithIdentifier(const char *);
 volatile uint32_t native_hid_stage,native_hid_resource_found;
@@ -191,6 +192,16 @@ void native_hid_input_probe(void) {
                         IOService *touch=native_hid_touch_allocate();
                         bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
                         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
+                    }
+                    // guamp-sensors >= 1: accelerometer, gyro, device orientation and proximity as four Built-In HID devices
+                    // (NativeHidInput step 4 of scripts/guamp-hid-variant.py), fed by the NativeEmmc sensor hub.
+                    unsigned sensors=0;
+                    PE_parse_boot_argn("guamp-sensors",&sensors,sizeof(sensors));
+                    for(unsigned kind=1;started && sensors>=1 && kind<=4;++kind) {
+                        IOService *sensor=native_hid_sensor_allocate(kind);
+                        bool sensorStarted=sensor && sensor->metaCast("IOHIDDevice") && sensor->init() && sensor->attach(resource) && sensor->start(resource);
+                        IOLog("GuampSensors: HID device %u %s\n",kind,sensorStarted?"started":"FAILED");
+                        if(!sensorStarted && sensor){sensor->detach(resource);OSSafeReleaseNULL(sensor);}
                     }
                     // The offline devices live for this bounded boot. Its
                     // service attachment and timer remain genuine live objects.
