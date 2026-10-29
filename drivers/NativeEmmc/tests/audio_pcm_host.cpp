@@ -197,6 +197,83 @@ static void ondemand() {
          "volume, hold dropped after 2 s, live edge when still writing, idle gate 4 s, head-silence trim: ok\n");
 }
 
+// ---- pre-roll: a running stream plays whole periods only; a dry ring gives one clean gap, then pre-roll again ---------
+static void preroll() {
+  static uint8_t mem[guampaudio::kRingBytes];
+  guampaudio::Stream s;
+  s.buf = mem;
+  s.bytes = sizeof(mem);
+  s.ticksPerSec = 24000000;
+  s.adspEnabled = true;
+  s.prerollFrames = 1920;
+  s.beginSession();
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, 0, 0) == 0 && !s.primed);
+  s.setSink(guampaudio::SinkAdsp, 0);
+  std::vector<uint8_t> pcm(4 * 48000 * 4), out(480 * 4), heard;
+  for (size_t i = 0; i < pcm.size(); i += 2) { const int16_t v = static_cast<int16_t>(1000 + (i / 2) % 20000); memcpy(&pcm[i], &v, 2); }
+  // The HAL rhythm of fin8: 1024 frames every 21.33 ms, the ADSP one 480-frame period every 10 ms (8 queued at start)
+  size_t fed = 0;
+  uint32_t silentPeriods = 0, partial = 0;
+  auto period = [&]() {
+    const uint32_t n = s.pull(out.data(), 480, 16, 0);
+    if (!n) silentPeriods++;
+    else if (n < 480) partial++;
+    if (n) heard.insert(heard.end(), out.begin(), out.begin() + n * 4);
+  };
+  for (int i = 0; i < 8; i++) period();   // path up: 8 slots at once, nothing queued yet -> silence, no data consumed
+  CHECK(silentPeriods == 8 && s.underruns == 0 && s.used() == 0);
+  double hal = 0;
+  for (int ms10 = 0; ms10 < 300; ms10++) {   // 3 s
+    while (hal <= ms10 * 10.0) {
+      CHECK(s.push(&pcm[fed], 1024 * 4, 0) == 1024 * 4);
+      fed += 1024 * 4;
+      hal += 1024 / 48.0;
+    }
+    period();
+  }
+  // after the pre-roll: no partial period ever, no underrun, and every frame heard in order (no zeros inserted)
+  CHECK(partial == 0 && s.underruns == 0 && heard.size() <= fed && !memcmp(heard.data(), pcm.data(), heard.size()));
+  CHECK(s.maxQueued <= 1920 + 1024 + 480 && s.prerollWaits > 0);
+  // the producer stalls: one underrun, the queued remainder is kept (not padded), playback resumes after the pre-roll
+  const uint32_t before = s.used();
+  while (s.used() >= 480 * 4) period();
+  const uint32_t rest = s.used();
+  period();
+  CHECK(s.underruns == 1 && !s.primed && s.used() == rest && before >= rest);
+  CHECK(s.push(&pcm[fed], 1024 * 4, 0) == 1024 * 4);
+  fed += 1024 * 4;
+  period();
+  CHECK(s.used() == rest + 1024 * 4);   // still below the pre-roll: silence, nothing taken
+  CHECK(s.push(&pcm[fed], 1024 * 4, 0) == 1024 * 4);
+  fed += 1024 * 4;
+  period();
+  CHECK(s.primed && s.used() == rest + 2048 * 4 - 480 * 4 && !memcmp(heard.data(), pcm.data(), heard.size()));
+  // STOP: the tail plays to the end, zero padded, no underrun counted; the session counters
+  CHECK(s.ioctl(GUAMP_AUDIO_STOP, nullptr, 0, 0) == 0 && s.draining);
+  while (s.used()) period();
+  CHECK(s.underruns == 1 && heard.size() == fed && !memcmp(heard.data(), pcm.data(), fed) && s.sessionPlayed() * 4 == fed);
+  s.reset();
+  s.beginSession();
+  CHECK(s.underruns == 0 && s.maxQueued == 0 && s.sessionPlayed() == 0);
+  // a short sound written before the path is up and stopped at once: whole, even below the pre-roll
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, 0, 0) == 0);
+  s.setSink(guampaudio::SinkNull, 0);
+  CHECK(s.push(pcm.data(), 600 * 4, 0) == 600 * 4 && s.hold);
+  CHECK(s.ioctl(GUAMP_AUDIO_STOP, nullptr, 0, 0) == 0 && s.draining);
+  s.setSink(guampaudio::SinkAdsp, 0);
+  CHECK(s.pull(out.data(), 480, 16, 0) == 480 && s.pull(out.data(), 480, 16, 0) == 120 && !s.used() && !s.draining);
+  // a held sound of 150 ms (path up while IO keeps running) keeps its attack: no live-edge cut below 200 ms
+  s.reset();
+  s.beginSession();
+  CHECK(s.ioctl(GUAMP_AUDIO_START, nullptr, 0, 0) == 0);
+  s.setSink(guampaudio::SinkNull, 0);
+  CHECK(s.push(pcm.data(), 7200 * 4, 0) == 7200 * 4 && s.hold);
+  s.setSink(guampaudio::SinkAdsp, 0);
+  CHECK(s.used() == 7200 * 4 && s.trimmedFrames == 0);
+  printf("pre-roll: HAL 1024-frame writes vs 480-frame ADSP periods without partial periods or inserted zeros, dry ring "
+         "-> one gap + pre-roll, tail played whole after STOP, held short sound keeps its attack, session counters: ok\n");
+}
+
 // ---- ASM/ADM builders ----------------------------------------------------------------------------------------------
 static std::vector<uint8_t> pkt(uint32_t n, const uint8_t *b) { return std::vector<uint8_t>(b, b + n); }
 static void hdr(const std::vector<uint8_t> &p, uint8_t svc, uint16_t src, uint16_t dst, uint32_t opcode) {
@@ -645,6 +722,7 @@ int main() {
   abi();
   ring();
   ondemand();
+  preroll();
   builders();
   pcmPath();
   holdMode();

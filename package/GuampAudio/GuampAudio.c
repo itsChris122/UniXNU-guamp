@@ -80,7 +80,11 @@ static struct {
   _Atomic UInt32 softGainQ16;  // gain applied while converting (unity when hwVolume)
   GuampFifo fifo;
   UInt64 eagain, errors;
+  Boolean wanted;              // between the Speaker's first StartIO and last StopIO
+  UInt64 retryAt;              // mach time of the next open attempt while wanted and not open
+  UInt64 retries;
 } gBackend = {.fd = -1, .softGainQ16 = GUAMP_AUDIO_GAIN_UNITY};
+static double gTicksPerSec = 24000000.0;   // mach_absolute_time() ticks per second (set by initialize)
 
 static long sinkWrite(void *ctx, const void *bytes, size_t length) {
   const ssize_t n = write(*(const int *)ctx, bytes, length);
@@ -100,8 +104,11 @@ static void backendVolume(Float32 db, UInt32 mute) {
   atomic_store(&gBackend.softGainQ16, gBackend.hwVolume ? GUAMP_AUDIO_GAIN_UNITY : gain);
 }
 
-static void backendOpen(Float32 db, UInt32 mute) {
-  pthread_mutex_lock(&gIOLock);
+// Called with gIOLock held. A refused open (EBUSY: the node is still held, or any other error) used to leave the whole
+// IO session on the null device, i.e. silent until the next StartIO (sounds that "randomly" stop): backendWrite now
+// retries once a second while the Speaker runs.
+static void backendOpenLocked(Float32 db, UInt32 mute) {
+  gBackend.wanted = true;
   if (gBackend.fd < 0) {
     const int fd = open(GUAMP_AUDIO_DEV_PATH, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     struct guamp_audio_info info;
@@ -127,15 +134,24 @@ static void backendOpen(Float32 db, UInt32 mute) {
       const int routeErr = ioctl(fd, GUAMP_AUDIO_SET_ROUTE, &route) ? errno : 0;
       backendVolume(db, mute);
       const int startErr = ioctl(fd, GUAMP_AUDIO_START) ? errno : 0;
-      os_log(gLog, "GuampAudio: %{public}s open: ring %u, period %u, flags 0x%x, route err %d, hw volume %d, start err %d",
-             GUAMP_AUDIO_DEV_PATH, info.ring_frames, info.period_frames, info.flags, routeErr, gBackend.hwVolume, startErr);
+      os_log(gLog, "GuampAudio: %{public}s open: ring %u, period %u, flags 0x%x, route err %d, hw volume %d, start err %d, "
+             "retries %llu", GUAMP_AUDIO_DEV_PATH, info.ring_frames, info.period_frames, info.flags, routeErr, gBackend.hwVolume,
+             startErr, (unsigned long long)gBackend.retries);
     }
   }
+  if (gBackend.fd < 0) gBackend.retryAt = mach_absolute_time() + (UInt64)gTicksPerSec;
+}
+
+static void backendOpen(Float32 db, UInt32 mute) {
+  pthread_mutex_lock(&gIOLock);
+  gBackend.retries = 0;
+  backendOpenLocked(db, mute);
   pthread_mutex_unlock(&gIOLock);
 }
 
 static void backendClose(void) {
   pthread_mutex_lock(&gIOLock);
+  gBackend.wanted = false;
   if (gBackend.fd >= 0) {
     struct guamp_audio_info info;
     memset(&info, 0, sizeof(info));
@@ -154,6 +170,14 @@ static void backendClose(void) {
 // IO thread: one WriteMix buffer (Float32 interleaved stereo) into the device.
 static void backendWrite(const Float32 *mix, UInt32 frames) {
   pthread_mutex_lock(&gIOLock);
+  if (gBackend.fd < 0 && gBackend.wanted && mach_absolute_time() >= gBackend.retryAt) {
+    pthread_mutex_lock(&gLock);   // order gIOLock -> gLock is allowed (gIOLock is never taken under gLock)
+    const Float32 db = gVolumeDb;
+    const UInt32 mute = gMute;
+    pthread_mutex_unlock(&gLock);
+    gBackend.retries++;
+    backendOpenLocked(db, mute);
+  }
   if (gBackend.fd >= 0) {
     const UInt32 gain = atomic_load(&gBackend.softGainQ16);
     int16_t chunk[512 * GUAMP_FIFO_CHANNELS];
@@ -538,6 +562,7 @@ static OSStatus initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
   mach_timebase_info_data_t tb;
   mach_timebase_info(&tb);
   const double ticksPerFrame = guamp_ticks_per_frame(tb.numer, tb.denom, kRate);
+  gTicksPerSec = ticksPerFrame * kRate;
   for (UInt32 i = 0; i < kDeviceCount; i++) guamp_clock_init(&gDevices[i].clock, ticksPerFrame, kRingFrames);
   const Boolean present = access(GUAMP_AUDIO_DEV_PATH, F_OK) == 0, mic = access(GUAMP_MIC_DEV_PATH, F_OK) == 0;
   os_log(gLog, "GuampAudio: initialized, %u devices (Speaker, Hawking, Codec), %.0f Hz, ring %u frames, %{public}s %{public}s, "
