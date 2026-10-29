@@ -470,10 +470,20 @@ static struct ce_service_to_pipe target_service_to_ce_map_wlan[] = {
 	},
 };
 
+/* guamp-wifi-trace (nw_abi.h, declared again here because the tail includes it at the end): the first N register
+ * accesses, logged before the access so the last line names the one that did not return. */
+extern volatile unsigned nw_wifi_trace_budget;
+int nw_wifi_trace_take(volatile unsigned *count);
+void nw_wifi_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static volatile unsigned gw_trace_mmio;
+
 static void ath10k_snoc_write32(struct ath10k *ar, u32 offset, u32 value)
 {
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 
+	if (nw_wifi_trace_budget && nw_wifi_trace_take(&gw_trace_mmio))
+		nw_wifi_trace("mmio %u: write32 PA 0x%llx (+0x%x) = 0x%08x", gw_trace_mmio,
+			      (unsigned long long)ar_snoc->mem_pa + offset, offset, value);
 	iowrite32(value, ar_snoc->mem + offset);
 }
 
@@ -482,6 +492,9 @@ static u32 ath10k_snoc_read32(struct ath10k *ar, u32 offset)
 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
 	u32 val;
 
+	if (nw_wifi_trace_budget && nw_wifi_trace_take(&gw_trace_mmio))
+		nw_wifi_trace("mmio %u: read32 PA 0x%llx (+0x%x)", gw_trace_mmio,
+			      (unsigned long long)ar_snoc->mem_pa + offset, offset);
 	val = ioread32(ar_snoc->mem + offset);
 
 	return val;

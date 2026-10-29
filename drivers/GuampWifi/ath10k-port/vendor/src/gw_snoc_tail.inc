@@ -4,6 +4,8 @@
 #include "lx_plat.h"
 #include "nw_mac80211.h"
 #include "nw_sta.h"
+/* guamp-wifi-trace one-shot breadcrumbs (nw_abi.h): nothing runs while the budget is 0 */
+#define GW_TRACE(...) do { if(nw_wifi_trace_budget) nw_wifi_trace(__VA_ARGS__); } while(0)
 static struct gw_snoc_board gw_board;
 static struct platform_device gw_device;
 static struct ath10k *gw_ar;
@@ -148,13 +150,18 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
      !board->power||!board->ready||!board->wlan_enable||!board->wlan_disable||
      !platform->alloc||!platform->free||!platform->dma_alloc||!platform->dma_free||!platform->dma_map||
      !platform->dma_sync||!platform->now_ms||!platform->sleep_ms||!platform->poll||!platform->fw_get) return -EINVAL;
+  GW_TRACE("start: board ready check");
   if(!board->ready(board->ctx)) return -ENODEV;
+  GW_TRACE("start: firmware preflight");
   int firmware_error=gw_firmware_preflight(platform);
+  GW_TRACE("start: firmware preflight result %d",firmware_error);
   if(firmware_error)return firmware_error;
   gw_board=*board; lx_plat=platform; gw_boot_error=0; gw_ce_live=false; memset(&nw_wifi_stats,0,sizeof(nw_wifi_stats));
   memset(&gw_device,0,sizeof(gw_device)); gw_device.dev.name="guamp-wcn-snoc";
   nw_wifi_set_hooks(&gw_hooks);
+  GW_TRACE("start: ath10k_core_create");
   gw_ar=ath10k_core_create(sizeof(struct ath10k_snoc),&gw_device.dev,ATH10K_BUS_SNOC,ATH10K_HW_WCN3990,&gw_hif);
+  GW_TRACE("start: ath10k_core_create %s",gw_ar?"done":"FAILED");
   if(!gw_ar) return -ENOMEM;
   struct ath10k_snoc *s=ath10k_snoc_priv(gw_ar);
   s->dev=&gw_device; s->ar=gw_ar; s->mem=board->registers; s->mem_pa=0x0c800000;
@@ -167,6 +174,7 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
     struct ath10k_snoc_pipe *p=&s->pipe_info[i];
     p->ce_hdl=&s->ce.ce_states[i]; p->pipe_num=i; p->hif_ce_state=gw_ar;
     p->buf_sz=host_ce_config_wlan[i].src_sz_max; p->ar_snoc=s; spin_lock_init(&p->pipe_lock);
+    GW_TRACE("start: ath10k_ce_alloc_pipe %u",i);
     e=ath10k_ce_alloc_pipe(gw_ar,i,&host_ce_config_wlan[i]);
     if(e) {
       while(i) ath10k_ce_free_pipe(gw_ar,--i);
@@ -174,25 +182,40 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
     }
   }
   struct ath10k_bus_params params={.dev_type=ATH10K_DEV_TYPE_LL,.chip_id=board->firmware_chip_id};
+  GW_TRACE("start: ath10k_core_register");
   e=ath10k_core_register(gw_ar,&params);
+  GW_TRACE("start: ath10k_core_register result %d",e);
   lx_log(e?3:6,"ath10k: phase probe queued: WCN3990 regs PA 0x0c800000 len 0x%x, chip id 0x%x, 12 CE pipes allocated (%d)",
     (unsigned)board->register_bytes,board->firmware_chip_id,e);
   if(e) { for(unsigned i=0;i<12;i++) ath10k_ce_free_pipe(gw_ar,i); ath10k_core_destroy(gw_ar); gw_ar=0; return e; }
   return 0; // enqueued probe, NOT associated/connected
 }
+static volatile unsigned gw_trace_polls,gw_trace_steps;
 void gw_snoc_poll_ce(void) {
   if(!gw_ar||gw_boot_error||gw_servicing_ce||!gw_ce_live)return;
   gw_servicing_ce=true;
-  for(unsigned i=0;i<12;i++) ath10k_ce_per_engine_service(gw_ar,i);
+  const bool trace=nw_wifi_trace_budget&&nw_wifi_trace_take(&gw_trace_polls);
+  for(unsigned i=0;i<12;i++) {
+    if(trace) nw_wifi_trace("poll_ce %u: ath10k_ce_per_engine_service ce%u (ctrl +0x%x)",gw_trace_polls,i,
+                            (unsigned)ath10k_snoc_priv(gw_ar)->ce.ce_states[i].ctrl_addr);
+    ath10k_ce_per_engine_service(gw_ar,i);
+  }
+  if(trace) nw_wifi_trace("poll_ce %u: napi_schedule",gw_trace_polls);
   napi_schedule(&gw_ar->napi);
   gw_servicing_ce=false;
 }
 int gw_snoc_step(void) {
   if(!gw_ar) return -ENODEV;
   if(gw_boot_error) return gw_boot_error;
+  const bool trace=nw_wifi_trace_budget&&nw_wifi_trace_take(&gw_trace_steps);
+  if(trace) nw_wifi_trace("step %u: poll_ce (stage %u, error %d)",gw_trace_steps,nw_wifi_stats.stage,nw_wifi_stats.last_err);
   gw_snoc_poll_ce();
-  if(gw_polling) return 0;
-  gw_polling=true; lx_pump(); nw_sta_run(); gw_polling=false;
+  if(gw_polling) { if(trace) nw_wifi_trace("step %u: nested, dispatcher skipped",gw_trace_steps); return 0; }
+  if(trace) nw_wifi_trace("step %u: lx_pump",gw_trace_steps);
+  gw_polling=true; lx_pump();
+  if(trace) nw_wifi_trace("step %u: nw_sta_run",gw_trace_steps);
+  nw_sta_run(); gw_polling=false;
+  if(trace) nw_wifi_trace("step %u: done",gw_trace_steps);
   return nw_sta_tx_pending();
 }
 int gw_snoc_stop(void) {

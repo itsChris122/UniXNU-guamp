@@ -7,6 +7,9 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
+#include <kern/sched_prim.h>
+#include <machine/machine_routines.h>
+#include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <IOKit/IORegistryEntry.h>
 #include <libkern/c++/OSData.h>
@@ -30,9 +33,16 @@ extern unsigned char gw_board_mac[6];   // ath10k-port gw_runtime.c: device_get_
 extern volatile int gw_board_mac_valid;
 volatile unsigned guamp_wifi_provider_stage=0;
 volatile int guamp_wifi_provider_error=0;
+void guamp_emmc_log_sync(void);   // NativeEmmc.cpp: one kpan pass of the kernel log (guamp-wifi-trace-kpan=1)
 }
 
 namespace guampwifi {
+// guamp-wifi-trace=N (diagnostics, default 0 = off, nothing changes): one "GuampWiFiTrace:" line before each radio probe
+// step (runStation, attach, gw_snoc_start, gw_snoc_step) and before the first N register accesses, CE polls, dispatcher
+// items, steps and attach iterations; each line is followed by guamp-wifi-trace-ms (default 150) of sleep so the USB mirror
+// sends it before a bus hang can stop the phone. guamp-wifi-trace-kpan=1 also writes the kernel log to kpan after each
+// line (synchronous eMMC pass, no framebuffer). Where the thread may not sleep the line says "nosleep" and nothing waits.
+static unsigned gTraceMs=150,gTraceKpan=0;
 struct Sm6115Runtime {
   enum Stage : unsigned { Off,Mapping,RpmConnect,ProxyVotes,Prepared,Modem,
     Firmware,RadioProbe,Scanning,ScanComplete,IosAttached,Failed,AwaitNetwork,TransportOnly };
@@ -301,6 +311,25 @@ struct Sm6115Runtime {
     thread_deallocate(worker);return Ok;
   }
 
+  static void traceSink(const char *line) {
+    if(!ml_get_interrupts_enabled()){printf("GuampWiFiTrace: %s (nosleep: interrupts off)\n",line);return;}
+    const bool canSleep=!ml_at_interrupt_context()&&preemption_enabled();
+    IOLog("GuampWiFiTrace: %s%s at %llu ms\n",line,canSleep?"":" (nosleep)",nowMs());
+    if(!canSleep)return;
+    if(gTraceKpan)guamp_emmc_log_sync();
+    if(gTraceMs)IOSleep(gTraceMs);
+  }
+  static void traceSetup() {
+    unsigned n=0,ms=gTraceMs,kpan=0;
+    PE_parse_boot_argn("guamp-wifi-trace",&n,sizeof(n));
+    if(!n)return;
+    PE_parse_boot_argn("guamp-wifi-trace-ms",&ms,sizeof(ms));
+    PE_parse_boot_argn("guamp-wifi-trace-kpan",&kpan,sizeof(kpan));
+    gTraceMs=ms>5000?5000:ms;gTraceKpan=kpan==1;
+    nw_wifi_trace_sink=traceSink;nw_wifi_trace_budget=n;
+    IOLog("GuampWiFiTrace: on: budget %u per phase, %u ms after each line, kpan sync %s\n",n,gTraceMs,gTraceKpan?"on":"off");
+  }
+
   void runStation() {
     if(!awaitFirmware()){transportOnly();return;}
     int e=configureStation();if(e){fail(e,"station config");transportOnly();return;}
@@ -308,6 +337,7 @@ struct Sm6115Runtime {
     // (QRTR, RMTFS, TFTP, SERVREG_LOC, SIM) keeps running as after any Wi-Fi outcome.
     unsigned attach=1;PE_parse_boot_argn("guamp-wifi-attach",&attach,sizeof(attach));
     if(!attach){IOLog("GuampWiFi: ath10k start/attach skipped (guamp-wifi-attach=0)\n");transition(TransportOnly);transportOnly();return;}
+    traceSetup();
     transition(RadioProbe);
     if(workerMode==1){runScan();transportOnly();return;}
 #if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
@@ -318,7 +348,9 @@ struct Sm6115Runtime {
       IOSleep(1);
     }
     transition(RadioProbe);ath10kStarted=true;
+    if(nw_wifi_trace_budget)nw_wifi_trace("runStation: guamp_xnu_wifi_attach");
     e=guamp_xnu_wifi_attach(&platform,&board);
+    if(nw_wifi_trace_budget)nw_wifi_trace("runStation: guamp_xnu_wifi_attach result %d",e);
     if(e){fail(e,"iOS attach");transportOnly();return;}
     // attach has handed dispatch to its own worker. Do not resume provider
     // pumping here, and do not overwrite an error reported by that worker.
@@ -332,7 +364,9 @@ struct Sm6115Runtime {
   void runScan() {
     const nw_wifi_events events={scanFinished,nullptr,nullptr,nullptr,nullptr,nullptr};
     nw_wifi_set_events(&events);ath10kStarted=true;
+    if(nw_wifi_trace_budget)nw_wifi_trace("runScan: nw_wifi_start_snoc");
     int e=nw_wifi_start_snoc(&platform,&board);
+    if(nw_wifi_trace_budget)nw_wifi_trace("runScan: nw_wifi_start_snoc result %d",e);
     if(e){fail(e,"ath10k start");return;}
     uint64_t deadline=nowMs()+30000;
     nw_wifi_status status{};

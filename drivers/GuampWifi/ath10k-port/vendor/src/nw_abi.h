@@ -86,6 +86,13 @@ extern struct nw_wifi_stats nw_wifi_stats;
 /* What the dispatcher runs now: kind (1 interrupt handler, 2 timer, 3 work, 4 board poll, 0 nothing), the function as an offset from
  * lx_now_ms, the nesting depth and the millisecond it started. A board can show it when the module stops making progress. */
 extern volatile uint64_t nw_wifi_where[4];
+/* Diagnostics, off by default (guamp-wifi-trace=N): the board sets the budget N and the sink before nw_wifi_start_snoc. With N == 0
+ * or no sink nothing is formatted or called. Each traced phase keeps its own counter: nw_wifi_trace_take() is true for the first N
+ * calls with that counter (N register accesses, N steps, ...). The sink gets one line, logged before the step it names. */
+extern volatile unsigned nw_wifi_trace_budget;
+extern void (*volatile nw_wifi_trace_sink)(const char *line);
+int nw_wifi_trace_take(volatile unsigned *count);
+void nw_wifi_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #ifdef __cplusplus
 }
 #endif
