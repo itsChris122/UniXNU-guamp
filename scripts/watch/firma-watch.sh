@@ -21,12 +21,18 @@ FW="NanoAudioControl SoftwareUpdateBridge BridgeCommons BridgeReporting NanoBack
 X=PlugIns/GreenfieldThumbnailExtension.appex
 EXES="Bridge $X/GreenfieldThumbnailExtension"
 mkdir -p $W/ent
-rm -rf $W/Bridge.app
-cp -r $O $W/Bridge.app
-chmod -R u+w $W/Bridge.app
-cd $W/Bridge.app
-rm -rf DeviceAssets/Outro1* DeviceAssets/Outro2* DeviceAssets/Screen* DeviceAssets/WatchSideBySide* \
-  VictoryBackground-926h@3x.png VictoryBackground-844h@3x.png beam_bridge_2022_v2.mlmodelc
+# FULL=1 (29/10, richiesta utente): bundle completo come nell'XS in ~/moto/watch/Bridge-full.app (i file grandi viaggiano con gli
+# addon di trasporto); senza FULL la versione ridotta in ~/moto/watch/Bridge.app.
+APP=Bridge.app
+if [ "${FULL:-0}" = 1 ]; then APP=Bridge-full.app; fi
+rm -rf $W/$APP
+cp -r $O $W/$APP
+chmod -R u+w $W/$APP
+cd $W/$APP
+if [ "${FULL:-0}" != 1 ]; then
+  rm -rf DeviceAssets/Outro1* DeviceAssets/Outro2* DeviceAssets/Screen* DeviceAssets/WatchSideBySide* \
+    VictoryBackground-926h@3x.png VictoryBackground-844h@3x.png beam_bridge_2022_v2.mlmodelc
+fi
 for f in $EXES; do
   $L -e $O/$f > $W/ent/$(basename $f).xml
   cp $C/$f $f

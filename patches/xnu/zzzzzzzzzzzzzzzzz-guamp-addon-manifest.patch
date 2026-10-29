@@ -1,0 +1,301 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index db2f2eb..68b5766 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7309,6 +7309,7 @@ volatile int native_gpu_addon_written = 0;
+ volatile int native_gpu_addon_same = 0;
+ volatile int native_gpu_addon_failed = 0;
+ volatile int native_gpu_addon_error = 0;
++static int native_gpu_addon_force;	/* guamp-addon-reinstall=N cycle: rewrite every file, even an equal one */
+ static int
+ native_gpu_addon_equal(vnode_t vp, const uint8_t *data, uint64_t size, uint32_t mode, vfs_context_t ctx)
+ {
+@@ -7339,7 +7340,7 @@ static int
+ native_gpu_addon_write(const char *path, const uint8_t *data, uint64_t size, uint32_t mode, vfs_context_t ctx)
+ {
+ 	vnode_t vp = NULLVP;
+-	int error = vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
++	int error = native_gpu_addon_force ? ENOENT : vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
+ 	if (!error) {
+ 		int equal = native_gpu_addon_equal(vp, data, size, mode, ctx);
+ 		vnode_close(vp, FREAD, ctx);
+@@ -7395,6 +7396,150 @@ native_gpu_addon_parents(proc_t p, user_addr_t scratch, const char *path)
+ 	}
+ 	return 0;
+ }
++/* Persistent addon (owner 29/10): what an addon writes into Data stays there (nothing below /private/var/ngpu is ever removed by
++ * a boot without that entry), and the views mount from Data's content whatever the boot payload carries. The manifest
++ * /private/var/ngpu/.guamp-manifest records, for every file written, its name, mode, size and a hash of its compressed addon bytes
++ * (FNV-1a 64, no inflate needed). An addon entry whose record matches and whose Data file still has that size and mode is counted
++ * "same" without being inflated or read back, so a boot that carries the whole addon no longer re-reads it all, and a "delta"
++ * addon (scripts/compose-guamp-delta-addon.py) only has to carry what changed. A delete entry (mode NATIVE_GPU_ADDON_DELETE,
++ * size 0) unlinks that regular file from Data and drops its record. An addon with no entries (24-byte header) is valid: nothing is
++ * written and every view still mounts. guamp-addon-reinstall=N (one shot, /private/var/db/guamp-addon-reinstall-N.done) ignores
++ * the manifest and rewrites every file of the addon even when equal; guamp-addon-manifest=0 ignores the manifest (old behaviour:
++ * compare every file). A missing or malformed manifest is treated as empty. Never panics. */
++#define NATIVE_GPU_ADDON_DELETE 0x10000u
++#define NATIVE_GPU_MANIFEST_MAX 4096
++struct native_gpu_manifest_record {
++	char name[160];
++	uint64_t hash;
++	uint64_t size;
++	uint32_t mode;
++	uint32_t used;
++};
++static const char native_gpu_manifest_path[] = "/private/var/ngpu/.guamp-manifest";
++volatile int native_gpu_addon_manifest_records = -1, native_gpu_addon_manifest_skipped = 0, native_gpu_addon_deleted = 0;
++volatile int native_gpu_addon_manifest_error = 0;
++static uint64_t
++native_gpu_addon_hash(const uint8_t *packed, uint64_t packed_size, uint64_t size, uint32_t mode)
++{
++	uint64_t hash = 0xcbf29ce484222325ULL;
++	for (uint64_t i = 0; i < packed_size; i++) {
++		hash = (hash ^ packed[i]) * 0x100000001b3ULL;
++	}
++	return hash ^ (size * 0x9e3779b97f4a7c15ULL) ^ ((uint64_t)mode << 48);
++}
++/* Reads the manifest into records (at most NATIVE_GPU_MANIFEST_MAX); returns the count, 0 when absent or malformed. */
++static uint32_t
++native_gpu_manifest_read(struct native_gpu_manifest_record *records, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_open(native_gpu_manifest_path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx)) {
++		return 0;
++	}
++	uint8_t header[16];
++	uint32_t count = 0;
++	int resid = 0, error = vn_rdwr(UIO_READ, vp, (caddr_t)header, sizeof(header), 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx),
++	    &resid, vfs_context_proc(ctx));
++	if (!error && !resid && !memcmp(header, "NGPUMAN1", 8)) {
++		memcpy(&count, header + 8, 4);
++		if (count > NATIVE_GPU_MANIFEST_MAX) {
++			count = 0;
++		}
++		int bytes = (int)(count * sizeof(struct native_gpu_manifest_record));
++		if (count && (vn_rdwr(UIO_READ, vp, (caddr_t)records, bytes, sizeof(header), UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx),
++		    &resid, vfs_context_proc(ctx)) || resid)) {
++			count = 0;
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	for (uint32_t i = 0; i < count; i++) {
++		if (!records[i].used || records[i].name[sizeof(records[i].name) - 1] || !records[i].name[0]) {
++			return 0;	/* malformed: start over */
++		}
++	}
++	return count;
++}
++static int
++native_gpu_manifest_write(const struct native_gpu_manifest_record *records, uint32_t count, vfs_context_t ctx)
++{
++	uint8_t header[16] = {'N', 'G', 'P', 'U', 'M', 'A', 'N', '1'};
++	uint32_t kept = 0;
++	for (uint32_t i = 0; i < count; i++) {
++		kept += records[i].used ? 1 : 0;
++	}
++	memcpy(header + 8, &kept, 4);
++	vnode_t vp = NULLVP;
++	int error = vnode_open(native_gpu_manifest_path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int resid = 0;
++	off_t at = sizeof(header);
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)header, sizeof(header), 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	for (uint32_t i = 0; !error && i < count; i++) {
++		if (!records[i].used) {
++			continue;
++		}
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)&records[i], sizeof(records[i]), at, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		at += sizeof(records[i]);
++	}
++	if (!error && resid) {
++		error = EIO;
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	int close_error = vnode_close(vp, FWRITE, ctx);
++	return error ? error : close_error;
++}
++static struct native_gpu_manifest_record *
++native_gpu_manifest_find(struct native_gpu_manifest_record *records, uint32_t count, const char *name)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		if (records[i].used && !strcmp(records[i].name, name)) {
++			return &records[i];
++		}
++	}
++	return NULL;
++}
++/* The Data file is still a regular file with the recorded size and mode. */
++static int
++native_gpu_addon_present(const char *path, uint64_t size, uint32_t mode, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		return 0;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	VATTR_WANTED(&va, va_mode);
++	int present = vnode_vtype(vp) == VREG && !vnode_getattr(vp, &va, ctx) && va.va_data_size == size && (va.va_mode & 07777) == mode;
++	vnode_put(vp);
++	return present;
++}
++static int
++native_gpu_addon_delete(proc_t p, user_addr_t scratch, const char *path, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	int regular = vnode_vtype(vp) == VREG;
++	vnode_put(vp);
++	if (!regular) {
++		return EISDIR;	/* only regular files: directories stay */
++	}
++	struct unlink_args request = {.path = scratch + 0xa00};
++	int32_t result = 0;
++	error = copyout(path, request.path, strlen(path) + 1);
++	if (!error) {
++		error = unlink(p, &request, &result);
++	}
++	return error;
++}
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -7411,10 +7556,14 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 	}
+ 	memcpy(&count, addon + 8, 4);
+ 	memcpy(&total, addon + 16, 8);
+-	if (total != bytes || !count || count > 4096) {
++	if (total != bytes || count > 4096 || (!count && bytes != 24)) {
+ 		native_gpu_addon_error = EINVAL;
+ 		return;
+ 	}
++	if (!count) {
++		native_gpu_addon_files = 0;	/* empty addon: Data keeps what earlier addons wrote */
++		return;
++	}
+ 	/* Validate the whole addon before writing anything. */
+ 	uint64_t at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -7432,7 +7581,8 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		uint64_t name_padded = (name_bytes + 7) & ~7ULL, size_padded = (packed + 7) & ~7ULL;
+ 		const char *name = (const char *)(addon + at);
+ 		if (name_bytes < 2 || name_bytes > 160 || bytes - at < name_padded || name[name_bytes - 1] || strnlen(name, name_bytes) != name_bytes - 1 ||
+-		    name[0] == '/' || (mode & ~0777) || size > INT32_MAX || !packed || packed > INT32_MAX || bytes - at - name_padded < size_padded) {
++		    name[0] == '/' || ((mode & ~0777) && (mode != NATIVE_GPU_ADDON_DELETE || size)) || size > INT32_MAX || !packed ||
++		    packed > INT32_MAX || bytes - at - name_padded < size_padded) {
+ 			native_gpu_addon_error = EINVAL;
+ 			return;
+ 		}
+@@ -7450,6 +7600,27 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 	}
+ 	native_gpu_addon_files = (int)count;
+ 	vfs_context_t ctx = vfs_context_current();
++	/* guamp-addon-reinstall=N: one shot per cycle, marker written only when every file was written. */
++	uint32_t reinstall = 0, use_manifest = 1;
++	char marker[96];
++	marker[0] = 0;
++	if (PE_parse_boot_argn("guamp-addon-reinstall", &reinstall, sizeof(reinstall)) && reinstall) {
++		snprintf(marker, sizeof(marker), "/private/var/db/guamp-addon-reinstall-%u.done", reinstall);
++		vnode_t vp = NULLVP;
++		if (!vnode_lookup(marker, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++			vnode_put(vp);
++			printf("guamp-addon-reinstall: cycle %u already done\n", reinstall);
++			marker[0] = 0;
++		} else {
++			native_gpu_addon_force = 1;
++		}
++	}
++	PE_parse_boot_argn("guamp-addon-manifest", &use_manifest, sizeof(use_manifest));
++	const size_t records_size = NATIVE_GPU_MANIFEST_MAX * sizeof(struct native_gpu_manifest_record);
++	struct native_gpu_manifest_record *records = use_manifest ? kalloc_data(records_size, Z_WAITOK | Z_ZERO) : NULL;
++	uint32_t n_records = records ? native_gpu_manifest_read(records, ctx) : 0;
++	native_gpu_addon_manifest_records = records ? (int)n_records : -1;
++	int manifest_changed = 0;
+ 	char path[192];
+ 	at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -7463,6 +7634,31 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		const char *name = (const char *)(addon + at);
+ 		at += (name_bytes + 7) & ~7ULL;
+ 		snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
++		struct native_gpu_manifest_record *record = records ? native_gpu_manifest_find(records, n_records, name) : NULL;
++		if (mode == NATIVE_GPU_ADDON_DELETE) {
++			int error = native_gpu_addon_delete(p, scratch, path, ctx);
++			if (record) {
++				record->used = 0;
++				manifest_changed = 1;
++			}
++			if (!error) {
++				native_gpu_addon_deleted++;
++			} else if (error != ENOENT) {
++				native_gpu_addon_failed++;
++				native_gpu_addon_error = error;
++			}
++			printf("guamp-addon: delete %s status %d\n", path, error);
++			at += (packed + 7) & ~7ULL;
++			continue;
++		}
++		uint64_t hash = records ? native_gpu_addon_hash(addon + at, packed, size, mode) : 0;
++		if (record && !native_gpu_addon_force && record->hash == hash && record->size == size && record->mode == mode &&
++		    native_gpu_addon_present(path, size, mode, ctx)) {
++			native_gpu_addon_same++;
++			native_gpu_addon_manifest_skipped++;
++			at += (packed + 7) & ~7ULL;
++			continue;
++		}
+ 		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
+ 		int error = data ? native_gpu_addon_inflate(addon + at, packed, data, size) : ENOMEM;
+ 		if (!error) {
+@@ -7482,8 +7678,42 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		} else {
+ 			native_gpu_addon_written++;
+ 		}
++		if (records && error <= 0) {	/* written or already equal: record it */
++			if (!record && n_records < NATIVE_GPU_MANIFEST_MAX) {
++				record = &records[n_records++];
++				strlcpy(record->name, name, sizeof(record->name));
++			}
++			if (record && (!record->used || record->hash != hash || record->size != size || record->mode != mode)) {
++				record->used = 1;
++				record->hash = hash;
++				record->size = size;
++				record->mode = mode;
++				manifest_changed = 1;
++			}
++		}
+ 		at += (packed + 7) & ~7ULL;
+ 	}
++	native_gpu_addon_force = 0;
++	if (records && manifest_changed) {
++		native_gpu_addon_manifest_error = native_gpu_manifest_write(records, n_records, ctx);
++	}
++	if (records) {
++		kfree_data(records, records_size);
++	}
++	if (marker[0] && !native_gpu_addon_failed) {
++		vnode_t vp = NULLVP;
++		struct mkdir_args request = {.path = scratch + 0xa00, .mode = 0755};
++		int32_t result = 0;
++		if (!copyout("/private/var/db", request.path, sizeof("/private/var/db"))) {
++			(void)mkdir(p, &request, &result);
++		}
++		if (!vnode_open(marker, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, 0600, 0, &vp, ctx)) {
++			vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	printf("guamp-addon: %u entries, manifest %d records (%d skipped unread, write status %d), deleted %d, reinstall cycle %u%s\n",
++	    count, native_gpu_addon_manifest_records, native_gpu_addon_manifest_skipped, native_gpu_addon_manifest_error,
++	    native_gpu_addon_deleted, reinstall, marker[0] ? "" : " (off or done)");
+ }
+ /* guamp: iPhone-only resource files (XS 17.7 21H16) shown to the iPadOS 17.7.11 processes through the same read-only union bindfs
+  * views as the GPU addon (boot-arg guamp-iphone-res=1). The files come from the boot payload's addon (scripts/make-guamp-iphone-res.py,

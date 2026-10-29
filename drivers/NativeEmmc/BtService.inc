@@ -954,8 +954,7 @@ void transport() {
 void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-bt");
   btshim::start();                                     // guamp-bt-shim=1: /dev/cu.bluetooth & co. (devfs is up by now)
-  unsigned mode = 1, delay = 0;
-  PE_parse_boot_argn("guamp-bt", &mode, sizeof(mode));
+  unsigned mode = guamp_bt_mode(), delay = 0;   // default 2 since 29/10 (GuampBtDefaults.h)
   PE_parse_boot_argn("guamp-bt-delay", &delay, sizeof(delay));
   if (delay && delay <= 600) IOSleep(delay * 1000);
   const char *railState = rails();
@@ -1027,8 +1026,8 @@ void publishAddress() {
 
 void start() {
   publishAddress();
-  unsigned on = 0;
-  if (!PE_parse_boot_argn("guamp-bt", &on, sizeof(on)) || (on != 1 && on != 2)) return;
+  const unsigned on = guamp_bt_mode();   // default 2 since 29/10; guamp-bt=0 keeps Bluetooth off
+  if (on != 1 && on != 2) return;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

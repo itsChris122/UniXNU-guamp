@@ -1,0 +1,19 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68b5766..f172c8c 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7866,9 +7866,11 @@ volatile int native_guamp_bt_tool_written = 0;
+ static void
+ native_guamp_bt_tool(proc_t p, user_addr_t scratch)
+ {
+-	uint32_t enabled = 0, bt = 0;
+-	/* guamp default (28/10): on with guamp-bt=2, as NativeEmmc GuampBtDefaults.h; guamp-bt-tool=0|1 still wins */
+-	if (PE_parse_boot_argn("guamp-bt", &bt, sizeof(bt)) && bt == 2) {
++	uint32_t enabled = 0, bt = 2;
++	/* guamp default (28/10): on with guamp-bt=2, as NativeEmmc GuampBtDefaults.h; guamp-bt-tool=0|1 still wins.
++	 * guamp-bt itself defaults to 2 since 29/10 (owner: Bluetooth verified, GuampBtDefaults.h guamp_bt_mode); guamp-bt=0 turns it off. */
++	PE_parse_boot_argn("guamp-bt", &bt, sizeof(bt));
++	if (bt == 2) {
+ 		enabled = 1;
+ 	}
+ 	PE_parse_boot_argn("guamp-bt-tool", &enabled, sizeof(enabled));
