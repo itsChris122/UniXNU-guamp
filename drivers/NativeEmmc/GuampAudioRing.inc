@@ -31,17 +31,66 @@ struct Stream {
   int32_t centiDb = 0;
   bool adspEnabled = false, hwReady = false;   // ADSP sink configured in this boot / path streaming now
   uint32_t routeChanges = 0, volumeChanges = 0;
+  // On-demand ADSP sink (guamp-adsp-ipc=6). iOS starts IO for each sound and stops it right after (a key click: StartIO, about
+  // 300 ms of PCM, StopIO), while the ADSP path needs about 0.45 s to come up. So:
+  //  - hold: a sound written while the path is down is kept in the ring (the null sink stops consuming) until the path takes
+  //    it, at most kHoldSec; then it is dropped (path failed);
+  //  - draining: STOP/close with that sound still queued keeps it (and the volume) for the ADSP, wanted until played;
+  //  - idle gate (guamp-audio-idle-ms, idleTicks): a running stream that writes only silence for that long stops being wanted,
+  //    so the path and the amplifier go down even if a client keeps IO running;
+  //  - trim: once the path streams, runs of silence at the head beyond kTargetFrames are skipped, so the delay of the held
+  //    start disappears at the first pause; if the client is still writing when the path comes up, the queue is cut to
+  //    2 x kTargetFrames at once (live edge).
+  static constexpr int32_t kSilence = 2;                   // |sample| <= this counts as silence
+  static constexpr uint32_t kTargetFrames = 4 * GUAMP_AUDIO_PERIOD_FRAMES, kMinSilentRun = 48;
+  static constexpr uint64_t kHoldSec = 2;
+  uint64_t idleTicks = 0, lastSoundTicks = 0, holdSince = 0;
+  bool hold = false, draining = false;
+  uint32_t holds = 0, holdDrops = 0, drains = 0;
+  uint64_t trimmedFrames = 0;
 
   uint32_t used() const { return static_cast<uint32_t>(wr - rd); }
   uint32_t space() const { return bytes - used(); }
   uint64_t framesPlayed() const { return rd / GUAMP_AUDIO_BYTES_PER_FRAME; }
+  // open/close: a draining sound keeps its queue and its volume (the next open appends after it)
   void reset() {
-    wr = rd = 0;
-    running = clockRunning = false;
+    running = false;
     underruns = 0;
+    if (draining && used()) return;
+    wr = rd = 0;
+    clockRunning = hold = draining = false;
     gainQ16 = GUAMP_AUDIO_GAIN_UNITY;
     mute = 0;
     centiDb = 0;
+  }
+  static bool loud(const uint8_t *p, uint32_t n) {
+    for (uint32_t i = 0; i + 1 < n; i += 2) {
+      const int32_t v = static_cast<int16_t>(static_cast<uint16_t>(p[i] | (p[i + 1] << 8)));
+      if (v > kSilence || v < -kSilence) return true;
+    }
+    return false;
+  }
+  bool silentFrameAt(uint64_t at) const {
+    for (uint32_t b = 0; b < GUAMP_AUDIO_BYTES_PER_FRAME; b += 2) {
+      const int32_t v = static_cast<int16_t>(
+          static_cast<uint16_t>(buf[(at + b) & (bytes - 1)] | (buf[(at + b + 1) & (bytes - 1)] << 8)));
+      if (v > kSilence || v < -kSilence) return false;
+    }
+    return true;
+  }
+  // Whether the ADSP path should be up (the sink glue's wanted(); the device lock is held)
+  bool wantAdsp(uint64_t now) const {
+    if (!adspEnabled) return false;
+    if (hold || (draining && used())) return true;
+    if (!running) return false;
+    if (!idleTicks) return true;
+    return lastSoundTicks && now - lastSoundTicks < idleTicks;
+  }
+  void dropHold() {
+    hold = draining = false;
+    holdDrops++;
+    rd = wr;
+    clockRunning = false;
   }
   // Producer: copies up to n bytes (whole frames) that fit; returns the bytes taken
   uint32_t push(const uint8_t *src, uint32_t n, uint64_t now) {
@@ -49,6 +98,14 @@ struct Stream {
     take -= take % GUAMP_AUDIO_BYTES_PER_FRAME;
     for (uint32_t i = 0; i < take; i++) buf[(wr + i) & (bytes - 1)] = src[i];
     wr += take;
+    if (take && adspEnabled && loud(src, take)) {
+      lastSoundTicks = now ? now : 1;
+      if (sink == SinkNull && !hold) {
+        hold = true;
+        holdSince = now;
+        holds++;
+      }
+    }
     if (take && running && sink == SinkNull && !clockRunning) anchor(now);   // restart after a dry ring
     return take;
   }
@@ -56,6 +113,7 @@ struct Stream {
   // the playback rule of asm_multi_channel_pcm_fmt_blk_v2), with the volume gain; silence for the missing part (an
   // underrun while running). Returns the frames taken from the ring.
   uint32_t pull(uint8_t *dst, uint32_t frames, uint32_t bits, uint64_t now) {
+    trim();
     const uint32_t avail = used() / GUAMP_AUDIO_BYTES_PER_FRAME, have = avail < frames ? avail : frames;
     const uint32_t width = bits == 24 ? 4 : 2, samples = frames * GUAMP_AUDIO_CHANNELS;
     for (uint32_t i = 0; i < samples; i++) {
@@ -70,6 +128,7 @@ struct Stream {
     }
     rd += static_cast<uint64_t>(have) * GUAMP_AUDIO_BYTES_PER_FRAME;
     if (have < frames && running) underruns++;
+    if (draining && !used()) draining = false;
     anchorTicks = now;          // position: frames handed to the ADSP so far, at the time they were taken
     anchorFrame = framesPlayed();
     clockRunning = true;
@@ -77,6 +136,11 @@ struct Stream {
   }
   // Null sink: consume what is due at now. The clock stops when the ring runs dry (underrun) and restarts at a write.
   void consume(uint64_t now) {
+    if (hold && sink == SinkNull) {
+      if (!ticksPerSec || now - holdSince < kHoldSec * ticksPerSec) return;   // the ADSP path is coming up
+      dropHold();
+      return;
+    }
     if (!running || sink != SinkNull || !clockRunning || !ticksPerSec || now < anchorTicks) return;
     const uint64_t due = anchorFrame + (now - anchorTicks) * GUAMP_AUDIO_RATE / ticksPerSec;
     const uint64_t played = framesPlayed(), queued = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
@@ -88,6 +152,17 @@ struct Stream {
     rd = wr;   // ran dry before now
     clockRunning = false;
     underruns++;
+  }
+  // ADSP consumer, before each period: skip head silence (runs of at least kMinSilentRun frames) beyond kTargetFrames queued
+  void trim() {
+    const uint32_t queued = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
+    if (queued <= kTargetFrames) return;
+    const uint32_t excess = queued - kTargetFrames;
+    uint32_t run = 0;
+    while (run < excess && silentFrameAt(rd + static_cast<uint64_t>(run) * GUAMP_AUDIO_BYTES_PER_FRAME)) run++;
+    if (run < kMinSilentRun) return;
+    rd += static_cast<uint64_t>(run) * GUAMP_AUDIO_BYTES_PER_FRAME;
+    trimmedFrames += run;
   }
   void anchor(uint64_t now) {
     anchorTicks = now;
@@ -105,6 +180,15 @@ struct Stream {
     sink = s;
     hwReady = s == SinkAdsp;
     clockRunning = false;
+    hold = false;
+    if (s == SinkNull) draining = false;
+    // Path up while the client still writes (music, video): start near the live edge, so the picture is not followed by the
+    // path's start-up delay for the whole stream. A sound that already ended (draining) plays whole, late.
+    if (s == SinkAdsp && running && !draining && used() > 2 * kTargetFrames * GUAMP_AUDIO_BYTES_PER_FRAME) {
+      const uint64_t keep = 2ull * kTargetFrames * GUAMP_AUDIO_BYTES_PER_FRAME;
+      trimmedFrames += (used() - keep) / GUAMP_AUDIO_BYTES_PER_FRAME;
+      rd = wr - keep;
+    }
     if (running && s == SinkNull && used()) anchor(now);
   }
   uint32_t flags() const {
@@ -126,12 +210,19 @@ struct Stream {
       case GUAMP_AUDIO_START:
         if (!running) {
           running = true;
+          draining = false;   // the new stream carries on after what is queued (hold, if any, stays)
           clockRunning = false;
           if (used() && sink == SinkNull) anchor(now);
         }
         return 0;
       case GUAMP_AUDIO_STOP:
-        running = clockRunning = false;
+        running = false;
+        if (adspEnabled && used() && (hold || sink == SinkAdsp)) {   // the end of a sound the ADSP has not played yet
+          draining = true;
+          drains++;
+          return 0;
+        }
+        clockRunning = hold = draining = false;
         rd = wr;
         return 0;
       case GUAMP_AUDIO_SET_VOLUME: {

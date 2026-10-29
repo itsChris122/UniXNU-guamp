@@ -29,6 +29,9 @@
 #include <sys/vnode.h>
 #include <miscfs/devfs/devfs.h>
 
+// patches/xnu/zzzzz-guamp-mac-dev-exempt.patch (see GuampAudioDev.inc): [1] = /dev/guamp-mic
+extern "C" int guamp_mac_exempt_major[2];
+
 #if !defined(GUAMP_WCD937X_POWER_PROVIDED) || !GUAMP_WCD937X_POWER_PROVIDED
 extern "C" __attribute__((weak)) int guamp_wcd937x_power(int) { return GUAMP_AUDIO_HW_ABSENT; }
 #endif
@@ -417,6 +420,9 @@ bool configure() {
   gRing.ticksPerSec = second;
   gMajor = cdevsw_add(-1, &kSw);
   if (gMajor < 0) IOLog("GuampMic: cdevsw_add failed %d\n", gMajor);
+  unsigned macOn = 1;   // guamp-audio-mac=0: the sandbox decides
+  PE_parse_boot_argn("guamp-audio-mac", &macOn, sizeof(macOn));
+  if (gMajor >= 0 && macOn) guamp_mac_exempt_major[1] = gMajor;
   thread_t t = nullptr;
   if (gMajor >= 0 && kernel_thread_start(nodeThread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
   gOn = true;

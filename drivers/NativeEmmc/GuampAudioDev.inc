@@ -17,6 +17,16 @@
 #include <sys/vnode.h>
 #include <miscfs/devfs/devfs.h>
 
+// patches/xnu/zzzzz-guamp-mac-dev-exempt.patch: [0] /dev/guamp-audio, [1] /dev/guamp-mic. audiomxd's sandbox profile names only
+// Apple audio nodes; a registered major skips the MAC policies for lookup/open/read/write/ioctl (owner and mode still apply).
+// guamp-audio-mac=0 leaves the decision to the sandbox (diagnostics).
+extern "C" int guamp_mac_exempt_major[2];
+inline bool guamp_audio_mac_exempt_wanted() {
+  unsigned on = 1;
+  PE_parse_boot_argn("guamp-audio-mac", &on, sizeof(on));
+  return on != 0;
+}
+
 namespace audiodev {
 
 IOLock *gLock = nullptr;
@@ -56,7 +66,8 @@ int adOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   gWrittenFrames = 0;
   const bool adsp = gStream.adspEnabled;
   IOLockUnlock(gLock);
-  IOLog("GuampAudioDev: open (%u), sink %s, ABI %u\n", gOpens, adsp ? "adsp (on START)" : "null", GUAMP_AUDIO_ABI_VERSION);
+  if (gOpens <= 8 || !(gOpens % 64))
+    IOLog("GuampAudioDev: open (%u), sink %s, ABI %u\n", gOpens, adsp ? "adsp (on sound)" : "null", GUAMP_AUDIO_ABI_VERSION);
   return 0;
 }
 
@@ -65,12 +76,17 @@ int adClose(dev_t dev, int flags, int devtype, struct proc *p) {
   gStream.consume(mach_absolute_time());
   const uint64_t written = gWrittenFrames, played = gStream.framesPlayed();
   const uint32_t underruns = gStream.underruns, routeChanges = gStream.routeChanges, volumes = gStream.volumeChanges;
+  const uint32_t holds = gStream.holds, holdDrops = gStream.holdDrops, drains = gStream.drains;
+  const unsigned long long trimmed = gStream.trimmedFrames;
+  const bool draining = gStream.draining;
   gStream.reset();
   gOpen = false;
   IOLockUnlock(gLock);
-  IOLog("GuampAudioDev: close; %llu frames written, %llu played, %u underruns, %u writes (%u blocked), %u ioctls, "
-        "%u route / %u volume changes\n", static_cast<unsigned long long>(written), static_cast<unsigned long long>(played),
-        underruns, gWrites, gBlocked, gIoctls, routeChanges, volumes);
+  if (gOpens <= 8 || !(gOpens % 64))   // iOS opens/closes for every sound: the first ones, then one in 64
+    IOLog("GuampAudioDev: close (%u); %llu frames written, %llu played, %u underruns, %u writes (%u blocked), %u ioctls, "
+          "%u route / %u volume changes; holds %u (dropped %u), drains %u%s, trimmed %llu frames\n", gOpens,
+          static_cast<unsigned long long>(written), static_cast<unsigned long long>(played), underruns, gWrites, gBlocked,
+          gIoctls, routeChanges, volumes, holds, holdDrops, drains, draining ? " (draining)" : "", trimmed);
   return 0;
 }
 
@@ -124,7 +140,7 @@ int adIoctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p) {
   const int e = gStream.ioctl(static_cast<uint32_t>(cmd), data, mach_absolute_time(), gWrittenFrames);
   const uint32_t newRoute = gStream.route, newGain = gStream.gainQ16;
   IOLockUnlock(gLock);
-  if (cmd == GUAMP_AUDIO_START || cmd == GUAMP_AUDIO_STOP || e || route != newRoute)
+  if (((cmd == GUAMP_AUDIO_START || cmd == GUAMP_AUDIO_STOP) && gOpens <= 8) || e || route != newRoute)
     IOLog("GuampAudioDev: ioctl %x -> %d (route %u, gain %x)\n", static_cast<unsigned>(cmd), e, newRoute, newGain);
   else if (gain != newGain && gIoctls < 64)
     IOLog("GuampAudioDev: volume gain %x\n", newGain);
@@ -167,6 +183,13 @@ void start() {
   }
   gStream.bytes = guampaudio::kRingBytes;
   gStream.adspEnabled = adspipc::gLevel == 6;
+  // guamp-audio-idle-ms (default 4000, 0 = off): a stream that writes only silence that long no longer holds the ADSP path
+  unsigned idleMs = 4000;
+  PE_parse_boot_argn("guamp-audio-idle-ms", &idleMs, sizeof(idleMs));
+  if (idleMs > 600000) idleMs = 4000;
+  uint64_t idle = 0;
+  nanoseconds_to_absolutetime(static_cast<uint64_t>(idleMs) * 1000000ull, &idle);
+  gStream.idleTicks = idle;
   gStream.dspBits = adspipc::gPcmBits;
   if (PE_parse_boot_argn("guamp-audio-cdc", &cdc, sizeof(cdc)) && cdc == 1)
     gStream.routes |= (1u << GUAMP_AUDIO_DEV_ROUTE_EARPIECE) | (1u << GUAMP_AUDIO_DEV_ROUTE_HEADPHONE);
@@ -178,6 +201,7 @@ void start() {
     IOLog("GuampAudioDev: cdevsw_add failed %d\n", gMajor);
     return;
   }
+  if (guamp_audio_mac_exempt_wanted()) guamp_mac_exempt_major[0] = gMajor;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
