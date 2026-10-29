@@ -1,0 +1,104 @@
+diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
+index 10ac956..f6df8ed 100644
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -128,6 +128,7 @@
+ #endif
+ 
+ #include <sys/sdt.h>
++#include <pexpert/pexpert.h>	/* guamp-disk-capacity */
+ 
+ #define ESUCCESS 0
+ #undef mount_t
+@@ -739,6 +740,83 @@ vfs_statfs(mount_t mp)
+ 	return &mp->mnt_vfsstat;
+ }
+ 
++/*
++ * guamp-disk-capacity=<GB> (29/10, default 0 = off). On guamp "/" is the sealed OS container (6 GB, read only) and Data
++ * is a separate 4 GiB container mounted on /private/var, so Settings > General > iPhone Storage (StorageData
++ * _GetDeviceSpace: getattrlist("/") ATTR_VOL_SIZE/SPACEAVAIL, rounded to the nearest 10^9) and statfs("/") see
++ * about 6 GB and nothing free. With the boot arg the read-only OS volumes ("/", MNT_ROOTFS, the union SystemOS layer
++ * and /private/preboot) report a total of <GB> * 10^9 bytes and the real free/available space of the Data mount,
++ * as on an iPhone where System and Data share one container. Covers statfs, getattrlist and getattrlistbulk (all of
++ * them go through vfs_getattr). Data itself and every other mount are untouched.
++ */
++static int guamp_disk_capacity_gb = -1;
++uint32_t guamp_disk_capacity_hits;
++
++static void
++guamp_disk_capacity_apply(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
++{
++	if (guamp_disk_capacity_gb < 0) {
++		uint32_t gb = 0;
++		PE_parse_boot_argn("guamp-disk-capacity", &gb, sizeof(gb));
++		guamp_disk_capacity_gb = gb <= 4096 ? (int)gb : 0;
++		printf("guamp-disk-capacity=%d: OS volumes report %d GB total, Data free space\n",
++		    guamp_disk_capacity_gb, guamp_disk_capacity_gb);
++	}
++	if (guamp_disk_capacity_gb == 0 || !(mp->mnt_flag & MNT_RDONLY)) {
++		return;
++	}
++	const char *on = mp->mnt_vfsstat.f_mntonname;
++	if (!(mp->mnt_flag & MNT_ROOTFS) && strcmp(on, "/") != 0 && strcmp(on, "/private/preboot") != 0) {
++		return;
++	}
++	if (!VFSATTR_IS_ACTIVE(vfa, f_blocks) && !VFSATTR_IS_ACTIVE(vfa, f_bfree) && !VFSATTR_IS_ACTIVE(vfa, f_bavail)) {
++		return;
++	}
++	mount_t data = NULL, m;
++	mount_list_lock();
++	TAILQ_FOREACH(m, &mountlist, mnt_list) {
++		if (m != mp && !(m->mnt_flag & MNT_RDONLY) && strcmp(m->mnt_vfsstat.f_mntonname, "/private/var") == 0 &&
++		    mount_iterref(m, 1) == 0) {
++			data = m;
++			break;
++		}
++	}
++	mount_list_unlock();
++	if (data == NULL) {
++		return;	/* early boot, before Data is mounted: real values */
++	}
++	struct vfs_attr dva;
++	VFSATTR_INIT(&dva);
++	VFSATTR_WANTED(&dva, f_bsize);
++	VFSATTR_WANTED(&dva, f_bfree);
++	VFSATTR_WANTED(&dva, f_bavail);
++	int error = VFS_GETATTR(data, &dva, ctx);
++	uint64_t dbs = (VFSATTR_IS_SUPPORTED(&dva, f_bsize) && dva.f_bsize) ? dva.f_bsize : data->mnt_vfsstat.f_bsize;
++	mount_iterdrop(data);
++	uint64_t rbs = (VFSATTR_IS_SUPPORTED(vfa, f_bsize) && vfa->f_bsize) ? vfa->f_bsize : mp->mnt_vfsstat.f_bsize;
++	if (error != 0 || dbs == 0 || rbs == 0 || !VFSATTR_IS_SUPPORTED(&dva, f_bfree) || !VFSATTR_IS_SUPPORTED(&dva, f_bavail)) {
++		return;
++	}
++	uint64_t total = (uint64_t)guamp_disk_capacity_gb * 1000000000ULL;
++	uint64_t freeb = dva.f_bfree * dbs, avail = dva.f_bavail * dbs;
++	freeb = freeb < total ? freeb : total;
++	avail = avail < freeb ? avail : freeb;
++	if (VFSATTR_IS_ACTIVE(vfa, f_blocks)) {
++		VFSATTR_RETURN(vfa, f_blocks, total / rbs);
++	}
++	if (VFSATTR_IS_ACTIVE(vfa, f_bfree)) {
++		VFSATTR_RETURN(vfa, f_bfree, freeb / rbs);
++	}
++	if (VFSATTR_IS_ACTIVE(vfa, f_bavail)) {
++		VFSATTR_RETURN(vfa, f_bavail, avail / rbs);
++	}
++	if (VFSATTR_IS_ACTIVE(vfa, f_bused)) {
++		/* used = total - free, so used + available never exceeds the reported size */
++		VFSATTR_RETURN(vfa, f_bused, (total - freeb) / rbs);
++	}
++	guamp_disk_capacity_hits++;
++}
++
+ int
+ vfs_getattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
+ {
+@@ -747,6 +825,7 @@ vfs_getattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
+ 	if ((error = VFS_GETATTR(mp, vfa, ctx)) != 0) {
+ 		return error;
+ 	}
++	guamp_disk_capacity_apply(mp, vfa, ctx);
+ 
+ 	/*
+ 	 * If we have a filesystem create time, use it to default some others.
