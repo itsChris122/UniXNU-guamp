@@ -87,7 +87,29 @@ static void limits() {
   CHECK(!nagAllowBytes(~0ull, 0, 4096, 384 * mib, 1024 * mib));
 }
 
+// patch 0006: the deny list and the table pressure checked at open.
+static void admission() {
+  const char *list = "SpringBoard, mediaserverd ,com.apple.WebKit.*,ScreenshotServicesService";
+  CHECK(nagListed(list, "SpringBoard"));
+  CHECK(!nagListed(list, "SpringBoardX"));
+  CHECK(!nagListed(list, "Spring"));
+  CHECK(nagListed(list, "mediaserverd"));
+  CHECK(nagListed(list, "com.apple.WebKit"));    // the 16-character name of com.apple.WebKit.WebContent: a longer prefix covers it
+  CHECK(!nagListed(list, "com.apple.WebKi"));
+  CHECK(nagListed(list, "ScreenshotServic"));    // a long entry is compared on its first 16 characters
+  CHECK(!nagListed(list, "Preferences"));
+  CHECK(!nagListed("", "SpringBoard"));
+  CHECK(!nagListed(nullptr, "SpringBoard"));
+  CHECK(nagListed("*", "anything"));
+  CHECK(nagListed("Kaleido*", "KaleidoscopePost"));
+  CHECK(!nagListed(",,", "x"));
+  CHECK(!nagTablePressure(4000, 60000));
+  CHECK(nagTablePressure(NagVmObjects - NagVmReservedObjects, 0));
+  CHECK(nagTablePressure(0, NagVmSpans - NagVmReservedSpans));
+}
+
 int main() {
+  admission();
   windows();
   rates();
   limits();

@@ -91,6 +91,9 @@ static void importLog()
 extern "C" volatile uint32_t native_adreno_gpu_all __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_gpu_all_stats[12] __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import));
+// patch 0006: [0] objects and [1] spans of the shared GPU table, opens refused by [2] the deny list, [3] table pressure, [4] the BO
+// total, [5] BoAllocs refused by the per-process ceiling.
+extern "C" volatile uint32_t native_adreno_gpu_all_stats2[6] __attribute__((weak_import));
 
 static void gpuAllLog()
 {
@@ -103,10 +106,14 @@ static void gpuAllLog()
   for (unsigned i = 0; i < 13; i++) same = same && now[i] == last[i];
   if (same) return;
   IOLog("GuampMetal: gpu-all live %u peak %u, deferred %u done %u pending %u; refused rate %u slot %u bo %u map %u; others BO %u MiB; "
-        "free window %u MiB, largest %u MiB; mount fail %u status %x slot %u n %u\n", now[0], now[1], now[2], now[3], now[9], now[4],
+        "free window %u MiB, largest given %u MiB; mount fail %u status %x slot %u n %u\n", now[0], now[1], now[2], now[3], now[9], now[4],
         now[5], now[6], now[7], now[8], now[10], now[11], native_adreno_mount_fail[0], native_adreno_mount_fail[1],
         native_adreno_mount_fail[2], now[12]);
   for (unsigned i = 0; i < 13; i++) last[i] = now[i];
+  if (&native_adreno_gpu_all_stats2)
+    IOLog("GuampMetal: gpu-all table %u objects %u spans; open refused deny %u table %u total %u; BoAlloc refused %u\n",
+          native_adreno_gpu_all_stats2[0], native_adreno_gpu_all_stats2[1], native_adreno_gpu_all_stats2[2],
+          native_adreno_gpu_all_stats2[3], native_adreno_gpu_all_stats2[4], native_adreno_gpu_all_stats2[5]);
 }
 
 static void metalLog()
