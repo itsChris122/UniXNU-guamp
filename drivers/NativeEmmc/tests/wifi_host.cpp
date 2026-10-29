@@ -357,17 +357,18 @@ static void testModem(const char *image, const char *extracted) {
     CHECK(r == b.expect, "%s: got %d", b.what, r);
     printf("refused %-26s -> %s\n", b.what, ext4::errorName(r));
   }
-  // block-mapped and inline-data inodes are refused per file
+  // inline-data (and encrypted) inodes are refused per file; block-mapped inodes are read since the BT M1 change
+  // (GuampExt4.inc: direct, single and double indirect), so the old "block-mapped file refused" case no longer holds
   d.patches.clear();
   mountWith(d, fs);
   uint8_t flags[4];
-  put32(flags, 0);
+  put32(flags, ext4::kFlagExtents | ext4::kFlagInlineData);
   d.patch(inodeOffset(fs, d, mdt.number) + 32, flags, 4);
   mountWith(d, fs);
   ext4::Inode plain;
   fs.lookupPath("/image/modem.mdt", &plain);
   uint8_t tmp[16];
-  CHECK(fs.readFile(plain, 0, tmp, 16) == ext4::kErrUnsupported, "block-mapped file refused");
+  CHECK(fs.readFile(plain, 0, tmp, 16) == ext4::kErrUnsupported, "inline-data file refused");
   d.patches.clear();
   close(d.fd);
 }

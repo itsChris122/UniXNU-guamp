@@ -41,6 +41,11 @@ fi
 # (zzzzzz, 29/10) edits the line of zzzzz.
 # The iPhone apps patch (zzzzzzzzzzz, 29/10: Wallet) edits the iphone-res table and the staged apps install.
 # The grant-all patch (zzwd, 29/10: guamp-gpu-all) edits the body of native_sandbox_grant that zzw adds.
+# Name order is byte order (QA 29/10): under en_US.UTF-8 the glob below would sort zzwb/zzwc/zzwd before
+# zzw-native-adreno-sandbox-grant (punctuation ignored), and zzwd edits the body that zzw adds. CI (C.UTF-8) is unchanged.
+# LC_ALL (it overrides LC_COLLATE) is C only for the two patch loops and restored after them.
+PATCH_LC_ALL=${LC_ALL-unset}
+export LC_ALL=C
 # Reverse newest first; the loop below re-applies them in name order.
 for LATE_PATCH in "$ROOT/patches/xnu/zzzzzzzzzzzzzzz-guamp-wallet-applications.patch" "$ROOT/patches/xnu/zzzzzzzzzzzzzz-guamp-iphone-applications.patch" "$ROOT/patches/xnu/zzzzzzzzzzzz-guamp-progressui-logo.patch" "$ROOT/patches/xnu/zzzzzzzzzzzz-guamp-boot-logo.patch" "$ROOT/patches/xnu/zzzzzzzzzzz-guamp-iphone-apps.patch" "$ROOT/patches/xnu/zzzzzzzzzz-guamp-cryptex-os.patch" "$ROOT/patches/xnu/zzzzzzzzz-guamp-default-args.patch" "$ROOT/patches/xnu/zzzzzzzz-guamp-wifi-network-ready.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-install-staged-apps.patch" "$ROOT/patches/xnu/zzzzzzz-guamp-audio-plugin.patch" "$ROOT/patches/xnu/zzzzzz-guamp-text-fixup-128.patch" "$ROOT/patches/xnu/zzzzzz-guamp-ca-metal.patch" "$ROOT/patches/xnu/zzzzz-guamp-text-fixup-64.patch" "$ROOT/patches/xnu/zzzz-guamp-ram-fb-wc.patch" "$ROOT/patches/xnu/zzzz-guamp-stuck-cpu.patch" "$ROOT/patches/xnu/zzzz-guamp-zbt-tool.patch" "$ROOT/patches/xnu/zzzz-guamp-setup-skip.patch" "$ROOT/patches/xnu/zzzz-guamp-iphone-res.patch" "$ROOT/patches/xnu/zzzz-guamp-exit-trace.patch" "$ROOT/patches/xnu/zzzz-guamp-cs-sealed.patch" "$ROOT/patches/xnu/zzzz-guamp-data-skeleton.patch" "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
     "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch" "$ROOT/patches/xnu/zzwd-native-sandbox-grant-all.patch"; do
@@ -54,6 +59,7 @@ for PATCH in "$ROOT"/patches/xnu/*.patch "$ROOT"/kits/NativePrelink/patches/*.pa
     git -C .cache/xnu-work apply "$PATCH"
   fi
 done
+if [ "$PATCH_LC_ALL" = unset ]; then unset LC_ALL; else export LC_ALL=$PATCH_LC_ALL; fi
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
 python3 scripts/prepare-xnu-source.py
 # The first pass of a new tree (XNU_BOOTSTRAP=1, set by the unixnu driver) only has to leave the compile records and
