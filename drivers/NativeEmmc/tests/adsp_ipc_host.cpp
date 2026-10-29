@@ -144,6 +144,7 @@ struct Peer {
   std::vector<Intent> appsIntents;
   std::vector<std::vector<uint8_t>> outbox;   // APR replies waiting for an apps intent
   bool requestOut = false;
+  uint32_t intentReqsSeen = 0;
   uint32_t stateQueries = 0, fwkQueries = 0, rxDones = 0, rxDoneReuse = 0, intentReqAcks = 0, opensSeen = 0, readNotif = 0;
   uint64_t fwkSentAtMs = 0, afeDoneAtMs = 0;
   std::vector<uint32_t> afeOps;
@@ -220,11 +221,26 @@ struct Peer {
     const char a[] = "apr_audio_svc";
     CHECK(cmd(2, kRcidApr, sizeof(a), reinterpret_cast<const uint8_t *>(a), sizeof(a)));
     aprOpenSent = true;
+    // As the guamp ADSP (boot p4): 64 intents of 128 bytes first, one per message, then the bigger ones (sent by
+    // moreIntents() as the small FIFO has room). An apps table that keeps only the first 32 never sees a 512-byte
+    // intent: the 192-byte AFE I2S_CONFIG was then blocked forever.
+    moreIntents();
+  }
+  uint32_t smallSent = 0;
+  bool bigSent = false;
+  void moreIntents() {
+    if (!aprOpenSent || bigSent) return;
+    while (smallSent < 64) {
+      const uint32_t small[2] = {128, 1000 + smallSent};
+      if (!cmd(5, kRcidApr, 1, reinterpret_cast<const uint8_t *>(small), 8)) return;
+      smallSent++;
+    }
     uint8_t pairs[16];
     const uint32_t v[4] = {512, 100, 512, 101};
     memcpy(pairs, v, 16);
-    CHECK(cmd(5, kRcidApr, 2, pairs, 16));
+    if (!cmd(5, kRcidApr, 2, pairs, 16)) return;
     CHECK(cmd(15, kRcidApr, 0x3));     // SIGNALS
+    bigSent = true;
   }
   // ADSP answers: 20-byte header, CMD_RSP type (apr_cb_func takes any type below 4)
   void reply(uint32_t token, uint32_t opcode, const std::vector<uint32_t> &payload, uint8_t svc = 3) {
@@ -386,9 +402,9 @@ struct Peer {
           break;
         }
         case 7: {                                                                // RX_INTENT_REQ from apps
+          // the real ADSP: it already advertised 512-byte intents, so it only acks (granted) without a new one
           CHECK(p1 == aprLcid && p2 <= 512);
-          const uint32_t v[4] = {512, 200 + p2 % 7, 0, 0};
-          CHECK(cmd(5, kRcidApr, 1, reinterpret_cast<const uint8_t *>(v), 8));
+          intentReqsSeen++;
           CHECK(cmd(8, kRcidApr, 1));
           break;
         }
@@ -398,7 +414,7 @@ struct Peer {
           uint32_t chunk, left;
           memcpy(&chunk, h + 8, 4); memcpy(&left, h + 12, 4);
           bytes = 16 + ((chunk + 7) & ~7u);
-          CHECK(p1 == aprLcid && (p2 == 100 || p2 == 101 || p2 >= 200));
+          CHECK(p1 == aprLcid && (p2 == 100 || p2 == 101 || (p2 >= 1000 && p2 < 1064 && chunk <= 128)));
           std::vector<uint8_t> d(chunk);
           txPeek(16, d.data(), chunk);
           if (c == 9) assembly.clear();
@@ -427,6 +443,7 @@ struct Peer {
     smp2p();
     if (nowMs() >= readyAtMs) glinkStart();
     glink();
+    moreIntents();
   }
 };
 static Peer *gPeer;
@@ -485,6 +502,10 @@ static void endToEnd() {
   for (const auto &li : c->intent) local += li.data ? 1 : 0;
   CHECK(local == 20 && c->rxPackets == 13 && c->txPackets == 13 && c->remote == Peer::kRcidApr);
   CHECK(adspipc::gGlink->ignoredOpens == 1 && adspipc::gGlink->rx.length == 1024);
+  // 66 remote intents (64 x 128 B + 2 x 512 B) all kept: the 192-byte I2S_CONFIG used a 512 one, no request needed
+  uint32_t known = 0, big = 0;
+  for (const auto &ri : c->remoteIntent) { known += ri.id ? 1 : 0; big += ri.id && ri.size == 512 ? 1 : 0; }
+  CHECK(known == 66 && big == 2 && c->remoteDropped == 0 && peer.intentReqsSeen == 0 && adspipc::gAprTimeouts == 0);
   printf("end to end: SMP2P 429 + negotiation + SSR ack, GLINK version/open/intents/signals, APR state x3 + fwk "
          "(520-byte reply via RX_INTENT_REQ, fragmented, RX FIFO wrapped), ADSP APR OK, AFE tone sequence with every "
          "packet checked, ADSP TONE OK, err-fatal exit\n");

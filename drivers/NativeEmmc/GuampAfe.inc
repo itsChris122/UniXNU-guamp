@@ -164,7 +164,7 @@ struct AfeTone {
   uint32_t handleMacro = 0;
   bool waiting = false, voted = false, clockOn = false, started = false, ampOn = false, dtmfOn = false, setupFailed = false;
   bool played = false;
-  uint32_t token = 0, waitOpcode = 0, deadline = 0, playUntil = 0, handle = 0, configTries = 0;
+  uint32_t token = 0, waitOpcode = 0, deadline = 0, playUntil = 0, handle = 0, configTries = 0, blockedAt = 0;
   uint32_t failedStep = 0, failedStatus = 0, undoErrors = 0, unexpected = 0, hwErrors = 0, answered = 0;
 
   void begin(uint32_t now) {
@@ -189,6 +189,7 @@ struct AfeTone {
       if (waiting) {
         if (now < deadline) return;
         waiting = false;
+        note("TIMEOUT: no answer in 1 s to opcode", waitOpcode, static_cast<uint32_t>(step));
         result(now, false, 0xffffffffu);   // no answer in 1 s
         continue;
       }
@@ -198,7 +199,15 @@ struct AfeTone {
         step = DtmfOff;
         continue;
       }
-      if (!issue(now)) return;   // channel busy: next pass
+      if (!issue(now)) {   // channel busy (no GLINK intent): next pass, but not forever
+        if (!blockedAt) blockedAt = now + 1;   // +1: 0 means "not blocked"
+        if (now + 1 - blockedAt < kAnswerMs) return;
+        blockedAt = 0;
+        note("SEND BLOCKED for 1 s at step", static_cast<uint32_t>(step), 0);
+        result(now, false, 0xfffffffeu);
+        continue;
+      }
+      blockedAt = 0;
       if (!waiting) continue;    // synchronous step done
       return;
     }

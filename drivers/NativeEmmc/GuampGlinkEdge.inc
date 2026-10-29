@@ -115,7 +115,7 @@ struct Glink {
       "read-notif rx", "signals rx", "close rx", "close-ack rx", "channel ready", "rx fifo attached", "ignored"};
     return t >= 0 && t < TrCount ? names[t] : "?";
   }
-  static constexpr uint32_t kMaxChannels = 4, kMaxLocal = 28, kMaxRemote = 32, kMaxPacket = 0x4400, kMaxRequest = 0x10000;
+  static constexpr uint32_t kMaxChannels = 4, kMaxLocal = 28, kMaxRemote = 128, kMaxPacket = 0x4400, kMaxRequest = 0x10000;
   static constexpr uint32_t kQueue = 64, kPairsPerMessage = 5, kFeatureIntentReuse = 1;
   struct LocalIntent { uint8_t *data; uint32_t id, size, used, remaining; bool active, reuse; };
   struct RemoteIntent { uint32_t id, size; bool used; };
@@ -127,7 +127,7 @@ struct Glink {
     LocalIntent intent[kMaxLocal];
     RemoteIntent remoteIntent[kMaxRemote];
     uint8_t *pending;
-    uint32_t pendingSize, pendingAt, pendingIntent, rxPackets, txPackets, requests;
+    uint32_t pendingSize, pendingAt, pendingIntent, rxPackets, txPackets, requests, remoteDropped, remoteReplaced;
   };
   struct Control { uint8_t bytes[48]; uint32_t size; };
 
@@ -588,6 +588,15 @@ private:
             if (ri.id == id) slot = &ri;
           for (auto &ri : c->remoteIntent)
             if (!slot && !ri.id) slot = &ri;
+          // Table full (the guamp ADSP advertises 64 x 128 B, then 32 x 512 B, 16 x 1 KiB, 4 x 4 KiB on
+          // apr_audio_svc): a bigger intent replaces the smallest idle one, so every packet size stays reachable.
+          // The remote never learns of the forgotten one; it simply stays unused there.
+          if (!slot && id) {
+            for (auto &ri : c->remoteIntent)
+              if (!ri.used && ri.size < size && (!slot || ri.size < slot->size)) slot = &ri;
+            if (slot) c->remoteReplaced++;
+            else c->remoteDropped++;
+          }
           if (!slot || !id) continue;
           *slot = {id, size, false};
         }
@@ -604,7 +613,9 @@ private:
         break;
       case IntentReqAck:
         note(TrIntentReqAckRx, c ? c->name : "", p1, p2);
-        if (c && !p2) c->requestPending = false;
+        // granted or not: the next send that finds no intent asks again (the guamp ADSP acks "granted" without a
+        // new intent when it believes an advertised one fits: keeping requestPending set blocked the channel)
+        if (c) c->requestPending = false;
         break;
       case RxDone:
       case RxDoneReuse: {

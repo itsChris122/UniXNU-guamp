@@ -88,11 +88,22 @@ bool smmuUp() {
 // FSR/FAR/FSYNR0 of the bank when they change (0 = no fault)
 void report(const char *when) {
   if (!gSmmu.active) return;
-  const uint32_t fsr = gSmmu.faultStatus();
-  if (fsr == gLastFsr) return;
-  gLastFsr = fsr;
-  IOLog("GuampAudioPlay: SMMU stream %x %s: FSR %x FAR %x%08x FSYNR0 %x%s\n", guampwifi::AdspAudioSmmu::Stream, when, fsr,
-        gSmmu.faultAddressHigh(), gSmmu.faultAddressLow(), gSmmu.faultSyndrome(), fsr ? " (ADSP access FAULTED)" : "");
+  // SMMUv2 FSR: MULTI 31, SS 30, FORMAT 10:9 (read-only: 2 = AArch64, NOT a fault), UUT 8, ASF 7, TLBLKF 6,
+  // TLBMCF 5, EF 4, PF 3, AFF 2, TF 1. FAR/FSYNR0 only mean something when a fault bit is set (boot p4 logged
+  // "FSR 400 FAR b28a1a644374": no fault, reset garbage in FAR).
+  const uint32_t fsr = gSmmu.faultStatus(), faults = fsr & 0xc00001feu;
+  if (faults == gLastFsr) return;
+  gLastFsr = faults;
+  if (!faults) {
+    IOLog("GuampAudioPlay: SMMU stream %x %s: no fault (FSR %x, format %u)\n", guampwifi::AdspAudioSmmu::Stream, when, fsr,
+          (fsr >> 9) & 3);
+    return;
+  }
+  IOLog("GuampAudioPlay: SMMU stream %x %s: FAULT FSR %x (%s%s%s%s%s) FAR %x%08x FSYNR0 %x\n", guampwifi::AdspAudioSmmu::Stream,
+        when, fsr, fsr & 2 ? "translation " : "", fsr & 4 ? "access-flag " : "", fsr & 8 ? "permission " : "",
+        fsr & 16 ? "external " : "", fsr & 0x80000000u ? "multi" : "", gSmmu.faultAddressHigh(), gSmmu.faultAddressLow(),
+        gSmmu.faultSyndrome());
+  gSmmu.clearFault();
 }
 
 apr::SmmuView probe() {

@@ -170,7 +170,76 @@ int playLpassClock(uint32_t clk, uint32_t hz, int on) {
   IOLog("GuampAdsp: play lpass clock %x %u Hz requested by the codec side: %s\n", clk, hz, held ? "running" : "NOT running");
   return held ? 0 : -5;
 }
-int aprSend(void *, const uint8_t *p, uint32_t n) { return gGlink && gGlink->send(gApr, p, n) == qipc::Ok ? 0 : -1; }
+// APR watchdog (every client: q6core, tone, playback, microphone): each command sent is remembered by token until an
+// answer with that token arrives; one line per command unanswered after 1 s, and one line per opcode that cannot be
+// sent for 1 s (GLINK has no remote intent big enough). Data commands (ASM WRITE/READ V2) have their own counters.
+struct AprPending { uint32_t token, opcode, at; uint16_t port; uint8_t svc; bool used, logged; };
+constinit AprPending gAprPend[24] = {};
+constinit uint32_t gBlockedOp = 0, gBlockedSince = 0, gBlockedBytes = 0, gAprTimeouts = 0;
+constinit bool gBlockedLogged = false;
+void aprTrack(const uint8_t *p, uint32_t n) {
+  if (n < apr::kHdrBytes) return;
+  const uint32_t op = apr::rd32(p + 16);
+  if (op == 0x00010dab || op == 0x00010dac) return;   // ASM_DATA_CMD_WRITE_V2 / READ_V2
+  AprPending *slot = nullptr;
+  for (auto &e : gAprPend)
+    if (!e.used || (e.logged && nowMs() - e.at > 10000)) { slot = &e; break; }
+  if (!slot) slot = &gAprPend[0];
+  *slot = {apr::rd32(p + 12), op, nowMs(), apr::rd16(p + 10), p[8], true, false};
+}
+void aprAnswered(const apr::Header &h) {
+  for (auto &e : gAprPend)
+    if (e.used && e.token == h.token && e.svc == h.srcSvc) {
+      if (e.logged)
+        IOLog("GuampAdsp: apr late answer to opcode %x token %x after %u ms\n", e.opcode, e.token, nowMs() - e.at);
+      e.used = false;
+      return;
+    }
+}
+void aprWatch() {
+  const uint32_t now = nowMs();
+  for (auto &e : gAprPend)
+    if (e.used && !e.logged && now - e.at >= 1000) {
+      e.logged = true;
+      gAprTimeouts++;
+      IOLog("GuampAdsp: apr TIMEOUT: no answer to opcode %x (svc %x port %x token %x) sent at %u ms\n", e.opcode, e.svc,
+            e.port, e.token, e.at);
+    }
+  if (gBlockedOp && !gBlockedLogged && now - gBlockedSince >= 1000) {
+    gBlockedLogged = true;
+    uint32_t known = 0, biggest = 0, free = 0;
+    const qipc::Glink::Channel *c = gGlink ? gGlink->channel(gApr) : nullptr;
+    if (c)
+      for (const auto &ri : c->remoteIntent)
+        if (ri.id) {
+          known++;
+          if (!ri.used) free++;
+          if (ri.size > biggest) biggest = ri.size;
+        }
+    IOLog("GuampAdsp: apr SEND BLOCKED: opcode %x (%u bytes) not sent for %u ms; glink remote intents %u known, %u idle, "
+          "biggest %u, request pending %d, dropped %u, replaced %u\n", gBlockedOp, gBlockedBytes, now - gBlockedSince, known,
+          free, biggest, c ? c->requestPending : 0, c ? c->remoteDropped : 0, c ? c->remoteReplaced : 0);
+  }
+}
+int aprSend(void *, const uint8_t *p, uint32_t n) {
+  const bool sent = gGlink && gGlink->send(gApr, p, n) == qipc::Ok;
+  const uint32_t op = n >= apr::kHdrBytes ? apr::rd32(p + 16) : 0;
+  if (!sent) {
+    if (gBlockedOp != op) {
+      gBlockedOp = op;
+      gBlockedSince = nowMs();
+      gBlockedBytes = n;
+      gBlockedLogged = false;
+    }
+    return -1;
+  }
+  if (gBlockedOp == op) {
+    if (gBlockedLogged) IOLog("GuampAdsp: apr send of opcode %x unblocked after %u ms\n", op, nowMs() - gBlockedSince);
+    gBlockedOp = 0;
+  }
+  aprTrack(p, n);
+  return 0;
+}
 void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
   apr::Header h;
   const uint8_t *payload = nullptr;
@@ -180,6 +249,7 @@ void glinkData(void *, uint16_t channel, const uint8_t *p, uint32_t n) {
         n, ok ? "ok" : "MALFORMED", ok ? h.srcDomain : 0, ok ? h.srcSvc : 0, ok ? h.srcPort : 0, ok ? h.destDomain : 0,
         ok ? h.destSvc : 0, ok ? h.destPort : 0, ok ? h.token : 0, ok ? h.opcode : 0, bytes);
   if (gLevel < 3 || channel != gApr || !ok) return;
+  aprAnswered(h);
   if (micglue::receive(p, n, nowMs())) return;   // microphone chain first (GuampMicDev.inc): only its mic token / ASM session 2
   if (gPlayStarted && gPlay.receive(p, n, nowMs())) return;   // playback (session 1) takes every other ASM/ADM packet
   if (h.srcSvc == apr::kSvcAfe && gToneStarted) gTone.receive(p, n, nowMs());
@@ -441,6 +511,7 @@ void run() {
       IOLog("GuampAdsp: ipc edge kept serviced every %u ms\n", kLoopMs);
     }
     // 8 x 10 ms periods in flight: poll faster while the ASM stream runs
+    aprWatch();
     static uint32_t lastReport = 0;
     if (gPlayGlue.report && gPlayStarted && gPlay.active() && nowMs() - lastReport >= 1000) {
       lastReport = nowMs();

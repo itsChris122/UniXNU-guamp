@@ -181,7 +181,7 @@ struct PcmPath {
   bool waiting = false, stopping = false, failed = false, mapped = false, admOpened = false, asmOpened = false;
   uint32_t token = 0, waitOpcode = 0, deadline = 0, handle = 0, copp = 0, failedStep = 0, failedStatus = 0;
   uint32_t seq = 0, inFlight = 0, writes = 0, writeDones = 0, writeErrors = 0, lastError = 0, unexpected = 0;
-  uint32_t sendBusy = 0, maxLateMs = 0, lastDoneAt = 0;
+  uint32_t sendBusy = 0, maxLateMs = 0, lastDoneAt = 0, blockedAt = 0;
   bool slotBusy[kSlots] = {};
 
   bool finished() const { return step == Done; }
@@ -205,6 +205,7 @@ struct PcmPath {
       if (waiting) {
         if (now < deadline) return;
         waiting = false;
+        note("pcm TIMEOUT: no answer in 1 s to opcode", waitOpcode, static_cast<uint32_t>(step));
         result(false, 0xffffffffu);
         continue;
       }
@@ -217,7 +218,15 @@ struct PcmPath {
         if (!stopping) feed(now);
         return;
       }
-      if (!issue(now)) return;
+      if (!issue(now)) {   // channel busy (no GLINK intent): next pass, but not forever
+        if (!blockedAt) blockedAt = now + 1;   // +1: 0 means "not blocked"
+        if (now + 1 - blockedAt < kAnswerMs) return;
+        blockedAt = 0;
+        note("pcm SEND BLOCKED for 1 s at step", static_cast<uint32_t>(step), 0);
+        result(false, 0xfffffffeu);
+        continue;
+      }
+      blockedAt = 0;
       if (waiting) return;
     }
   }

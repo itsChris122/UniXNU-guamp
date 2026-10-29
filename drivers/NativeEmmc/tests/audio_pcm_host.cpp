@@ -536,7 +536,37 @@ static void playback() {
          "linger: ok\n");
 }
 
+// ---- a command GLINK cannot send (no remote intent) fails after 1 s instead of blocking the chain forever ----------
+static void sendBlocked() {
+  std::vector<std::string> notes;
+  static std::vector<std::string> *gNotes;
+  gNotes = &notes;
+  apr::AfeTone t;
+  t.send = [](void *, const uint8_t *, uint32_t) { return -1; };
+  t.hw = [](void *, int, bool) { return 0; };
+  t.log = [](void *, const char *what, uint32_t, uint32_t) { gNotes->push_back(what); };
+  t.useDtmf = false;
+  t.holdPort = true;
+  t.begin(0);
+  uint32_t now = 0;
+  for (; now < 10000 && !t.finished(); now += 5) t.stepAt(now);
+  CHECK(t.finished() && t.setupFailed && t.failedStep == apr::AfeTone::ClockOn && t.failedStatus == 0xfffffffeu);
+  CHECK(now >= 2000 && now < 2200);   // vote blocked 1 s (not fatal), clock blocked 1 s (fatal), nothing to undo
+  size_t blocked = 0;
+  for (const auto &n : notes) blocked += n == "SEND BLOCKED for 1 s at step";
+  CHECK(blocked == 2);
+  apr::PcmPath p;
+  static uint8_t shm[8 * 4096];
+  p.shm = {shm, 0x10000000, 1, sizeof(shm)};
+  p.send = [](void *, const uint8_t *, uint32_t) { return -1; };
+  p.begin(0);
+  for (now = 0; now < 5000 && !p.finished(); now += 5) p.stepAt(now);
+  CHECK(p.finished() && p.failed && p.failedStep == apr::PcmPath::MemMap && p.failedStatus == 0xfffffffeu && now < 1100);
+  printf("send blocked: AFE and PCM steps fail after 1 s with a log line, nothing left hanging: ok\n");
+}
+
 int main() {
+  sendBlocked();
   abi();
   ring();
   builders();
