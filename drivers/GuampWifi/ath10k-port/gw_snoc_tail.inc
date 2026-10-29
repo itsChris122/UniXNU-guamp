@@ -99,6 +99,13 @@ static void gw_hif_power_down(struct ath10k *ar) {
 }
 static int gw_map_service_to_pipe(struct ath10k *ar,u16 service,u8 *ul,u8 *dl) {
   int e=ath10k_snoc_hif_map_service_to_pipe(ar,service,ul,dl);
+  /* ath10k_htc_start asks for the pktlog service only to find out whether the bus has it: the snoc table gives it a DL pipe
+   * and no UL pipe, so -ENOENT is the answer Linux gets as well (ath10k_htc_pktlog_svc_supported, logged at debug level),
+   * and pktlog is skipped. Not an error. */
+  if(e==-ENOENT&&service==ATH10K_HTC_SVC_ID_HTT_LOG_MSG) {
+    lx_log(6,"ath10k: phase HTC service 0x%04x (pktlog) has no UL pipe on snoc: pktlog not used, as in Linux",service);
+    return e;
+  }
   lx_log(e?3:6,"ath10k: phase HTC service connect 0x%04x -> UL pipe %u DL pipe %u (%d)",service,e?0:*ul,e?0:*dl,e);
   return e;
 }

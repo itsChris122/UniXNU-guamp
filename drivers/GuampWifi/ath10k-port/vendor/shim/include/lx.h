@@ -96,6 +96,7 @@ typedef u64 __be64;
 void lx_warn(const char *file, int line);
 void lx_bug(const char *file, int line) __attribute__((noreturn));
 void lx_log(int level, const char *fmt, ...) __printf(2, 3);
+int lx_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);   /* vsnprintf with printk's %pV, %pM, %pad, %*ph ... */
 
 /* byte order: the target is little endian */
 #define cpu_to_le16(x) ((__le16)(x))

@@ -24,7 +24,7 @@ u32 crc32_le(u32 crc,const unsigned char *p,size_t n) {
   return crc;
 }
 int gw_printk(const char *format,...) {
-  char text[384]; va_list ap; va_start(ap,format); int n=vsnprintf(text,sizeof(text),format,ap); va_end(ap);
+  char text[384]; va_list ap; va_start(ap,format); int n=lx_vsnprintf(text,sizeof(text),format,ap); va_end(ap);
   if(lx_plat&&lx_plat->log) lx_plat->log(7,text); return n;
 }
 int of_property_read_string_index(const struct device_node *n,const char *key,int i,const char **out) {

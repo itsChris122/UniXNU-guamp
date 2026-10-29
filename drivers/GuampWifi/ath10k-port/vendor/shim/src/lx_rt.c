@@ -28,8 +28,105 @@ void lx_delay_us(unsigned int us) { lx_delay_ms((us + 999) / 1000 ? (us + 999) /
 void lx_warn(const char *f, int l) { lx_log(4, "warning at %s:%d", f, l); }
 void lx_bug(const char *f, int l) { lx_log(3, "bug at %s:%d", f, l); lx_plat->halt(); for (;;) {} }
 void (*lx_log_tap)(int level, const char *line);
+/* printk's own conversions. The kernel's vsnprintf knows the C ones only and prints "%pV" (every ath10k_info/warn/err/dbg
+ * line: a struct va_format) as a bare pointer followed by "V". This formatter takes the conversions one at a time: the C ones
+ * go to snprintf with the value fetched here, the Linux pointer extensions are expanded here, as lib/vsprintf.c does:
+ * %pV (nested format, recursive), %pM %pMR %pMF %pm (MAC address), %pad %pap %pa (dma/phys address by reference),
+ * %*ph %*phC %*phD %*phN (hex dump of up to 64 bytes), %pI4 %pi4 (IPv4); any other extension (%pK %pS %ps %pB ...) prints
+ * the plain pointer. As in Linux, every letter or digit after the "p" belongs to the extension. */
+struct lx_fmt_out { char *b; size_t n, at; };
+static void fmt_put(struct lx_fmt_out *o, const char *s, size_t len) {
+  for (; len; len--, s++, o->at++) if (o->at + 1 < o->n) o->b[o->at] = *s; }
+static void fmt_putf(struct lx_fmt_out *o, const char *f, ...) __printf(2, 3);
+static void fmt_putf(struct lx_fmt_out *o, const char *f, ...) {
+  char t[80]; va_list ap; va_start(ap, f); vsnprintf(t, sizeof t, f, ap); va_end(ap); fmt_put(o, t, strlen(t)); }
+static int fmt_alnum(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+static void fmt_core(struct lx_fmt_out *o, const char *f, va_list *ap, int depth);
+static void fmt_pointer(struct lx_fmt_out *o, const char *ext, int width, void *p, int depth) {
+  const u8 *a = p;
+  if (*ext && (uintptr_t)p < 4096) { fmt_put(o, "(null)", 6); return; }
+  if (ext[0] == 'V') {
+    const struct va_format *v = p; va_list c;
+    if (depth >= 4) { fmt_put(o, "(nested %pV)", 12); return; }
+    va_copy(c, *v->va); fmt_core(o, v->fmt, &c, depth + 1); va_end(c);
+  } else if (ext[0] == 'M' || ext[0] == 'm') {
+    int rev = ext[1] == 'R'; char sep = ext[0] == 'm' ? 0 : ext[1] == 'F' ? '-' : ':';
+    for (int i = 0; i < 6; i++) { if (i && sep) fmt_put(o, &sep, 1); fmt_putf(o, "%02x", a[rev ? 5 - i : i]); }
+  } else if (ext[0] == 'a') {
+    fmt_putf(o, "0x%016llx", (unsigned long long)*(const u64 *)p);
+  } else if (ext[0] == 'h') {
+    char sep = ext[1] == 'C' ? ':' : ext[1] == 'D' ? '-' : ext[1] == 'N' ? 0 : ' ';
+    int n = width < 0 ? 1 : width > 64 ? 64 : width;
+    for (int i = 0; i < n; i++) { if (i && sep) fmt_put(o, &sep, 1); fmt_putf(o, "%02x", a[i]); }
+  } else if ((ext[0] == 'I' || ext[0] == 'i') && ext[1] == '4') {
+    fmt_putf(o, ext[0] == 'I' ? "%u.%u.%u.%u" : "%03u.%03u.%03u.%03u", a[0], a[1], a[2], a[3]);
+  } else {
+    fmt_putf(o, "%p", p);
+  }
+}
+static void fmt_core(struct lx_fmt_out *o, const char *f, va_list *ap, int depth) {
+  while (*f) {
+    const char *lit = f; while (*f && *f != '%') f++;
+    fmt_put(o, lit, (size_t)(f - lit));
+    if (!*f) break;
+    const char *start = f++;
+    char flags[8]; int nf = 0, width = -1, prec = -1, len = 0;   /* len: 0 int, 1 long, 2 long long, -1 short, -2 char */
+    while (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '0') { if (nf < 7) flags[nf++] = *f; f++; }
+    flags[nf] = 0;
+    if (*f == '*') { width = va_arg(*ap, int); f++; if (width < 0) { width = -width; if (nf < 7) { flags[nf++] = '-'; flags[nf] = 0; } } }
+    else if (*f >= '0' && *f <= '9') { width = 0; while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0'); }
+    if (*f == '.') { f++; prec = 0;
+      if (*f == '*') { prec = va_arg(*ap, int); f++; } else while (*f >= '0' && *f <= '9') prec = prec * 10 + (*f++ - '0'); }
+    for (;; f++) {
+      if (*f == 'h') len = len < 0 ? -2 : -1;
+      else if (*f == 'l') len = len ? 2 : 1;
+      else if (*f == 'z' || *f == 't' || *f == 'j' || *f == 'q' || *f == 'L') len = 2;
+      else break;
+    }
+    char c = *f; if (c) f++;
+    char spec[32];
+    if (width > 64) width = 64;
+    if (prec > 64 && c != 's') prec = 64;
+    if (c == 'd' || c == 'i' || c == 'u' || c == 'x' || c == 'X' || c == 'o' || c == 'c') {
+      if (prec >= 0) snprintf(spec, sizeof spec, "%%%s%.0d.%d%s%c", flags, width < 0 ? 0 : width, prec, c == 'c' ? "" : "ll", c);
+      else snprintf(spec, sizeof spec, "%%%s%.0d%s%c", flags, width < 0 ? 0 : width, c == 'c' ? "" : "ll", c);
+      if (c == 'c') { fmt_putf(o, spec, va_arg(*ap, int)); continue; }
+      int sgn = c == 'd' || c == 'i'; unsigned long long v;
+      if (len >= 2) v = va_arg(*ap, unsigned long long);
+      else if (len == 1) v = sgn ? (unsigned long long)va_arg(*ap, long) : va_arg(*ap, unsigned long);
+      else { int i = va_arg(*ap, int);
+        if (len == -1) v = sgn ? (unsigned long long)(long long)(short)i : (unsigned short)i;
+        else if (len == -2) v = sgn ? (unsigned long long)(long long)(signed char)i : (unsigned char)i;
+        else v = sgn ? (unsigned long long)(long long)i : (unsigned)i; }
+      fmt_putf(o, spec, v);
+    } else if (c == 's') {
+      const char *s = va_arg(*ap, const char *); if (!s) s = "(null)";
+      size_t n = 0; while (s[n] && (prec < 0 || n < (size_t)prec)) n++;
+      int pad = width > (int)n ? width - (int)n : 0, left = 0;
+      for (int i = 0; i < nf; i++) left |= flags[i] == '-';
+      if (!left) for (; pad; pad--) fmt_put(o, " ", 1);
+      fmt_put(o, s, n);
+      for (; pad; pad--) fmt_put(o, " ", 1);
+    } else if (c == 'p') {
+      char ext[8]; int ne = 0; while (fmt_alnum(*f)) { if (ne < 7) ext[ne++] = *f; f++; }
+      ext[ne] = 0;
+      fmt_pointer(o, ext, width, va_arg(*ap, void *), depth);
+    } else if (c == 'n') {
+      (void)va_arg(*ap, void *);
+    } else if (c == '%') {
+      fmt_put(o, "%", 1);
+    } else {
+      fmt_put(o, start, (size_t)(f - start));   /* unknown (no floating point in the kernel): kept as written */
+    }
+  }
+}
+int lx_vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
+  struct lx_fmt_out o = { buf, size, 0 }; va_list c;
+  va_copy(c, ap); fmt_core(&o, fmt, &c, 0); va_end(c);
+  if (size) buf[o.at < size ? o.at : size - 1] = 0;
+  return (int)o.at; }
 void lx_log(int level, const char *fmt, ...) {
-  char b[256]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap); lx_plat->log(level, b);
+  char b[256]; va_list ap; va_start(ap, fmt); lx_vsnprintf(b, sizeof b, fmt, ap); va_end(ap); lx_plat->log(level, b);
   if (lx_log_tap) lx_log_tap(level, b); }
 u32 lx_random_u32(void) { g_seed ^= g_seed << 13; g_seed ^= g_seed >> 17; g_seed ^= g_seed << 5; return g_seed; }
 
