@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // guamp (Moto G9 Play, SM6115/bengal) audio output hardware: board facts and the register sequences of the speaker
-// amplifier (aw882xx), the LPASS LPI i2s1 pins, the bolero RX macro and the wcd937x headphone path. Pure code: every
+// amplifier (aw882xx), the LPASS LPI i2s1 pins, the bolero RX macro, the wcd937x headphone/earpiece paths with the
+// class-H FSM, and the wcd937x MBHC (3.5 mm jack). Pure code: every
 // access goes through gah_ops, so tests/audio_hw_host.cpp runs the same sequences against simulated chips. The kernel
 // glue (GuampAudioHw.inc) owns MMIO, I2C, GPIO and logging. Every constant states its source; paths are relative to
 // sorgenti/guamp/android_kernel_motorola_sm6225 (K), K/techpack/audio (TA), ~/moto/guamp.dts (DT), ~/moto/dtbo/0.dts
@@ -98,12 +99,19 @@ static const uint8_t kAwSpkProfile[144] = {
 #define RXM_VOL_CTL(n) (0x1414 + 0x80 * (n))  // signed dB, -84..+40 ("RX_RX0 Digital Volume")
 #define RXM_PATH_SEC7(n) (0x1434 + 0x80 * (n))
 #define RXM_DSM_CTL(n) (0x1440 + 0x80 * (n))
+#define RXM_PATH_MIX_CTL(n) (0x1418 + 0x80 * (n)) // mix path, PGA mute 0x10
+#define RXM_TOP_HPHL_COMP_LUT 0x1028           // bit 7: LUT bypass (rx_macro_hphdelay_lutbypass)
+#define RXM_TOP_HPHR_COMP_LUT 0x103c
+#define RXM_COMP0_CTL7 0x181c                  // COMPANDER0_CTL7 / COMPANDER1_CTL7
+#define RXM_COMP1_CTL7 0x185c
+#define RXM_SWR_CONTROL 0x1108                 // CLK_RST_CTRL_SWR_CONTROL: bit 0 RX SoundWire clock, bit 1 reset
 #define VAM_MCLK_CONTROL 0x3000
 #define VAM_FS_CNT_CONTROL 0x3004
 #define VAM_TOP_CSR_TOP_CFG0 0x3080
 
-// ---- wcd937x analog codec (DTBO0 wcd937x-codec, split-codec; registers reachable ONLY over SoundWire: rx slave
-// enumeration 0x0a_01170224 on rx_swr_master 0x0a610000; supplies L9A 1.8 V (vdd-rxtx, vddpx), L14A 1.8 V (buck);
+// ---- wcd937x analog codec (DTBO0 wcd937x-codec, split-codec; registers reachable ONLY over SoundWire, through the
+// TX slave 0x0a_01170223 on the VA master (regmap on tx_swr_dev); the RX slave 0x0a_01170224 on rx_swr_master
+// 0x0a610000 carries only the HPH/EAR PCM (GuampAudioRxSwr.h); supplies L9A 1.8 V (vdd-rxtx, vddpx), L14A 1.8 V (buck);
 // reset gpio92). TA/asoc/codecs/wcd937x/wcd937x-registers.h:
 #define WCD_ANA_BIAS 0x3001
 #define WCD_ANA_RX_SUPPLIES 0x3008
@@ -126,6 +134,38 @@ static const uint8_t kAwSpkProfile[144] = {
 #define WCD_RDAC_HD2_CTL_R 0x3136
 #define WCD_HPH_TIMER1 0x313a
 #define WCD_DIG_CHIP_ID0 0x3401
+#define WCD_ANA_EAR 0x300a                    // bit 7 EAR PA (DAPM "EAR PGA")
+#define WCD_ANA_EAR_COMP_CTL 0x300b           // bit 7 compander off, [6:2] "EAR PA GAIN"
+#define WCD_ANA_MBHC_MECH 0x3014              // 7 L_DET_EN, 5 MECH_DETECTION_TYPE, 4 HPHL_PLUG_TYPE, 3 GND_PLUG_TYPE, 2 pull-up comp, 0 100k
+#define WCD_ANA_MBHC_ELECT 0x3015             // 7 FSM_EN, 6:4 BTN_ISRC, 3 ELECT_DETECTION_TYPE, 2:1 SCHMT_ISRC, 0 bias
+#define WCD_ANA_MBHC_RESULT_3 0x3019          // 4 SWCH_LEVEL_REMOVE (1 = no plug)
+#define WCD_ANA_MICB2 0x3023                  // 7:6 enable (1 = on), 5:0 VOUT
+#define WCD_ANA_MICB2_RAMP 0x3024
+#define WCD_CLASSH_MODE_2 0x3098
+#define WCD_CLASSH_MODE_3 0x3099
+#define WCD_FLYBACK_EN 0x30a4
+#define WCD_FLYBACK_VNEG_CTRL_1 0x30a5
+#define WCD_FLYBACK_VNEG_CTRL_4 0x30a8
+#define WCD_FLYBACK_VNEGDAC_CTRL_2 0x30af
+#define WCD_RX_BIAS_HPH_LOWPOWER 0x30bf
+#define WCD_RX_BIAS_FLYB_BUFF 0x30c7
+#define WCD_HPH_PA_CTL1 0x30d1
+#define WCD_EAR_EN_REG 0x30e9
+#define WCD_MBHC_NEW_CTL_1 0x3120             // 7 clock, 4 ADC_MODE, 3 ADC_EN, 1:0 BTN_DBNC
+#define WCD_MBHC_NEW_CTL_2 0x3121             // 6:4 MUX_CTL, 3:2 moisture rref, 1:0 HS_VREF
+#define WCD_MBHC_NEW_PLUG_DETECT_CTL 0x3122   // 3:0 INSREM_DBNC
+#define WCD_MBHC_NEW_FSM_STATUS 0x3125        // 7 ADC_TIMEOUT, 6 ADC_COMPLETE
+#define WCD_MBHC_NEW_ADC_RESULT 0x3126
+#define WCD_HPH_NEW_INT_RDAC_HD2_CTL_L 0x3133
+#define WCD_HPH_NEW_INT_RDAC_HD2_CTL_R 0x3136
+#define WCD_HPH_NEW_INT_PA_MISC2 0x3138
+#define WCD_MBHC_NEW_INT_MECH_DET_CURRENT 0x31b1
+#define WCD_DIG_EAR_PATH_CTL 0x3450           // bit 0 RDAC3_MUX: 0 RX1, 1 RX3
+#define WCD_DIG_INTR_MASK_0 0x346b
+#define WCD_DIG_INTR_STATUS_0 0x346e          // bit 4 MBHC_SW_DET
+#define WCD_DIG_INTR_CLEAR_0 0x3471
+#define WCD_DIG_INTR_LEVEL_0 0x3474
+#define WCD_EAR_GAIN_MAX 16                   // "EAR PA GAIN" G_M18_DB
 #define WCD_DIG_ANA_CLK_CTL 0x3408
 #define WCD_DIG_DIG_CLK_CTL 0x3409
 #define WCD_DIG_RX0_CTL 0x340d
@@ -159,6 +199,9 @@ struct gah_ops {
     void (*sleep_ms)(void *ctx, unsigned ms);
     void (*delay_us)(void *ctx, unsigned us);
     void (*note)(void *ctx, const char *step, int rc, uint32_t a, uint32_t b);   // one log line per step
+    // RX SoundWire data port of wcd937x slave port 0 (HPH_L ch 1, HPH_R ch 2 -> master port 1): connect + datapath
+    // with bank switch (on), or disable + datapath off. null = no RX SoundWire link (-95).
+    int (*swr_rx)(void *ctx, int on, uint8_t slave_ch_mask);
 };
 
 static inline void gah_note(const struct gah_ops *o, const char *s, int rc, uint32_t a, uint32_t b) {
@@ -338,53 +381,74 @@ static inline uint8_t gah_rxm_vol_code(int32_t db) {
     return (uint8_t)(int8_t)db;
 }
 
-// Headphone interpolators INT0 (HPHL) and INT1 (HPHR), mixer_paths "headphones": RX0/RX1 -> INTn_1 MIX1 INP0, 48 kHz,
-// DEM mux CLSH_DSM_OUT; then rx_macro_enable_interp_clk (PGA mute, DSM clock, CFG2, class-H for a 16 ohm load),
-// rx_macro_enable_rx_path_clk (CFG1 0x10, clock 0x20), gain, unmute. Not done (defaults of the Linux mixer paths are
-// off for these): compander, HD2, idle detect, softclip.
-static inline void gah_rxm_hph(const struct gah_ops *o, int on, int32_t vol_db) {
+// Interpolators of an output (rx-macro.c, mixer_paths.xml): headphones = RX0 -> INT0 (HPHL) + RX1 -> INT1 (HPHR);
+// handset (earpiece) = RX0 -> INT0 alone with "RX_EAR Mode" ON. Both use "RX INTn DEM MUX" = CLSH_DSM_OUT.
+// On: input mux, 48 kHz, DEM mux, then rx_macro_enable_interp_clk (PGA mute, DSM clock, CFG2, LUT bypass or ear-mode
+// CFG1 bit 1, class-H block with the 16 ohm K1 and V_PA 0x1c, or 0x39 in ear mode), rx_macro_enable_rx_path_clk
+// (CFG1 0x10, clock 0x20) and the digital gain. The path STAYS MUTED: Linux unmutes it only after the wcd937x PA is
+// up (WCD_BOLERO_EVT_RX_MUTE from the PA POST_PMU), gah_rxm_mute(o, ear, 0) here. Compander, HD2, idle detect are
+// off in the vendor mixer paths and are not touched. Off: the reverse, rate back to 48 kHz, class-H block off.
+static inline void gah_rxm_path(const struct gah_ops *o, int on, int ear, int32_t vol_db) {
+    const unsigned count = ear ? 1u : 2u;
     if (on) {
         gah_cdc_bits(o, RXM_CLSH_CRC, 0x01, 0x01);
         gah_cdc_bits(o, RXM_CLSH_K1_LSB, 0xff, 0xc0);
         gah_cdc_bits(o, RXM_CLSH_K1_MSB, 0x0f, 0x00);
-        for (unsigned n = 0; n < 2; n++) {
+        for (unsigned n = 0; n < count; n++) {
             gah_cdc_bits(o, RXM_INP_MUX_INT0_CFG0 + 8 * n, 0x0f, 5 + n);
             gah_cdc_bits(o, RXM_PATH_CTL(n), 0x0f, 0x04);
             gah_cdc_bits(o, RXM_PATH_CFG1(n), 0x01, 0x01);
             gah_cdc_bits(o, RXM_PATH_CTL(n), 0x10, 0x10);
             gah_cdc_bits(o, RXM_DSM_CTL(n), 0x01, 0x01);
             gah_cdc_bits(o, RXM_PATH_CFG2(n), 0x03, 0x03);
-            gah_cdc_bits(o, RXM_CLSH_HPH_V_PA, 0x3f, 0x1c);
+            if (ear) gah_cdc_bits(o, RXM_PATH_CFG1(0), 0x02, 0x02);
+            else gah_cdc_bits(o, n ? RXM_TOP_HPHR_COMP_LUT : RXM_TOP_HPHL_COMP_LUT, 0x80, 0x80);
+            gah_cdc_bits(o, RXM_CLSH_HPH_V_PA, 0x3f, ear ? 0x39 : 0x1c);
             gah_cdc_bits(o, RXM_CLSH_DECAY_CTRL, 0x07, 0x00);
             gah_cdc_bits(o, RXM_PATH_CFG0(n), 0x40, 0x40);
             gah_cdc_bits(o, RXM_PATH_CFG1(n), 0x10, 0x10);
             gah_cdc_bits(o, RXM_PATH_CTL(n), 0x20, 0x20);
             o->cdc_wr(o->ctx, RXM_VOL_CTL(n), gah_rxm_vol_code(vol_db));
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x10, 0x00);
-            gah_note(o, "rx macro INTn on (n, PATH_CTL)", 0, n, o->cdc_rd(o->ctx, RXM_PATH_CTL(n)));
+            gah_note(o, ear ? "rx macro INT0 on, ear mode, muted (n, PATH_CTL)" : "rx macro INTn on, muted (n, PATH_CTL)", 0, n,
+                     o->cdc_rd(o->ctx, RXM_PATH_CTL(n)));
         }
-    } else {
-        for (unsigned n = 0; n < 2; n++) {
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x10, 0x10);
-            gah_cdc_bits(o, RXM_PATH_CFG1(n), 0x10, 0x00);
-            gah_cdc_bits(o, RXM_DSM_CTL(n), 0x01, 0x00);
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x20, 0x00);
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x40, 0x40);
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x40, 0x00);
-            gah_cdc_bits(o, RXM_PATH_CTL(n), 0x0f, 0x04);
-            gah_cdc_bits(o, RXM_PATH_CFG2(n), 0x03, 0x00);
-            gah_note(o, "rx macro INTn off (n)", 0, n, 0);
-        }
-        gah_cdc_bits(o, RXM_CLSH_CRC, 0x01, 0x00);
+        return;
     }
+    for (unsigned n = 0; n < count; n++) {
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x10, 0x10);
+        gah_cdc_bits(o, RXM_PATH_MIX_CTL(n), 0x10, 0x10);
+        gah_cdc_bits(o, RXM_PATH_CFG1(n), 0x10, 0x00);
+        gah_cdc_bits(o, RXM_DSM_CTL(n), 0x01, 0x00);
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x20, 0x00);
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x40, 0x40);
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x40, 0x00);
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x0f, 0x04);
+        gah_cdc_bits(o, RXM_PATH_CFG2(n), 0x03, 0x00);
+        // rx_macro_hphdelay_lutbypass off. Linux leaves RX0 CFG1 bit 1 set after an ear-mode run (it clears it only
+        // when ear mode is off); here it is cleared either way, so a later headphone run starts from the HPH state.
+        if (n == 0) gah_cdc_bits(o, RXM_PATH_CFG1(0), 0x02, 0x00);
+        gah_cdc_bits(o, n ? RXM_TOP_HPHR_COMP_LUT : RXM_TOP_HPHL_COMP_LUT, 0x80, 0x00);
+        gah_cdc_bits(o, n ? RXM_COMP1_CTL7 : RXM_COMP0_CTL7, 0x20, 0x20);
+        gah_note(o, "rx macro INTn off (n)", 0, n, 0);
+    }
+    gah_cdc_bits(o, RXM_CLSH_CRC, 0x01, 0x00);
 }
 
-static inline void gah_rxm_volume(const struct gah_ops *o, int32_t vol_db) {
-    for (unsigned n = 0; n < 2; n++) o->cdc_wr(o->ctx, RXM_VOL_CTL(n), gah_rxm_vol_code(vol_db));
-    gah_note(o, "rx macro digital gain (dB code)", 0, gah_rxm_vol_code(vol_db), 0);
+// WCD_BOLERO_EVT_RX_MUTE (rx_macro_event_handler): main and mix path PGA mute of the output's interpolators.
+static inline void gah_rxm_mute(const struct gah_ops *o, int ear, int mute) {
+    for (unsigned n = 0; n < (ear ? 1u : 2u); n++) {
+        gah_cdc_bits(o, RXM_PATH_CTL(n), 0x10, mute ? 0x10 : 0x00);
+        gah_cdc_bits(o, RXM_PATH_MIX_CTL(n), 0x10, mute ? 0x10 : 0x00);
+    }
+    gah_note(o, mute ? "rx macro muted (interpolators)" : "rx macro unmuted (interpolators)", 0, ear ? 1u : 2u, 0);
 }
 
-// ---- wcd937x (needs the SoundWire master: wcd_rd/wcd_wr null -> -95, nothing touched) --------------------------
+static inline void gah_rxm_volume(const struct gah_ops *o, int ear, int32_t vol_db) {
+    for (unsigned n = 0; n < (ear ? 1u : 2u); n++) o->cdc_wr(o->ctx, RXM_VOL_CTL(n), gah_rxm_vol_code(vol_db));
+    gah_note(o, "rx macro digital gain (dB code, interpolators)", 0, gah_rxm_vol_code(vol_db), ear ? 1u : 2u);
+}
+
+// ---- wcd937x RX (registers over the VA SoundWire link of the capture side; the audio itself over the RX link) ------
 static inline int gah_wcd_bits(const struct gah_ops *o, uint16_t reg, uint8_t mask, uint8_t val) {
     uint8_t v = 0;
     int r = o->wcd_rd(o->ctx, reg, &v);
@@ -396,14 +460,18 @@ static inline uint8_t gah_wcd_get(const struct gah_ops *o, uint16_t reg) {
     o->wcd_rd(o->ctx, reg, &v);
     return v;
 }
+static inline int gah_wcd_ready(const struct gah_ops *o, const char *what) {
+    if (o->wcd_rd && o->wcd_wr) return 0;
+    gah_note(o, what, GAH_ERR_NOTSUP, 0, 0);
+    return GAH_ERR_NOTSUP;
+}
 
-// wcd937x_reset + wcd937x_init_reg: not here. Reset/rails = guamp_wcd937x_power (GuampAudioHw.inc), init_reg =
+// wcd937x reset + init_reg: not here. Reset/rails = guamp_wcd937x_power (GuampAudioHw.inc), init_reg =
 // guampmic::Codec::wcdSetup (GuampMicCodec.inc, run at every bring-up of the SoundWire link).
 
-// HPHL+HPHR, class AB, no compander: wcd937x_rx_clk_enable, hph{l,r}_dac_event PRE/POST_PMU, enable_hph{l,r}_pa
-// PRE/POST_PMU. Not modelled: the class-H FSM (wcd-clsh.c) and the SoundWire port/datapath enables.
-static inline int gah_wcd_hph(const struct gah_ops *o, int on, uint8_t gain_code) {
-    if (!o->wcd_rd || !o->wcd_wr) { gah_note(o, "wcd937x hph: no SoundWire master", GAH_ERR_NOTSUP, 0, 0); return GAH_ERR_NOTSUP; }
+// wcd937x_rx_clk_enable / _disable for one user (the HPH pair counts as one here: both enable and disable happen in
+// the same call, Linux's counter goes 0 -> 2 -> 0 and writes the same registers).
+static inline void gah_wcd_rx_clk(const struct gah_ops *o, int on) {
     if (on) {
         gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x08, 0x08);
         gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x01, 0x01);
@@ -412,31 +480,181 @@ static inline int gah_wcd_hph(const struct gah_ops *o, int on, uint8_t gain_code
         gah_wcd_bits(o, WCD_DIG_RX1_CTL, 0x40, 0x00);
         gah_wcd_bits(o, WCD_DIG_RX2_CTL, 0x40, 0x00);
         gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x02, 0x02);
-        gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x03, 0x03);
-        gah_wcd_bits(o, WCD_DIG_HPH_GAIN_CTL, 0x0c, 0x0c);
+    } else {
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x01, 0x00);
+        gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x02, 0x00);
+        gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x01, 0x00);
+    }
+}
+
+// wcd-clsh.c for "RX HPH Mode" = CLS_AB (mixer_paths.xml default; the vendor never selects a class-H mode for these
+// paths), state machine IDLE -> HPHL (-> HPH_ST, nothing) or IDLE -> EAR: wcd_clsh_state_hph_l / _ear enable, and the
+// disable of the last state going back to IDLE. In CLS_AB the CLSH SoundWire port is not connected (wcd937x_enable_clsh).
+static inline void gah_wcd_clsh(const struct gah_ops *o, int on) {
+    if (on) {
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x02, 0x00);       // buck regulator mode
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x04, 0x00);       // flyback mode: not HIFI
+        gah_wcd_bits(o, WCD_FLYBACK_VNEG_CTRL_4, 0xf0, 0x70);
+        gah_wcd_bits(o, WCD_FLYBACK_VNEGDAC_CTRL_2, 0xe0, 0xa0); // force IQ
+        o->delay_us(o->ctx, 100);
+        gah_wcd_bits(o, WCD_CLASSH_MODE_3, 0x02, 0x02);
+        gah_wcd_bits(o, WCD_CLASSH_MODE_2, 0xff, 0x1c);
+        gah_wcd_bits(o, WCD_FLYBACK_VNEG_CTRL_1, 0xe0, 0xe0);    // flyback on
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x40, 0x40);
+        o->delay_us(o->ctx, 100);
+        gah_wcd_bits(o, WCD_FLYBACK_VNEGDAC_CTRL_2, 0xe0, 0xe0);
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_RX_BIAS_FLYB_BUFF, 0x0f, 0x0a);      // flyback current
+        gah_wcd_bits(o, WCD_RX_BIAS_FLYB_BUFF, 0xf0, 0xa0);
+        o->delay_us(o->ctx, 100);
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x08, 0x00);       // buck mode: not HIFI
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x80, 0x80);       // buck on
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_CLASSH_MODE_2, 0xff, 0x3a);
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_ANA_HPH, 0x0c, 0x0c);                // wcd_clsh_set_hph_mode(CLS_AB)
+    } else {
+        gah_wcd_bits(o, WCD_ANA_HPH, 0x0c, 0x00);                // CLS_H_NORMAL
+        gah_wcd_bits(o, WCD_FLYBACK_VNEG_CTRL_1, 0xe0, 0xe0);    // flyback off
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x40, 0x00);
+        o->delay_us(o->ctx, 100);
+        gah_wcd_bits(o, WCD_FLYBACK_VNEGDAC_CTRL_2, 0xe0, 0xe0);
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x80, 0x00);       // buck off
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_CLASSH_MODE_2, 0xff, 0x3a);
+        o->delay_us(o->ctx, 500);
+        gah_wcd_bits(o, WCD_HPH_NEW_INT_PA_MISC2, 0x20, 0x00);   // force IQ off
+        gah_wcd_bits(o, WCD_RX_BIAS_HPH_LOWPOWER, 0xf0, 0x80);
+        gah_wcd_bits(o, WCD_HPH_PA_CTL1, 0x0e, 0x06);
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x04, 0x00);       // flyback and buck mode back to default
+        gah_wcd_bits(o, WCD_FLYBACK_VNEG_CTRL_4, 0xf0, 0x70);
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x08, 0x00);
+    }
+    gah_note(o, on ? "wcd937x class-H fsm CLS_AB on (RX_SUPPLIES, ANA_HPH)" : "wcd937x class-H fsm back to IDLE", 0,
+             gah_wcd_get(o, WCD_ANA_RX_SUPPLIES), gah_wcd_get(o, WCD_ANA_HPH));
+}
+
+static inline int gah_swr_rx(const struct gah_ops *o, int on, uint8_t ch_mask) {
+    int r = o->swr_rx ? o->swr_rx(o->ctx, on, ch_mask) : GAH_ERR_NOTSUP;
+    gah_note(o, on ? "rx soundwire port + datapath on (slave ch mask)" : "rx soundwire port + datapath off (slave ch mask)", r,
+             ch_mask, 0);
+    return r;
+}
+
+// Headphones, CLS_AB without compander, the DAPM power-up order of soc-dapm (4.19) over the wcd937x widgets of the
+// "headphones" path: DACs RDAC1/RDAC2 (hph{l,r}_dac_event PRE/POST_PMU, "HPHL/HPHR Volume"), mixers RX1/RX2 (port
+// HPH_L/HPH_R connect = slave port 0 ch 1|2 -> master port 1), PGAs HPHL/HPHR (enable_hph{l,r}_pa: datapath, class-H,
+// ANA_HPH 0x20/0x10, PDM watchdog; DAPM power bits ANA_HPH 7/6; POST_PMU 20 ms each, TIMER1, RX_SUPPLIES bit 1).
+// The RX macro is unmuted by the caller afterwards (WCD_BOLERO_EVT_RX_MUTE). gain_code: HPH_x_EN[4:0], see
+// gah_wcd_gain_code. The SoundWire port + datapath go through o->swr_rx at the PA PRE_PMU point, as in Linux.
+static inline int gah_wcd_hph(const struct gah_ops *o, int on, uint8_t gain_code) {
+    int r = gah_wcd_ready(o, "wcd937x hph: no wcd937x register access");
+    if (r) return r;
+    if (on) {
+        gah_wcd_rx_clk(o, 1);
+        gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x01, 0x01);
+        gah_wcd_bits(o, WCD_DIG_HPH_GAIN_CTL, 0x04, 0x04);
         gah_wcd_bits(o, WCD_HPH_RDAC_CLK_CTL1, 0x80, 0x00);
-        gah_wcd_bits(o, WCD_DIG_COMP_CTL_0, 0x03, 0x00);
+        gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x02, 0x02);
+        gah_wcd_bits(o, WCD_DIG_HPH_GAIN_CTL, 0x08, 0x08);
+        gah_wcd_bits(o, WCD_HPH_RDAC_CLK_CTL1, 0x80, 0x00);
+        const int lowpower = gah_wcd_get(o, WCD_EFUSE_16) == 0x02 && (gah_wcd_get(o, WCD_ANA_HPH) & 0x0c) == 0x0c;
+        if (lowpower) gah_wcd_bits(o, WCD_RX_BIAS_HPH_LOWPOWER, 0xf0, 0x90);
+        gah_wcd_bits(o, WCD_DIG_COMP_CTL_0, 0x02, 0x00);
         gah_wcd_bits(o, WCD_HPH_L_EN, 0x3f, (uint8_t)(0x20 | (gain_code & 0x1f)));
+        gah_wcd_bits(o, WCD_HPH_TIMER1, 0x02, 0x00);
+        gah_wcd_bits(o, WCD_DIG_COMP_CTL_0, 0x01, 0x00);
         gah_wcd_bits(o, WCD_HPH_R_EN, 0x3f, (uint8_t)(0x20 | (gain_code & 0x1f)));
         gah_wcd_bits(o, WCD_HPH_TIMER1, 0x02, 0x00);
-        gah_wcd_bits(o, WCD_ANA_HPH, 0x30, 0x30);
+        r = gah_swr_rx(o, 1, 0x03);
+        if (r) {
+            gah_wcd_rx_clk(o, 0);
+            gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x03, 0x00);
+            return r;
+        }
+        gah_wcd_clsh(o, 1);
+        gah_wcd_bits(o, WCD_ANA_HPH, 0x20, 0x20);
         o->delay_us(o->ctx, 100);
         gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL0, 0x17, 0x13);
+        gah_wcd_bits(o, WCD_ANA_HPH, 0x10, 0x10);
+        o->delay_us(o->ctx, 100);
         gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL1, 0x17, 0x13);
-        o->sleep_ms(o->ctx, 20);
-        gah_wcd_bits(o, WCD_HPH_TIMER1, 0x02, 0x02);
-        int r = gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x02, 0x02);
-        gah_note(o, "wcd937x HPH PA on (gain code)", r, gain_code, gah_wcd_get(o, WCD_ANA_HPH));
+        r = gah_wcd_bits(o, WCD_ANA_HPH, 0xc0, 0xc0);              // DAPM: HPHL PGA bit 7, HPHR PGA bit 6
+        for (unsigned side = 0; side < 2; side++) {
+            o->sleep_ms(o->ctx, 20);                               // no compander: 20 ms after the PA
+            gah_wcd_bits(o, WCD_HPH_TIMER1, 0x02, 0x02);
+            gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x02, 0x02);      // CLS_AB
+        }
+        gah_note(o, "wcd937x HPH PA on (gain code, ANA_HPH)", r, gain_code, gah_wcd_get(o, WCD_ANA_HPH));
         return r;
     }
-    gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL0, 0x17, 0x00);
-    gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL1, 0x17, 0x00);
-    gah_wcd_bits(o, WCD_ANA_HPH, 0x30, 0x00);
+    gah_wcd_bits(o, WCD_ANA_HPH, 0xc0, 0x00);
     o->sleep_ms(o->ctx, 20);
-    gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x03, 0x00);
-    gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x03, 0x00);
-    int r = gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x03, 0x00);
-    gah_note(o, "wcd937x HPH PA off", r, 0, 0);
+    gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL0, 0x17, 0x00);
+    gah_wcd_bits(o, WCD_ANA_HPH, 0x20, 0x00);
+    o->sleep_ms(o->ctx, 20);
+    gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL1, 0x17, 0x00);
+    gah_wcd_bits(o, WCD_ANA_HPH, 0x10, 0x00);
+    gah_wcd_clsh(o, 0);
+    gah_wcd_bits(o, WCD_HPH_NEW_INT_RDAC_HD2_CTL_L, 0x0f, 0x01);
+    gah_wcd_bits(o, WCD_HPH_NEW_INT_RDAC_HD2_CTL_R, 0x0f, 0x01);
+    gah_wcd_rx_clk(o, 0);
+    gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x03, 0x00);
+    r = gah_swr_rx(o, 0, 0x03);
+    gah_note(o, "wcd937x HPH PA off", r, 0, gah_wcd_get(o, WCD_ANA_HPH));
+    return r;
+}
+
+// Earpiece ("handset" path: RX_CDC_DMA_RX_0 one channel, RX0 -> INT0, EAR_RDAC on, RDAC3_MUX = RX1, RX_EAR Mode ON),
+// CLS_AB without compander: RDAC3 (ear_dac_event PRE_PMU), mixer RX1 (port HPH_L = slave port 0 ch 1), EAR PGA
+// (enable_ear_pa: datapath, PDM watchdog of HPHL, EAR compander off bit; DAPM ANA_EAR bit 7; POST_PMU 6 ms,
+// RX_SUPPLIES bit 1). ear_gain: "EAR PA GAIN" index 0..16 (G_6_DB .. G_M18_DB, 1.5 dB steps) in EAR_COMPANDER_CTL[6:2].
+static inline int gah_wcd_ear(const struct gah_ops *o, int on, uint8_t ear_gain) {
+    int r = gah_wcd_ready(o, "wcd937x ear: no wcd937x register access");
+    if (r) return r;
+    if (ear_gain > WCD_EAR_GAIN_MAX) ear_gain = WCD_EAR_GAIN_MAX;
+    if (on) {
+        gah_wcd_bits(o, WCD_DIG_EAR_PATH_CTL, 0x01, 0x00);           // RDAC3_MUX = RX1
+        gah_wcd_bits(o, WCD_ANA_EAR_COMP_CTL, 0x7c, (uint8_t)(ear_gain << 2));
+        gah_wcd_rx_clk(o, 1);
+        gah_wcd_bits(o, WCD_DIG_HPH_GAIN_CTL, 0x04, 0x04);
+        gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x01, 0x01);
+        o->sleep_ms(o->ctx, 5);
+        gah_wcd_bits(o, WCD_FLYBACK_EN, 0x04, 0x00);
+        gah_wcd_clsh(o, 1);
+        r = gah_swr_rx(o, 1, 0x01);
+        if (r) {
+            gah_wcd_clsh(o, 0);
+            gah_wcd_bits(o, WCD_FLYBACK_EN, 0x04, 0x04);
+            gah_wcd_rx_clk(o, 0);
+            gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x01, 0x00);
+            return r;
+        }
+        gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL0, 0x17, 0x13);
+        gah_wcd_bits(o, WCD_ANA_EAR_COMP_CTL, 0x80, 0x80);
+        r = gah_wcd_bits(o, WCD_ANA_EAR, 0x80, 0x80);               // DAPM: EAR PGA bit 7
+        o->sleep_ms(o->ctx, 6);
+        gah_wcd_bits(o, WCD_ANA_RX_SUPPLIES, 0x02, 0x02);           // CLS_AB
+        gah_note(o, "wcd937x EAR PA on (gain index, EAR_COMPANDER_CTL)", r, ear_gain, gah_wcd_get(o, WCD_ANA_EAR_COMP_CTL));
+        return r;
+    }
+    gah_wcd_bits(o, WCD_ANA_EAR, 0x80, 0x00);
+    gah_wcd_bits(o, WCD_ANA_EAR_COMP_CTL, 0x80, 0x00);
+    o->sleep_ms(o->ctx, 7);
+    gah_wcd_clsh(o, 0);
+    gah_wcd_bits(o, WCD_FLYBACK_EN, 0x04, 0x04);
+    gah_wcd_bits(o, WCD_DIG_PDM_WD_CTL0, 0x17, 0x00);
+    o->sleep_ms(o->ctx, 10);
+    gah_wcd_bits(o, WCD_EAR_EN_REG, 0x02, 0x00);                    // EAR CnP FSM off, PA toggle, FSM on
+    gah_wcd_bits(o, WCD_ANA_EAR, 0x80, 0x80);
+    gah_wcd_bits(o, WCD_ANA_EAR, 0x80, 0x00);
+    gah_wcd_bits(o, WCD_EAR_EN_REG, 0x02, 0x02);
+    gah_wcd_bits(o, WCD_HPH_NEW_INT_RDAC_HD2_CTL_L, 0x0f, 0x01);
+    gah_wcd_rx_clk(o, 0);
+    gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0x01, 0x00);
+    r = gah_swr_rx(o, 0, 0x01);
+    gah_note(o, "wcd937x EAR PA off", r, 0, gah_wcd_get(o, WCD_ANA_EAR));
     return r;
 }
 
@@ -446,5 +664,197 @@ static inline uint8_t gah_wcd_gain_code(int32_t level_cb) {
     if (steps < 0) steps = 0;
     if (steps > 20) steps = 20;
     return (uint8_t)(20 - steps);
+}
+// Level (centibel) -> "EAR PA GAIN" index: +6 dB .. -18 dB in 1.5 dB steps (index 0 = +6 dB), rounded quieter.
+static inline uint8_t gah_wcd_ear_gain(int32_t level_cb) {
+    int32_t idx = (600 - level_cb + 149) / 150;
+    if (idx < 0) idx = 0;
+    if (idx > WCD_EAR_GAIN_MAX) idx = WCD_EAR_GAIN_MAX;
+    return (uint8_t)idx;
+}
+
+// ---- wcd937x MBHC: 3.5 mm jack (wcd-mbhc-v2.c wcd_mbhc_initialise + wcd937x-mbhc.c callbacks, ADC detection of
+// wcd-mbhc-adc.c). guamp machine DT: qcom,msm-mbhc-hphl-swh = 1, gnd-swh = 1, no USB-C analog, MBHC micbias = MIC
+// BIAS2 (2.6 V, hs_ext_micbias), WCD_MBHC_HS_V_MAX 1600 mV -> HS_VREF 2, moisture detection off, insertion debounce
+// 96 ms. The mechanical switch raises WCD937X_IRQ_MBHC_SW_DET (INTR_STATUS_0 bit 4, regmap-irq: level registers 0,
+// clear_ack); MECH_DETECTION_TYPE says which edge is armed (1 = insertion) and is flipped at every event, as
+// wcd_mbhc_swch_irq_handler does. Polled here (the codec interrupt reaches the CPU only as a SoundWire slave alert).
+// SWCH_LEVEL_REMOVE (RESULT_3 bit 4, 1 = no plug) is read too: it backs the interrupt up when it never comes.
+enum { GAH_JACK_NONE = 0, GAH_JACK_HEADPHONE = 1, GAH_JACK_HEADSET = 2, GAH_JACK_HIGH_HPH = 3, GAH_JACK_UNKNOWN = 4 };
+
+struct gah_jack {
+    uint8_t inited, present, type, armed;   // armed = MECH_DETECTION_TYPE now (1 insertion, 0 removal)
+    uint8_t micb2, level_votes, last_mech, last_res3;
+    uint16_t mic_mv, adc;
+    uint32_t events, irq_events, level_events, polls;
+    int32_t last_rc;
+};
+
+static inline int gah_mbhc_init(const struct gah_ops *o, struct gah_jack *j) {
+    int r = gah_wcd_ready(o, "mbhc: no wcd937x register access");
+    if (r) return r;
+    gah_wcd_bits(o, WCD_MBHC_NEW_INT_MECH_DET_CURRENT, 0x1f, 0x08);   // HS_PULLUP_I_2P0_UA
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_2, 0x0c, 0x00);                  // moisture detection off (R_OFF)
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x10, 0x10);                   // HPHL_PLUG_TYPE = hphl_swh 1
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x08, 0x08);                   // GND_PLUG_TYPE = gnd_swh 1
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x01, 0x01);                   // SW_HPH_LP_100K_TO_GND
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x04, 0x04);                   // HS_L_DET_PULL_UP_COMP_CTRL
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x20, 0x20);                   // detect insertion first
+    gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x80, 0x80);                   // L_DET_EN
+    gah_wcd_bits(o, WCD_MBHC_NEW_PLUG_DETECT_CTL, 0x0f, 0x06);        // INSREM_DBNC 96 ms
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x03, 0x02);                  // BTN_DBNC 16 ms
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x01, 0x01);                  // mbhc_bias
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x80, 0x80);                  // clk_setup
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_2, 0x03, 0x02);                  // HS_VREF (1600 - 1400) / 100
+    for (unsigned i = 0; i < 3; i++) gah_wcd_bits(o, (uint16_t)(WCD_DIG_INTR_LEVEL_0 + i), 0xff, 0x00);
+    gah_wcd_bits(o, WCD_DIG_INTR_CLEAR_0, 0xff, 0x10);                // clear_ack: write the bit, then 0
+    gah_wcd_bits(o, WCD_DIG_INTR_CLEAR_0, 0xff, 0x00);
+    r = gah_wcd_bits(o, WCD_DIG_INTR_MASK_0, 0x10, 0x00);             // unmask MBHC_SW_DET
+    j->inited = r == 0;
+    j->armed = 1;
+    j->present = 0;
+    j->type = GAH_JACK_NONE;
+    j->level_votes = 0;
+    j->last_rc = r;
+    gah_note(o, "mbhc init (MECH, CTL_1)", r, gah_wcd_get(o, WCD_ANA_MBHC_MECH), gah_wcd_get(o, WCD_MBHC_NEW_CTL_1));
+    return r;
+}
+// The registers this module set are lost when the codec is reset (guamp_wcd937x_power, capture link restart).
+static inline int gah_mbhc_lost(const struct gah_ops *o) {
+    uint8_t v = 0;
+    if (o->wcd_rd(o->ctx, WCD_MBHC_NEW_CTL_1, &v)) return 1;
+    return (v & 0x80) == 0 || (gah_wcd_get(o, WCD_ANA_MBHC_MECH) & 0x80) == 0;
+}
+
+// wcd937x_micbias_control(MIC_BIAS_2, MICB_ENABLE / MICB_DISABLE) for the headset microphone. The clock bits are the
+// ones the capture side also sets (it never clears DIG_CLK 0xf0 either); only MICB2 is switched off here.
+static inline void gah_mbhc_micb2(const struct gah_ops *o, struct gah_jack *j, int on) {
+    if (on) {
+        gah_wcd_bits(o, WCD_DIG_DIG_CLK_CTL, 0xf0, 0xf0);
+        gah_wcd_bits(o, WCD_DIG_ANA_CLK_CTL, 0x10, 0x10);
+        gah_wcd_bits(o, WCD_MICB1_TEST_CTL_2, 0x01, 0x01);
+        gah_wcd_bits(o, WCD_MICB2_TEST_CTL_2, 0x01, 0x01);
+        gah_wcd_bits(o, WCD_MICB3_TEST_CTL_2, 0x01, 0x01);
+        gah_wcd_bits(o, WCD_ANA_MICB2, 0xc0, 0x40);
+    } else {
+        gah_wcd_bits(o, WCD_ANA_MICB2, 0xc0, 0x00);
+    }
+    j->micb2 = on ? 1 : 0;
+}
+
+// MICB2 VOUT -> mV (wcd_mbhc_get_micbias: 1000 + 50 mV per step), ADC code -> mV (wcd_get_voltage_from_adc).
+static inline uint32_t gah_mbhc_micb_mv(uint8_t micb2) { return 1000u + 50u * (micb2 & 0x3fu); }
+static inline uint32_t gah_mbhc_adc_mv(uint8_t adc, uint32_t micb_mv) { return (adc * 125u * micb_mv) / (1800u * 10u); }
+// wcd_mbhc_get_plug_from_adc with the default thresholds scaled to the micbias (1700 / 75 mV at 1.8 V).
+static inline uint8_t gah_mbhc_plug_from_mv(uint32_t mv, uint32_t micb_mv) {
+    const uint32_t hs = 1700u * micb_mv / 1800u, hph = 75u * micb_mv / 1800u;
+    if (mv < hph) return (uint8_t)GAH_JACK_HEADPHONE;
+    if (mv > hs) return (uint8_t)GAH_JACK_HIGH_HPH;
+    return (uint8_t)GAH_JACK_HEADSET;
+}
+
+// wcd_measure_adc_once(MUX_CTL_IN2P = 1): one ADC conversion of the mic ring with MICBIAS2 on. <0 on timeout.
+static inline int gah_mbhc_adc_once(const struct gah_ops *o, uint8_t *code) {
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x10, 0x00);                  // ADC_MODE one-shot
+    const uint8_t adc_en = gah_wcd_get(o, WCD_MBHC_NEW_CTL_1) & 0x08;
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x08, 0x00);
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x80, 0x00);                  // FSM_EN 0
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_2, 0x70, 0x10);                  // MUX_CTL = IN2P
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x80, 0x80);
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x08, 0x08);                  // ADC_EN
+    int r = GAH_ERR_IO;
+    for (unsigned t = 0; t < 6 && r; t++) {
+        o->delay_us(o->ctx, 600);
+        const uint8_t st = gah_wcd_get(o, WCD_MBHC_NEW_FSM_STATUS);
+        if (st & 0x80) continue;                                        // ADC_TIMEOUT
+        if (!(st & 0x40)) continue;                                     // ADC_COMPLETE
+        *code = gah_wcd_get(o, WCD_MBHC_NEW_ADC_RESULT);
+        r = 0;
+    }
+    gah_wcd_bits(o, WCD_MBHC_NEW_CTL_1, 0x08, adc_en);
+    return r;
+}
+
+// Insertion: micbias ramp + MICBIAS2, settle, one ADC reading -> plug type (headphone: mic ring at ground; headset:
+// mic in between; high impedance: open). MICBIAS2 stays on for a headset (its microphone), off otherwise.
+static inline void gah_mbhc_classify(const struct gah_ops *o, struct gah_jack *j) {
+    gah_wcd_bits(o, WCD_ANA_MICB2_RAMP, 0x1c, 0x0c);
+    gah_wcd_bits(o, WCD_ANA_MICB2_RAMP, 0x80, 0x80);
+    gah_mbhc_micb2(o, j, 1);
+    o->sleep_ms(o->ctx, 50);
+    const uint32_t micb_mv = gah_mbhc_micb_mv(gah_wcd_get(o, WCD_ANA_MICB2));
+    uint8_t code = 0;
+    const int r = gah_mbhc_adc_once(o, &code);
+    j->adc = code;
+    j->mic_mv = (uint16_t)gah_mbhc_adc_mv(code, micb_mv);
+    j->type = r ? (uint8_t)GAH_JACK_UNKNOWN : gah_mbhc_plug_from_mv(j->mic_mv, micb_mv);
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x80, 0x00);                  // FSM off again (no button detection)
+    gah_wcd_bits(o, WCD_ANA_MICB2_RAMP, 0x80, 0x00);
+    gah_wcd_bits(o, WCD_ANA_MICB2_RAMP, 0x1c, 0x00);
+    if (j->type != GAH_JACK_HEADSET) gah_mbhc_micb2(o, j, 0);
+    gah_note(o, "mbhc plug type (type 1 hph 2 headset 3 high-z 4 unknown, mic mV)", r, j->type, j->mic_mv);
+}
+
+static inline void gah_mbhc_removed(const struct gah_ops *o, struct gah_jack *j) {
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x80, 0x00);                  // FSM_EN 0
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x70, 0x00);                  // BTN_ISRC_CTL 0
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x08, 0x08);                  // ELECT_DETECTION_TYPE 1
+    gah_wcd_bits(o, WCD_ANA_MBHC_ELECT, 0x06, 0x00);                  // ELECT_SCHMT_ISRC 0
+    if (j->micb2) gah_mbhc_micb2(o, j, 0);
+    j->type = GAH_JACK_NONE;
+    j->mic_mv = 0;
+}
+
+// One poll. 1 = the jack state changed (j->present / j->type are new), 0 = nothing, <0 = register access failed.
+// level_polls: consecutive polls SWCH_LEVEL_REMOVE must disagree with the state before it counts (0 = never).
+static inline int gah_mbhc_poll(const struct gah_ops *o, struct gah_jack *j, unsigned level_polls) {
+    uint8_t st = 0, mech = 0, res3 = 0;
+    int r = o->wcd_rd(o->ctx, WCD_DIG_INTR_STATUS_0, &st);
+    if (!r) r = o->wcd_rd(o->ctx, WCD_ANA_MBHC_MECH, &mech);
+    if (!r) r = o->wcd_rd(o->ctx, WCD_ANA_MBHC_RESULT_3, &res3);
+    j->polls++;
+    if (r) { j->last_rc = r; return r; }
+    if (mech != j->last_mech || (res3 & 0x10) != (j->last_res3 & 0x10)) {
+        gah_note(o, "mbhc raw (MECH, RESULT_3 | INTR_STATUS_0 << 8)", 0, mech, (uint32_t)res3 | (uint32_t)st << 8);
+        j->last_mech = mech;
+        j->last_res3 = res3;
+    }
+    int insert = -1;   // 1 insertion, 0 removal, -1 nothing
+    if (st & 0x10) {
+        gah_wcd_bits(o, WCD_DIG_INTR_CLEAR_0, 0xff, 0x10);
+        gah_wcd_bits(o, WCD_DIG_INTR_CLEAR_0, 0xff, 0x00);
+        const uint8_t armed = (mech >> 5) & 1;
+        gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x20, armed ? 0x00 : 0x20);   // detect the other edge next
+        j->armed = !armed;
+        if (armed && !j->present) insert = 1;
+        else if (!armed && j->present) insert = 0;
+        if (insert >= 0) j->irq_events++;
+        j->level_votes = 0;
+    } else if (level_polls) {
+        const int plugged = (res3 & 0x10) == 0;
+        if (plugged != (int)j->present) {
+            if (++j->level_votes >= level_polls) {
+                insert = plugged;
+                j->level_events++;
+                gah_wcd_bits(o, WCD_ANA_MBHC_MECH, 0x20, plugged ? 0x00 : 0x20);
+                j->armed = !plugged;
+                j->level_votes = 0;
+            }
+        } else {
+            j->level_votes = 0;
+        }
+    }
+    if (insert < 0) return 0;
+    if (insert) {
+        j->present = 1;
+        gah_mbhc_classify(o, j);
+    } else {
+        j->present = 0;
+        gah_mbhc_removed(o, j);
+    }
+    j->events++;
+    gah_note(o, insert ? "mbhc jack inserted (type, mic mV)" : "mbhc jack removed (events, irq events)", 0,
+             insert ? j->type : j->events, insert ? j->mic_mv : j->irq_events);
+    return 1;
 }
 #endif
