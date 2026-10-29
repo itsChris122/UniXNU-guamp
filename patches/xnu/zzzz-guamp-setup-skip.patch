@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,528 @@
+@@ -7858,6 +7858,615 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -40,20 +40,31 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 + * fairplayd.A2 (KeepAlive; the kernel has no FairPlayIOKit, so it exits at once and launchd respawned it every ~10 s, 191 pids in
 + * one log; its clients then got stuck on the throttled port, e.g. lockdownd in FairPlayGetHWInfo). Disabled, its Mach services
 + * are not registered and clients fail at once; guamp-slim-fairplay=1 enables it again. iconservicesagent is always written as
-+ * enabled. The file is rewritten every boot, so a boot with another argument restores the matching list. */
++ * enabled. The file is rewritten every boot, so a boot with another argument restores the matching list.
++ * guamp-slim-fast=1 (29/10, opt-in, NOW list only; analisi/kernel-build/AVVIO-VELOCE-20261029.md): FAST jobs disabled too,
++ * services this phone cannot use (no account, no network services, no NFC/UWB hardware, no Apple diagnostics) that read
++ * ~150 MB of the eMMC at boot and keep 50+ processes resident: Find My, analytics and crash/diagnostic collectors, software
++ * update and Trial, device management and Classroom, Siri inference, Health/Fitness/Home, Maps helpers, Duet/ML predictions,
++ * store/books/games/TV, family sharing, UWB, Xcode pairing, translation, Announce, Night Shift helper, key transparency, ID
++ * verification, Tap to Pay, Shared with You. Never in it: Bluetooth, audio, GPU, Wallet (passd, nfcd, seld, seserviced),
++ * Photos, Safari (parsecd, WebKit), Wi-Fi, telephony/SIM (CommCenter helpers, callservicesd, imagent, apsd, safetyalertsd),
++ * dictation (assistantd, corespeechd), mobileassetd, chronod, PowerLog. guamp-slim-commcenter=1 (NOW list) leaves
++ * CommCenter enabled for the SIM work (it is off in every other list). */
 +#define GUAMP_SLIM_NOW 1
 +#define GUAMP_SLIM_LEGACY 2
 +#define GUAMP_SLIM_BT 4
 +#define GUAMP_SLIM_SPOTLIGHT 8	/* skipped by guamp-slim-spotlight=1 (not in the legacy list) */
 +#define GUAMP_SLIM_MEDIA 16	/* skipped by guamp-slim-media=1 (not in the legacy list) */
 +#define GUAMP_SLIM_FAIRPLAY 32	/* skipped by guamp-slim-fairplay=1 (NOW list only) */
++#define GUAMP_SLIM_FAST 64	/* added by guamp-slim-fast=1 (NOW list only) */
++#define GUAMP_SLIM_COMMCENTER 128	/* skipped by guamp-slim-commcenter=1 (NOW list only) */
 +#define GUAMP_SLIM_ALL (GUAMP_SLIM_NOW | GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT)
 +static const struct {
 +	const char *label;
 +	int lists;
 +	int disabled;
 +} native_guamp_slim_jobs[] = {
-+	{"com.apple.CommCenter", GUAMP_SLIM_ALL, 1},
++	{"com.apple.CommCenter", GUAMP_SLIM_ALL | GUAMP_SLIM_COMMCENTER, 1},
 +	{"com.apple.accessoryupdaterd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.biomesyncd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.bluetoothd", GUAMP_SLIM_BT, 1},
@@ -76,8 +87,77 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	{"com.apple.systemstats.microstackshot_periodic", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.tailspind", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.tipsd", GUAMP_SLIM_ALL, 1},
++	/* guamp-slim-fast=1: labels checked against /System/Library/LaunchDaemons of 21H461 (29/10). Find My */
++	{"com.apple.icloud.findmydeviced", GUAMP_SLIM_FAST, 1},
++	{"com.apple.findmy.findmybeaconingd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.findmy.findmylocated", GUAMP_SLIM_FAST, 1},
++	{"com.apple.icloud.fmfd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.icloud.fmflocatord", GUAMP_SLIM_FAST, 1},
++	{"com.apple.icloud.searchpartyd", GUAMP_SLIM_FAST, 1},
++	/* analytics, crash and diagnostic collectors (-no_corpses: no crash reports anyway) */
++	{"com.apple.analyticsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.osanalytics.osanalyticshelper", GUAMP_SLIM_FAST, 1},
++	{"com.apple.aggregated", GUAMP_SLIM_FAST, 1},
++	{"com.apple.diagnosticextensionsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.rtcreportingd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.symptomsd-diag", GUAMP_SLIM_FAST, 1},
++	{"com.apple.wirelessinsightsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.geoanalyticsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.corecaptured", GUAMP_SLIM_FAST, 1},
++	{"com.apple.OTACrashCopier", GUAMP_SLIM_FAST, 1},
++	{"com.apple.nand.aspcarry", GUAMP_SLIM_FAST, 1},
++	{"com.apple.ReportMemoryException", GUAMP_SLIM_FAST, 1},
++	/* software update, Trial experiments, repair */
++	{"com.apple.mobile.softwareupdated", GUAMP_SLIM_FAST, 1},
++	{"com.apple.softwareupdateservicesd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.betaenrollmentd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.mobilerepaird", GUAMP_SLIM_FAST, 1},
++	{"com.apple.triald", GUAMP_SLIM_FAST, 1},
++	/* device management, Classroom */
++	{"com.apple.remotemanagementd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.devicemanagementclient.mdmd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.studentd", GUAMP_SLIM_FAST, 1},
++	/* Siri inference (server side and learning; dictation daemons stay) */
++	{"com.apple.siriinferenced", GUAMP_SLIM_FAST, 1},
++	/* Health, Fitness, Home */
++	{"com.apple.healthd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.fitcore", GUAMP_SLIM_FAST, 1},
++	{"com.apple.fitnesscoachingd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.homed", GUAMP_SLIM_FAST, 1},
++	/* Maps helpers (geod stays) */
++	{"com.apple.navd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.Maps.mapssyncd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.Maps.mapspushd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.maps.destinationd", GUAMP_SLIM_FAST, 1},
++	/* Duet and on-device ML predictions (coreduetd, biomed, dasd stay) */
++	{"com.apple.duetexpertd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.ospredictiond", GUAMP_SLIM_FAST, 1},
++	{"com.apple.mlhostd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.intelligentroutingd", GUAMP_SLIM_FAST, 1},
++	/* store engagement, ads, Books, Game Center, TV */
++	{"com.apple.amsengagementd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.ap.promotedcontentd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.bookdatastored", GUAMP_SLIM_FAST, 1},
++	{"com.apple.bookassetd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.gamed", GUAMP_SLIM_FAST, 1},
++	{"com.apple.tvremoted", GUAMP_SLIM_FAST, 1},
++	{"com.apple.videosubscriptionsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.watchlistd", GUAMP_SLIM_FAST, 1},
++	/* family sharing */
++	{"com.apple.familycircled", GUAMP_SLIM_FAST, 1},
++	{"com.apple.askpermissiond", GUAMP_SLIM_FAST, 1},
++	/* no hardware or no account: UWB, Xcode pairing, translation, Announce, eye relief, key transparency, ID, Tap to Pay */
++	{"com.apple.nearbyd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.dt.remotepairingdeviced", GUAMP_SLIM_FAST, 1},
++	{"com.apple.translationd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.announced", GUAMP_SLIM_FAST, 1},
++	{"com.apple.eyereliefd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.transparencyd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.coreidvd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.softposreaderd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.sociallayerd", GUAMP_SLIM_FAST, 1},
 +};
-+static char native_guamp_slim_plist[2048];
++static char native_guamp_slim_plist[8192];
 +/* Builds the disabled.plist of one list (same XML layout as the stock array), skipping the opt-in groups in skip. Returns its size,
 + * 0 if it did not fit (the caller then keeps the stock list). */
 +static size_t
@@ -393,6 +473,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	PE_parse_boot_argn("guamp-slim-media", &guamp_slim_media, sizeof(guamp_slim_media));
 +	unsigned int guamp_slim_fairplay = 0;	/* 29/10: 1 leaves fairplayd.A2 enabled */
 +	PE_parse_boot_argn("guamp-slim-fairplay", &guamp_slim_fairplay, sizeof(guamp_slim_fairplay));
++	unsigned int guamp_slim_fast = 0, guamp_slim_commcenter = 0;	/* 29/10, opt-in: GUAMP_SLIM_FAST jobs off, CommCenter on */
++	PE_parse_boot_argn("guamp-slim-fast", &guamp_slim_fast, sizeof(guamp_slim_fast));
++	PE_parse_boot_argn("guamp-slim-commcenter", &guamp_slim_commcenter, sizeof(guamp_slim_commcenter));
 +	unsigned int guamp_kb_prefs = 1;	/* default 1: written only when absent (29/10); guamp-kb-prefs=2 rewrites them, =0 leaves them as is */
 +	PE_parse_boot_argn("guamp-kb-prefs", &guamp_kb_prefs, sizeof(guamp_kb_prefs));
 +	for (size_t i = 0; i < sizeof(native_guamp_setup_files) / sizeof(native_guamp_setup_files[0]); i++) {
@@ -405,8 +488,12 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +		if (guamp_slim && data == native_guamp_disabled) {
 +			int list = guamp_slim == 2 ? GUAMP_SLIM_BT : guamp_slim_legacy == 1 ? GUAMP_SLIM_LEGACY : GUAMP_SLIM_NOW;
 +			int skip = list == GUAMP_SLIM_NOW ? (guamp_slim_spotlight == 1 ? GUAMP_SLIM_SPOTLIGHT : 0) |
-+			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) | (guamp_slim_fairplay == 1 ? GUAMP_SLIM_FAIRPLAY : 0) : 0;
-+			size_t built = native_guamp_slim_build(list, skip);
++			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) | (guamp_slim_fairplay == 1 ? GUAMP_SLIM_FAIRPLAY : 0) |
++			    (guamp_slim_commcenter == 1 ? GUAMP_SLIM_COMMCENTER : 0) : 0;
++			int fast = list == GUAMP_SLIM_NOW && guamp_slim_fast == 1;
++			size_t built = native_guamp_slim_build(list | (fast ? GUAMP_SLIM_FAST : 0), skip);
++			printf("guamp-slim-fast=%d, guamp-slim-commcenter=%d (CommCenter %s)\n", fast, (skip & GUAMP_SLIM_COMMCENTER) ? 1 : 0,
++			    (skip & GUAMP_SLIM_COMMCENTER) ? "enabled" : "disabled");
 +			if (built) {
 +				data = (const uint8_t *)native_guamp_slim_plist;
 +				size = built;
