@@ -1,5 +1,5 @@
 diff --git a/bsd/vfs/kpi_vfs.c b/bsd/vfs/kpi_vfs.c
-index 10ac956..f6df8ed 100644
+index 10ac956..fdd0d2a 100644
 --- a/bsd/vfs/kpi_vfs.c
 +++ b/bsd/vfs/kpi_vfs.c
 @@ -128,6 +128,7 @@
@@ -10,69 +10,104 @@ index 10ac956..f6df8ed 100644
  
  #define ESUCCESS 0
  #undef mount_t
-@@ -739,6 +740,83 @@ vfs_statfs(mount_t mp)
+@@ -739,6 +740,118 @@ vfs_statfs(mount_t mp)
  	return &mp->mnt_vfsstat;
  }
  
 +/*
 + * guamp-disk-capacity=<GB> (29/10, default 0 = off). On guamp "/" is the sealed OS container (6 GB, read only) and Data
-+ * is a separate 4 GiB container mounted on /private/var, so Settings > General > iPhone Storage (StorageData
-+ * _GetDeviceSpace: getattrlist("/") ATTR_VOL_SIZE/SPACEAVAIL, rounded to the nearest 10^9) and statfs("/") see
-+ * about 6 GB and nothing free. With the boot arg the read-only OS volumes ("/", MNT_ROOTFS, the union SystemOS layer
-+ * and /private/preboot) report a total of <GB> * 10^9 bytes and the real free/available space of the Data mount,
-+ * as on an iPhone where System and Data share one container. Covers statfs, getattrlist and getattrlistbulk (all of
-+ * them go through vfs_getattr). Data itself and every other mount are untouched.
++ * is a separate 4 GiB container on /private/var, while on an iPhone System and Data share one container and every
++ * volume of it reports the container size. With the boot arg the read-only OS volumes ("/", MNT_ROOTFS, the union
++ * SystemOS layer, /private/preboot) and the Data mount (/private/var) report a total of <GB> * 10^9 bytes; free and
++ * available always stay the real values of Data, so iOS never sees more free space than there is. Data keeps its real
++ * "used"; the OS volumes report used = total - free. Covers statfs, getattrlist, getattrlistbulk and NSURL volume
++ * capacity (all of them go through vfs_getattr): iPhone Storage (StorageData _GetDeviceSpace, getattrlist "/"),
++ * MobileGestalt TotalSystemCapacity/TotalDataCapacity. TotalDiskCapacity (IOMedia disk0 "Size") is in IOUserClient.cpp.
 + */
 +static int guamp_disk_capacity_gb = -1;
 +uint32_t guamp_disk_capacity_hits;
 +
-+static void
-+guamp_disk_capacity_apply(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
++int guamp_disk_capacity_gb_get(void);
++int
++guamp_disk_capacity_gb_get(void)
 +{
 +	if (guamp_disk_capacity_gb < 0) {
 +		uint32_t gb = 0;
 +		PE_parse_boot_argn("guamp-disk-capacity", &gb, sizeof(gb));
 +		guamp_disk_capacity_gb = gb <= 4096 ? (int)gb : 0;
-+		printf("guamp-disk-capacity=%d: OS volumes report %d GB total, Data free space\n",
++		printf("guamp-disk-capacity=%d: OS and Data volumes report %d GB total, real Data free space\n",
 +		    guamp_disk_capacity_gb, guamp_disk_capacity_gb);
 +	}
-+	if (guamp_disk_capacity_gb == 0 || !(mp->mnt_flag & MNT_RDONLY)) {
++	return guamp_disk_capacity_gb;
++}
++
++static void
++guamp_disk_capacity_apply(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
++{
++	if (guamp_disk_capacity_gb_get() <= 0) {
++		return;
++	}
++	if (!VFSATTR_IS_ACTIVE(vfa, f_blocks) && !VFSATTR_IS_ACTIVE(vfa, f_bfree) && !VFSATTR_IS_ACTIVE(vfa, f_bavail) &&
++	    !VFSATTR_IS_ACTIVE(vfa, f_bused)) {
 +		return;
 +	}
 +	const char *on = mp->mnt_vfsstat.f_mntonname;
-+	if (!(mp->mnt_flag & MNT_ROOTFS) && strcmp(on, "/") != 0 && strcmp(on, "/private/preboot") != 0) {
++	bool is_data = !(mp->mnt_flag & MNT_RDONLY) && strcmp(on, "/private/var") == 0;
++	bool is_os = (mp->mnt_flag & MNT_RDONLY) &&
++	    ((mp->mnt_flag & MNT_ROOTFS) || strcmp(on, "/") == 0 || strcmp(on, "/private/preboot") == 0);
++	if (!is_data && !is_os) {
 +		return;
 +	}
-+	if (!VFSATTR_IS_ACTIVE(vfa, f_blocks) && !VFSATTR_IS_ACTIVE(vfa, f_bfree) && !VFSATTR_IS_ACTIVE(vfa, f_bavail)) {
-+		return;
-+	}
-+	mount_t data = NULL, m;
-+	mount_list_lock();
-+	TAILQ_FOREACH(m, &mountlist, mnt_list) {
-+		if (m != mp && !(m->mnt_flag & MNT_RDONLY) && strcmp(m->mnt_vfsstat.f_mntonname, "/private/var") == 0 &&
-+		    mount_iterref(m, 1) == 0) {
-+			data = m;
-+			break;
-+		}
-+	}
-+	mount_list_unlock();
-+	if (data == NULL) {
-+		return;	/* early boot, before Data is mounted: real values */
-+	}
-+	struct vfs_attr dva;
-+	VFSATTR_INIT(&dva);
-+	VFSATTR_WANTED(&dva, f_bsize);
-+	VFSATTR_WANTED(&dva, f_bfree);
-+	VFSATTR_WANTED(&dva, f_bavail);
-+	int error = VFS_GETATTR(data, &dva, ctx);
-+	uint64_t dbs = (VFSATTR_IS_SUPPORTED(&dva, f_bsize) && dva.f_bsize) ? dva.f_bsize : data->mnt_vfsstat.f_bsize;
-+	mount_iterdrop(data);
 +	uint64_t rbs = (VFSATTR_IS_SUPPORTED(vfa, f_bsize) && vfa->f_bsize) ? vfa->f_bsize : mp->mnt_vfsstat.f_bsize;
-+	if (error != 0 || dbs == 0 || rbs == 0 || !VFSATTR_IS_SUPPORTED(&dva, f_bfree) || !VFSATTR_IS_SUPPORTED(&dva, f_bavail)) {
++	uint64_t freeb, avail;
++	if (rbs == 0) {
 +		return;
++	}
++	if (is_data) {
++		/* the free space of Data itself: from this answer, or from the file system when only the size was asked */
++		if (VFSATTR_IS_SUPPORTED(vfa, f_bfree) && VFSATTR_IS_SUPPORTED(vfa, f_bavail)) {
++			freeb = vfa->f_bfree * rbs;
++			avail = vfa->f_bavail * rbs;
++		} else {
++			struct vfs_attr own;
++			VFSATTR_INIT(&own);
++			VFSATTR_WANTED(&own, f_bfree);
++			VFSATTR_WANTED(&own, f_bavail);
++			if (VFS_GETATTR(mp, &own, ctx) != 0 || !VFSATTR_IS_SUPPORTED(&own, f_bfree) || !VFSATTR_IS_SUPPORTED(&own, f_bavail)) {
++				return;
++			}
++			freeb = own.f_bfree * rbs;
++			avail = own.f_bavail * rbs;
++		}
++	} else {
++		mount_t data = NULL, m;
++		mount_list_lock();
++		TAILQ_FOREACH(m, &mountlist, mnt_list) {
++			if (m != mp && !(m->mnt_flag & MNT_RDONLY) && strcmp(m->mnt_vfsstat.f_mntonname, "/private/var") == 0 &&
++			    mount_iterref(m, 1) == 0) {
++				data = m;
++				break;
++			}
++		}
++		mount_list_unlock();
++		if (data == NULL) {
++			return;	/* early boot, before Data is mounted: real values */
++		}
++		struct vfs_attr dva;
++		VFSATTR_INIT(&dva);
++		VFSATTR_WANTED(&dva, f_bsize);
++		VFSATTR_WANTED(&dva, f_bfree);
++		VFSATTR_WANTED(&dva, f_bavail);
++		int error = VFS_GETATTR(data, &dva, ctx);
++		uint64_t dbs = (VFSATTR_IS_SUPPORTED(&dva, f_bsize) && dva.f_bsize) ? dva.f_bsize : data->mnt_vfsstat.f_bsize;
++		mount_iterdrop(data);
++		if (error != 0 || dbs == 0 || !VFSATTR_IS_SUPPORTED(&dva, f_bfree) || !VFSATTR_IS_SUPPORTED(&dva, f_bavail)) {
++			return;
++		}
++		freeb = dva.f_bfree * dbs;
++		avail = dva.f_bavail * dbs;
 +	}
 +	uint64_t total = (uint64_t)guamp_disk_capacity_gb * 1000000000ULL;
-+	uint64_t freeb = dva.f_bfree * dbs, avail = dva.f_bavail * dbs;
 +	freeb = freeb < total ? freeb : total;
 +	avail = avail < freeb ? avail : freeb;
 +	if (VFSATTR_IS_ACTIVE(vfa, f_blocks)) {
@@ -84,7 +119,7 @@ index 10ac956..f6df8ed 100644
 +	if (VFSATTR_IS_ACTIVE(vfa, f_bavail)) {
 +		VFSATTR_RETURN(vfa, f_bavail, avail / rbs);
 +	}
-+	if (VFSATTR_IS_ACTIVE(vfa, f_bused)) {
++	if (is_os && VFSATTR_IS_ACTIVE(vfa, f_bused)) {
 +		/* used = total - free, so used + available never exceeds the reported size */
 +		VFSATTR_RETURN(vfa, f_bused, (total - freeb) / rbs);
 +	}
@@ -94,7 +129,7 @@ index 10ac956..f6df8ed 100644
  int
  vfs_getattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
  {
-@@ -747,6 +825,7 @@ vfs_getattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
+@@ -747,6 +860,7 @@ vfs_getattr(mount_t mp, struct vfs_attr *vfa, vfs_context_t ctx)
  	if ((error = VFS_GETATTR(mp, vfa, ctx)) != 0) {
  		return error;
  	}
@@ -102,3 +137,64 @@ index 10ac956..f6df8ed 100644
  
  	/*
  	 * If we have a filesystem create time, use it to default some others.
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 0431e27..352dfbc 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -3600,6 +3600,27 @@ is_io_registry_entry_get_registry_entry_id(
+ }
+ 
+ 
++/*
++ * guamp-disk-capacity=<GB> (29/10, see kpi_vfs.c): MobileGestalt TotalDiskCapacity (Settings > General > About >
++ * Capacity) is the "Size" of the IOMedia with BSD name disk0, and NativeEmmc publishes one device per window, so disk0
++ * is the 6 GB OS or the 4 GiB Data window. User space reads of that one property of disk0 return <GB> * 10^9; the
++ * registry itself is untouched (partition schemes and APFS use IOMedia::getSize()).
++ */
++extern "C" int guamp_disk_capacity_gb_get(void);
++static OSNumber *
++guamp_disk_capacity_size(IORegistryEntry * entry)
++{
++	int gb = guamp_disk_capacity_gb_get();
++	if (gb <= 0 || !entry->metaCast("IOMedia")) {
++		return NULL;
++	}
++	OSObject * bsd = entry->copyProperty("BSD Name");
++	OSString * name = OSDynamicCast(OSString, bsd);
++	bool disk0 = name && name->isEqualTo("disk0");
++	OSSafeReleaseNULL(bsd);
++	return disk0 ? OSNumber::withNumber((unsigned long long)gb * 1000000000ULL, 64) : NULL;
++}
++
+ static OSObject *
+ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ {
+@@ -3607,6 +3628,9 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+ 	OSObject     * compatProperties;
+ 	OSDictionary * props;
+ 
++	if (name && 0 == strcmp(name, "Size") && (obj = guamp_disk_capacity_size(regEntry))) {
++		return obj;
++	}
+ 	obj = regEntry->copyProperty(name);
+ 	if (obj) {
+ 		return obj;
+@@ -3915,6 +3939,18 @@ is_io_registry_entry_get_properties_bin_buf(
+ 			dict->release();
+ 		}
+ 		compatProperties->release();
++	} else if (OSNumber * guampSize = guamp_disk_capacity_size(entry)) {
++		OSDictionary * dict = entry->dictionaryWithProperties();
++		if (!dict) {
++			err = kIOReturnNoMemory;
++		} else {
++			dict->setObject("Size", guampSize);
++			if (!dict->serialize(s)) {
++				err = kIOReturnUnsupported;
++			}
++			dict->release();
++		}
++		guampSize->release();
+ 	} else if (!entry->serializeProperties(s)) {
+ 		err = kIOReturnUnsupported;
+ 	}
