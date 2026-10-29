@@ -9,7 +9,12 @@
 // Options: guamp-audio-mic-src=1|3 (amic1 secondary, amic3 main = default), guamp-audio-mic-ms=<test ms> (100..20000,
 // default 3000: levels logged every 500 ms, then the verdict), guamp-audio-mic-hold=0 (tear the chain down after the
 // verdict; default 1 keeps it up for the plug-in), guamp-audio-mic-gain=<dB> (TX decimator, -84..40, default 0).
-// Verdict lines (prefix "GuampMic:"): "MIC CAPTURE OK (...)", "MIC PATH UP (no shared memory ...)",
+// guamp-audio-mic-macro=1 also sends the LPASS MACRO vote (off: no lpass_core_hw_vote in the guamp DT).
+// Register dumps ("GuampMic: dump <when> <block>: addr=value ..."): after the codec path is on, 1 s into the capture
+// and at a silent verdict: TX macro, VA macro, LPI SWR pins, SoundWire master (+ interrupt status decoded), wcd937x
+// TX registers and the slave data-port registers read back over the bus.
+// Verdict lines (prefix "GuampMic:"): "MIC CAPTURE OK (...)", "MIC CAPTURE SILENT (all samples 0 ...)",
+// "MIC PATH UP (no shared memory ...)",
 // "MIC CAPTURE FAILED (<step> status <s> ...)".
 #ifndef GUAMP_MIC_DEV_INC
 #define GUAMP_MIC_DEV_INC
@@ -48,7 +53,7 @@ guampmic::Capture gRing;
 guampmic::Codec gCodec;
 apr::MicPath gPath;
 guamp_audio_shm gShm = {};
-constinit bool gOpen = false;
+constinit bool gOpen = false, gMacroVote = false, gDumpPathOn = false, gDump1s = false;
 constinit int gMajor = -1;
 constinit void *gNode = nullptr;
 constinit uint32_t gOpens = 0, gReads = 0, gFsgenUsers = 0;
@@ -130,6 +135,63 @@ void sinkPcm(void *, const uint8_t *pcm, uint32_t bytes) {
   IOLockUnlock(gLock);
 }
 
+// ---- register dump (diagnostics of a silent capture) -----------------------------------------------------------------
+void dumpMmio(const char *when, const char *block, uint64_t base, const uint32_t *offs, unsigned n) {
+  char line[240];
+  int at = snprintf(line, sizeof(line), "GuampMic: dump %s %s:", when, block);
+  for (unsigned i = 0; i < n; i++) {
+    if (at > static_cast<int>(sizeof(line)) - 24) {
+      IOLog("%s\n", line);
+      at = snprintf(line, sizeof(line), "GuampMic: dump %s %s+:", when, block);
+    }
+    at += snprintf(line + at, sizeof(line) - at, " %x=%x", static_cast<unsigned>(offs[i]), busRd(nullptr, base + offs[i]));
+  }
+  IOLog("%s\n", line);
+}
+void dumpWcd(const char *when, const char *block, const uint16_t *regs, unsigned n) {
+  char line[240];
+  int at = snprintf(line, sizeof(line), "GuampMic: dump %s %s:", when, block);
+  for (unsigned i = 0; i < n; i++) {
+    if (at > static_cast<int>(sizeof(line)) - 16) {
+      IOLog("%s\n", line);
+      at = snprintf(line, sizeof(line), "GuampMic: dump %s %s+:", when, block);
+    }
+    uint8_t v = 0;
+    const bool ok = gCodec.swr.devNum && gCodec.swr.read(gCodec.swr.devNum, regs[i], &v);
+    at += ok ? snprintf(line + at, sizeof(line) - at, " %x=%x", regs[i], v) : snprintf(line + at, sizeof(line) - at, " %x=??", regs[i]);
+  }
+  IOLog("%s\n", line);
+}
+void dump(const char *when) {
+  if (!gMapped) return;
+  static const uint32_t tx[] = {0x000, 0x004, 0x008, 0x080, 0x088, 0x090, 0x0A4, 0x0C0, 0x0C4, 0x0D0, 0x0D4, 0x100, 0x104,
+                                0x400, 0x404, 0x408, 0x40C, 0x410, 0x414, 0x418, 0x41C, 0x420, 0x424, 0x428, 0x42C};
+  static const uint32_t va[] = {0x000, 0x004, 0x008, 0x080, 0x094, 0x0A4, 0x0D0, 0x0D4, 0x0D8, 0x0DC};
+  static const uint32_t sw[] = {0x000, 0x004, 0x014, 0x100, 0x200, 0x204, 0x210, 0x30C, 0x314, 0x500, 0x1044, 0x1048,
+                                0x104C, 0x1090, 0x101C, 0x105C, 0x1124, 0x1164, 0x1224, 0x1264, 0x1228, 0x1268, 0x1234,
+                                0x1274, 0x1324, 0x1364};
+  static const uint32_t lpi[] = {0x0000, 0x0004, 0x1000, 0x1004, 0x2000, 0x2004};
+  static const uint16_t wcd[] = {0x3001, 0x300E, 0x300F, 0x3010, 0x3011, 0x3022, 0x3023, 0x3025, 0x3029, 0x306C, 0x306F,
+                                 0x3072, 0x3103, 0x3127, 0x312A, 0x3406, 0x3408, 0x3409, 0x3457};
+  // slave: SCP frame ctl banks 0/1 and the data ports DP1 (ADC1) / DP2 (ADC2): ch enable, sample, offset1/2, lane
+  static const uint16_t slv[] = {0x0040, 0x0041, 0x0044, 0x0060, 0x0070, 0x0120, 0x0122, 0x0124, 0x0130, 0x0132, 0x0134,
+                                 0x0220, 0x0222, 0x0224, 0x0225, 0x0228, 0x0230, 0x0232, 0x0234, 0x0235, 0x0238};
+  IOLockLock(gCodecLock);
+  dumpMmio(when, "tx", guampmic::kTx, tx, sizeof(tx) / sizeof(tx[0]));
+  dumpMmio(when, "va", guampmic::kVa, va, sizeof(va) / sizeof(va[0]));
+  dumpMmio(when, "swrm", guampmic::kSwrm, sw, sizeof(sw) / sizeof(sw[0]));
+  const uint32_t hctl = busRd(nullptr, guampmic::kSwrmHctl), slew = busRd(nullptr, guampmic::kLpiSlew);
+  dumpMmio(when, "lpi", guampmic::kLpi, lpi, sizeof(lpi) / sizeof(lpi[0]));
+  const uint32_t is = busRd(nullptr, guampmic::kSwrm + guampmic::kSwIntStatus);
+  IOLog("GuampMic: dump %s swrm hctl=%x lpi slew=%x int status %x:%s%s%s%s%s%s%s\n", when, hctl, slew, is,
+        is & 0x8 ? " BUS-CLASH" : "", is & 0x80 ? " CMD-ERROR" : "", is & 0x100 ? " DOUT-COLLISION" : "",
+        is & 0x10 ? " RD-OVERFLOW" : "", is & 0x20 ? " RD-UNDERFLOW" : "", is & 0x40 ? " WR-OVERFLOW" : "",
+        is & 0x4 ? " SLAVE-STATUS-CHANGED" : "");
+  dumpWcd(when, "wcd", wcd, sizeof(wcd) / sizeof(wcd[0]));
+  dumpWcd(when, "slave", slv, sizeof(slv) / sizeof(slv[0]));
+  IOLockUnlock(gCodecLock);
+}
+
 // ---- called from GuampAdspIpc.inc (guamp-adsp thread) ---------------------------------------------------------------
 bool enabled() { return gOn; }
 // AFE/ADM answers with the mic token, ASM packets for the mic session: ours
@@ -154,7 +216,12 @@ void verdict() {
   else if (gPath.upWithoutMemory())
     IOLog("GuampMic: MIC PATH UP (no shared memory: no samples; AFE port %x started, amic%u, wcd chip id %x, swr dev %u, "
           "votes %u/%u)\n", gPath.afePort, gMic, gCodec.chipId, gCodec.swr.devNum, gPath.votedMacro, gPath.votedDcodec);
-  else if (gPath.capturing() && gPath.readDones && !gPath.readErrors)
+  else if (gPath.capturing() && gPath.readDones && !gPath.readErrors && !gPath.peakMax) {
+    IOLog("GuampMic: MIC CAPTURE SILENT (all samples 0: %u frames in %u reads; DSP, AFE and shared memory work, the codec "
+          "path delivers nothing; amic%u, wcd chip id %x, swr dev %u)\n", gPath.framesIn, gPath.readDones, gMic,
+          gCodec.chipId, gCodec.swr.devNum);
+    dump("silent");
+  } else if (gPath.capturing() && gPath.readDones && !gPath.readErrors)
     IOLog("GuampMic: MIC CAPTURE OK (%u frames in %u reads, peak %u, rms %u, amic%u, wcd chip id %x)\n", gPath.framesIn,
           gPath.readDones, gPath.peakMax, gPath.rms(), gMic, gCodec.chipId);
   else
@@ -172,6 +239,7 @@ void service(uint32_t now, int (*send)(void *, const uint8_t *, uint32_t)) {
     gPath.log = pathLog;
     gPath.hw = codecStep;
     gPath.sink = sinkPcm;
+    gPath.voteMacro = gMacroVote;
     const uint32_t want = apr::MicPath::kSlots * apr::MicPath::kSlotStride;
     const int s = guamp_audio_shm_get(want, &gShm);
     if (!s && gShm.cpu && gShm.bytes >= want) gPath.shm = {static_cast<uint8_t *>(gShm.cpu), gShm.iova_lsw, gShm.msw, want};
@@ -180,6 +248,14 @@ void service(uint32_t now, int (*send)(void *, const uint8_t *, uint32_t)) {
     gPath.begin(now);
   }
   gPath.stepAt(now);
+  if (!gDumpPathOn && gCodec.portOn) {
+    gDumpPathOn = true;
+    dump("path-on");
+  }
+  if (!gDump1s && gStartAt && now - gStartAt >= 1000) {
+    gDump1s = true;
+    dump("capture-1s");
+  }
   if (gPath.capturing() && !gStartAt) {
     gStartAt = now;
     gNextLevel = now + 500;
@@ -323,6 +399,7 @@ bool configure() {
   if (PE_parse_boot_argn("guamp-audio-mic-src", &v, sizeof(v)) && (v == 1 || v == 3)) gMic = v;
   if (PE_parse_boot_argn("guamp-audio-mic-ms", &v, sizeof(v)) && v >= 100 && v <= 20000) gTestMs = v;
   if (PE_parse_boot_argn("guamp-audio-mic-hold", &v, sizeof(v))) gHold = v != 0;
+  if (PE_parse_boot_argn("guamp-audio-mic-macro", &v, sizeof(v))) gMacroVote = v == 1;
   int gain = 0;
   if (PE_parse_boot_argn("guamp-audio-mic-gain", &gain, sizeof(gain)) && gain >= -84 && gain <= 40) gGainDb = gain;
   gLock = IOLockAlloc();

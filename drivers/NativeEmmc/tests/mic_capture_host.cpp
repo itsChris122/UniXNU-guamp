@@ -146,6 +146,7 @@ static guampmic::Codec makeCodec() {
   gSim.wcd[0x3401] = 0x00; gSim.wcd[0x3402] = 0x00; gSim.wcd[0x3403] = 0x0A; gSim.wcd[0x3404] = 0x01;
   gSim.wcd[guampmic::kWEfuse16] = 0x01;
   gSim.at(guampmic::kTx + guampmic::kTxPathCfg0) = 0x00;   // HPF corner 4 Hz after reset
+  for (uint32_t i = 0; i < 3; i++) gSim.at(guampmic::kVa + 0xD0 + 4 * i) = 0xEE;   // reset values (bolero-cdc-regmap.c)
   guampmic::Codec c;
   c.bus = {nullptr, simRd, simWr, simDelay, nullptr};
   return c;
@@ -159,6 +160,7 @@ static void codec() {
   CHECK((gSim.at(kVa + kVaMclkCtl) & 1) && (gSim.at(kVa + kVaFsCnt) & 1) && (gSim.at(kVa + kVaTopCfg0) & 2));
   CHECK((gSim.at(kTx + kTxFreqMclk) & 1) && (gSim.at(kTx + kTxMclkCtl) & 1) && (gSim.at(kTx + kTxFsCnt) & 1));
   CHECK((gSim.at(kTx + kTxPathSec7) & 0x3F) == 0x0A && (gSim.at(kVa + kVaSwrCtrl) & 0xF) == 0xA);
+  CHECK(gSim.at(kVa + 0xD0) == 0xCC && gSim.at(kVa + 0xD4) == 0xCC && gSim.at(kVa + 0xD8) == 0xCC);   // va_macro_init 2.1
   CHECK(gSim.at(kVa + kVaSwrControl) == 1);   // enabled, reset pulse released
   CHECK(gSim.at(kLpi) == 0x104 && gSim.at(kLpi + 0x1000) == 0x106 && gSim.at(kLpi + 0x2000) == 0x106);
   CHECK(gSim.at(kLpiSlew) == ((3u << 0) | (3u << 2) | (3u << 4)));
@@ -287,6 +289,7 @@ static void path() {
   m.hw = hwStep;
   m.sink = sink;
   m.shm = {shmMem, 0x10000000, 1, sizeof(shmMem)};
+  m.voteMacro = true;   // guamp-audio-mic-macro=1: both votes
   uint32_t now = 0;
   m.begin(now);
   drive(m, now, 100);
@@ -352,7 +355,8 @@ static void path() {
   now = 0;
   n.begin(now);
   drive(n, now, 100);
-  CHECK(n.upWithoutMemory() && gAdsp.opcodes.size() == 6 && gHwCalls.size() == 2);
+  CHECK(n.upWithoutMemory() && gAdsp.opcodes.size() == 5 && gHwCalls.size() == 2);   // default: DCODEC vote only
+  CHECK(gAdsp.opcodes[0] == apr::kAfeHwVote && u32(gAdsp.sent[0], 20) == 4 && gAdsp.opcodes[1] == apr::kAfeSvcSetParam);
   // ---- cdc dma config refused at 144 bytes: one retry with 16
   gAdsp = Adsp();
   gHwCalls.clear();
@@ -364,7 +368,7 @@ static void path() {
   now = 0;
   r.begin(now);
   drive(r, now, 100);
-  CHECK(r.upWithoutMemory() && r.cdcParamBytes == 16 && u16(gAdsp.sent[5], 44) == 16 && u16(gAdsp.sent[5], 2) == 20 + 16 + 12 + 16);
+  CHECK(r.upWithoutMemory() && r.cdcParamBytes == 16 && u16(gAdsp.sent[4], 44) == 16 && u16(gAdsp.sent[4], 2) == 20 + 16 + 12 + 16);
   // ---- port start refused: codec undone, clocks off, devotes; no ASM/ADM traffic
   gAdsp = Adsp();
   gHwCalls.clear();
@@ -378,7 +382,7 @@ static void path() {
   drive(s, now, 100);
   CHECK(s.finished() && s.setupFailed && s.failedStep == apr::MicPath::PortStart && s.failedStatus == 0xd);
   CHECK(gHwCalls == std::vector<int>({apr::MicPath::CodecUp, apr::MicPath::CodecDown}));
-  CHECK(gAdsp.opcodes.back() == apr::kAfeHwDevote && gAdsp.opcodes[gAdsp.opcodes.size() - 2] == apr::kAfeHwDevote);
+  CHECK(gAdsp.opcodes.back() == apr::kAfeHwDevote && gAdsp.opcodes[gAdsp.opcodes.size() - 2] == apr::kAfeSvcSetParam);
   for (uint32_t op : gAdsp.opcodes) CHECK(op != apr::kAsmOpenReadV3 && op != apr::kAdmOpenV5 && op != apr::kAfeDeviceStop);
   // ---- silent ADSP: the first vote times out, the rest still tries; the clock times out -> undo without clock-off
   gAdsp = Adsp();
@@ -391,7 +395,7 @@ static void path() {
   t.begin(now);
   for (unsigned i = 0; i < 20 && !t.finished(); i++) { t.stepAt(now); now += 1001; }
   CHECK(t.finished() && t.setupFailed && t.failedStep == apr::MicPath::ClkCore && gHwCalls.empty());
-  CHECK(gAdsp.opcodes == std::vector<uint32_t>({apr::kAfeHwVote, apr::kAfeHwVote, apr::kAfeSvcSetParam}));
+  CHECK(gAdsp.opcodes == std::vector<uint32_t>({apr::kAfeHwVote, apr::kAfeSvcSetParam}));
   printf("path: votes, TX clocks, codec, CODEC_DMA_TX_3 config/start, mem map, ADM TX, ASM open read, enc cfg, route, run, "
          "4 reads, READ_DONE -> sink, stop in reverse; no shm; config retry; start refused; silent ADSP\n");
 }
