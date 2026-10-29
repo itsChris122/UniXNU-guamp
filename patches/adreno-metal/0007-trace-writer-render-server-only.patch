@@ -1,0 +1,23 @@
+guamp: frame trace writer (frames.trace, cpu.profile) only in backboardd
+
+The paths are in com.apple.backboardd caches; every other Metal client (gpu-all) retried the open every 400 ms and drew
+repeated sandbox denies. NMB_TRACE_ALL=1 restores the old behaviour.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 0e5055e..e353da4 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -302,6 +302,13 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
+ static void traceStartWriter() {
+  bool expected=false;
+  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
++ // guamp (UniXNU-guamp patches/adreno-metal/0007): frames.trace and cpu.profile live in backboardd's own cache directory; any other
++ // process (gpu-all clients, sandboxed widgets and posters) was denied the open every 400 ms for its whole life (sandbox deny storm,
++ // a sampling profiler thread for nothing). Only the render server writes them; NMB_TRACE_ALL=1 restores the old behaviour.
++ {
++  const char *name=getprogname();const char *all=getenv("NMB_TRACE_ALL");
++  if(!(all && strtoul(all,nullptr,0)) && !(name && strcmp(name,"backboardd")==0))return;
++ }
+  std::thread([]{
+   pthread_setname_np("frame-trace");
+   int fd=-1;

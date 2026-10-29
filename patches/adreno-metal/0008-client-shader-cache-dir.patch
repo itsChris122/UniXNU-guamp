@@ -1,0 +1,32 @@
+guamp: client Metal devices get a writable cache directory and Turnip shader cache
+
+clientDevice checked the m2v directory with access() only (passes where the sandbox refuses writes) and never set
+MESA_SHADER_CACHE_DIR, so sandboxed clients (AegirPoster, widgets) compiled every pipeline again at each launch on the main
+thread (AegirPoster killed by the 5 s PosterBoard snapshot timeout inside libvulkan_freedreno). A probe file is now made, and
+MESA_SHADER_CACHE_DIR points at the same directory unless already set.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index e03de5b..a5cc46d 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -208,6 +208,20 @@ static id clientDevice(unsigned port) {
+         strlcat(candidates[i], "m2v", sizeof candidates[i]);
+         mkdir(candidates[i], 0700);
+         if (access(candidates[i], W_OK) != 0) continue;
++        // guamp (UniXNU-guamp patches/adreno-metal/0008): access() passes where the sandbox still refuses the write (AegirPoster, widgets),
++        // so a file is really made here first; and Turnip's on-disk shader cache goes into the same directory, as in the render server.
++        // A client had none: MESA_SHADER_CACHE_DIR unset, Mesa's default ($HOME/.cache) is outside what a sandboxed extension may write, so
++        // every launch compiled its pipelines again on the main thread (AegirPoster killed by PosterBoard's 5 s snapshot timeout inside
++        // libvulkan_freedreno). An explicit MESA_SHADER_CACHE_DIR in the environment wins.
++        {
++            char probe[600];
++            snprintf(probe, sizeof probe, "%s/.probe-XXXXXX", candidates[i]);
++            const int fd = mkstemp(probe);
++            if (fd < 0) continue;
++            close(fd);
++            unlink(probe);
++        }
++        setenv("MESA_SHADER_CACHE_DIR", candidates[i], 0);
+         ++usable;
+         @try {
+             device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
