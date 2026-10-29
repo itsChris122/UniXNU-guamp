@@ -41,7 +41,7 @@ struct nw_wifi_stats { uint32_t stage, scans, frames, beacons, bss_seen; int las
 struct nw_bss_info {
   uint8_t bssid[6]; uint8_t ssid_len; uint8_t ssid[32];
   uint32_t freq_mhz; int8_t signal_dbm; uint16_t caps, beacon_int; uint32_t age_ms;
-  uint16_t ie_len; uint8_t ie[384];                  /* the information elements as the access point sent them */
+  uint16_t ie_len; uint8_t ie[768];                  /* the information elements as the access point sent them */
 };
 enum { NW_STA_OFF, NW_STA_IDLE, NW_STA_SCANNING, NW_STA_AUTH, NW_STA_ASSOC, NW_STA_KEYS, NW_STA_UP };
 enum { NW_RES_OK = 0, NW_RES_NOT_FOUND = 1, NW_RES_TIMEOUT = 2, NW_RES_REJECTED = 3, NW_RES_BAD_KEY = 4, NW_RES_UNSUPPORTED = 5, NW_RES_FAILED = 6 };

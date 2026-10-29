@@ -36,3 +36,17 @@ static void control_regression_cases(void) {
   CHECK(st.state==NW_STA_UP,"valid current-AP traffic cancels beacon-miss grace period");
   nw_wifi_disconnect();spin(2);
 }
+/* guamp 29/10: a firmware that never reports a transmit status for message 4 (neither ACK nor NOACK) must not fail
+ * every WPA2 join: the first handshake installs its keys after M4_STATUS_WAIT_MS (1.5 s) without a status. */
+static void m4_status_missing_case(void) {
+  struct nw_wifi_status st; const int keys=n_setkey;
+  g_open=0; g_right=1; beacon(); g_conn_done=-1;
+  CHECK(nw_wifi_connect((const u8 *)SSID,strlen(SSID),NULL,PASS,strlen(PASS))==0,"WPA2 join accepted for the missing-status case");
+  spin(1200);
+  CHECK(g_conn_done==-1 && n_setkey==keys && g_pending_m4_skb,"without any message 4 status the keys still wait at 1.2 s");
+  spin(800); nw_wifi_status_get(&st);
+  CHECK(g_conn_done==NW_RES_OK && n_setkey==keys+2 && st.state==NW_STA_UP,"no transmit status at all for message 4: keys installed after 1.5 s (%d, %d keys)",g_conn_done,n_setkey-keys);
+  if(g_pending_m2_skb){kfree_skb(g_pending_m2_skb);g_pending_m2_skb=0;}
+  if(g_pending_m4_skb){kfree_skb(g_pending_m4_skb);g_pending_m4_skb=0;}
+  nw_wifi_disconnect(); spin(5);
+}

@@ -8,6 +8,8 @@
 #include <kern/thread.h>
 #include <kern/debug.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IORegistryEntry.h>
+#include <libkern/c++/OSData.h>
 #include "guamp_xnu_sm6115_runtime.h"
 #include "guamp_xnu_sm6115_provider.h"
 #include "GuampScm.inc"
@@ -24,6 +26,8 @@ extern "C" {
 
 extern "C" int guamp_ath10k_firmware_get(const char *,const uint8_t **,size_t *);
 extern "C" {
+extern unsigned char gw_board_mac[6];   // ath10k-port gw_runtime.c: device_get_mac_address()
+extern volatile int gw_board_mac_valid;
 volatile unsigned guamp_wifi_provider_stage=0;
 volatile int guamp_wifi_provider_error=0;
 }
@@ -248,8 +252,30 @@ struct Sm6115Runtime {
     return error;
   }
 
+  // guamp 29/10: the radio uses the board's Wi-Fi address (ADT /chosen/mac-address-wifi0), the one the guamp-wifi-ui
+  // placeholder en0 and MobileGestalt already have, as Linux hands ath10k a DT local-mac-address. guamp-wifi-mac=0: the
+  // firmware's (WMI service ready). The address is not logged here.
+  static void boardAddress() {
+    unsigned use=1;PE_parse_boot_argn("guamp-wifi-mac",&use,sizeof(use));
+    gw_board_mac_valid=0;
+    if(!use){IOLog("GuampWiFi: radio address: the firmware's (guamp-wifi-mac=0)\n");return;}
+    bool found=false;
+    if(IORegistryEntry *chosen=IORegistryEntry::fromPath("IODeviceTree:/chosen")) {
+      OSData *mac=OSDynamicCast(OSData,chosen->getProperty("mac-address-wifi0"));
+      if(mac&&mac->getLength()==6) {
+        const uint8_t *b=static_cast<const uint8_t *>(mac->getBytesNoCopy());
+        if((b[0]|b[1]|b[2]|b[3]|b[4]|b[5])&&!(b[0]&1)){memcpy(gw_board_mac,b,6);found=true;}
+      }
+      chosen->release();
+    }
+    gw_board_mac_valid=found;
+    IOLog("GuampWiFi: radio address: %s\n",found?"the ADT's (/chosen/mac-address-wifi0, as en0 and MobileGestalt)":
+          "no valid /chosen/mac-address-wifi0, the firmware's");
+  }
+
   int configureStation() {
     if(!physicalReady())return NotReady;
+    boardAddress();
     platform={nowMs,sleepMs,poll,log,halt,GuampXnuDma::allocate,GuampXnuDma::deallocate,
       nullptr,nullptr,nullptr,nullptr,firmwareGet};
     if(!GuampXnuDma::installHooks(&platform))return NoMemory;
