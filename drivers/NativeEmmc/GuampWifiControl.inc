@@ -32,6 +32,8 @@ struct WifiControl {
     // simSnapshot is called after every completed read sequence (transport thread).
     bool sim;
     void (*simSnapshot)(void *,const guampsim::SimProbe &);
+    // Optional per-packet QRTR control log (rx and tx), see Qrtr::trace.
+    void (*qrtrTrace)(void *,bool tx,const Qrtr::Header &,const uint8_t *,uint32_t,int);
   };
   // Gate timeouts after the modem PAS start (Linux: subsys err_ready 10 s; icnss has no WLFW timeout, the WLAN PD
   // only registers 0x45 after the modem has fetched wlanmdsp.mbn over QRTR TFTP).
@@ -56,6 +58,7 @@ struct WifiControl {
     arena=shared; allocator=a; ops=platform; error=0; channel=0;
     routerStarted=wlanStarted=false; descriptor=outboundFifo=outboundBytes=0;
     sawInbound=sawNegotiated=sawOpenSent=sawRemote=sawServer=false;
+    qrtr.traceCtx=platform.ctx; qrtr.trace=platform.qrtrTrace;
     gate="qrtr tftp/servreg";
     e=tftp.start(this,qftpTx,qftpSize,qftpRead);if(e)return fail(e);
     e=qrtr.addLocalService(QftpReadOnly::Service,QftpReadOnly::ServiceInstance,QftpReadOnly::Port,this,qftpRx);
@@ -199,6 +202,13 @@ private:
       trace(" glink refused at rx tail/head (fifo 480)",0,glink.refusedTail,glink.refusedHead,glink.rx.length);
     }
     trace(" glink lcid/router/remoteNode",0,channel,routerStarted,qrtr.remoteKnown?qrtr.remoteNode:0xffffffffu);
+    for(const auto &ch:glink.channels) if(ch.local&&ch.local==channel) {
+      uint32_t intents=0; for(const auto &ri:ch.remoteIntent) intents+=ri.id&&!ri.used;
+      trace(" glink IPCRTR tx packets/free remote intents/pending bytes",0,glink.txPackets,intents,ch.pending?ch.pendingSize-ch.pendingAt:0);
+      trace(" glink IPCRTR intent request pending/read notifications/rx packets",0,ch.requestPending,glink.readNotifications,glink.rxPackets);
+    }
+    trace(" qrtr hello rx/tx control sent/rx control",0,qrtr.helloReceived,qrtr.txControl,qrtr.rxControl);
+    trace(" qrtr queued/link busy (again)/data traced",0,qrtr.count,qrtr.txAgain,qrtr.dataTraced);
     trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
     if(rmtfs.ready) trace(" rmtfs requests/failures/overlay bytes",0,rmtfs.requests,rmtfs.failures,rmtfs.shadowBytes);
     if(simOn) {

@@ -236,26 +236,50 @@ static std::vector<uint8_t> v1(uint32_t type,uint32_t sn,uint32_t sp,uint32_t dn
   put32(&p[0],1); put32(&p[4],type); put32(&p[8],sn); put32(&p[12],sp); put32(&p[20],uint32_t(body.size())); put32(&p[24],dn); put32(&p[28],dp);
   memcpy(&p[32],body.data(),body.size()); return p;
 }
+struct Seen { bool tx; uint32_t type,sn,sp,dn,dp,cmd,w1,w2,w3,w4; int e; };
+static std::vector<Seen> seen;
+static void seenTrace(void *,bool tx,const Qrtr::Header &h,const uint8_t *b,uint32_t n,int e) {
+  Seen x={tx,h.type,h.sn,h.sp,h.dn,h.dp,0,0,0,0,0,e};
+  if(b&&n>=4) x.cmd=le32(b); if(b&&n>=20) { x.w1=le32(b+4); x.w2=le32(b+8); x.w3=le32(b+12); x.w4=le32(b+16); }
+  seen.push_back(x);
+}
 static void qrtrTest() {
   Router r; CHECK(r.g.r.start(r.g.io,&r,Router::serverTx)==Ok);
+  r.q.trace=seenTrace; seen.clear();
   CHECK(r.q.addLocalService(Rmtfs::Service,Rmtfs::ServiceInstance,Rmtfs::Port,&r,Router::rx)==Ok);
   CHECK(r.q.start({nullptr,Router::alloc,Router::release},&r,Router::tx,nullptr,Router::data)==Ok&&r.q.step()==Ok);
-  bool announced=false;
-  for(auto &p:r.out) if(le32(&p[4])==Qrtr::NewServer) {
-    const uint8_t *b=&p[32]; announced=le32(b)==4&&le32(b+4)==14&&le32(b+8)==1&&le32(b+12)==1&&le32(b+16)==0x4300&&le32(&p[24])==Qrtr::Broadcast;
-  }
-  CHECK(announced); r.out.clear();
+  // Linux qrtr_hello_work: only HELLO (dst node QRTR_EP_NID_AUTO, port CTRL) before the remote HELLO
+  CHECK(r.out.size()==1&&le32(&r.out[0][4])==Qrtr::Hello&&le32(&r.out[0][8])==1&&le32(&r.out[0][12])==Qrtr::Ctrl&&
+        le32(&r.out[0][24])==Qrtr::Broadcast&&le32(&r.out[0][28])==Qrtr::Ctrl&&le32(&r.out[0][20])==20);
+  CHECK(seen.size()==1&&seen[0].tx&&seen[0].type==Qrtr::Hello&&seen[0].dn==Qrtr::Broadcast&&!seen[0].e);
+  r.out.clear();
+  // modem HELLO from node 0 port CTRL: announce_servers unicast to (0, CTRL), nothing else (no HELLO echo, no lookup)
+  auto pkt=v1(Qrtr::Hello,0,Qrtr::Ctrl,Qrtr::Broadcast,Qrtr::Ctrl,std::vector<uint8_t>{2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0});
+  CHECK(r.q.receive(pkt.data(),uint32_t(pkt.size()))==Ok&&r.q.step()==Ok&&r.out.size()==1);
+  { const auto &p=r.out[0]; const uint8_t *b=&p[32];
+    CHECK(le32(&p[4])==Qrtr::NewServer&&le32(&p[8])==1&&le32(&p[12])==Qrtr::Ctrl&&le32(&p[24])==0&&le32(&p[28])==Qrtr::Ctrl);
+    CHECK(le32(b)==4&&le32(b+4)==14&&le32(b+8)==1&&le32(b+12)==1&&le32(b+16)==0x4300); }
+  CHECK(seen.size()==3&&!seen[1].tx&&seen[1].type==Qrtr::Hello&&seen[1].sn==0&&seen[1].sp==Qrtr::Ctrl);
+  CHECK(seen[2].tx&&seen[2].cmd==Qrtr::NewServer&&seen[2].w1==14&&seen[2].w2==1&&seen[2].w3==1&&seen[2].w4==0x4300&&seen[2].dn==0);
+  r.out.clear();
+  // a later lookup is still answered with the real port
   std::vector<uint8_t> lookup(20); put32(&lookup[0],Qrtr::NewLookup); put32(&lookup[4],14); put32(&lookup[8],1);
-  auto pkt=v1(Qrtr::NewLookup,0,0xfffffffeu,1,0xfffffffeu,lookup);
+  pkt=v1(Qrtr::NewLookup,0,0x4005,1,0xfffffffeu,lookup);
   CHECK(r.q.receive(pkt.data(),uint32_t(pkt.size()))==Ok&&r.q.step()==Ok&&r.out.size()==1&&le32(&r.out[0][32+16])==0x4300);
+  CHECK(le32(&r.out[0][24])==0&&le32(&r.out[0][28])==0x4005);
   r.out.clear();
   Req open(0x77,1); open.str(1,"/boot/modem_fs2");
   pkt=v1(Qrtr::Data,0,0x5002,1,0x4300,open.b);
+  size_t before=seen.size();
   CHECK(r.q.receive(pkt.data(),uint32_t(pkt.size()))==Ok&&r.q.step()==Ok&&r.out.size()==1);
+  CHECK(seen.size()==before+1&&!seen.back().tx&&seen.back().type==Qrtr::Data&&seen.back().dp==0x4300);  // first DATA traced
   const auto &o=r.out[0];
   CHECK(le32(&o[4])==Qrtr::Data&&le32(&o[8])==1&&le32(&o[12])==0x4300&&le32(&o[24])==0&&le32(&o[28])==0x5002);
   Packet p={0x4300,0,0x5002,std::vector<uint8_t>(o.begin()+32,o.begin()+32+le32(&o[20]))};
   Resp resp=decode(p); CHECK(resp.txn==0x77&&resp.result==0&&le32(resp.opt.data())==0);
+  // a refused packet (to another node) is traced with its error
+  pkt=v1(Qrtr::Data,0,0x5002,9,0x4300,open.b); before=seen.size();
+  CHECK(r.q.receive(pkt.data(),uint32_t(pkt.size()))==NotFound&&seen.size()==before+1&&seen.back().e==NotFound);
   r.q.stop();
 }
 int main() {
