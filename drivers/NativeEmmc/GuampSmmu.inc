@@ -1,22 +1,39 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// SM6115 apps SMMUv500 stage1, 4K tables / 32-bit WLAN IOVA. Register ABI from
+// SM6115 apps SMMUv500 stage1, 4K tables / 32-bit IOVA, one context bank per client stream. Register ABI from
 // Motorola arm-smmu.c/arm-smmu-regs.h and msm-arm-smmu-bengal.dtsi.
 // Preserves global setup and all other streams; never enables global bypass.
 // Table memory must be coherent/Normal-NC, physically backed, and XNU-owned.
+// SmmuContext<stream, mask, IOVA window>: WlanSmmu (WCN3990 0x1a0/1, 0xa0000000..0xb0000000, the original code) and
+// AdspAudioSmmu (msm-audio-ion: iommus <&apps_smmu 0x1c1 0x0>, IOVA pool 0x10000000.., here the first 4 MiB) are two
+// instances of the same code. Layout: L1 table, one L2 table, one L3 table per 2 MiB of the window (the window must
+// be 2 MiB aligned inside one 1 GiB L1 slot). start() choosing an SMR slot and a context bank is serialised across
+// every instance (and translation unit) by one spin lock, so Wi-Fi and audio never pick the same free slot/bank.
 #ifndef GUAMP_SMMU_INC
 #define GUAMP_SMMU_INC
 #include "GuampWifiWire.inc"
 namespace guampwifi {
-struct WlanSmmu {
-  static constexpr uint64_t IovaBase=0xa0000000ull,IovaEnd=0xb0000000ull;
-  static constexpr uint32_t TableBytes=130*4096,Stream=0x1a0,StreamMask=1;
+// One lock for the apps SMMU global registers (SMR/S2CR/CBAR allocation): an inline variable, so one object in the
+// whole kernel archive whichever translation unit includes this file.
+struct SmmuGlobalLock {
+  static inline volatile uint32_t word = 0;
+  static void lock() { while (__atomic_exchange_n(&word, 1u, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(&word, __ATOMIC_RELAXED)) {} } }
+  static void unlock() { __atomic_store_n(&word, 0u, __ATOMIC_RELEASE); }
+};
+template <uint32_t StreamId, uint32_t StreamIdMask, uint64_t Base, uint64_t End>
+struct SmmuContext {
+  static constexpr uint64_t IovaBase=Base,IovaEnd=End;
+  static constexpr uint32_t L3Tables=uint32_t((End-Base)>>21);
+  static constexpr uint32_t TableBytes=(2+L3Tables)*4096,Stream=StreamId,StreamMask=StreamIdMask;
+  static constexpr uint32_t L1Index=uint32_t(Base>>30),L2First=uint32_t((Base>>21)&511);
+  static_assert(!(Base&0x1fffff)&&!(End&0x1fffff)&&End>Base&&End<=0x100000000ull&&(Base>>30)==((End-1)>>30)&&
+                L3Tables>=1&&L2First+L3Tables<=512,"IOVA window: 2 MiB aligned, inside one 1 GiB slot, below 4 GiB");
   Memory registers={},tables={};
   uint64_t tablePhysical=0,ramBase=0,ramBytes=0;
   uint32_t cb=0,slot=0,bank=0,gr1=0,oas=0,asid=0;
   uint32_t oldSmr=0,oldS2cr=0,oldCbar=0,oldCba2r=0;
   uint32_t oldCb[16]={}; // selected control/TTBR/MAIR words only
   bool active=false,owned=false;
-  bool preexisting=false;        // an SMR for SID 0x1a0 was already valid (WLAN set up before XNU: not a cold boot)
+  bool preexisting=false;        // an SMR for this stream was already valid (set up before XNU: not a cold boot)
   uint32_t groupsSeen=0,banksSeen=0,s2cbSeen=0;   // ID0.NUMSMRG, ID1.NUMCB, ID1.NUMS2CB, for the diagnostic log
   void *ctx=nullptr; void (*delayUs)(void *,uint32_t)=nullptr;
   static constexpr uint32_t SavedOffsets[16]={0,4,0x10,0x20,0x24,0x28,0x2c,0x30,
@@ -27,6 +44,14 @@ struct WlanSmmu {
   int start(const Memory &mmio,const Memory &pageTables,uint64_t physical,
             uint64_t managedBase,uint64_t managedBytes,bool radioStopped,
             void *opaque,void (*delay)(void *,uint32_t)) {
+    SmmuGlobalLock::lock();
+    const int e=startLocked(mmio,pageTables,physical,managedBase,managedBytes,radioStopped,opaque,delay);
+    SmmuGlobalLock::unlock();
+    return e;
+  }
+  int startLocked(const Memory &mmio,const Memory &pageTables,uint64_t physical,
+                  uint64_t managedBase,uint64_t managedBytes,bool radioStopped,
+                  void *opaque,void (*delay)(void *,uint32_t)) {
     if(active||owned) return Busy;
     if(!radioStopped) return Busy;
     if(!mmio.read||!mmio.write||!mmio.barrier||!pageTables.read||!pageTables.write||!pageTables.barrier||
@@ -74,10 +99,10 @@ struct WlanSmmu {
     for(uint32_t i=0;i<16;i++) oldCb[i]=registers.r32(bank+SavedOffsets[i]);
     owned=true;
     tables.zero(0,TableBytes);
-    putPte(0,2,(tablePhysical+4096)|3);
-    for(uint32_t i=0;i<128;i++) putPte(4096,256+i,(tablePhysical+(2+i)*4096)|3);
+    putPte(0,L1Index,(tablePhysical+4096)|3);
+    for(uint32_t i=0;i<L3Tables;i++) putPte(4096,L2First+i,(tablePhysical+(2+i)*4096)|3);
     tables.fence();
-    // Keep WLAN faulting until its new context is fully initialized and synced.
+    // Keep the stream faulting until its new context is fully initialized and synced.
     registers.w32(0xc00+4*slot,2u<<16); registers.fence();
     registers.w32(bank,0);
     registers.w32(gr1+0x800+4*cb,1); // AArch64 context format
@@ -154,6 +179,17 @@ struct WlanSmmu {
   int stop(bool radioStopped) {
     if(!radioStopped) return Busy;
     if(!owned) return Ok;
+    SmmuGlobalLock::lock();
+    const int e=stopLocked();
+    SmmuGlobalLock::unlock();
+    return e;
+  }
+  uint32_t faultAddressLow() const { return owned?registers.r32(bank+0x60):0; }
+  uint32_t faultAddressHigh() const { return owned?registers.r32(bank+0x64):0; }
+  uint32_t faultSyndrome() const { return owned?registers.r32(bank+0x68):0; }
+  void clearFault() const { if(owned) { registers.w32(bank+0x58,0xffffffffu); registers.fence(); } }
+private:
+  int stopLocked() {
     registers.w32(0xc00+4*slot,2u<<16); registers.fence();
     registers.w32(bank,0); int e=sync(); if(e) return e;
     // Restore only configuration words. TTBCR2/TTBCR must precede TTBRs,
@@ -171,7 +207,6 @@ struct WlanSmmu {
     registers.w32(0x800+4*slot,oldSmr); registers.w32(0xc00+4*slot,oldS2cr); registers.fence();
     active=owned=false; return Ok;
   }
-private:
   uint64_t makePte(uint64_t physical) const {
     // AF, inner shareable, EL0/EL1 RW, NS, PXN+XN. No executable DMA mappings.
     return (physical&~uint64_t(4095))|3u|(1u<<5)|(1u<<6)|(3u<<8)|(1u<<10)|(3ull<<53);
@@ -195,5 +230,8 @@ private:
     return Timeout;
   }
 };
+using WlanSmmu=SmmuContext<0x1a0,1,0xa0000000ull,0xb0000000ull>;
+using AdspAudioSmmu=SmmuContext<0x1c1,0,0x10000000ull,0x10400000ull>;
+static_assert(WlanSmmu::TableBytes==130*4096&&WlanSmmu::L1Index==2&&WlanSmmu::L2First==256,"WLAN layout unchanged");
 } // namespace guampwifi
 #endif

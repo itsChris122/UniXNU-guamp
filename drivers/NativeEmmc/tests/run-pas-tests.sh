@@ -16,7 +16,7 @@ echo "== kernel glue: arm64-apple-ios, -Werror, integer registers only, smc pres
 clang++ $KFLAGS -S "$HERE/adsp_glue_check.cpp" -o "$WORK/adsp_glue.s" && grep -q 'smc' "$WORK/adsp_glue.s" \
   && echo "adsp_glue_check: compiled, smc emitted" || rc=1
 echo "== no raw newline inside a string literal of the new kernel sources"
-(cd "$HERE/.." && python3 -I tests/check_literals.py GuampAdsp.inc GuampAdspIpc.inc GuampGpuZap.inc GuampSmemWrite.inc GuampSmemLock.inc GuampWifiWire.inc GuampSmp2pEdge.inc GuampGlinkEdge.inc GuampApr.inc GuampAfe.inc GuampAsm.inc GuampAudioRing.inc GuampAudioDev.inc GuampAudioPlay.inc GuampAudioHwWeak.inc GuampAudioHw.h ../../package/GuampAudio/guamp_audio_dev.h GuampPas.inc GuampPasCore.inc GuampScm.inc GuampScmArm64.inc NativeEmmc.cpp) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GuampAdsp.inc GuampAdspIpc.inc GuampGpuZap.inc GuampSmemWrite.inc GuampSmemLock.inc GuampWifiWire.inc GuampSmp2pEdge.inc GuampGlinkEdge.inc GuampApr.inc GuampAfe.inc GuampAsm.inc GuampAudioRing.inc GuampAudioDev.inc GuampAudioPlay.inc GuampSmmu.inc GuampAudioHwWeak.inc GuampAudioHw.h ../../package/GuampAudio/guamp_audio_dev.h GuampPas.inc GuampPasCore.inc GuampScm.inc GuampScmArm64.inc NativeEmmc.cpp) || rc=1
 echo "== SCM transport (clang, gcc)"
 clang++ $FLAGS "$HERE/scm_host.cpp" -o "$WORK/scm" && "$WORK/scm" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/scm_host.cpp" -o "$WORK/scm_gcc" && "$WORK/scm_gcc" >/dev/null || rc=1
@@ -34,5 +34,8 @@ g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/audio_pcm_host.cpp" -o "$WO
 echo "== microphone (guamp_mic_dev.h ABI, GuampMicRing.inc, GuampMicCodec.inc on a simulated LPASS/SoundWire/wcd937x, apr::MicPath on a simulated ADSP) (clang + ASan/UBSan, gcc)"
 clang++ ${FLAGS/-O2/-O1} -g -fsanitize=address,undefined -fno-omit-frame-pointer "$HERE/mic_capture_host.cpp" -o "$WORK/mic" && "$WORK/mic" || rc=1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/mic_capture_host.cpp" -o "$WORK/mic_gcc" && "$WORK/mic_gcc" >/dev/null || rc=1
+echo "== apps SMMU context (GuampSmmu.inc SmmuContext: audio 0x1c1 and WLAN) against a register model (clang + ASan/UBSan, gcc)"
+clang++ ${FLAGS/-O2/-O1} -g -fsanitize=address,undefined -fno-omit-frame-pointer "$HERE/smmu_ctx_host.cpp" -o "$WORK/smmu" && "$WORK/smmu" || rc=1
+g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/smmu_ctx_host.cpp" -o "$WORK/smmu_gcc" && "$WORK/smmu_gcc" >/dev/null || rc=1
 echo "== result: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc
