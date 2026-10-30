@@ -850,6 +850,35 @@ void psci(uint64_t function)
   __asm__ volatile("smc #0" : "+r"(x0) : : "memory");
 }
 
+// guamp 30/10: wifid waits about 300 s at every boot in SCNetworkInterfaceCopyAll -> __wait_for_IOKit_to_quiesce (fin16
+// guamp-wprobe): some IOService never stops being busy. Logs the busy services that have no busy child (the ones holding it).
+static void guampBusyDump()
+{
+  IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
+  if (!it) return;
+  IOService *root = IOService::getServiceRoot();
+  unsigned busy = 0, leaves = 0;
+  while (IORegistryEntry *entry = it->getNextObject()) {
+    IOService *service = OSDynamicCast(IOService, entry);
+    if (!service || !service->getBusyState()) continue;
+    busy++;
+    bool busyChild = false;
+    if (OSIterator *children = service->getChildIterator(gIOServicePlane)) {
+      while (OSObject *child = children->getNextObject()) {
+        IOService *c = OSDynamicCast(IOService, child);
+        if (c && c->getBusyState()) { busyChild = true; break; }
+      }
+      children->release();
+    }
+    if (busyChild || ++leaves > 24) continue;
+    IOService *parent = service->getProvider();
+    IOLog("guamp-busy: %s (%s) busy %u%s, provider %s\n", service->getName(), service->getMetaClass()->getClassName(),
+          service->getBusyState(), service->isInactive() ? " inactive" : "", parent ? parent->getName() : "-");
+  }
+  it->release();
+  IOLog("guamp-busy: root busy %u, %u busy services, %u holding\n", root ? root->getBusyState() : 0, busy, leaves);
+}
+
 void mirrorEntry(thread_call_param_t, thread_call_param_t)
 {
   Card &card = gCard;
@@ -879,6 +908,8 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   const uint64_t busy = __atomic_load_n(&native_emmc_busy, __ATOMIC_RELAXED);
   const uint64_t requests = __atomic_load_n(&native_emmc_requests, __ATOMIC_RELAXED);
   if (report) {
+    static unsigned busyDumps = 0;
+    if (++busyDumps <= 30 && busyDumps % 3 == 0) guampBusyDump();   // every 30 s up to 5 minutes
     dispext::log();
     guampPerfSample();
     uint64_t busyNs = 0;
