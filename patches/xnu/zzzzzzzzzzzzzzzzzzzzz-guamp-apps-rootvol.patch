@@ -1,0 +1,56 @@
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 8965991..dcdee23 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -243,6 +243,36 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 
+ 	vfs_setfsprivate(mp, xmp);
+ 	vfs_getnewfsid(mp);
++	/*
++	 * guamp 30/10 (app sparite, claude/ls-causa): the boot view on /Applications gives LaunchServices one volume more.
++	 * Phone, Wallet and Watch come from the union's upper layer and report the view's own fsid/st_dev (0x2f000007), every
++	 * other /Applications app falls through to the root volume (0x1000057). LaunchServices files the three under a container
++	 * of their own: the root container is always mounted (flag, no alias), any other container gets its mount state from
++	 * _LSUpdateContainerState (bookmark of the volume -> +[FSNode getVolumeIdentifier:forBookmarkData:error:]) when a database
++	 * loaded from disk is enumerated (_LSEnumerateViableBundlesOfClass -> _LSCheckAllContainerStates); a seeding marks it
++	 * mounted directly (_LSContainerAdd -> _LSContainerSetMounted). So the apps are there only in boots that seed, and
++	 * -[FSNode isSecuredSystemContent] (device of root or preboot) is NO for them. The view now reports the root volume's
++	 * fsid (st_dev, statfs f_fsid, ATTR_CMN_FSID: bind_vnops.c returns the mount's f_fsid as va_fsid): one volume, the root
++	 * container, secured system content like the apps of the sealed /Applications. vfs_getvfs() of that fsid still finds the
++	 * root mount (mounted first). The guamp-ls-auto key holds this fsid, so the first boot rebuilds the database once.
++	 * Only the boot-time mount on /Applications; guamp-apps-rootvol=0 keeps the view's own fsid.
++	 */
++	if (native_bindfs_boot_mount && !strcmp(vfs_statfs(mp)->f_mntonname, "/Applications")) {
++		uint32_t guamp_rootvol = 1;
++		vnode_t guamp_root = rootvnode;
++
++		PE_parse_boot_argn("guamp-apps-rootvol", &guamp_rootvol, sizeof(guamp_rootvol));
++		if (guamp_rootvol && guamp_root != NULLVP && vnode_mount(guamp_root) != NULL && vnode_mount(guamp_root) != mp) {
++			fsid_t own = vfs_statfs(mp)->f_fsid;
++
++			vfs_statfs(mp)->f_fsid = vfs_statfs(vnode_mount(guamp_root))->f_fsid;
++			printf("guamp-apps-rootvol: /Applications view fsid %08x %08x -> root %08x %08x\n", (uint32_t)own.val[0],
++			    (uint32_t)own.val[1], (uint32_t)vfs_statfs(mp)->f_fsid.val[0], (uint32_t)vfs_statfs(mp)->f_fsid.val[1]);
++		} else {
++			printf("guamp-apps-rootvol: /Applications view keeps fsid %08x (guamp-apps-rootvol=%u)\n",
++			    (uint32_t)vfs_statfs(mp)->f_fsid.val[0], guamp_rootvol);
++		}
++	}
+ 	vfs_setlocklocal(mp);
+ 
+ 	/* fill in the stat block */
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index 4712e14..a9438cd 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -2311,6 +2311,10 @@ guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size
+ 	}
+ 	/* 30/10 (app sparite): Phone, Wallet and Watch of the /Applications view, every access by anyone, to see how lsd finds (or
+ 	 * loses) them after a reboot without a database rebuild. */
++	/* 30/10 (claude/ls-causa): the /Applications volume itself (lsd resolving the container of the view at boot). */
++	if (!strcmp(buf, "/Applications") || !strcmp(buf, "/Applications/")) {
++		return 1;
++	}
+ 	if (strnstr(buf, "MobilePhone.app", size) != NULL || strnstr(buf, "Passbook.app", size) != NULL ||
+ 	    strnstr(buf, "Bridge.app", size) != NULL) {
+ 		return 1;
