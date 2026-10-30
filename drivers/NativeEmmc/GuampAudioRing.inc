@@ -72,6 +72,17 @@ struct Stream {
   // and wrote less, which caused the next wait (fin14: 11-19 underruns and ~3 s of inserted silence per 3.3 s sound).
   uint64_t silentFrames = 0, anchorClock = 0;
   uint64_t clockFrames() const { return framesPlayed() + silentFrames; }
+  // Free-running device clock of a running stream (GET_POSITION): 48 kHz of host time from START. The HAL writes about one
+  // buffer ahead of the clock it is given; a clock that moved only when the ADSP took a period (8 x 10 ms in flight) kept the
+  // writes just in time, so a pre-roll above ~80 ms was never reached (fin16: pre-roll 300 ms, max queue 82 ms, 30 underruns
+  // in 3.3 s). From START the HAL now writes at a steady rate while the ADSP waits for the pre-roll, and the queue then holds
+  // about the pre-roll minus the periods in flight.
+  bool freeClock = false;
+  uint64_t freeTicks = 0, freeFrame = 0, lastPosition = 0;
+  uint64_t positionFrame(uint64_t now) const {
+    if (!freeClock || !ticksPerSec || now < freeTicks) return clockFrames();
+    return freeFrame + (now - freeTicks) * GUAMP_AUDIO_RATE / ticksPerSec;
+  }
   // open/close: a draining sound keeps its queue and its volume (the next open appends after it)
   void reset() {
     running = false;
@@ -262,10 +273,14 @@ struct Stream {
           draining = false;   // the new stream carries on after what is queued (hold, if any, stays)
           clockRunning = false;
           if (used() && sink == SinkNull) anchor(now);
+          freeClock = true;
+          freeTicks = now;
+          freeFrame = clockFrames() > lastPosition ? clockFrames() : lastPosition;
         }
         return 0;
       case GUAMP_AUDIO_STOP:
         running = false;
+        freeClock = false;
         if (adspEnabled && used() && (hold || sink == SinkAdsp)) {   // the end of a sound the ADSP has not played yet
           draining = true;
           drains++;
@@ -294,7 +309,11 @@ struct Stream {
       case GUAMP_AUDIO_GET_POSITION: {
         consume(now);
         guamp_audio_position *p = static_cast<guamp_audio_position *>(data);
-        *p = {clockFrames(), positionTicks(now), used() / GUAMP_AUDIO_BYTES_PER_FRAME, underruns};
+        const bool freeRun = running && freeClock && sink == SinkAdsp;   // the null sink keeps its own real-time clock
+        uint64_t frame = freeRun ? positionFrame(now) : clockFrames();
+        if (frame < lastPosition) frame = lastPosition;   // never backwards across sounds
+        lastPosition = frame;
+        *p = {frame, freeRun ? now : positionTicks(now), used() / GUAMP_AUDIO_BYTES_PER_FRAME, underruns};
         return 0;
       }
       default: return 25;   // ENOTTY (DRAIN is handled by the glue: it sleeps)
