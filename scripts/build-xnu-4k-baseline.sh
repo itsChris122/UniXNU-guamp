@@ -146,7 +146,17 @@ EXTRA_MAKE_ARGS=()
 if [ "${GUAMP_CCACHE:-1}" != 0 ] && command -v ccache >/dev/null 2>&1; then
   XNU_CLANG=$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang)
   XNU_CLANGXX=$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang++)
-  EXTRA_MAKE_ARGS+=("CC=ccache $XNU_CLANG" "CXX=ccache $XNU_CLANGXX")
+  # one word each: XNU runs the compiler as `env $(CC) ...` (MIG), so "ccache clang" would be taken as one file name
+  CCACHE_BIN="$ROOT/build/ccache-bin"
+  mkdir -p "$CCACHE_BIN"
+  printf '#!/bin/sh
+exec ccache "%s" "$@"
+' "$XNU_CLANG" > "$CCACHE_BIN/clang"
+  printf '#!/bin/sh
+exec ccache "%s" "$@"
+' "$XNU_CLANGXX" > "$CCACHE_BIN/clang++"
+  chmod +x "$CCACHE_BIN/clang" "$CCACHE_BIN/clang++"
+  EXTRA_MAKE_ARGS+=("CC=$CCACHE_BIN/clang" "CXX=$CCACHE_BIN/clang++")
   echo "ccache: on ($(ccache --version | head -1), dir ${CCACHE_DIR:-default})"
 fi
 ARM_DT_PLATFORM=${XNU_ARM_DT_PLATFORM:-0}
