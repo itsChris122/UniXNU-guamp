@@ -1,0 +1,16 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index a9438cd..a6f8192 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -2315,6 +2315,11 @@ guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size
+ 	if (!strcmp(buf, "/Applications") || !strcmp(buf, "/Applications/")) {
+ 		return 1;
+ 	}
++	/* guamp 30/10: ringtones are silent (iOS writes zeros) while text tones play: who opens which tone file */
++	if (strnstr(buf, "Ringtones", size) != NULL || strnstr(buf, ".m4r", size) != NULL || strnstr(buf, "ToneLibrary", size) != NULL ||
++	    strnstr(buf, "/Tones", size) != NULL || strnstr(buf, ".ahap", size) != NULL || strnstr(buf, "Haptic", size) != NULL) {
++		return 1;
++	}
+ 	if (strnstr(buf, "MobilePhone.app", size) != NULL || strnstr(buf, "Passbook.app", size) != NULL ||
+ 	    strnstr(buf, "Bridge.app", size) != NULL) {
+ 		return 1;
