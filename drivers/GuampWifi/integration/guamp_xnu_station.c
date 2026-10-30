@@ -350,8 +350,7 @@ static bool link_transmit(mbuf_t packet, size_t length)
     if (error == -ENOBUFS) full++;
     else if (error == -ENETDOWN) down++;
     if (refused <= 8 || (refused & 255) == 0)
-      printf("GuampWiFi: net: frame of %u bytes refused by the station: %d (refused %u: queue full %u, link down %u)
-",
+      printf("GuampWiFi: net: frame of %u bytes refused by the station: %d (refused %u: queue full %u, link down %u)\n",
           (unsigned)length, error, refused, full, down);
   }
   return error == 0;

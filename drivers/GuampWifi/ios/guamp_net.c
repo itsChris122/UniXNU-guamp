@@ -219,8 +219,7 @@ rx_bad(const char *why, const uint8_t *frame, size_t length, unsigned ip_length)
 	}
 	rx_bad_said++;
 	printf("GuampWiFi: net: bad frame (%s): %zu bytes, IP length %u, protocol %u, %u.%u.%u.%u -> %u.%u.%u.%u; "
-	    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x
-",
+	    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x\n",
 	    why, length, ip_length, ip[9], ip[12], ip[13], ip[14], ip[15], ip[16], ip[17], ip[18], ip[19],
 	    ip[20], ip[21], ip[22], ip[23], ip[24], ip[25], ip[26], ip[27], ip[28], ip[29], ip[30], ip[31], ip[32], ip[33], ip[34],
 	    ip[35], ip[36], ip[37], ip[38], ip[39], frame[length - 8], frame[length - 7], frame[length - 6], frame[length - 5],
@@ -463,8 +462,7 @@ net_thread(void *parameter, __unused wait_result_t result)
 			    n->count.dropped_out, n->count.dropped_in);
 			if (n->link->wireless) {
 				printf("GuampWiFi: net: en%u received IPv4 %llu (TCP %llu, UDP %llu), IPv6 %llu, ARP %llu, other %llu; bad: IP length %llu, "
-				    "IP checksum %llu, TCP/UDP checksum %llu; padded %llu, same as a recent frame %llu
-", n->unit, rx_check_count.ipv4,
+				    "IP checksum %llu, TCP/UDP checksum %llu; padded %llu, same as a recent frame %llu\n", n->unit, rx_check_count.ipv4,
 				    rx_check_count.tcp, rx_check_count.udp, rx_check_count.ipv6, rx_check_count.arp, rx_check_count.other,
 				    rx_check_count.short_ip, rx_check_count.bad_ip, rx_check_count.bad_l4, rx_check_count.padded, rx_check_count.duplicate);
 			}
