@@ -877,6 +877,15 @@ static void guampBusyDump()
   }
   it->release();
   IOLog("guamp-busy: root busy %u, %u busy services, %u holding\n", root ? root->getBusyState() : 0, busy, leaves);
+  // configd's InterfaceNamer also waits for an IONetworkStack it can open (WaitStackTimeout 300 s) before it posts quiet
+  const OSMetaClass *stackClass = OSMetaClass::getMetaClassWithName(OSSymbol::withCStringNoCopy("IONetworkStack"));
+  OSDictionary *match = IOService::serviceMatching("IONetworkStack");
+  IOService *stack = match ? IOService::copyMatchingService(match) : nullptr;
+  OSSafeReleaseNULL(match);
+  const OSMetaClass *familyClass = OSMetaClass::getMetaClassWithName(OSSymbol::withCStringNoCopy("IONetworkInterface"));
+  IOLog("guamp-busy: IONetworkStack class %s, service %s%s; IONetworkInterface class %s\n", stackClass ? "loaded" : "absent",
+        stack ? "published" : "absent", stack && stack->isInactive() ? " (inactive)" : "", familyClass ? "loaded" : "absent");
+  OSSafeReleaseNULL(stack);
 }
 
 void mirrorEntry(thread_call_param_t, thread_call_param_t)
