@@ -190,10 +190,13 @@ struct Stream {
     underruns++;
   }
   // ADSP consumer, before each period: skip head silence (runs of at least kMinSilentRun frames) beyond kTargetFrames queued
+  // With pre-roll the floor is the pre-roll depth, not kTargetFrames: trimming a pause inside a sound down to 40 ms ate the
+  // 120 ms margin the pre-roll had built and the next late write was an underrun (fin13: 2-6 per 3 s sound, ~68% trimmed).
   void trim() {
     const uint32_t queued = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
-    if (queued <= kTargetFrames) return;
-    const uint32_t excess = queued - kTargetFrames;
+    const uint32_t keep = prerollFrames > kTargetFrames ? prerollFrames : kTargetFrames;
+    if (queued <= keep) return;
+    const uint32_t excess = queued - keep;
     uint32_t run = 0;
     while (run < excess && silentFrameAt(rd + static_cast<uint64_t>(run) * GUAMP_AUDIO_BYTES_PER_FRAME)) run++;
     if (run < kMinSilentRun) return;
