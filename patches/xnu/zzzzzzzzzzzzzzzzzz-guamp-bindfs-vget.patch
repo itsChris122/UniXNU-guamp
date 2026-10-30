@@ -1,0 +1,148 @@
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 4466a64..2b0a97d 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -77,6 +77,10 @@
+ #include <IOKit/IOBSD.h>
+ 
+ #include "bindfs.h"
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++
++#define BIND_ROOT_INO_VFS 2	/* BIND_ROOT_INO of bind_vnops.c: the inode number the views report for their root */
+ 
+ volatile int native_bindfs_boot_mount = 0;
+ 
+@@ -395,6 +399,104 @@ bindfs_root(struct mount * mp, struct vnode ** vpp, __unused vfs_context_t ctx)
+ 	return 0;
+ }
+ 
++/*
++ * guamp (owner 30/10): VFS_VGET for the boot views (/Applications of iphone-res above all). bindfs had none, so every lookup by
++ * file ID on a view failed: openbyid_np, fsgetpath, /.vol and the bookmarks and inode checks LaunchServices keeps for each bundle
++ * (FSNode getFileIdentifier/getVolumeIdentifier, _LSAliasAndInodeOnContainerMatchesNode). lsd registered Phone, Wallet and Watch
++ * when it seeded its database (paths) and could no longer find them by ID after a reboot, so they left the Home Screen unless
++ * the database was rebuilt at every boot (guamp-ls-auto=2, about 110 s of lsd). The view reports the lower inode numbers as file
++ * IDs (bind_vnops.c getattr) and its own fsid, so an ID is resolved on the lower mount, its path is taken below the lower root and
++ * looked up again under the mount point: the caller gets the view's vnode, with its name and parent, never the lower one, and an
++ * ID outside the bound tree is ENOENT. guamp-bindfs-vget=0 restores the old behaviour (no vget, capabilities without
++ * PERSISTENTOBJECTIDS/PATH_FROM_ID). The first 32 calls and then one in 256 are logged ("guamp-bindfs-vget:").
++ */
++static int
++bindfs_vget_enabled(void)
++{
++	uint32_t enabled = 1;
++	return !PE_parse_boot_argn("guamp-bindfs-vget", &enabled, sizeof(enabled)) || enabled != 0;
++}
++
++static uint32_t bindfs_vget_calls;
++
++static int
++bindfs_vfs_vget(struct mount * mp, ino64_t ino, struct vnode ** vpp, vfs_context_t ctx)
++{
++	struct bind_mount * bind_mp = MOUNTTOBINDMOUNT(mp);
++	struct vnode * lowervp      = NULLVP;
++	char * lowerpath            = NULL;
++	char * path                 = NULL;
++	int len                     = MAXPATHLEN;
++	int error;
++
++	*vpp = NULLVP;
++	if (!bindfs_vget_enabled()) {
++		return ENOTSUP;
++	}
++	if (bind_mp == NULL || bind_mp->bindm_lowerrootvp == NULLVP) {
++		return ENOENT;
++	}
++	uint32_t call = OSIncrementAtomic((volatile SInt32 *)&bindfs_vget_calls);
++	if (ino == BIND_ROOT_INO_VFS) {
++		error = vnode_get(bind_mp->bindm_rootvp);
++		if (!error) {
++			*vpp = bind_mp->bindm_rootvp;
++		}
++		goto out;
++	}
++	error = VFS_VGET(vnode_mount(bind_mp->bindm_lowerrootvp), ino, &lowervp, ctx);
++	if (error) {
++		goto out;
++	}
++	lowerpath = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	path      = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (lowerpath == NULL || path == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	error = vn_getpath(lowervp, lowerpath, &len);
++	vnode_put(lowervp);
++	lowervp = NULLVP;
++	if (error) {
++		goto out;
++	}
++	len   = MAXPATHLEN;
++	error = vn_getpath(bind_mp->bindm_lowerrootvp, path, &len);
++	if (error) {
++		goto out;
++	}
++	size_t root = strlen(path);
++	if (strncmp(lowerpath, path, root) || (lowerpath[root] != '\0' && lowerpath[root] != '/')) {
++		error = ENOENT;	/* not below the bound tree */
++		goto out;
++	}
++	if (snprintf(path, MAXPATHLEN, "%s%s", vfs_statfs(mp)->f_mntonname, lowerpath + root) >= MAXPATHLEN) {
++		error = ENAMETOOLONG;
++		goto out;
++	}
++	error = vnode_lookup(path, 0, vpp, ctx);
++	if (!error && vnode_mount(*vpp) != mp) {
++		vnode_put(*vpp);	/* a name the lower volume of the mount point answers first: not ours */
++		*vpp  = NULLVP;
++		error = ENOENT;
++	}
++out:
++	if (lowervp != NULLVP) {
++		vnode_put(lowervp);
++	}
++	if (call < 32 || (call & 255) == 0) {
++		printf("guamp-bindfs-vget: %s ino %llu -> %s error %d (call %u)\n", vfs_statfs(mp)->f_mntonname, (unsigned long long)ino,
++		    error ? "-" : (path ? path : "root"), error, call + 1);
++	}
++	if (lowerpath) {
++		kfree_data(lowerpath, MAXPATHLEN);
++	}
++	if (path) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	return error;
++}
++
+ static int
+ bindfs_vfs_getattr(struct mount * mp, struct vfs_attr * vfap, vfs_context_t ctx)
+ {
+@@ -416,12 +518,16 @@ bindfs_vfs_getattr(struct mount * mp, struct vfs_attr * vfap, vfs_context_t ctx)
+ 	if (bindfs_vfs_getlowerattr(vnode_mount(bind_mp->bindm_lowerrootvp), &vfa, ctx) == 0) {
+ 		if (VFSATTR_IS_SUPPORTED(&vfa, f_capabilities)) {
+ 			memcpy(&capabilities, &vfa.f_capabilities, sizeof(capabilities));
+-			/* don't support vget */
+-			capabilities.capabilities[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
++			/* don't support vget (guamp 30/10: unless bindfs_vfs_vget below is on, then the lower answer stands) */
++			if (!bindfs_vget_enabled()) {
++				capabilities.capabilities[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
++			}
+ 
+ 			capabilities.capabilities[VOL_CAPABILITIES_FORMAT] |= VOL_CAP_FMT_HIDDEN_FILES; /* Always support UF_HIDDEN */
+ 
+-			capabilities.valid[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
++			if (!bindfs_vget_enabled()) {
++				capabilities.valid[VOL_CAPABILITIES_FORMAT] &= ~(VOL_CAP_FMT_PERSISTENTOBJECTIDS | VOL_CAP_FMT_PATH_FROM_ID);
++			}
+ 
+ 			capabilities.valid[VOL_CAPABILITIES_FORMAT] |= VOL_CAP_FMT_HIDDEN_FILES; /* Always support UF_HIDDEN */
+ 
+@@ -555,6 +661,7 @@ struct vfsops bindfs_vfsops = {
+ 	.vfs_root               = bindfs_root,
+ 	.vfs_getattr            = bindfs_vfs_getattr,
+ 	.vfs_sync               = bindfs_sync,
++	.vfs_vget               = bindfs_vfs_vget,
+ 	.vfs_init               = bindfs_init,
+ 	.vfs_sysctl             = NULL,
+ 	.vfs_setattr            = NULL,
