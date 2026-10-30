@@ -141,6 +141,14 @@ if [ ! -f "$KERNEL_SDKROOT/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
 fi
 # The baseline builds the kernel; `all` also checks the Apple kext export ABI.
 EXTRA_MAKE_ARGS=()
+# guamp 30/10: compile through ccache when the runner has it (the workflow restores its directory between runs), so a
+# build that changes a few patches recompiles only what they touch. GUAMP_CCACHE=0 turns it off.
+if [ "${GUAMP_CCACHE:-1}" != 0 ] && command -v ccache >/dev/null 2>&1; then
+  XNU_CLANG=$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang)
+  XNU_CLANGXX=$(xcrun -sdk "${XNU_SDKROOT:-iphoneos}" -find clang++)
+  EXTRA_MAKE_ARGS+=("CC=ccache $XNU_CLANG" "CXX=ccache $XNU_CLANGXX")
+  echo "ccache: on ($(ccache --version | head -1), dir ${CCACHE_DIR:-default})"
+fi
 ARM_DT_PLATFORM=${XNU_ARM_DT_PLATFORM:-0}
 if [ "$ARM_DT_PLATFORM" != 0 ] && [ "$ARM_DT_PLATFORM" != 1 ]; then
   echo 'XNU_ARM_DT_PLATFORM must be 0 or 1' >&2
