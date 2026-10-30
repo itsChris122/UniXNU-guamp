@@ -1,0 +1,129 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 35cc23b..2853d3e 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4374,3 +4374,124 @@ dtrace_thread_didexec(thread_t thread)
+ 	thread->t_dtrace_flags |= TH_DTRACE_EXECSUCCESS;
+ }
+ #endif /* CONFIG_DTRACE */
++
++/*
++ * guamp 30/10: guamp-wprobe=<process name> (off by default) logs, at 45, 90, 180 and 280 s after boot, where every thread
++ * of that process waits: run state, block hint, wait event, user pc/lr and the user frame chain (return addresses; the
++ * shared cache slide is printed so they can be symbolised offline). wifid answers the driver's requests at 28 s, then
++ * makes none until 319 s at every boot (Wi-Fi grey for about 5 minutes): this shows what it waits for.
++ */
++#include <kern/thread_call.h>
++#include <kern/processor.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_shared_region.h>
++
++extern char *proc_name_address(void *p);
++
++static thread_call_t guamp_wprobe_call;
++static uint32_t guamp_wprobe_round;
++static const uint32_t guamp_wprobe_secs[] = {45, 90, 180, 280};
++#define GUAMP_WPROBE_THREADS 48
++#define GUAMP_WPROBE_FRAMES 24
++
++static void
++guamp_wprobe_arm(void)
++{
++	uint64_t deadline;
++
++	if (guamp_wprobe_round >= sizeof(guamp_wprobe_secs) / sizeof(guamp_wprobe_secs[0])) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)guamp_wprobe_secs[guamp_wprobe_round] * NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(guamp_wprobe_call, deadline);
++}
++
++static void
++guamp_wprobe_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	char name[32] = "wifid";
++	thread_t list[GUAMP_WPROBE_THREADS];
++	uint32_t count = 0, slide = 0, round = guamp_wprobe_round++;
++	task_t found = TASK_NULL, task;
++
++	PE_parse_boot_argn("guamp-wprobe", name, sizeof(name));
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *bsd_info = get_bsdtask_info(task);
++		thread_t thread;
++
++		if (bsd_info == NULL || strncmp(proc_name_address(bsd_info), name, sizeof(name)) != 0) {
++			continue;
++		}
++		task_reference(task);
++		found = task;
++		task_lock(task);
++		queue_iterate(&task->threads, thread, thread_t, task_threads) {
++			if (count < GUAMP_WPROBE_THREADS) {
++				thread_reference(thread);
++				list[count++] = thread;
++			}
++		}
++		if (task->shared_region != NULL) {
++			slide = task->shared_region->sr_slide;
++		}
++		task_unlock(task);
++		break;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	if (found == TASK_NULL) {
++		printf("guamp-wprobe: round %u: no process %s\n", round, name);
++		guamp_wprobe_arm();
++		return;
++	}
++	printf("guamp-wprobe: round %u: %s, %u threads, shared cache slide 0x%x\n", round, name, count, slide);
++	for (uint32_t i = 0; i < count; i++) {
++		thread_t thread = list[i];
++		uint64_t pc = 0, lr = 0, fp = 0;
++#if defined(__arm64__)
++		arm_saved_state_t *state = thread->machine.upcb;
++
++		if (state != NULL) {
++			pc = get_saved_state_pc(state);
++			lr = get_saved_state_lr(state);
++			fp = get_saved_state_fp(state);
++		}
++#endif
++		printf("guamp-wprobe: %u t%llu state 0x%x hint %d event 0x%llx pc 0x%llx lr 0x%llx\n", round, thread_tid(thread),
++		    thread->state, (int)thread->block_hint, (uint64_t)VM_KERNEL_UNSLIDE_OR_PERM(thread->wait_event), pc, lr);
++		char line[GUAMP_WPROBE_FRAMES * 13 + 1];
++		uint32_t used = 0;
++
++		line[0] = 0;
++		for (uint32_t f = 0; f < GUAMP_WPROBE_FRAMES && fp != 0 && (fp & 7) == 0; f++) {
++			uint64_t frame[2];
++
++			if (copyinmap(found->map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++				break;
++			}
++			used += (uint32_t)snprintf(line + used, sizeof(line) - used, " %llx", frame[1]);
++			if (used >= sizeof(line) - 1 || frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("guamp-wprobe: %u t%llu frames%s\n", round, thread_tid(thread), line);
++		thread_deallocate(thread);
++	}
++	task_deallocate(found);
++	guamp_wprobe_arm();
++}
++
++__startup_func
++static void
++guamp_wprobe_init(void)
++{
++	char name[32];
++
++	if (!PE_parse_boot_argn("guamp-wprobe", name, sizeof(name))) {
++		return;
++	}
++	guamp_wprobe_call = thread_call_allocate_with_options(guamp_wprobe_fire, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++	guamp_wprobe_arm();
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, guamp_wprobe_init);
