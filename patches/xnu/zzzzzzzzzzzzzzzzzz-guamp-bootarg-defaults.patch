@@ -1,0 +1,57 @@
+--- a/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
++++ b/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
+@@ -187,13 +187,41 @@
+ 	return arg_found;
+ }
+ 
++/*
++ * guamp (30/10): the verified guamp boot-args are defaults here, in one table, so the boot image carries only the kernel, the ADT
++ * and an empty addon. A key on the boot line always wins (=0 turns a feature off); only "guamp-" keys fall back to the table, and
++ * guamp-defaults=0 on the boot line disables the whole table. To change a default (for example guamp-ls-auto) edit only this
++ * string; Codex/emmc/argomenti-predefiniti-1030.txt lists the same keys for the image composer (guamp-defaults-1030 is its marker).
++ */
++static char guamp_bootarg_defaults[] =
++    "guamp-defaults-1030=1 guamp-gpu-all=1 guamp-gpu-all-deny=mediaserverd guamp-ca-metal-reset=1 guamp-ca-metal-noframe=900 guamp-disk-capacity=64 "
++    "guamp-adsp=1 guamp-adsp-ipc=6 guamp-adsp-delay=8 guamp-audio-dev=1 guamp-audio-plugin=1 guamp-audio-hw=1 guamp-audio-hw-att=12 "
++    "guamp-audio-mic=1 guamp-audio-mic-gain=30 guamp-sensors=2 guamp-slim=1 guamp-wifi-start=2 guamp-wifi-ui=1 guamp-biokit=1 "
++    "guamp-emmc-ra=64 guamp-ls-auto=2";
++
++static boolean_t
++guamp_bootarg_default(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
++{
++	uint32_t enabled = 1;
++	if (strncmp(arg_string, "guamp-", 6) || !strcmp(arg_string, "guamp-defaults")) {
++		return FALSE;
++	}
++	if (PE_parse_boot_argn_internal(PE_boot_args(), "guamp-defaults", &enabled, sizeof(enabled), FALSE) && !enabled) {
++		return FALSE;
++	}
++	return PE_parse_boot_argn_internal(guamp_bootarg_defaults, arg_string, arg_ptr, max_len, force_string);
++}
++
+ boolean_t
+ PE_parse_boot_argn(
+ 	const char      *arg_string,
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE)) {
++		return TRUE;
++	}
++	return guamp_bootarg_default(arg_string, arg_ptr, max_len, FALSE);
+ }
+ 
+ boolean_t
+@@ -213,7 +241,10 @@
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE)) {
++		return TRUE;
++	}
++	return guamp_bootarg_default(arg_string, arg_ptr, strlen, TRUE);
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
