@@ -370,7 +370,11 @@ void thread(void *, wait_result_t) {
   ChargeBus chargeBus;
   uint32_t stable = 0, last = 0, sent = 0;
   const bool ringer = ringerInit();
-  const bool torchRuns = torch::init();
+  bool torchRuns = torch::init();
+  // guamp 30/10: the torch init (and its log line) happens in the first seconds, before the live log starts; when it failed
+  // the torch stayed off for the whole boot without a trace (fin12: Control Center lit, no request reached the PMIC).
+  // Retried every 30 s, up to 20 times, with the outcome in the log.
+  unsigned torchRetries = 0;
   bool keyLast = false, keyStable = false;
   unsigned keyCount = 0;
   ponReport();
@@ -478,6 +482,11 @@ void thread(void *, wait_result_t) {
         IOLog("GuampPon: Power held %u ms (pon %02x); PMIC %s %s at %u ms\n", held, gPonRaw,
               guamp_pon::resetType(x.type), x.enabled ? "armed" : "disabled", x.totalMs());
       }
+    }
+    if (!torchRuns && tick % 1200 == 600 && torchRetries < 20) {
+      torchRetries++;
+      torchRuns = torch::init();
+      IOLog("GuampPmic: torch init retry %u: %s\n", torchRetries, torchRuns ? "ready" : "still off");
     }
     if (torchRuns) torch::poll(tick);
     IOSleep(25);
