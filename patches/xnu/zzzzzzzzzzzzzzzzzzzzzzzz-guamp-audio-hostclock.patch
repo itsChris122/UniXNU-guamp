@@ -1,0 +1,62 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 2853d3e..779aad9 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4495,3 +4495,57 @@ guamp_wprobe_init(void)
+ 	guamp_wprobe_arm();
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, guamp_wprobe_init);
++
++/*
++ * guamp 31/10: CoreAudio takes the host clock to be 24 MHz, a double constant read by AudioGetHostClockFrequency and by the
++ * audio server's IO clock and IO thread. The guamp timer runs at 19.2 MHz, so every 1024-frame IO cycle of 21.3 ms slept
++ * 26.7 ms and the HAL delivered about 80 % of real time: playback broke up at the right pitch (fin17: 29 s written while
++ * the DSP played 36 s). Same finding and fix as UniXNU sheng (ShengAudioService setHostClock): the constant lives in the
++ * dyld shared cache on a page with code, which the caller cannot write, so the kernel writes the shared physical page, once
++ * for every process. `unslid` is the constant's address in the cache (iPadOS 21H461 arm64: 0x1b6b93908); only a value that
++ * reads 24000000.0 (or already the timer frequency) is touched. Called by /dev/guamp-audio open, in audiomxd's context.
++ * Returns 0 when the constant holds the timer frequency.
++ */
++#include <vm/pmap.h>
++#include <vm/vm_map.h>
++#include <kern/clock.h>
++
++int guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out);
++
++int
++guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out)
++{
++	const uint64_t apple = 0x4176e36000000000ULL;   /* 24000000.0 */
++	task_t task = current_task();
++	struct vm_shared_region *region = task->shared_region;
++	uint64_t seen = 0;
++
++	if (region == NULL || unslid == 0) {
++		return 1;
++	}
++	const uint64_t address = unslid + region->sr_slide;
++	if ((address & 7) != 0 || copyin((user_addr_t)address, &seen, sizeof(seen)) != 0) {
++		return 2;
++	}
++	if (seen_out != NULL) {
++		*seen_out = seen;
++	}
++	mach_timebase_info_data_t tb;
++	clock_timebase_info(&tb);
++	const uint64_t hz = 1000000000ULL * tb.denom / tb.numer;
++	const unsigned top = 63 - (unsigned)__builtin_clzll(hz);
++	const uint64_t bits = (uint64_t)(1023 + top) << 52 | ((hz << (52 - top)) & ((1ULL << 52) - 1));
++	if (seen == bits) {
++		return 0;
++	}
++	if (seen != apple) {
++		return 3;
++	}
++	const pmap_paddr_t pa = pmap_find_pa(vm_map_pmap(task->map), address);
++	if (pa == 0) {
++		return 4;
++	}
++	*(volatile uint64_t *)phystokv(pa) = bits;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}

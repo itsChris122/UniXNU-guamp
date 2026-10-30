@@ -43,6 +43,8 @@ char gOwner[32];
 unsigned gLogAll = 1;
 // The session line. A sound that ended with frames still queued (STOP -> draining) is logged when its tail has been
 // played (pollPending(), from the wanted() hook of the ADSP sink) or when the next open comes first, so "played" is final.
+extern "C" int guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out);
+
 struct SessionLine {
   bool pending = false, cut = false;
   uint32_t n = 0, writes = 0, blocked = 0, ioctls = 0, underruns = 0, prerollWaits = 0, maxQueued = 0, routes = 0;
@@ -135,6 +137,19 @@ int adOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   }
   gOpen = true;
   gOpens = gOpens + 1;
+  // CoreAudio's 24 MHz host clock constant set to the 19.2 MHz timer (guamp_coreaudio_host_clock, patch ...-audio-hostclock):
+  // the opener is the audio server, which has the constant's page mapped. guamp-audio-hostclock=<unslid address>, 0 = off.
+  static bool hostClockDone = false;
+  static uint32_t hostClockTries = 0;
+  if (!hostClockDone && hostClockTries < 8) {
+    uint64_t unslid = 0x1b6b93908ULL, seen = 0;
+    PE_parse_boot_argn("guamp-audio-hostclock", &unslid, sizeof(unslid));
+    const int r = unslid ? guamp_coreaudio_host_clock(unslid, &seen) : -1;
+    hostClockTries++;
+    hostClockDone = r <= 0;
+    IOLog("GuampAudioDev: CoreAudio host clock constant at %llx (unslid) read %llx, result %d\n",
+          static_cast<unsigned long long>(unslid), static_cast<unsigned long long>(seen), r);
+  }
   gStream.reset();
   gStream.beginSession();
   gWrittenFrames = 0;
