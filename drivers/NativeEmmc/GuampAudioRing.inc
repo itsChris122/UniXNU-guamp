@@ -67,6 +67,11 @@ struct Stream {
   uint32_t used() const { return static_cast<uint32_t>(wr - rd); }
   uint32_t space() const { return bytes - used(); }
   uint64_t framesPlayed() const { return rd / GUAMP_AUDIO_BYTES_PER_FRAME; }
+  // Device clock for GET_POSITION: frames played plus the silence the ADSP played while the stream ran (pre-roll waits,
+  // underruns). With framesPlayed() alone the clock stood still during every pre-roll wait, the HAL saw the device slow down
+  // and wrote less, which caused the next wait (fin14: 11-19 underruns and ~3 s of inserted silence per 3.3 s sound).
+  uint64_t silentFrames = 0, anchorClock = 0;
+  uint64_t clockFrames() const { return framesPlayed() + silentFrames; }
   // open/close: a draining sound keeps its queue and its volume (the next open appends after it)
   void reset() {
     running = false;
@@ -164,9 +169,11 @@ struct Stream {
     }
     rd += static_cast<uint64_t>(have) * GUAMP_AUDIO_BYTES_PER_FRAME;
     if (have < frames && running && !prerollFrames) underruns++;
+    if (have < frames && running) silentFrames += frames - have;
     if (draining && !used()) draining = false;
     anchorTicks = now;          // position: frames handed to the ADSP so far, at the time they were taken
     anchorFrame = framesPlayed();
+    anchorClock = clockFrames();
     clockRunning = true;
     return have;
   }
@@ -206,12 +213,13 @@ struct Stream {
   void anchor(uint64_t now) {
     anchorTicks = now;
     anchorFrame = framesPlayed();
+    anchorClock = clockFrames();
     clockRunning = true;
   }
-  // The host time at which framesPlayed() was (or is) exact
+  // The host time at which clockFrames() was (or is) exact
   uint64_t positionTicks(uint64_t now) const {
     if (!clockRunning || !ticksPerSec) return now;
-    return anchorTicks + (framesPlayed() - anchorFrame) * ticksPerSec / GUAMP_AUDIO_RATE;
+    return anchorTicks + (clockFrames() - anchorClock) * ticksPerSec / GUAMP_AUDIO_RATE;
   }
   // Switches the consumer (under the device lock): the ADSP path streaming or not
   void setSink(uint32_t s, uint64_t now) {
@@ -286,7 +294,7 @@ struct Stream {
       case GUAMP_AUDIO_GET_POSITION: {
         consume(now);
         guamp_audio_position *p = static_cast<guamp_audio_position *>(data);
-        *p = {framesPlayed(), positionTicks(now), used() / GUAMP_AUDIO_BYTES_PER_FRAME, underruns};
+        *p = {clockFrames(), positionTicks(now), used() / GUAMP_AUDIO_BYTES_PER_FRAME, underruns};
         return 0;
       }
       default: return 25;   // ENOTTY (DRAIN is handled by the glue: it sleeps)
