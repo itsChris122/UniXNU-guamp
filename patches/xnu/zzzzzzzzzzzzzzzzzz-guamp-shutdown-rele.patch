@@ -1,0 +1,55 @@
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -2665,6 +2665,40 @@
+ }
+ 
+ 
++/*
++ * guamp (30/10): both "usecount -ve" panics seen on the phone (fin8 tr1 after 7.6 h, fin9 kernel 40977084002 at 989 s)
++ * come from the same path at shutdown: launchd reboot() -> vfs_unmountall(system) -> unmount of the sealed root (APFS OS
++ * volume, after the cryptex union on "/" and our bindfs views were unmounted in the nonsystem pass) -> vflush(FORCECLOSE)
++ * -> vclean -> vnode_update_identity(PURGE) -> vnode_rele of a parent directory that is already dead (v_type VBAD,
++ * usecount 0). Data was unmounted cleanly before, so the panic only turns a normal power-off (low battery) into a panic
++ * reset. While the system is shutting down, a release that would take a dead vnode below zero is logged (first 16) and
++ * ignored instead; anywhere else, and with guamp-shutdown-rele=0, the stock panic stays.
++ */
++#include <pexpert/pexpert.h>
++static int
++guamp_shutdown_rele_tolerated(vnode_t vp)
++{
++	static int enabled = -1;
++	static int logged = 0;
++	if (enabled < 0) {
++		uint32_t value = 1;
++		(void)PE_parse_boot_argn("guamp-shutdown-rele", &value, sizeof(value));
++		enabled = value ? 1 : 0;
++	}
++	if (!enabled || get_system_inshutdown() == 0 ||
++	    !(vp->v_type == VBAD || ISSET(vp->v_lflag, VL_DEAD | VL_TERMINATE))) {
++		return 0;
++	}
++	if (logged < 16) {
++		logged++;
++		mount_t mp = vp->v_mount;
++		printf("guamp-shutdown-rele: dead vnode %p (type %d, tag %d, flag %x, lflag %x, name %s) usecount %d on %s: "
++		    "release ignored\n", vp, vp->v_type, vp->v_tag, vp->v_flag, vp->v_lflag, vp->v_name ? vp->v_name : "-",
++		    vp->v_usecount, (mp && mp != dead_mountp) ? mp->mnt_vfsstat.f_mntonname : "(dead mount)");
++	}
++	return 1;
++}
++
+ void
+ vnode_rele_internal(vnode_t vp, int fmode, int dont_reenter, int locked)
+ {
+@@ -2681,6 +2715,11 @@
+ #endif
+ 	/* Enable atomic ops on v_usecount without the vnode lock */
+ 	old_usecount = os_atomic_dec_orig(&vp->v_usecount, relaxed);
++	if (old_usecount < 1 && guamp_shutdown_rele_tolerated(vp)) {
++		/* guamp (30/10): see guamp_shutdown_rele_tolerated(); the reference is not ours to drop. */
++		os_atomic_inc(&vp->v_usecount, relaxed);
++		goto done;
++	}
+ 	if (old_usecount < 1) {
+ 		/*
+ 		 * Because we allow atomic ops on usecount (in lookup only, under
