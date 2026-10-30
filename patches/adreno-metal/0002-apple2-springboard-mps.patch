@@ -1,0 +1,28 @@
+guamp: answer MTLGPUFamilyApple2 to SpringBoard too (AdrenoMetal 2ff4be9, NativeBridgeMetalFrontend.mm)
+
+The board withholds every Apple family (NativeMetalWithhold "apple-families", GuampAdrenoProbe.cpp); Apple2 is answered only to
+NMB_APPLE2_CLIENTS (default "Preferences,iconservicesagent"). MPSDevice::GetMPSDevice asks supportsFamily: from Apple9 down to
+Apple2 and returns nil when none is supported; Siri's orb prewarm in SpringBoard then creates an MPSKernel and Metal aborts it
+("[%@ initWithDevice:] Failed to get MPSDevice.", MPSKernel.mm:95), three times a boot (fin9..fin9g, 30/10). With Apple2, MPS
+takes its generic device type (no "Apple A8X GPU" name match) and loads its kernels from the AIR default.metallib files of
+MetalPerformanceShaders.framework. The render server (backboardd) keeps every Apple family withheld. Applied by the GPU workflow
+after 0001.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 1ca89f9..a094204 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2512,7 +2512,12 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+  static const SEL family=sel_registerName("supportsFamily:");
+  static const bool withholdApple1=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple1-family");}();
+  static const bool withholdApple=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple-families");}();
+- static const bool apple2Client=[]{const char *list=getenv("NMB_APPLE2_CLIENTS");if(!list)list="Preferences,iconservicesagent";
++ // SpringBoard too (guamp 30/10): with every Apple family withheld, MPSDevice::GetMPSDevice (MPSCore 0x1dff42f28 in iPadOS 17.7.11)
++ // finds no family from Apple9 down to Apple2 and returns nil, and Siri's orb prewarm (-[SiriPresentationViewController
++ // prewarmOrbViewShaders] -> SUICOrbView -> MPSKernel initWithDevice:) aborts SpringBoard in MTLReportFailure "Failed to get
++ // MPSDevice." three times a boot. Apple2 alone gives MPS its generic device (no Apple GPU name matched), whose kernels come from
++ // the AIR default.metallib files of MetalPerformanceShaders.framework, compiled like any other library.
++ static const bool apple2Client=[]{const char *list=getenv("NMB_APPLE2_CLIENTS");if(!list)list="Preferences,iconservicesagent,SpringBoard";
+   const char *name=getprogname();if(!name)return false;const size_t len=strlen(name);
+   for(const char *at=list;*at;) {const char *end=strchr(at,',');const size_t part=end?(size_t)(end-at):strlen(at);
+    if(part==len && !strncmp(at,name,len))return true;if(!end)break;at=end+1;}
