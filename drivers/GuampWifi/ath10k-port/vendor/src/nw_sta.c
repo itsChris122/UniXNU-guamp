@@ -555,6 +555,9 @@ static void finish_authorized(void) {
   lx_log(6, "wifi: connected"); connect_done(NW_RES_OK); }
 /* Once a second while connected: what arrived. A second with nothing at all is logged with the receive rings and the transmit outcomes, and the
  * firmware is asked for its ring and receive statistics once per quiet spell; every tenth second the same line is logged anyway. */
+/* guamp 30/10: why data frames from the access point do not reach the interface (fin12: every TCP connection stops near
+ * 12 KB, right after the server's first flight). Said with the 10-second statistics line. */
+static struct { unsigned delivered, frag, not_decrypted, no_snap, too_long, amsdu, short_frame, not_up, max_len; } g_rxd;
 static void heartbeat(u64 now) {
   if (now - C.hb_at < 1000) return;
   unsigned f = nw_wifi_stats.frames - C.hb_frames, bc = nw_wifi_stats.beacons - C.hb_beacons; static unsigned n;
@@ -565,6 +568,8 @@ static void heartbeat(u64 now) {
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
   lx_log(6, "wifi: tx %s", tx_reasons());
+  lx_log(6, "wifi: data rx delivered %u (longest %u); dropped: fragment %u, not decrypted %u, no SNAP %u, too long %u, A-MSDU bit %u, short %u, link not up %u",
+         g_rxd.delivered, g_rxd.max_len, g_rxd.frag, g_rxd.not_decrypted, g_rxd.no_snap, g_rxd.too_long, g_rxd.amsdu, g_rxd.short_frame, g_rxd.not_up);
   nw_wifi_ring_state(rx, sizeof rx); semi = strchr(rx, ';'); lx_log(6, "wifi: rings %.*s", semi ? (int)(semi - rx) : (int)strlen(rx), rx); if (semi) lx_log(6, "wifi: rings%s", semi + 1);
   if (C.hb_quiet == 1) { nw_wifi_htt_stats(37); nw_wifi_htt_stats(5); nw_wifi_htt_stats(45); nw_wifi_htt_stats(15); } }
 static void handle_eapol(const u8 *p, unsigned len) {
@@ -726,8 +731,10 @@ void nw_sta_rx(struct sk_buff *skb) {
       !ieee80211_has_tods(h->frame_control) && !memcmp(h->addr2,C.ap.bssid,6) && rx_destination(h->addr1)) {
     // Fragment reassembly is not implemented in this minimal station. Never
     // hand an individual fragment to the OS as if it were a complete Ethernet frame.
-    if(ieee80211_has_morefrags(h->frame_control)||(le16_to_cpu(h->seq_ctrl)&15))return;
-    if(ieee80211_has_protected(h->frame_control)&&!(rs->flag&RX_FLAG_DECRYPTED))return;
+    if(ieee80211_has_morefrags(h->frame_control)||(le16_to_cpu(h->seq_ctrl)&15)){g_rxd.frag++;return;}
+    if(ieee80211_has_protected(h->frame_control)&&!(rs->flag&RX_FLAG_DECRYPTED)){g_rxd.not_decrypted++;return;}
+    if(ieee80211_is_data_qos(h->frame_control)&&(*ieee80211_get_qos_ctl(h)&IEEE80211_QOS_CTL_A_MSDU_PRESENT))g_rxd.amsdu++;
+    if(skb->len>g_rxd.max_len)g_rxd.max_len=skb->len;
     unsigned hl = ieee80211_hdrlen(h->frame_control); struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb);
     if (ieee80211_has_protected(h->frame_control) && !(st->flag & RX_FLAG_IV_STRIPPED)) hl += 8;
     if (skb->len >= hl + 8 && rx_snap(skb->data+hl) && !skb->data[hl+5] &&
@@ -738,8 +745,11 @@ void nw_sta_rx(struct sk_buff *skb) {
       }
       return;
     }
-    if(C.state==NW_STA_UP&&(!C.secure||(rs->flag&RX_FLAG_DECRYPTED))&&skb->len>=hl+8&&
-       skb->len-hl-8<=2000&&rx_snap(skb->data+hl)) {g_current_link_frames++;to_eth(skb);} } }
+    if(C.state!=NW_STA_UP||(C.secure&&!(rs->flag&RX_FLAG_DECRYPTED))){g_rxd.not_up++;return;}
+    if(skb->len<hl+8){g_rxd.short_frame++;return;}
+    if(skb->len-hl-8>2000){g_rxd.too_long++;return;}
+    if(!rx_snap(skb->data+hl)){g_rxd.no_snap++;return;}
+    g_rxd.delivered++;g_current_link_frames++;to_eth(skb); } }
 
 /* ---- the connection's life ---- */
 static void connect_done(int res) {
