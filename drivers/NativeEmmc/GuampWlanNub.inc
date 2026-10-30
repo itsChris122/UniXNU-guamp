@@ -56,6 +56,45 @@ public:
 };
 OSDefineMetaClassAndStructors(GuampWLAN, IONetworkInterface)
 
+// IONetworkStack (31/10): configd's InterfaceNamer posts "*QUIET*" (which SCNetworkInterfaceCopyAll, and with it wifid,
+// waits for) only after it has opened an IONetworkStack; without one it gives up after WaitStackTimeout, 300 s, and wifid
+// stood still from 27 s to 319 s at every boot (fin16 guamp-wprobe: __wait_for_IOKit_to_quiesce; fin18: no class, no
+// service). As HakiOS xnu/files/iokit/Kernel/MiniIONetworkStack.cpp: the service under IOResources, a user client that
+// opens, and a refusal of the naming request (en0 is born with its name).
+class IONetworkStack : public IOService {
+  OSDeclareDefaultStructors(IONetworkStack)
+};
+OSDefineMetaClassAndStructors(IONetworkStack, IOService)
+
+class IONetworkStackUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(IONetworkStackUserClient)
+public:
+  bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+  IOReturn clientClose() APPLE_KEXT_OVERRIDE;
+  IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient)
+
+bool IONetworkStackUserClient::start(IOService *provider) {
+  if (!IOUserClient::start(provider)) return false;
+  char who[32] = "?";
+  proc_selfname(who, sizeof(who));
+  IOLog("GuampNetStack: IONetworkStack opened by %s, registry busy %u\n", who,
+        static_cast<unsigned>(IOService::getServiceRoot()->getBusyState()));
+  return true;
+}
+
+IOReturn IONetworkStackUserClient::clientClose() {
+  if (!isInactive()) terminate();
+  return kIOReturnSuccess;
+}
+
+IOReturn IONetworkStackUserClient::setProperties(OSObject *) {
+  static unsigned said;
+  if (said++ < 4) IOLog("GuampNetStack: asked to name an interface: none to name\n");
+  return kIOReturnUnsupported;
+}
+
 namespace wlannub {
 static unsigned gUserClientAsked;
 static unsigned gSelectorsSaid;
@@ -193,7 +232,30 @@ IOReturn IO80211UserClient::externalMethod(uint32_t selector, IOExternalMethodAr
 
 // Once, when en0 exists (guamp_net.c hakios_net_attach): on the station's attach thread, or from bsd_init for the
 // guamp-wifi-ui placeholder en0, which the station takes over later (then guamp_wlan_set_address).
+// The IONetworkStack above, once, under IOResources (where IONetworkingFamily puts its own). guamp-netstack=0: not published.
+extern "C" void guamp_netstack_publish() {
+  static bool done;
+  uint32_t on = 1;
+  if (done || (PE_parse_boot_argn("guamp-netstack", &on, sizeof(on)) && !on)) return;
+  done = true;
+  IOService *resources = IOService::getResourceService();
+  IONetworkStack *stack = OSTypeAlloc(IONetworkStack);
+  if (!resources || !stack || !stack->init()) {
+    OSSafeReleaseNULL(stack);
+    IOLog("GuampNetStack: cannot create IONetworkStack\n");
+    return;
+  }
+  stack->setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
+  if (IOService *published = wlannub::publish(stack, resources, "IONetworkStack")) {
+    IOLog("GuampNetStack: IONetworkStack published\n");
+    published->release();
+  } else {
+    IOLog("GuampNetStack: IONetworkStack did not start\n");
+  }
+}
+
 extern "C" void guamp_wlan_publish(const char *interface, const uint8_t *address) {
+  guamp_netstack_publish();
   IOService *platform = IOService::getPlatform();
   IO80211Controller *controller = OSTypeAlloc(IO80211Controller);
   GuampWLAN *wlan = OSTypeAlloc(GuampWLAN);
