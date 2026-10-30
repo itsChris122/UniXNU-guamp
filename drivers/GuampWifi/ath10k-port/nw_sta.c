@@ -564,6 +564,10 @@ static void heartbeat(u64 now) {
   C.hb_at = now; C.hb_frames = nw_wifi_stats.frames; C.hb_beacons = nw_wifi_stats.beacons; n++;
   if (f || bc) { if (C.hb_quiet) lx_log(6, "wifi: frames arrive again after %u quiet seconds", C.hb_quiet); C.hb_quiet = 0; if (n % 10) return; nw_wifi_htt_stats(37); }
   else C.hb_quiet++;
+  /* guamp 30/10: no frame at all (not even a beacon) for 8 s while connected: the link is gone even if the firmware never
+   * reports a beacon miss. fin12 stayed "connected" for 15 minutes with nothing received from 621 s on, so wifid never
+   * joined again. Reported as lost: wifid reconnects. */
+  if (C.state == NW_STA_UP && C.hb_quiet == 8) { lx_log(4, "wifi: nothing received for 8 s while connected: link lost"); teardown(1, 0); return; }
   char rx[200]; nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
