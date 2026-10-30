@@ -176,6 +176,129 @@ net_output(ifnet_t ifp, mbuf_t packet)
 	return 0;
 }
 
+/*
+ * guamp 30/10 (fin10: connected, DHCP and DNS fine, but TLS stops after the server's first flight and 114 MB arrive in
+ * 80k frames while no TCP connection gets past 12 KB): each IPv4 frame that arrives is checked the way the stack will
+ * check it -- header checksum, IP length against the frame, TCP/UDP checksum -- and compared with the last 256 frames
+ * (a frame handed up twice). The counts are said with the minute's line, the first 24 bad frames one by one.
+ */
+static struct {
+	uint64_t ipv4, ipv6, arp, other, short_ip, bad_ip, bad_l4, padded, duplicate, tcp, udp;
+} rx_check_count;
+static uint32_t rx_recent[256];
+static unsigned rx_recent_next, rx_bad_said;
+
+static uint32_t
+rx_sum(const uint8_t *p, size_t length, uint32_t sum)
+{
+	for (; length > 1; p += 2, length -= 2) {
+		sum += (uint32_t)(p[0] << 8 | p[1]);
+	}
+	if (length) {
+		sum += (uint32_t)p[0] << 8;
+	}
+	return sum;
+}
+
+static uint16_t
+rx_fold(uint32_t sum)
+{
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	return (uint16_t)~sum;
+}
+
+static void
+rx_bad(const char *why, const uint8_t *frame, size_t length, unsigned ip_length)
+{
+	const uint8_t *ip = frame + ETHER_HDR_LEN;
+
+	if (rx_bad_said >= 24) {
+		return;
+	}
+	rx_bad_said++;
+	printf("GuampWiFi: net: bad frame (%s): %zu bytes, IP length %u, protocol %u, %u.%u.%u.%u -> %u.%u.%u.%u; "
+	    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x
+",
+	    why, length, ip_length, ip[9], ip[12], ip[13], ip[14], ip[15], ip[16], ip[17], ip[18], ip[19],
+	    ip[20], ip[21], ip[22], ip[23], ip[24], ip[25], ip[26], ip[27], ip[28], ip[29], ip[30], ip[31], ip[32], ip[33], ip[34],
+	    ip[35], ip[36], ip[37], ip[38], ip[39], frame[length - 8], frame[length - 7], frame[length - 6], frame[length - 5],
+	    frame[length - 4], frame[length - 3], frame[length - 2], frame[length - 1]);
+}
+
+static void
+rx_check(const uint8_t *frame, size_t length)
+{
+	const uint8_t *ip = frame + ETHER_HDR_LEN;
+	uint16_t type;
+	uint32_t hash = 2166136261u;
+
+	if (length < ETHER_HDR_LEN) {
+		return;
+	}
+	for (size_t i = 0; i < length && i < 96; i++) {
+		hash = (hash ^ frame[i]) * 16777619u;
+	}
+	hash ^= (uint32_t)length;
+	for (unsigned i = 0; i < 256; i++) {
+		if (rx_recent[i] == hash) {
+			rx_check_count.duplicate++;
+			break;
+		}
+	}
+	rx_recent[rx_recent_next++ & 255] = hash;
+	type = (uint16_t)(frame[12] << 8 | frame[13]);
+	if (type == ETHERTYPE_IPV6) {
+		rx_check_count.ipv6++;
+		return;
+	}
+	if (type == ETHERTYPE_ARP) {
+		rx_check_count.arp++;
+		return;
+	}
+	if (type != ETHERTYPE_IP || length < ETHER_HDR_LEN + 40) {
+		rx_check_count.other++;
+		return;
+	}
+	rx_check_count.ipv4++;
+	unsigned header = 4u * (ip[0] & 0xf), ip_length = (unsigned)(ip[2] << 8 | ip[3]);
+	if ((ip[0] >> 4) != 4 || header < 20 || ip_length < header || ETHER_HDR_LEN + ip_length > length) {
+		rx_check_count.short_ip++;
+		rx_bad("IP length", frame, length, ip_length);
+		return;
+	}
+	if (ETHER_HDR_LEN + ip_length < length) {
+		rx_check_count.padded++;
+	}
+	if (rx_fold(rx_sum(ip, header, 0)) != 0) {
+		rx_check_count.bad_ip++;
+		rx_bad("IP checksum", frame, length, ip_length);
+		return;
+	}
+	if ((ip[6] & 0x3f) || ip[7]) {
+		return;         /* a fragment: its checksum covers the whole datagram */
+	}
+	if (ip[9] != IPPROTO_TCP && ip[9] != IPPROTO_UDP) {
+		return;
+	}
+	const uint8_t *l4 = ip + header;
+	unsigned l4_length = ip_length - header;
+	if (ip[9] == IPPROTO_TCP) {
+		rx_check_count.tcp++;
+	} else {
+		rx_check_count.udp++;
+		if (l4_length < 8 || (l4[6] == 0 && l4[7] == 0)) {
+			return;         /* no UDP checksum */
+		}
+	}
+	uint32_t sum = rx_sum(ip + 12, 8, 0) + ip[9] + l4_length;
+	if (rx_fold(rx_sum(l4, l4_length, sum)) != 0) {
+		rx_check_count.bad_l4++;
+		rx_bad(ip[9] == IPPROTO_TCP ? "TCP checksum" : "UDP checksum", frame, length, ip_length);
+	}
+}
+
 /* A frame has arrived on unit `unit`. */
 void
 hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length)
@@ -190,6 +313,9 @@ hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length)
 		return;
 	}
 	trace_frame("in ", frame, length, length);
+	if (n->link->wireless) {
+		rx_check(frame, length);
+	}
 	if (length < ETHER_HDR_LEN || length > HAKIOS_NET_FRAME_MAX || mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
 		n->count.dropped_in++;
 		return;
@@ -335,6 +461,13 @@ net_thread(void *parameter, __unused wait_result_t result)
 			printf("GuampWiFi: net: en%u so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
 			    n->unit, n->count.sent, n->count.sent_bytes, n->count.received, n->count.received_bytes,
 			    n->count.dropped_out, n->count.dropped_in);
+			if (n->link->wireless) {
+				printf("GuampWiFi: net: en%u received IPv4 %llu (TCP %llu, UDP %llu), IPv6 %llu, ARP %llu, other %llu; bad: IP length %llu, "
+				    "IP checksum %llu, TCP/UDP checksum %llu; padded %llu, same as a recent frame %llu
+", n->unit, rx_check_count.ipv4,
+				    rx_check_count.tcp, rx_check_count.udp, rx_check_count.ipv6, rx_check_count.arp, rx_check_count.other,
+				    rx_check_count.short_ip, rx_check_count.bad_ip, rx_check_count.bad_l4, rx_check_count.padded, rx_check_count.duplicate);
+			}
 		}
 		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
 	}

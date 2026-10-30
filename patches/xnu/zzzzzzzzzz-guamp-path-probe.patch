@@ -12,7 +12,7 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
  {
  	struct vnode *dp;       /* the directory we are searching */
  	struct vnode *usedvp = ndp->ni_dvp;  /* store pointer to vp in case we must loop due to
-@@ -2209,3 +2209,104 @@
+@@ -2209,3 +2209,110 @@
  		kdebug_lookup(vp ? vp : dvp, &ndp->ni_cnd);
  	}
  }
@@ -65,6 +65,12 @@ diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
 +	 * of Notes/TV/Podcasts/Safari (read by the app itself at launch) gives the persona each app runs in. */
 +	if (strnstr(buf, "/Cryptexes/App/", size) != NULL || strnstr(buf, "/Logging/Subsystems/", size) != NULL) {
 +		return 0;
++	}
++	/* 30/10 (app sparite): Phone, Wallet and Watch of the /Applications view, every access by anyone, to see how lsd finds (or
++	 * loses) them after a reboot without a database rebuild. */
++	if (strnstr(buf, "MobilePhone.app", size) != NULL || strnstr(buf, "Passbook.app", size) != NULL ||
++	    strnstr(buf, "Bridge.app", size) != NULL) {
++		return 1;
 +	}
 +	if (strnstr(buf, "MobileSafari.framework", size) != NULL || strnstr(buf, "SafariCore.framework", size) != NULL ||
 +	    strnstr(buf, "/Cryptexes/", size) != NULL || strnstr(buf, "WebContentExtension.appex", size) != NULL ||

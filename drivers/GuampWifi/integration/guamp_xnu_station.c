@@ -342,7 +342,19 @@ static bool link_transmit(mbuf_t packet, size_t length)
   uint8_t frame[REDWOOD_NET_FRAME_MAX];
   if (length < ETHER_HDR_LEN || length > sizeof(frame) ||
       mbuf_copydata(packet, 0, length, frame) != 0) return false;
-  return nw_wifi_tx(frame, length) == 0;
+  /* guamp 30/10: why en0 drops frames on the way out (fin10: 2809 of 35234): queue full (128) or link not authorized */
+  static uint32_t refused, full, down;
+  int error = nw_wifi_tx(frame, length);
+  if (error) {
+    refused++;
+    if (error == -ENOBUFS) full++;
+    else if (error == -ENETDOWN) down++;
+    if (refused <= 8 || (refused & 255) == 0)
+      printf("GuampWiFi: net: frame of %u bytes refused by the station: %d (refused %u: queue full %u, link down %u)
+",
+          (unsigned)length, error, refused, full, down);
+  }
+  return error == 0;
 }
 
 static int station_power(bool on)
@@ -374,7 +386,11 @@ static int station_scan(const struct redwood_sta_scan *request)
   scan.dwell_ms = request->dwell_ms;
   scan.frequency_count = request->frequency_count;
   for (unsigned i = 0; i < scan.frequency_count; ++i) scan.frequencies_mhz[i] = request->frequencies[i];
-  public_state_set(REDWOOD_STA_SCANNING, 0);
+  /* guamp 30/10: a scan asked while joined (wifid's background scans) leaves the phase JOINED. Phase SCANNING made SSID, BSSID,
+   * RSSI and CURRENT_NETWORK answer ENXIO for the whole scan (334 refusals in fin10), so wifid saw the network come and go:
+   * empty signal icon with the link up. The station keeps its connection while it scans (do_scan does not touch C.state). */
+  const bool joined = previous == REDWOOD_STA_JOINED;
+  if (!joined) public_state_set(REDWOOD_STA_SCANNING, 0);
   int error = nw_wifi_scan_ex(&scan);
   if (error) {
     error = request_to_errno(error);

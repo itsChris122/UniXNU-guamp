@@ -834,8 +834,8 @@ int nw_wifi_tx(const uint8_t *eth, size_t len) {
   if (!eth || len < 14 || len > 2000) return -EINVAL;
   struct txq_item *it = lx_plat->alloc(sizeof *it + len); if (!it) return -3; it->len = len; it->next = 0; memcpy(it->data, eth, len);
   lock();
-  if(!__atomic_load_n(&g_link_authorized,__ATOMIC_ACQUIRE)||!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)||g_txq_n>=128) {
-    int error=g_txq_n>=128?-ENOBUFS:-ENETDOWN;unlock();lx_free(it);return error;
+  if(!__atomic_load_n(&g_link_authorized,__ATOMIC_ACQUIRE)||!__atomic_load_n(&g_radio_enabled,__ATOMIC_ACQUIRE)||g_txq_n>=512) {
+    int error=g_txq_n>=512?-ENOBUFS:-ENETDOWN;unlock();lx_free(it);return error;
   }
   if (g_txq_tail) g_txq_tail->next = it; else g_txq_head = it; g_txq_tail = it; g_txq_n++; unlock(); return 0; }
 
