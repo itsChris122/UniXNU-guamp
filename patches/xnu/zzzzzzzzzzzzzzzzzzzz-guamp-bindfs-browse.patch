@@ -1,0 +1,26 @@
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 2b0a97d..8965991 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -225,6 +225,21 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 	/* force these flags */
+ 	flags |= (MNT_DONTBROWSE | MNT_MULTILABEL | MNT_NOSUID | MNT_RDONLY);
+ 	vfs_setflags(mp, flags);
++	/*
++	 * guamp 30/10: the boot views (/Applications of iphone-res with Phone, Wallet and Watch, the cryptex and GPU views) are
++	 * the system's own content, not a foreign file system: without MNT_DONTBROWSE. lsd registered the apps of the view when
++	 * it seeded its database but the database it saved never held them (fin11b: after a clean shutdown lsd loaded it without
++	 * looking at the apps at all), the suspected reason being the "not a path to user data" flag. guamp-bindfs-browse=0
++	 * keeps the flag.
++	 */
++	{
++		uint32_t guamp_browse = 1;
++
++		PE_parse_boot_argn("guamp-bindfs-browse", &guamp_browse, sizeof(guamp_browse));
++		if (guamp_browse) {
++			vfs_clearflags(mp, MNT_DONTBROWSE);
++		}
++	}
+ 
+ 	vfs_setfsprivate(mp, xmp);
+ 	vfs_getnewfsid(mp);
