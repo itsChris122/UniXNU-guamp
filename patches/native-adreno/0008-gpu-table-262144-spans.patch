@@ -1,0 +1,28 @@
+diff -ru a/NativeAdrenoGpuAll.h b/NativeAdrenoGpuAll.h
+--- a/NativeAdrenoGpuAll.h	2026-10-31 00:52:06.993016847 +0100
++++ b/NativeAdrenoGpuAll.h	2026-10-31 00:52:07.005016848 +0100
+@@ -82,10 +82,10 @@
+     }
+ };
+ 
+-/* The GPU table shared by every connection (NativeAdrenoVm: 16384 mappings, NativeAdrenoGpuContext attaches it with 131072 spans): the
++/* The GPU table shared by every connection (NativeAdrenoVm: 16384 mappings, NativeAdrenoGpuContext attaches it with 262144 spans, the most NativeAdrenoVm::attach takes; 131072 until 31/10, when WebKit.GPU, mediaplaybackd and Preferences were refused at 112487 spans): the
+  * processes other than the render server stop at a quarter short of each, so the render server always finds room (it held about 4000
+  * mappings at most, i567). */
+-enum : uint64_t {NagVmObjects=16384, NagVmSpans=131072, NagVmReservedObjects=4096, NagVmReservedSpans=32768};
++enum : uint64_t {NagVmObjects=16384, NagVmSpans=262144, NagVmReservedObjects=4096, NagVmReservedSpans=32768};
+ inline bool nagAllowMap(uint64_t objects,uint64_t spans,uint64_t new_spans) {
+     return objects<NagVmObjects-NagVmReservedObjects && spans+new_spans<=NagVmSpans-NagVmReservedSpans;
+ }
+diff -ru a/NativeAdrenoGpuContext.cpp b/NativeAdrenoGpuContext.cpp
+--- a/NativeAdrenoGpuContext.cpp	2026-10-31 00:52:06.989016847 +0100
++++ b/NativeAdrenoGpuContext.cpp	2026-10-31 00:52:07.001016847 +0100
+@@ -78,7 +78,7 @@
+         NativeAdrenoVmRegion lower={&tables_,smmu_.arenaHandle(),smmu_.stateHandle()};
+         /* 65536 spans: 256 MiB of BOs even when every page is its own span. The Metal runtime pools its memory in 64 MiB blocks,
+          * which XNU rarely finds physically contiguous; one scattered block is 16384 spans (int-070 ran out at 16384). */
+-        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,131072,262144);
++        status=vm_.attach(io,smmu_.configHandle(),smmu_.streamsHandle(),&lower,nullptr,262144,262144);
+     }
+     if(!status) {
+         step(Map);

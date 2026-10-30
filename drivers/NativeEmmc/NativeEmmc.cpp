@@ -852,8 +852,23 @@ void psci(uint64_t function)
 
 // guamp 30/10: wifid waits about 300 s at every boot in SCNetworkInterfaceCopyAll -> __wait_for_IOKit_to_quiesce (fin16
 // guamp-wprobe): some IOService never stops being busy. Logs the busy services that have no busy child (the ones holding it).
+// guamp-ls-auto / ls-verify outcome of this boot (kern_exec.c, before launchd): their own lines come before the USB log starts
+extern "C" {
+extern uint32_t native_guamp_ls_auto_rebuilt, native_guamp_ls_auto_deleted, native_guamp_ls_auto_entries;
+extern int native_guamp_ls_auto_error, native_guamp_lsv_decision;
+extern uint32_t native_guamp_lsv_apps_found, native_guamp_lsv_restored, native_guamp_lsv_saved;
+}
+
 static void guampBusyDump()
 {
+  static bool lsSaid;
+  if (!lsSaid) {
+    lsSaid = true;
+    IOLog("guamp-busy: at boot ls-auto rebuilt %u deleted %u entries %u error %d; ls-verify decision %d (0 kept, 1 restored, "
+          "2 rebuild, 3 no store, 4 no view apps) apps found %u restored %u saved %u\n", native_guamp_ls_auto_rebuilt,
+          native_guamp_ls_auto_deleted, native_guamp_ls_auto_entries, native_guamp_ls_auto_error, native_guamp_lsv_decision,
+          native_guamp_lsv_apps_found, native_guamp_lsv_restored, native_guamp_lsv_saved);
+  }
   IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
   if (!it) return;
   IOService *root = IOService::getServiceRoot();
