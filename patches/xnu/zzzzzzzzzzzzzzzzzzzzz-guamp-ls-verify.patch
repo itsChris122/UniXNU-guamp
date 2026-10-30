@@ -553,7 +553,7 @@ index 7d13dba..6276634 100644
  static void
  native_guamp_ls_auto(proc_t p, user_addr_t scratch)
  {
-@@ -8666,6 +9210,15 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
+@@ -8666,6 +9210,14 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
  	}
  	int rebuild = mode == 2 || strcmp(old, key);
  	int already = native_guamp_ls_rebuild_deleted > 0;	/* guamp-ls-rebuild=N deleted the stores in this boot */
@@ -562,8 +562,7 @@ index 7d13dba..6276634 100644
 +	} else if (mode == 3) {
 +		(void)native_guamp_mkdir(p, scratch, "/private/var/db");
 +		(void)native_guamp_mkdir(p, scratch, native_guamp_lsv_good);
-+		(void)native_guamp_lsv_write_small(native_guamp_lsv_state, "rebuilt
-+", ctx);
++		(void)native_guamp_lsv_write_small(native_guamp_lsv_state, "rebuilt\n", ctx);
 +		native_guamp_lsv_decision = 2;
 +	}
  	error = 0;
