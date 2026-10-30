@@ -77,6 +77,7 @@ static struct {
   u64 replay, old_replay, group_replay, retry_replay; int have_replay, old_have_replay, group_replay_valid, retry_replay_valid; int ptk_ready; int hs_stage; int rekey;
   struct ieee80211_key_conf *ptk_key, *gtk_keys[4]; u16 seq; u8 gtk_id;
   u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;
+  u8 group_cipher;   /* the access point's RSN group cipher suite: 4 CCMP, 2 TKIP (WPA/WPA2 mixed networks) */
   /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */
   u8 gtk[32]; int gtk_len, gtk_idx; u64 m4_replay; u32 m4_cookie; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;
 } C;
@@ -213,12 +214,13 @@ void nw_sta_scan_done(bool aborted) {
 static const u8 *find_ie(const u8 *ies, unsigned len, u8 id) { const struct element *e = cfg80211_find_elem_match(id, ies, len, 0, 0, 0); return e ? (const u8 *)e : 0; }
 static const u8 *find_rsn(const u8 *ies, unsigned len) { return find_ie(ies, len, WLAN_EID_RSN); }
 
-/* parses the access point's RSN element: returns 0 when it offers CCMP with a pre-shared key (and no mandatory management protection) */
-static int rsn_check(const u8 *e) {
+/* parses the access point's RSN element: returns 0 when it offers pairwise CCMP with a pre-shared key (and no mandatory management
+ * protection); the group cipher may be CCMP or TKIP (30/10: WPA/WPA2 mixed routers) and goes to *group */
+static int rsn_check(const u8 *e, u8 *group) {
   if (!e) return -1;
   const u8 *p = e + 2, *end = e + 2 + e[1]; if (end - p < 2 || p[0]!=1 || p[1]!=0) return -1; p += 2;
   if (end - p < 4) return -1;
-  if (memcmp(p,OUI_RSN,3) || p[3]!=4) return -2; p += 4; /* WPA2-PSK/CCMP group cipher only */
+  if (memcmp(p,OUI_RSN,3) || (p[3]!=4 && p[3]!=2)) return -2; *group = p[3]; p += 4; /* group cipher CCMP, or TKIP in WPA/WPA2 mixed mode */
   if (end - p < 2) return -1; unsigned n = p[0] | p[1] << 8; p += 2; int ccmp = 0;
   for (unsigned i = 0; i < n; i++) { if (end - p < 4) return -1; if (!memcmp(p, OUI_RSN, 3) && p[3] == 4) ccmp = 1; p += 4; }
   if (end - p < 2) return -1; n = p[0] | p[1] << 8; p += 2; int psk = 0;
@@ -227,6 +229,12 @@ static int rsn_check(const u8 *e) {
   if (!ccmp || !psk) return -2;
   if (caps & 0x0040) return -2;                                                                      /* management frame protection required */
   return 0; }
+
+/* Our RSN element: version 1, the access point's group cipher, pairwise CCMP, key management PSK, no capabilities. The same bytes
+ * go in the association request and in message 2, as the access point compares them. */
+static void rsn_ie(u8 *out) {
+  static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
+  memcpy(out, rsn, sizeof rsn); out[7] = C.group_cipher == 2 ? 2 : 4; }
 
 /* ---- frames out ---- */
 static struct sk_buff *new_frame(unsigned body) {
@@ -327,9 +335,7 @@ static void send_assoc(void) {
   int five = C.ap.freq >= 4900; const int *r = five ? rates_5g : rates_2g; int nr = five ? 8 : 12;
   int first = nr > 8 ? 8 : nr; e = skb_put(skb, 2 + first); e[0] = WLAN_EID_SUPP_RATES; e[1] = first; for (int i = 0; i < first; i++) e[2 + i] = r[i];
   if (nr > 8) { e = skb_put(skb, 2 + nr - 8); e[0] = WLAN_EID_EXT_SUPP_RATES; e[1] = nr - 8; for (int i = 8; i < nr; i++) e[2 + i - 8] = r[i]; }
-  if (C.secure) {   /* RSN: version 1, group CCMP, pairwise CCMP, key management PSK, no capabilities */
-    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
-    skb_put_data(skb, rsn, sizeof rsn); }
+  if (C.secure) { u8 rsn[22]; rsn_ie(rsn); skb_put_data(skb, rsn, sizeof rsn); }
   if (g_ht_ie_len) skb_put_data(skb, g_ht_ie, g_ht_ie_len);
   if (g_vht_ie_len) skb_put_data(skb, g_vht_ie, g_vht_ie_len);
   tx_frame(skb); }
@@ -492,6 +498,9 @@ static int install_key(int pairwise, int idx, const u8 *key, int len) {
   struct ieee80211_key_conf *kc = lx_alloc(sizeof *kc + 32, 1); if (!kc) return -ENOMEM;
   kc->cipher = WLAN_CIPHER_SUITE_CCMP; kc->keyidx = idx; kc->keylen = len; kc->icv_len = 8; kc->iv_len = 8; kc->hw_key_idx = 0xff; kc->link_id = -1;
   kc->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0; memcpy(kc->key, key, len);
+  if (!pairwise && len == 32) {   /* TKIP group key: 16 bytes of key, then the Michael keys; the EAPOL layout is the authenticator's */
+    kc->cipher = WLAN_CIPHER_SUITE_TKIP; kc->icv_len = 4;     /* (tx at 16, rx at 24): swap them for the supplicant, as wpa_supplicant */
+    memcpy(kc->key + 16, key + 24, 8); memcpy(kc->key + 24, key + 16, 8); }
   int r = g_ops->set_key(g_hw, SET_KEY, g_vif, pairwise ? C.sta : 0, kc);
   if (r) { lx_log(3, "wifi: installing the %s key failed: %d", pairwise ? "pairwise" : "group", r); lx_free(kc); return r; }
   if (pairwise) { struct ieee80211_key_conf *old=C.ptk_key; C.ptk_key=kc; if(old) lx_free(old); }
@@ -521,13 +530,13 @@ static void install_keys(void) {
     /* Keep the old pairwise key active unless the complete candidate setup succeeds.
      * Install a changed group key first: if PTK installation fails the old link
      * remains usable and the new GTK is still valid for the AP's group traffic. */
-    if (C.gtk_len && install_key(0,C.gtk_idx,C.gtk,16)) { abort_rekey("GTK install failed"); return; }
+    if (C.gtk_len && install_key(0,C.gtk_idx,C.gtk,C.gtk_len)) { abort_rekey("GTK install failed"); return; }
     if (install_key(1,0,C.ptk+32,16)) { abort_rekey("PTK install failed"); return; }
     m4_wait_cancel(); secure_zero(C.old_ptk,sizeof C.old_ptk); secure_zero(C.gtk,sizeof C.gtk); C.old_replay=0; C.old_have_replay=0; C.hs_stage=4; C.rekey=0; C.gtk_len=0; C.m4_replay=0;
     lx_log(6,"wifi: pairwise rekey completed"); return;
   }
   if (install_key(1, 0, C.ptk + 32, 16)) { connect_done(NW_RES_FAILED); return; }
-  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, 16)) { connect_done(NW_RES_FAILED); return; }
+  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, C.gtk_len)) { connect_done(NW_RES_FAILED); return; }
   C.hs_stage = 4; finish_authorized(); }
 /* From the completion of a sent handshake frame. */
 void nw_sta_eapol_status(u64 replay, u32 cookie, bool acked) {
@@ -562,7 +571,9 @@ static void handle_eapol(const u8 *p, unsigned len) {
   if (len < sizeof *k || k->type != 3 || k->desc != 2) return;
   unsigned info = k->info[0] << 8 | k->info[1], dlen = k->datalen[0] << 8 | k->datalen[1];
   if (sizeof *k + dlen > len || ((unsigned)k->len[0]<<8 | k->len[1]) != sizeof *k - 4 + dlen) return;
-  if ((info & 0x0c00) || (k->keylen[0]!=0) || (k->keylen[1]!=16)) return;
+  unsigned keylen = k->keylen[0] << 8 | k->keylen[1];
+  /* pairwise messages carry the CCMP key length; WPA2 group messages carry 0 (hostapd) or the group key's length */
+  if ((info & 0x0c00) || ((info & 0x0008) ? keylen != 16 : (keylen && keylen != 16 && keylen != 32))) return;
   if ((info & 7) != 2) { lx_log(4, "wifi: key descriptor version %u not handled", info & 7); return; }
   int pairwise = !!(info & 0x0008), ack = !!(info & 0x0080), mic = !!(info & 0x0100);
   unsigned total = sizeof *k + dlen; u8 buf[512]; if (total > sizeof buf) return;
@@ -581,7 +592,7 @@ static void handle_eapol(const u8 *p, unsigned len) {
     }
     C.replay = be64(k->replay); C.have_replay = 1; C.hs_stage = 1;
     struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o + 22); o->ver = 2; o->type = 3; o->desc = 2;
-    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };
+    u8 rsn[22]; rsn_ie(rsn);
     unsigned body = sizeof *o - 4 + sizeof rsn; o->len[0] = body >> 8; o->len[1] = body; o->info[0] = 0x01; o->info[1] = 0x0a; o->keylen[0] = 0;
     memcpy(o->replay, k->replay, 8); memcpy(o->nonce, C.snonce, 32); o->datalen[0] = 0; o->datalen[1] = sizeof rsn; memcpy(o->data, rsn, sizeof rsn);
     sign(o, sizeof *o + sizeof rsn); send_eapol(o, sizeof *o + sizeof rsn,0); lx_log(6, "wifi: handshake message 2 sent"); return; }
@@ -611,22 +622,29 @@ static void handle_eapol(const u8 *p, unsigned len) {
     o->info[0] = 0x03; o->info[1] = 0x0a; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o);
     /* A duplicate message 3 gets message 4 again without reinstalling keys. */
     int again = C.hs_stage >= 3;
-    if (!again && gtk && gtklen != 16) return;
+    unsigned want_gtk = C.group_cipher == 2 ? 32 : 16;
+    if (!again && gtk && gtklen != want_gtk) { lx_log(4, "wifi: group key of %u bytes, %u expected", gtklen, want_gtk); return; }
     C.m4_replay = be64(k->replay);
-    if (!again) { C.gtk_len = gtk ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);
+    if (!again) { C.gtk_len = gtk ? want_gtk : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, C.gtk_len);
       C.hs_stage = 3; }
     C.m4_at = lx_now_ms();   /* each message 4 sent starts its own wait for a transmit status */
     /* Set the stage before tx(): completion can be synchronous. */
     if(++g_next_m4_cookie==0) ++g_next_m4_cookie; C.m4_cookie=g_next_m4_cookie; m4_wait_begin(C.m4_replay,C.m4_cookie);
     send_eapol(o, sizeof *o,C.m4_cookie); lx_log(6, "wifi: handshake message 4 sent%s (tx acked %u, not acked %u, dropped %u; %s)", again ? " again" : "", nw_eapol_tx[0], nw_eapol_tx[1], nw_eapol_tx[2], tx_reasons());
+    /* guamp 30/10: the first handshake installs the keys right after message 4 is queued, as wpa_supplicant does (send 4/4,
+     * then set_key). Message 4 already carries ATH10K_SKB_F_NO_HWCRYPT (unprotected frame), so it still leaves in the clear.
+     * Waiting for its transmit status instead held the handshake on a WCN3990 that reports none for it: the access point
+     * repeated message 3 every second, each repeat restarted the 1.5 s wait, and it gave up with reason 2 (fin9g, hotspot).
+     * A rekey keeps waiting for the acknowledgement so the working keys stay until the new ones are confirmed. */
+    if (!again && !C.rekey) { lx_log(6, "wifi: keys installed right after message 4"); install_keys(); }
     return; }
   if (!pairwise && ack) {   /* group key update */
     if(C.group_replay_valid && rc==C.group_replay) {
       struct eapol_key *o=(void *)buf; memset(o,0,sizeof *o); o->ver=2; o->type=3; o->desc=2; unsigned body=sizeof *o-4;
       o->len[0]=body>>8; o->len[1]=body; o->info[0]=0x03; o->info[1]=0x02; memcpy(o->replay,k->replay,8); sign(o,sizeof *o); send_eapol(o,sizeof *o,0); return;
     }
-    if (!gtk || gtklen!=16) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
-    if (install_key(0, gtkid, gtk, 16)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    if (!gtk || gtklen!=(C.group_cipher == 2 ? 32u : 16u)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    if (install_key(0, gtkid, gtk, gtklen)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
     C.group_replay=rc; C.group_replay_valid=1; C.retry_replay_valid=0;
     struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;
     o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o,0); } }
@@ -785,7 +803,7 @@ static void start_connect(const struct nw_request *request) {
   if (!best) { lx_log(4, "wifi: network not in the scan list"); connect_done(NW_RES_NOT_FOUND); return; }
   const u8 *rsn = find_rsn(C.ap.ie, C.ap.ie_len); C.secure = request->has_pass;
   if (C.secure) {
-    if (rsn_check(rsn)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }
+    if (rsn_check(rsn, &C.group_cipher)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }
     if (request->pass_len == 64) { for (int i = 0; i < 32; i++) { unsigned v; const char *s = request->pass + 2 * i; int hi = (s[0] <= '9' ? s[0] - '0' : (s[0] | 32) - 'a' + 10), lo = (s[1] <= '9' ? s[1] - '0' : (s[1] | 32) - 'a' + 10); v = hi << 4 | lo; C.pmk[i] = v; } }
     else nw_pbkdf2_sha1(request->pass, request->pass_len, C.ssid, C.ssid_len, 4096, C.pmk, 32);
   } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }
