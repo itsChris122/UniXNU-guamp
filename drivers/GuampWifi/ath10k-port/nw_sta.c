@@ -465,6 +465,7 @@ static void to_eth(struct sk_buff *skb) {
   unsigned plen = skb->len - hl - 8; if (plen > 2000) return;
   static u8 eth[14 + 2000]; memcpy(eth, h->addr1, 6); memcpy(eth + 6, h->addr3, 6); memcpy(eth + 12, llc + 6, 2); memcpy(eth + 14, llc + 8, plen);
   if (eth[12] == 0x88 && eth[13] == 0x8e) return;   /* EAPOL belongs to the handshake */
+  if (!memcmp(eth + 6, g_vif->addr, 6)) return;    /* guamp 30/10: our own broadcast relayed back by the access point */
   if (g_ev.rx) g_ev.rx(eth, 14 + plen); }
 
 /* ---- the handshake ---- */
@@ -704,6 +705,9 @@ void nw_sta_rx(struct sk_buff *skb) {
       }
       return;
     }
+    /* guamp 30/10: our own broadcasts relayed back by the access point (ARP, DHCP, IPv6 NS: "looped back NS" in DAD)
+     * are dropped, as mac80211 does for a station; fin11 handed them to the stack */
+    if(skb->len>=12&&!memcmp(skb->data+6,g_vif->addr,6))return;
     if(C.state==NW_STA_UP&&(!C.secure||(rs->flag&RX_FLAG_DECRYPTED))&&g_ev.rx) {
       g_current_link_frames++;g_ev.rx(skb->data,skb->len);
     }

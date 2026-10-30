@@ -40,6 +40,7 @@
  */
 #include <IOKit/IOLib.h>                /* IOMallocData: plain functions, no kalloc startup sites */
 #include <kern/locks.h>
+#include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
@@ -138,6 +139,8 @@ struct apple80211_scan_request {
 	uint8_t names[10][56];
 	uint32_t short_ssid, unused_3;
 };
+
+#define GUAMP_NOISE_DBM         (-95)
 
 /* SCAN_RESULT (11) and CURRENT_NETWORK (103): 1164 bytes */
 struct apple80211_scan_result {
@@ -271,6 +274,11 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 	result->version = 1;
 	channel_fill(&result->channel, bss->frequency, 0);
 	result->rssi = bss->rssi;
+	/* guamp 30/10: a noise floor too (the radio does not report one: -95 dBm, typical for 2.4/5 GHz), so the SNR iOS derives
+	 * its signal bars from is not 0 (fin11b: Wi-Fi joined at -52 dBm, icon without bars) */
+	result->noise_known = 1;
+	result->noise = GUAMP_NOISE_DBM;
+	result->snr = (int16_t)(bss->rssi - GUAMP_NOISE_DBM);
 	result->beacon_interval = bss->beacon_interval;
 	result->capability = bss->capability;
 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
@@ -389,6 +397,31 @@ get(struct apple80211req *request)
 		IOFreeData(answer, sizeof(*answer));
 		return error;
 	}
+	/*
+	 * guamp 30/10: VIRTUAL_IF_ROLE (96) and VIRTUAL_IF_PARENT (97). wifid asks both of en0 right after CARD_CAPABILITIES
+	 * (29 s in fin11b); with EOPNOTSUPP it then did nothing for about 290 s (POWER only at 319 s in fin9g, fin10, fin11b),
+	 * which is why Wi-Fi stayed grey in Control Center for 5 minutes. en0 is the primary interface, not a virtual one.
+	 * guamp-wifi-vif: 0 = refused as before; 1 (default) = role 0 and no parent (ENXIO); 2 = both ENXIO; 3 = role 1 and an
+	 * empty parent name. Each answer is logged by the request log below.
+	 */
+	case 96:
+	case 97: {
+		uint32_t mode = 1;
+
+		PE_parse_boot_argn("guamp-wifi-vif", &mode, sizeof(mode));
+		if (mode == 0) {
+			return EOPNOTSUPP;
+		}
+		if (mode == 2 || (mode == 1 && request->req_type == 97)) {
+			return ENXIO;
+		}
+		if (request->req_type == 96) {
+			request->req_val = mode == 3 ? 1 : 0;
+			return 0;
+		}
+		char parent[16] = "";
+		return give(request, parent, sizeof(parent));
+	}
 	case 21:                                /* how the last join went */
 		/* guamp 29/10: iOS 17.7.11 reads 0xffff as "still running" (retries up to 40 times) and 0 as error -3902 */
 		lck_mtx_lock(&apple80211_lock);
@@ -455,6 +488,16 @@ get(struct apple80211req *request)
 			int32_t each[4], all, each_ext[4], all_ext;
 		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
 			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 17: {                              /* the noise floor, laid out like RSSI (16): see GUAMP_NOISE_DBM */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { GUAMP_NOISE_DBM }, .all = GUAMP_NOISE_DBM,
+			     .each_ext = { GUAMP_NOISE_DBM }, .all_ext = GUAMP_NOISE_DBM };
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
@@ -678,6 +721,8 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		if (state != NULL) {
 			hakios_sta_state(state);
 			link.rssi = status == 1 ? state->bss.rssi : 0;
+			link.noise = status == 1 ? (uint16_t)(int16_t)GUAMP_NOISE_DBM : 0;
+			link.snr = status == 1 ? (uint16_t)(state->bss.rssi - GUAMP_NOISE_DBM) : 0;
 			IOFreeData(state, sizeof(*state));
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);

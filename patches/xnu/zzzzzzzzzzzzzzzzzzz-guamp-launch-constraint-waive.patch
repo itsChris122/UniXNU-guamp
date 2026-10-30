@@ -1,0 +1,35 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7650,8 +7650,30 @@
+ 	/* call the launch constraints hook */
+ 	os_reason_t launch_constraint_reason;
+ 	if ((error = mac_proc_check_launch_constraints(p, imgp, &launch_constraint_reason)) != 0) {
+-		signature_failure_reason = launch_constraint_reason;
+-		goto done;
++		/*
++		 * guamp 30/10: the WebKit processes of the OS cryptex (/System/Library/ExtensionKit/Extensions/WebContentExtension
++		 * and NetworkingExtension) fail their self constraint here (AMFI c[1]p[1]m[1]e[4]), presumably because the cryptex
++		 * reaches / through the guamp union view and not as a sealed system volume: Safari loaded no page although the
++		 * network worked (fin11, fin11b; amfi_enforce_launch_constraints=0 is ignored). Their code signature and trust
++		 * cache entry were already checked above; only the launch constraint is waived, for binaries below
++		 * /ExtensionKit/Extensions/ and with a line in the log. guamp-lc-waive=0 enforces it again.
++		 */
++		uint32_t guamp_lc_waive = 1;
++		char guamp_lc_path[128];
++		int guamp_lc_len = sizeof(guamp_lc_path);
++
++		PE_parse_boot_argn("guamp-lc-waive", &guamp_lc_waive, sizeof(guamp_lc_waive));
++		if (guamp_lc_waive && imgp->ip_vp != NULLVP && vn_getpath(imgp->ip_vp, guamp_lc_path, &guamp_lc_len) == 0 &&
++		    strnstr(guamp_lc_path, "/ExtensionKit/Extensions/", sizeof(guamp_lc_path)) != NULL) {
++			printf("guamp-lc-waive: %s[%d] launch constraint %d waived\n", guamp_lc_path, proc_getpid(p), error);
++			if (launch_constraint_reason != OS_REASON_NULL) {
++				os_reason_free(launch_constraint_reason);
++			}
++			error = 0;
++		} else {
++			signature_failure_reason = launch_constraint_reason;
++			goto done;
++		}
+ 	}
+ 
+ #if XNU_TARGET_OS_OSX
