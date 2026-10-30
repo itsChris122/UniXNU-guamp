@@ -106,6 +106,8 @@ struct Stream {
     holds = holdDrops = drains = 0;
     routeChanges = volumeChanges = 0;
     trimmedFrames = 0;
+    lastWriteTicks = maxWriteGap = 0;
+    lateWrites = 0;
     sessionBase = framesPlayed();
   }
   uint64_t sessionPlayed() const { return framesPlayed() - sessionBase; }
@@ -132,7 +134,19 @@ struct Stream {
     clockRunning = false;
   }
   // Producer: copies up to n bytes (whole frames) that fit; returns the bytes taken
+  // Write timing of this sound (fin17: 29 s written in ~36 s with the right pitch): the longest pause between two writes of a
+  // running stream and how many pauses exceeded 32 ms (1.5 HAL buffers of 1024 frames), i.e. late IO cycles of coreaudiod
+  uint64_t lastWriteTicks = 0, maxWriteGap = 0;
+  uint32_t lateWrites = 0;
   uint32_t push(const uint8_t *src, uint32_t n, uint64_t now) {
+    if (running && now && ticksPerSec) {
+      if (lastWriteTicks && now > lastWriteTicks) {
+        const uint64_t gap = now - lastWriteTicks;
+        if (gap > maxWriteGap) maxWriteGap = gap;
+        if (gap > ticksPerSec * 32 / 1000) lateWrites++;
+      }
+      lastWriteTicks = now;
+    }
     uint32_t take = n < space() ? n : space();
     take -= take % GUAMP_AUDIO_BYTES_PER_FRAME;
     for (uint32_t i = 0; i < take; i++) buf[(wr + i) & (bytes - 1)] = src[i];
