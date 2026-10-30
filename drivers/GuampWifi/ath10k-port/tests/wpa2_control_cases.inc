@@ -36,17 +36,31 @@ static void control_regression_cases(void) {
   CHECK(st.state==NW_STA_UP,"valid current-AP traffic cancels beacon-miss grace period");
   nw_wifi_disconnect();spin(2);
 }
-/* guamp 29/10: a firmware that never reports a transmit status for message 4 (neither ACK nor NOACK) must not fail
- * every WPA2 join: the first handshake installs its keys after M4_STATUS_WAIT_MS (1.5 s) without a status. */
+/* guamp 29/10, 30/10: a firmware that never reports a transmit status for message 4 (neither ACK nor NOACK) must not hold
+ * the join: the first handshake installs its keys right after message 4, as wpa_supplicant. */
 static void m4_status_missing_case(void) {
   struct nw_wifi_status st; const int keys=n_setkey;
-  g_open=0; g_right=1; beacon(); g_conn_done=-1;
+  g_open=0; g_right=1; beacon(); g_conn_done=-1; g_msg4_seen=0;
   CHECK(nw_wifi_connect((const u8 *)SSID,strlen(SSID),NULL,PASS,strlen(PASS))==0,"WPA2 join accepted for the missing-status case");
-  spin(1200);
-  CHECK(g_conn_done==-1 && n_setkey==keys && g_pending_m4_skb,"without any message 4 status the keys still wait at 1.2 s");
-  spin(800); nw_wifi_status_get(&st);
-  CHECK(g_conn_done==NW_RES_OK && n_setkey==keys+2 && st.state==NW_STA_UP,"no transmit status at all for message 4: keys installed after 1.5 s (%d, %d keys)",g_conn_done,n_setkey-keys);
+  spin(300); nw_wifi_status_get(&st);
+  CHECK(g_conn_done==NW_RES_OK && n_setkey==keys+2 && st.state==NW_STA_UP && g_pending_m4_skb,"no transmit status at all for message 4: keys installed at once (%d, %d keys)",g_conn_done,n_setkey-keys);
+  spin(2000); CHECK(n_setkey==keys+2,"no second installation once the status wait would have expired");
   if(g_pending_m2_skb){kfree_skb(g_pending_m2_skb);g_pending_m2_skb=0;}
   if(g_pending_m4_skb){kfree_skb(g_pending_m4_skb);g_pending_m4_skb=0;}
   nw_wifi_disconnect(); spin(5);
+}
+
+/* guamp 30/10: WPA/WPA2 mixed network (RSN group TKIP, pairwise CCMP), as the user's router: our RSN element names group
+ * TKIP in the association and in message 2, and the 32-byte TKIP GTK is installed with its Michael keys swapped. */
+static void tkip_group_case(void) {
+  struct nw_wifi_status st; const int keys=n_setkey;
+  for (int i = 0; i < 32; i++) g_ap_gtk32[i] = (u8)(0xc0 + i);
+  g_group_tkip=1; g_open=0; g_right=1; g_expect_gtk_id=1; g_ap_gtk_id=1; beacon(); g_conn_done=-1; g_msg4_seen=0; g_assoc_rsn_group=g_m2_rsn_group=0;
+  CHECK(nw_wifi_connect((const u8 *)SSID,strlen(SSID),NULL,PASS,strlen(PASS))==0,"join accepted on a network with group TKIP");
+  spin(300); nw_wifi_status_get(&st);
+  CHECK(g_assoc_rsn_group==2 && g_m2_rsn_group==2,"mixed network: association and message 2 name group TKIP (%d, %d)",g_assoc_rsn_group,g_m2_rsn_group);
+  CHECK(g_conn_done==NW_RES_OK && n_setkey==keys+2 && st.state==NW_STA_UP,"mixed network: CCMP pairwise and TKIP group keys, link up (%d, %d keys)",g_conn_done,n_setkey-keys);
+  if(g_pending_m2_skb){kfree_skb(g_pending_m2_skb);g_pending_m2_skb=0;}
+  if(g_pending_m4_skb){kfree_skb(g_pending_m4_skb);g_pending_m4_skb=0;}
+  nw_wifi_disconnect(); spin(5); g_group_tkip=0;
 }

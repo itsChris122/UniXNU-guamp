@@ -327,10 +327,12 @@ get(struct apple80211req *request)
 		 * bits alone, from the first (the framework hands in a buffer that begins after the old
 		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
 		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
-		 * for a WPA2 network ("Unable to join").
+		 * for a WPA2 network ("Unable to join"). 30/10: also TKIP (1) and TKIP MIC (12), for WPA/WPA2
+		 * mixed networks whose group cipher is TKIP: without them wifid never sent ASSOCIATE (fin9d).
+		 * The station still joins with pairwise CCMP only (nw_sta.c rsn_check).
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));

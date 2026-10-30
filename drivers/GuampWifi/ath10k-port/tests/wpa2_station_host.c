@@ -33,7 +33,8 @@ static const struct lx_platform plat = { p_now, p_sleep, p_poll, p_log, p_halt, 
 static const u8 AP[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
 static const char *SSID = "TestNet", *PASS = "correct horse";
 static u8 g_pmk[32], g_ptk[48], g_anonce[32], g_snonce[32], g_sta_mac[6]; static u64 g_replay = 100;
-static int g_stage, g_open, g_right;
+static int g_stage, g_open, g_right, g_group_tkip;   /* g_group_tkip: WPA/WPA2 mixed network, group cipher TKIP */
+static u8 g_ap_gtk32[32];
 static u8 g_last_msg3[200]; static unsigned g_last_msg3_len;
 static struct ieee80211_supported_band band;
 static struct ieee80211_channel chans[3]; static struct ieee80211_rate rates[12];
@@ -46,7 +47,7 @@ static void beacon(void) {
   u8 *e = skb_put(skb, 2 + strlen(SSID)); e[0] = 0; e[1] = strlen(SSID); memcpy(e + 2, SSID, strlen(SSID));
   e = skb_put(skb, 10); e[0] = 1; e[1] = 8; static const u8 r[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 }; memcpy(e + 2, r, 8);
   e = skb_put(skb, 6); e[0] = 5; e[1] = 4; e[2] = 0; e[3] = 2; e[4] = 0; e[5] = 0;     /* TIM with DTIM period 2 */
-  if (!g_open) { static const u8 rsn[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 }; skb_put_data(skb, rsn, sizeof rsn); }
+  if (!g_open) { u8 rsn[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 }; if (g_group_tkip) rsn[7] = 2; skb_put_data(skb, rsn, sizeof rsn); }
   inject(skb, 2437); }
 static struct sk_buff *mgmt_to_sta(u16 stype, const void *body, unsigned n) {
   struct sk_buff *skb = alloc_skb(200 + n, 0); struct ieee80211_mgmt *m = skb_put_zero(skb, 24);
@@ -72,13 +73,22 @@ static int check_mic(const u8 *k, unsigned n) { u8 c[400], h[20]; memcpy(c, k, n
 static const u8 GTK[16] = { 0xa0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 static u8 g_ap_gtk[16]; static int g_ap_gtk_id=1, g_msg3_gtk=1;
 static u8 g_last_group_update[200]; static unsigned g_last_group_update_len;
+static void send_msg3_tkip(void) {   /* GTK KDE with a 32-byte TKIP group key: 2 + 38 bytes, wrapped to 48 */
+  u8 kd[40], wrapped[48], f[220]; memset(kd, 0, sizeof kd); kd[0] = 0xdd; kd[1] = 38; kd[2] = 0x00; kd[3] = 0x0f; kd[4] = 0xac; kd[5] = 1; kd[6] = g_ap_gtk_id; memcpy(kd + 8, g_ap_gtk32, 32);
+  aes_wrap(g_ptk + 16, kd, 40, wrapped);
+  memset(f, 0, sizeof f); f[0] = 2; f[1] = 3; f[4] = 2; be16(f + 5, 0x13ca); be16(f + 7, 16); g_replay++; for (int i = 0; i < 8; i++) f[9 + i] = g_replay >> (56 - 8 * i);
+  memcpy(f + 17, g_anonce, 32); be16(f + 97, 48); memcpy(f + 99, wrapped, 48); unsigned total = 99 + 48; be16(f + 2, total - 4);
+  u8 h[20]; nw_hmac_sha1(g_ptk, 16, f, total, h); memcpy(f + 81, h, 16);
+  memcpy(g_last_msg3, f, total); g_last_msg3_len = total; ap_eapol(f, total); }
 static void send_msg3(void) {
+  if (g_group_tkip) { send_msg3_tkip(); return; }
   u8 kd[40], wrapped[48], f[200]; memset(kd, 0, sizeof kd); if(g_msg3_gtk) { kd[0] = 0xdd; kd[1] = 22; kd[2] = 0x00; kd[3] = 0x0f; kd[4] = 0xac; kd[5] = 1; kd[6] = g_ap_gtk_id; kd[7] = 0; memcpy(kd + 8, g_ap_gtk, 16); kd[24] = 0xdd; } /* GTK KDE and padding */
   aes_wrap(g_ptk + 16, kd, 32, wrapped);
   memset(f, 0, sizeof f); f[0] = 2; f[1] = 3; f[4] = 2; be16(f + 5, 0x13ca); be16(f + 7, 16); g_replay++; for (int i = 0; i < 8; i++) f[9 + i] = g_replay >> (56 - 8 * i);
   memcpy(f + 17, g_anonce, 32); be16(f + 97, 40); memcpy(f + 99, wrapped, 40); unsigned total = 99 + 40; be16(f + 2, total - 4);
   u8 h[20]; nw_hmac_sha1(g_ptk, 16, f, total, h); memcpy(f + 81, h, 16);
   memcpy(g_last_msg3, f, total); g_last_msg3_len = total; ap_eapol(f, total); }
+static int g_assoc_rsn_group, g_m2_rsn_group, g_m4_keys_before = -1, g_m4_protected;
 static void resend_msg3(void) { if (g_last_msg3_len) ap_eapol(g_last_msg3, g_last_msg3_len); }
 static void send_group_update(int corrupt_mic) {
   u8 kd[40]={0}, wrapped[48], f[200]={0}, h[20];
@@ -111,7 +121,10 @@ static void op_cfg(struct ieee80211_hw *hw, struct ieee80211_vif *v, u64 ch) { (
 static int op_setkey(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct ieee80211_vif *v, struct ieee80211_sta *s, struct ieee80211_key_conf *k) {
   (void)hw; (void)v; if (cmd != SET_KEY) { if(k->flags&IEEE80211_KEY_FLAG_PAIRWISE)n_disable_pairwise++;else n_disable_group++; return 0; }
   n_setkey++; if (k->flags & IEEE80211_KEY_FLAG_PAIRWISE) { CHECK(s != 0, "pairwise key has a station"); CHECK(!memcmp(k->key, g_ptk + 32, 16), "TK equals the AP's"); if(g_fail_pairwise){g_fail_pairwise--;return -EIO;} g_pk = k; }
-  else { CHECK(!memcmp(k->key, g_ap_gtk, 16) && k->keyidx == g_expect_gtk_id, "GTK and its index arrive intact"); if(g_fail_group){g_fail_group--;return -EIO;} g_gk = k; } return 0; }
+  else if (g_group_tkip) { CHECK(k->cipher == WLAN_CIPHER_SUITE_TKIP && k->keylen == 32 && k->keyidx == g_expect_gtk_id, "TKIP group key: cipher, length and index");
+    CHECK(!memcmp(k->key, g_ap_gtk32, 16) && !memcmp(k->key + 16, g_ap_gtk32 + 24, 8) && !memcmp(k->key + 24, g_ap_gtk32 + 16, 8), "TKIP group key: Michael keys swapped for the supplicant");
+    g_gk = k; }
+  else { CHECK(k->cipher == WLAN_CIPHER_SUITE_CCMP && !memcmp(k->key, g_ap_gtk, 16) && k->keyidx == g_expect_gtk_id, "GTK and its index arrive intact"); if(g_fail_group){g_fail_group--;return -EIO;} g_gk = k; } return 0; }
 static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struct sk_buff *skb) {
   (void)hw; (void)c; n_tx++;
   /* ath10k advertises HW_80211_ENCAP: ordinary data reaches its TX op as
@@ -126,15 +139,16 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
   if (ieee80211_is_auth(h->frame_control)) { g_auth_seen = 1; u8 b[6] = { 0, 0, 2, 0, 0, 0 }; inject(mgmt_to_sta(IEEE80211_STYPE_AUTH, b, 6), 2437); }
   else if (ieee80211_is_assoc_req(h->frame_control)) { g_assoc_seen = 1;
     const u8 *ie = skb->data + 24 + 4; unsigned left = skb->len - 28; int ssid_ok = 0, rsn_ok = 0;
-    while (left >= 2 && left >= 2u + ie[1]) { if (ie[0] == 0 && ie[1] == strlen(SSID) && !memcmp(ie + 2, SSID, ie[1])) ssid_ok = 1; if (ie[0] == 48 && ie[1] == 20) rsn_ok = 1; left -= 2 + ie[1]; ie += 2 + ie[1]; }
+    while (left >= 2 && left >= 2u + ie[1]) { if (ie[0] == 0 && ie[1] == strlen(SSID) && !memcmp(ie + 2, SSID, ie[1])) ssid_ok = 1; if (ie[0] == 48 && ie[1] == 20) { rsn_ok = 1; g_assoc_rsn_group = ie[7]; } left -= 2 + ie[1]; ie += 2 + ie[1]; }
     CHECK(ssid_ok, "association request names the network"); CHECK(rsn_ok == !g_open, "association request carries the RSN element when needed");
     u8 b[6] = { 0x11, 0x04, 0, 0, 0x01, 0xc0 }; inject(mgmt_to_sta(IEEE80211_STYPE_ASSOC_RESP, b, 6), 2437);
     if (!g_open) { g_stage = 1; send_msg1(); } }
   else if (ieee80211_is_data(h->frame_control) && skb->len > 26 + 8 && skb->data[26 + 6] == 0x88 && skb->data[26 + 7] == 0x8e) {
     const u8 *k = skb->data + 26 + 8; unsigned n = skb->len - 26 - 8; unsigned info = k[5] << 8 | k[6];
-    if (info == 0x010a) { g_msg2_seen = 1; memcpy(g_snonce, k + 17, 32); derive(); int ok = check_mic(k, n); if (g_right) CHECK(ok, "message 2 MIC verifies under the PTK"); else CHECK(!ok, "message 2 MIC differs under a wrong passphrase");
+    if (info == 0x010a) { g_msg2_seen = 1; if (n >= 99 + 22) g_m2_rsn_group = k[99 + 7]; memcpy(g_snonce, k + 17, 32); derive(); int ok = check_mic(k, n); if (g_right) CHECK(ok, "message 2 MIC verifies under the PTK"); else CHECK(!ok, "message 2 MIC differs under a wrong passphrase");
       if (g_pending_m2_skb) kfree_skb(g_pending_m2_skb); g_pending_m2_skb=skb; send_msg3(); return; }
-    else if (info == 0x030a) { g_msg4_seen = 1; g_msg4_tx_count++; CHECK(check_mic(k, n), "message 4 MIC verifies");
+    else if (info == 0x030a) { if (!g_msg4_seen) g_m4_keys_before = n_setkey; g_msg4_seen = 1; g_msg4_tx_count++;
+      if (ieee80211_has_protected(h->frame_control) || txi->control.hw_key) g_m4_protected = 1; CHECK(check_mic(k, n), "message 4 MIC verifies");
       if (g_pending_m4_skb) kfree_skb(g_pending_m4_skb); g_pending_m4_skb=skb; return; }
     else if (info == 0x0302) { g_group_m4_count++; CHECK(check_mic(k,n),"group-key message 2 MIC verifies"); } }
   else if (ieee80211_is_data(h->frame_control)) { if (g_last_data) kfree_skb(g_last_data); g_last_data = skb; (void)fc; return; }
@@ -201,16 +215,20 @@ int main(void) {
   /* the right one */
   g_right = 1; g_conn_done = -1; g_stage = 0; n_state = 0; n_setkey = 0; g_msg2_seen = g_msg4_seen = 0; g_msg4_tx_count = 0;
   nw_wifi_connect((const u8 *)SSID, strlen(SSID), 0, pskhex, 64); spin(500);
-  CHECK(g_msg4_seen && g_conn_done == -1 && n_setkey == 0, "message 4 alone does not authorize or install keys before TX completion");
-  rx_regression_unauthorized();
+  /* guamp 30/10: as wpa_supplicant, the keys go in right after message 4 is handed to the driver (fin9g: the WCN3990 gave no
+   * transmit status for it and the access point gave up); message 4 itself leaves before them and unprotected. */
+  CHECK(g_msg4_seen && g_m4_keys_before == 0 && !g_m4_protected, "message 4 is handed to the driver unprotected, before any key");
+  CHECK(g_conn_done == NW_RES_OK && n_setkey == 2, "keys installed and link authorized right after message 4, without a TX status");
+  (void)rx_regression_unauthorized;
   complete_tx(&g_pending_m2_skb,true);
-  CHECK(g_conn_done == -1 && n_setkey == 0, "a late ACK for message 2 cannot complete message 4");
+  CHECK(g_conn_done == NW_RES_OK && n_setkey == 2, "a late ACK for message 2 changes nothing");
   complete_tx(&g_pending_m4_skb,false);
-  CHECK(g_conn_done == -1 && n_setkey == 0, "a negative message 4 TX status cannot authorize");
+  CHECK(g_conn_done == NW_RES_OK && n_setkey == 2, "a negative message 4 TX status does not reinstall or drop the keys");
   resend_msg3(); spin(5);
-  CHECK(g_msg4_tx_count >= 2 && n_setkey == 0, "replayed message 3 is answered again without reinstalling keys");
+  CHECK(g_msg4_tx_count >= 2 && n_setkey == 2 && !g_m4_protected, "replayed message 3 is answered again, unprotected, without reinstalling keys");
   complete_tx(&g_pending_m4_skb,true); spin(300);
   CHECK(g_auth_seen && g_assoc_seen && g_msg2_seen && g_msg4_seen, "auth, assoc, message 2 and message 4 all went out");
+  CHECK(g_assoc_rsn_group == 4 && g_m2_rsn_group == 4, "CCMP network: association and message 2 name group CCMP");
   CHECK(g_conn_done == NW_RES_OK, "connected (%d)", g_conn_done); CHECK(n_setkey == 2, "two keys installed (%d)", n_setkey);
   CHECK(n_state >= 4 && g_states[0] == IEEE80211_STA_NONE && g_states[n_state - 1] == IEEE80211_STA_AUTHORIZED, "station state ends authorized");
   struct nw_wifi_status st; nw_wifi_status_get(&st); CHECK(st.state == NW_STA_UP && st.freq_mhz == 2437, "status says up");
@@ -259,5 +277,6 @@ int main(void) {
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
   control_regression_cases();
   m4_status_missing_case();
+  tkip_group_case();
   ready_regression_cases(hw);
   printf("%s\n", fails ? "FAILED" : "all passed"); return fails ? 1 : 0; }
