@@ -14,7 +14,7 @@
 +    "guamp-defaults-1030=1 guamp-gpu-all=1 guamp-gpu-all-deny=mediaserverd guamp-ca-metal-reset=1 guamp-ca-metal-noframe=900 guamp-disk-capacity=64 "
 +    "guamp-adsp=1 guamp-adsp-ipc=6 guamp-adsp-delay=8 guamp-audio-dev=1 guamp-audio-plugin=1 guamp-audio-hw=1 guamp-audio-hw-att=12 "
 +    "guamp-audio-mic=1 guamp-audio-mic-gain=30 guamp-sensors=2 guamp-slim=1 guamp-wifi-start=2 guamp-wifi-ui=1 guamp-biokit=1 "
-+    "guamp-emmc-ra=64 guamp-ls-auto=2";
++    "guamp-emmc-ra=64 guamp-ls-auto=3";
 +
 +static boolean_t
 +guamp_bootarg_default(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
