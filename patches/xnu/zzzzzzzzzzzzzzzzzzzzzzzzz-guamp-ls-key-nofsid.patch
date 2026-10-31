@@ -1,0 +1,25 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index c908c3b..7503f3e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9204,7 +9204,19 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
+ 		vnode_close(vp, FREAD, ctx);
+ 	}
+ 	/* "ffffffff ffffffff hhhhhhhhhhhhhhhh\n": 35 bytes */
+-	snprintf(key, sizeof(key), "%08x %08x %016llx\n", (uint32_t)fsid.val[0], (uint32_t)fsid.val[1], (unsigned long long)hash);
++	/*
++	 * guamp 31/10: with guamp-apps-rootvol (default) the view reports the root volume's fsid, whose device number can differ
++	 * from boot to boot (fin21w: rebuilt 1, deleted 2, the addon unchanged); lsd no longer tells the view's apps apart by it,
++	 * so the key keeps only the hash of the addon's apps (fsid written as zeros). guamp-apps-rootvol=0: the fsid as before.
++	 */
++	uint32_t keep_fsid = 1;
++	if (!PE_parse_boot_argn("guamp-apps-rootvol", &keep_fsid, sizeof(keep_fsid)) || keep_fsid != 0) {
++		keep_fsid = 0;
++	} else {
++		keep_fsid = 1;
++	}
++	snprintf(key, sizeof(key), "%08x %08x %016llx\n", keep_fsid ? (uint32_t)fsid.val[0] : 0u,
++	    keep_fsid ? (uint32_t)fsid.val[1] : 0u, (unsigned long long)hash);
+ 	if (!native_guamp_ls_auto_entries && strlen(old) == 35) {
+ 		memcpy(key + 18, old + 18, 18);	/* no addon this boot: the apps written before are unchanged */
+ 	}
