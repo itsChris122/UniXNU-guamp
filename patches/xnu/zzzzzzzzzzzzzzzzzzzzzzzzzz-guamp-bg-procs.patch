@@ -1,0 +1,111 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 779aad9..92cc3a4 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4549,3 +4549,106 @@ guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	return 0;
+ }
++
++/*
++ * guamp 31/10: the Music, Stocks and Calendar widget extensions run at ~95-99 % of a core each for as long as the phone is on
++ * (fin21w guamp-wprobe=MusicWidgets: the main thread always inside CoreText TOpenTypeMorph::ShapeGlyphs / OTL GSUB lookups),
++ * which starved the audio server and the render server. Until the cause is fixed, processes whose name starts with one of
++ * guamp-bg-procs (default "MusicWidgets,StocksWidget,CalendarWidget"; "0" = off) are put in the Darwin background band
++ * (TASK_POLICY_DARWIN_BG, external): they still run, on what the rest leaves. Checked every 15 s for 20 minutes.
++ */
++#include <kern/policy_internal.h>
++
++static thread_call_t guamp_bg_call;
++static uint32_t guamp_bg_round;
++static char guamp_bg_names[96] = "MusicWidgets,StocksWidget,CalendarWidget";
++#define GUAMP_BG_MAX 16
++static int guamp_bg_done[GUAMP_BG_MAX];
++static uint32_t guamp_bg_count;
++
++static bool
++guamp_bg_wanted(const char *comm)
++{
++	const char *at = guamp_bg_names;
++
++	while (*at) {
++		const char *end = at;
++		while (*end && *end != ',') {
++			end++;
++		}
++		size_t len = (size_t)(end - at);
++		if (len && strncmp(comm, at, len) == 0) {
++			return true;
++		}
++		at = *end ? end + 1 : end;
++	}
++	return false;
++}
++
++static void
++guamp_bg_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	task_t found[GUAMP_BG_MAX];
++	int pids[GUAMP_BG_MAX];
++	char names[GUAMP_BG_MAX][17];
++	uint32_t n = 0;
++	task_t task;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *bsd_info = get_bsdtask_info(task);
++		if (bsd_info == NULL || n >= GUAMP_BG_MAX) {
++			continue;
++		}
++		const char *comm = proc_name_address(bsd_info);
++		if (!guamp_bg_wanted(comm)) {
++			continue;
++		}
++		int pid = task_pid(task);
++		bool seen = false;
++		for (uint32_t i = 0; i < guamp_bg_count; i++) {
++			seen = seen || guamp_bg_done[i] == pid;
++		}
++		if (seen) {
++			continue;
++		}
++		task_reference(task);
++		found[n] = task;
++		pids[n] = pid;
++		strlcpy(names[n], comm, sizeof(names[n]));
++		n++;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	for (uint32_t i = 0; i < n; i++) {
++		proc_set_task_policy(found[i], TASK_POLICY_EXTERNAL, TASK_POLICY_DARWIN_BG, TASK_POLICY_ENABLE);
++		task_deallocate(found[i]);
++		if (guamp_bg_count < GUAMP_BG_MAX) {
++			guamp_bg_done[guamp_bg_count++] = pids[i];
++		}
++		printf("guamp-bg-procs: %s[%d] put in the background band\n", names[i], pids[i]);
++	}
++	if (++guamp_bg_round < 80) {
++		uint64_t deadline;
++		clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(guamp_bg_call, deadline);
++	}
++}
++
++__startup_func
++static void
++guamp_bg_init(void)
++{
++	char names[sizeof(guamp_bg_names)];
++
++	if (PE_parse_boot_argn("guamp-bg-procs", names, sizeof(names))) {
++		if (!strcmp(names, "0")) {
++			return;
++		}
++		strlcpy(guamp_bg_names, names, sizeof(guamp_bg_names));
++	}
++	guamp_bg_call = thread_call_allocate_with_options(guamp_bg_fire, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(guamp_bg_call, deadline);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, guamp_bg_init);
