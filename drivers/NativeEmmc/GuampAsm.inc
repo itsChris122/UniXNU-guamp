@@ -351,11 +351,20 @@ private:
     }
   }
   // Keep every free slot queued: fill it (silence when short), then ASM_DATA_CMD_WRITE_V2
+  // A slot filled for a write the channel refused (busy) keeps its period and is sent as it is on the next pass: refilling it
+  // took a new period out of the ring and threw the first away (fin23: 917 writes, 1295 periods taken, 12 gaps in 7 s).
+  bool slotFilled[kSlots] = {};
+  uint32_t resent = 0;
   void feed(uint32_t now) {
     for (uint32_t s = 0; s < kSlots && shm.cpu; s++) {
       if (slotBusy[s]) continue;
       uint8_t *dst = shm.cpu + s * kSlotStride;
-      if (fill) fill(ctx, dst, kFrames, bits);
+      if (!slotFilled[s]) {
+        if (fill) fill(ctx, dst, kFrames, bits);
+        slotFilled[s] = true;
+      } else {
+        resent++;
+      }
       uint8_t pkt[kHdrBytes + 32];
       const uint32_t n = asmWrite(pkt, sizeof(pkt), seq, port(), shm.iovaLsw + s * kSlotStride, shm.msw, handle,
                                   periodBytes(), seq);
@@ -364,6 +373,7 @@ private:
         return;
       }
       slotBusy[s] = true;
+      slotFilled[s] = false;
       inFlight++;
       writes++;
       seq++;
