@@ -248,6 +248,14 @@ static void send_auth(void) {
   mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);
   u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;      /* open system, sequence 1, status 0 */
   tx_frame(skb); }
+/* guamp 31/10: "Unable to join": the access point answered no authentication at all (8 tries in ~2.4 s), now and then, with the
+ * same AP that took us minutes before. After a link we lost without telling it (the RX watchdog), it can still hold our old
+ * association and ignore a new authentication for a while. A deauthentication (reason 3, leaving) first clears it. */
+static void send_deauth(void) {
+  struct sk_buff *skb = new_frame(4); if (!skb) return;
+  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DEAUTH);
+  u8 *b = skb_put_zero(skb, 2); b[0] = 3; b[1] = 0;
+  tx_frame(skb); }
 static int rates_2g[] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c };
 static int rates_5g[] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
 
@@ -799,7 +807,7 @@ static void timer_fn(struct work_struct *w) {
       connect_done(C.hs_stage ? NW_RES_BAD_KEY : NW_RES_TIMEOUT); return; }
   }
   switch (C.state) {
-  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
+  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 15) { connect_done(NW_RES_TIMEOUT); return; }   /* 16 x 300 ms (was 8: 2.4 s) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
   case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } send_assoc(); } break;
   case NW_STA_KEYS: break;
   case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;
@@ -837,7 +845,7 @@ static void start_connect(const struct nw_request *request) {
   link_changed(BSS_CHANGED_BSSID | BSS_CHANGED_TXPOWER);
   C.state = NW_STA_AUTH; C.tries = 0; C.started = lx_now_ms(); nw_wifi_stats.stage = 7;
   lx_log(6, "wifi: connecting to %02x:%02x:%02x:%02x:%02x:%02x on %u MHz, signal %d dBm, transmit power %d dBm", C.ap.bssid[0], C.ap.bssid[1], C.ap.bssid[2], C.ap.bssid[3], C.ap.bssid[4], C.ap.bssid[5], C.ap.freq, C.ap.signal, g_vif->bss_conf.txpower);
-  send_auth(); lx_queue_delayed(&g_timer, 100); }
+  send_deauth(); send_auth(); lx_queue_delayed(&g_timer, 100); }
 
 /* ---- the data path ---- */
 static void send_queued(void) {

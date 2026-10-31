@@ -37,6 +37,7 @@ enum {
   kSpeaker = 2, kSpeakerOut, kSpeakerIn, kSpeakerVolume, kSpeakerMute,
   kHawking, kHawkingIn,
   kCodec, kCodecIn, kCodecSource,
+  kActuator, kActuatorOut,
   kObjectCount
 };
 static const Float64 kRate = 48000.0;
@@ -57,6 +58,10 @@ static Device gDevices[] = {
   {kSpeaker, kSpeakerOut, kSpeakerIn, kSpeakerVolume, kSpeakerMute, 0, 2, 2, CFSTR("Speaker"), CFSTR("Speaker"), 0, {0, 0, 0, 0, 0}},
   {kHawking, 0, kHawkingIn, 0, 0, 0, 0, 1, CFSTR("Hawking"), CFSTR("Hawking"), 0, {0, 0, 0, 0, 0}},
   {kCodec, 0, kCodecIn, 0, 0, kCodecSource, 0, 1, CFSTR("Codec"), CFSTR("Codec"), 0, {0, 0, 0, 0, 0}},
+  // "Actuator" (31/10): the iPhone's Taptic Engine, one output channel, as HakiOS's plug-in has it. VirtualAudio builds the
+  // ringtone route of the iPhone's tables with the actuator in it (the ringer's vibration is a waveform on it); without the
+  // device the ringtone previews never reached /dev/guamp-audio while text tones played. Its samples are dropped for now.
+  {kActuator, kActuatorOut, 0, 0, 0, 0, 1, 0, CFSTR("Actuator"), CFSTR("Actuator"), 0, {0, 0, 0, 0, 0}},
 };
 static const UInt32 kDeviceCount = sizeof(gDevices) / sizeof(gDevices[0]);
 
@@ -357,7 +362,7 @@ static OSStatus property(AudioObjectID object, const AudioObjectPropertyAddress 
   r->status = kAudioHardwareNoError;
   const UInt32 sel = a->mSelector;
   if (object == kPlugIn) {
-    AudioObjectID list[3] = {kSpeaker, kHawking, kCodec};
+    AudioObjectID list[4] = {kSpeaker, kHawking, kCodec, kActuator};
     switch (sel) {
       case kAudioObjectPropertyBaseClass: putU32(r, kAudioObjectClassID); break;
       case kAudioObjectPropertyClass: putU32(r, kAudioPlugInClassID); break;
@@ -606,7 +611,7 @@ static OSStatus isSettable(AudioServerPlugInDriverRef d, AudioObjectID object, p
   if (!a || !out) return kAudioHardwareIllegalOperationError;
   if (!hasProperty(d, object, pid, a)) return kAudioHardwareUnknownPropertyError;
   const UInt32 s = a->mSelector;
-  *out = (object == kSpeaker || object == kHawking || object == kCodec) ? s == kAudioDevicePropertyNominalSampleRate
+  *out = (object == kSpeaker || object == kHawking || object == kCodec || object == kActuator) ? s == kAudioDevicePropertyNominalSampleRate
        : object == kSpeakerVolume ? s == kAudioLevelControlPropertyScalarValue || s == kAudioLevelControlPropertyDecibelValue
        : object == kSpeakerMute   ? s == kAudioBooleanControlPropertyValue
        : object == kCodecSource   ? s == kAudioSelectorControlPropertyCurrentItem
