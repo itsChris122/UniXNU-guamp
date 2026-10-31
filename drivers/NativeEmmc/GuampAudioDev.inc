@@ -50,7 +50,7 @@ struct SessionLine {
   uint32_t n = 0, writes = 0, blocked = 0, ioctls = 0, underruns = 0, prerollWaits = 0, maxQueued = 0, routes = 0;
   uint32_t volumes = 0, holds = 0, holdDrops = 0, drains = 0, gain = 0;
   uint64_t written = 0, played = 0, trimmed = 0;
-  uint32_t maxGapMs = 0, lateWrites = 0;
+  uint32_t maxGapMs = 0, lateWrites = 0, pulls = 0, pullMs = 0, maxBurst = 0;
   int pid = -1;
   char who[32] = {};
 };
@@ -80,6 +80,9 @@ void sessionTail(SessionLine *l) {
   l->trimmed = gStream.trimmedFrames;
   l->maxGapMs = gStream.ticksPerSec ? static_cast<uint32_t>(gStream.maxWriteGap * 1000 / gStream.ticksPerSec) : 0;
   l->lateWrites = gStream.lateWrites;
+  l->pulls = gStream.pulls;
+  l->pullMs = gStream.ticksPerSec ? static_cast<uint32_t>((gStream.lastPull - gStream.firstPull) * 1000 / gStream.ticksPerSec) : 0;
+  l->maxBurst = gStream.maxBurst;
   l->maxQueued = gStream.maxQueued;
 }
 
@@ -89,11 +92,11 @@ void logSession(const SessionLine &l) {
   // periods, deepest queue the ADSP saw (ms of latency), writes and their average size, final gain (Q16)
   IOLog("GuampAudioDev: session %u %s[%d]: %llu frames written, %llu played, %u underruns, %u pre-roll, max queue %u ms, "
         "%u writes (avg %llu frames, %u blocked), %u ioctls, %u route / %u volume changes, gain %x, holds %u (dropped %u), "
-        "drains %u, trimmed %llu, longest write pause %u ms, %u pauses over 32 ms%s\n", l.n, l.who, l.pid, static_cast<unsigned long long>(l.written),
+        "drains %u, trimmed %llu, longest write pause %u ms, %u pauses over 32 ms, DSP took %u periods in %u ms (burst %u)%s\n", l.n, l.who, l.pid, static_cast<unsigned long long>(l.written),
         static_cast<unsigned long long>(l.played), l.underruns, l.prerollWaits, l.maxQueued / (GUAMP_AUDIO_RATE / 1000),
         l.writes, static_cast<unsigned long long>(l.writes ? l.written / l.writes : 0), l.blocked, l.ioctls, l.routes,
         l.volumes, l.gain, l.holds, l.holdDrops, l.drains, static_cast<unsigned long long>(l.trimmed), l.maxGapMs,
-        l.lateWrites, l.cut ? " (tail cut short by the next open)" : "");
+        l.lateWrites, l.pulls, l.pullMs, l.maxBurst, l.cut ? " (tail cut short by the next open)" : "");
 }
 
 // The pending session line once its tail has been played (or dropped); called without the device lock

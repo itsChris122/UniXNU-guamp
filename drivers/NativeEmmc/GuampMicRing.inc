@@ -79,9 +79,15 @@ struct Capture {
     peak = 0;
   }
   // Consumer: up to n bytes (whole frames); returns the bytes copied
+  // Reads that found less than asked (31/10: recordings crackle at the right speed; the plug-in pads a short read)
+  uint32_t shortReads = 0, emptyReads = 0;
   uint32_t take(uint8_t *dst, uint32_t n) {
     n -= n % GUAMP_MIC_FRAME_BYTES;
     const uint32_t have = used() < n ? used() : n;
+    if (have < n) {
+      if (have) shortReads++;
+      else emptyReads++;
+    }
     for (uint32_t i = 0; i < have; i++) dst[i] = buf[(rd + i) & (bytes - 1)];
     rd += have;
     read += have;

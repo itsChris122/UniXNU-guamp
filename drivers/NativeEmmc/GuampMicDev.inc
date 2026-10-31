@@ -330,13 +330,14 @@ int mClose(dev_t dev, int flags, int devtype, struct proc *p) {
   IOLockLock(gLock);
   gRing.produce(mach_absolute_time());
   const uint64_t captured = gRing.framesCaptured(), read = gRing.read / GUAMP_MIC_FRAME_BYTES;
-  const uint32_t overruns = gRing.overruns;
+  const uint32_t overruns = gRing.overruns, shortReads = gRing.shortReads, emptyReads = gRing.emptyReads;
+  gRing.shortReads = gRing.emptyReads = 0;
   gRing.running = false;
   gRing.rd = gRing.wr;
   gOpen = false;
   IOLockUnlock(gLock);
-  IOLog("GuampMic: close; %llu frames captured, %llu read, %u overruns, %u reads\n",
-        static_cast<unsigned long long>(captured), static_cast<unsigned long long>(read), overruns, gReads);
+  IOLog("GuampMic: close; %llu frames captured, %llu read, %u overruns, %u reads (%u short, %u empty)\n",
+        static_cast<unsigned long long>(captured), static_cast<unsigned long long>(read), overruns, gReads, shortReads, emptyReads);
   return 0;
 }
 int mRead(dev_t dev, struct uio *uio, int ioflag) {

@@ -108,6 +108,8 @@ struct Stream {
     trimmedFrames = 0;
     lastWriteTicks = maxWriteGap = 0;
     lateWrites = 0;
+    pulls = burst = maxBurst = 0;
+    firstPull = lastPull = 0;
     sessionBase = framesPlayed();
   }
   uint64_t sessionPlayed() const { return framesPlayed() - sessionBase; }
@@ -165,7 +167,18 @@ struct Stream {
   // ADSP consumer: `frames` frames into dst as `bits`-bit samples (16: s16 LE; 24: s24 in the top 24 bits of an s32 LE,
   // the playback rule of asm_multi_channel_pcm_fmt_blk_v2), with the volume gain; silence for the missing part (an
   // underrun while running). Returns the frames taken from the ring.
+  // ADSP pace of this sound (31/10: underruns with on-time writes and 300 ms queued): periods taken, first/last time, and the
+  // largest number taken within 2 ms of each other (a burst of WRITE_DONEs)
+  uint32_t pulls = 0, burst = 0, maxBurst = 0;
+  uint64_t firstPull = 0, lastPull = 0;
   uint32_t pull(uint8_t *dst, uint32_t frames, uint32_t bits, uint64_t now) {
+    if (running && ticksPerSec) {
+      if (!pulls) firstPull = now;
+      burst = (pulls && now - lastPull < ticksPerSec / 500) ? burst + 1 : 1;
+      if (burst > maxBurst) maxBurst = burst;
+      lastPull = now;
+      pulls++;
+    }
     trim();
     const uint32_t avail = used() / GUAMP_AUDIO_BYTES_PER_FRAME;
     if (avail > maxQueued) maxQueued = avail;
