@@ -1,0 +1,21 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 68a4773..539cb83 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4649,6 +4649,16 @@ guamp_bg_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	lck_mtx_unlock(&tasks_threads_lock);
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		proc_set_task_policy(found[i], TASK_POLICY_EXTERNAL, TASK_POLICY_DARWIN_BG, TASK_POLICY_ENABLE);
++		/*
++		 * guamp 31/10: guamp-bg-procs-suspend=1 also suspends them (test: do backboardd's recompositions and the display copies,
++		 * ~24 frames/s at rest, come from these widgets re-rendering forever?). They keep their last snapshot on the Home Screen.
++		 */
++		uint32_t suspend = 0;
++		if (PE_parse_boot_argn("guamp-bg-procs-suspend", &suspend, sizeof(suspend)) && suspend) {
++			extern kern_return_t task_suspend_internal(task_t);
++			kern_return_t kr = task_suspend_internal(found[i]);
++			printf("guamp-bg-procs: %s[%d] suspended (%d)\n", names[i], pids[i], kr);
++		}
+ 		task_deallocate(found[i]);
+ 		if (guamp_bg_count < GUAMP_BG_MAX) {
+ 			guamp_bg_done[guamp_bg_count++] = pids[i];
