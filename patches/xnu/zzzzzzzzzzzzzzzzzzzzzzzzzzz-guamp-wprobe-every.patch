@@ -1,0 +1,70 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 92cc3a4..68a4773 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4399,6 +4399,17 @@ guamp_wprobe_arm(void)
+ {
+ 	uint64_t deadline;
+ 
++	uint32_t every = 0;
++
++	/* guamp 31/10: guamp-wprobe-every=<s> probes every <s> seconds for 60 rounds (ringtone previews happen when the user taps) */
++	if (PE_parse_boot_argn("guamp-wprobe-every", &every, sizeof(every)) && every) {
++		if (guamp_wprobe_round >= 60) {
++			return;
++		}
++		clock_interval_to_deadline(every, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(guamp_wprobe_call, deadline);
++		return;
++	}
+ 	if (guamp_wprobe_round >= sizeof(guamp_wprobe_secs) / sizeof(guamp_wprobe_secs[0])) {
+ 		return;
+ 	}
+@@ -4411,10 +4422,20 @@ guamp_wprobe_fire(__unused thread_call_param_t p0, __unused thread_call_param_t
+ {
+ 	char name[32] = "wifid";
+ 	thread_t list[GUAMP_WPROBE_THREADS];
+-	uint32_t count = 0, slide = 0, round = guamp_wprobe_round++;
++	uint32_t count = 0, slide = 0, round = guamp_wprobe_round;
+ 	task_t found = TASK_NULL, task;
++	static bool second;
+ 
+-	PE_parse_boot_argn("guamp-wprobe", name, sizeof(name));
++	if (second) {
++		if (!PE_parse_boot_argn("guamp-wprobe2", name, sizeof(name))) {
++			second = false;
++			guamp_wprobe_round++;
++			guamp_wprobe_arm();
++			return;
++		}
++	} else {
++		PE_parse_boot_argn("guamp-wprobe", name, sizeof(name));
++	}
+ 	lck_mtx_lock(&tasks_threads_lock);
+ 	queue_iterate(&tasks, task, task_t, tasks) {
+ 		void *bsd_info = get_bsdtask_info(task);
+@@ -4441,8 +4462,7 @@ guamp_wprobe_fire(__unused thread_call_param_t p0, __unused thread_call_param_t
+ 	lck_mtx_unlock(&tasks_threads_lock);
+ 	if (found == TASK_NULL) {
+ 		printf("guamp-wprobe: round %u: no process %s\n", round, name);
+-		guamp_wprobe_arm();
+-		return;
++		goto next;
+ 	}
+ 	printf("guamp-wprobe: round %u: %s, %u threads, shared cache slide 0x%x\n", round, name, count, slide);
+ 	for (uint32_t i = 0; i < count; i++) {
+@@ -4479,6 +4499,14 @@ guamp_wprobe_fire(__unused thread_call_param_t p0, __unused thread_call_param_t
+ 		thread_deallocate(thread);
+ 	}
+ 	task_deallocate(found);
++next:
++	if (!second) {
++		second = true;
++		thread_call_enter(guamp_wprobe_call);   /* the second process (guamp-wprobe2), if any, at once */
++		return;
++	}
++	second = false;
++	guamp_wprobe_round++;
+ 	guamp_wprobe_arm();
+ }
+ 
