@@ -40,6 +40,8 @@
  */
 #include <IOKit/IOLib.h>                /* IOMallocData: plain functions, no kalloc startup sites */
 #include <kern/locks.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
@@ -202,7 +204,8 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10 };
+       EVENT_SCAN_DONE = 10, EVENT_LINK_QUALITY = 17, EVENT_RSSI_CHANGED = 39 };
+/* (17 and 39: positions in IO80211.framework's APPLE80211_M_ name table of iPadOS 17.7.11, read from the dyld cache 31/10) */
 
 static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes one interface, and that is its name) */
 
@@ -211,10 +214,58 @@ static unsigned result_next;                    /* which of what the last scan h
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 
 /* guamp: once, from guamp_wifi_bsd_network_ready() (bsd_init), before en0 can be asked anything */
+static void post(uint32_t code, const void *data, uint32_t length);
+
+/*
+ * guamp 31/10: the signal bars stayed at 0. Nothing ever told iOS that the signal changed: only POWER, SSID/BSSID, LINK,
+ * ASSOC_DONE and SCAN_DONE were posted, and SpringBoard does not poll the RSSI. Every 5 s while joined: LINK_QUALITY with the
+ * RSSI and the rate, and RSSI_CHANGED (iOS reads the value with the RSSI request, 16). guamp-wifi-rssi-events=0: off.
+ */
+static thread_call_t signal_call;
+
+static void
+signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static unsigned said;
+	struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
+
+	if (state != NULL) {
+		hakios_sta_state(state);
+		if (state->phase == HAKIOS_STA_JOINED) {
+			struct {
+				int32_t rssi;
+				uint32_t rate;
+			} quality = { .rssi = state->bss.rssi, .rate = 0 };
+
+			post(EVENT_LINK_QUALITY, &quality, sizeof(quality));
+			post(EVENT_RSSI_CHANGED, NULL, 0);
+			if (said < 4) {
+				said++;
+				printf("GuampWiFi: apple80211: signal events posted, rssi %d dBm\n", (int)state->bss.rssi);
+			}
+		}
+		IOFreeData(state, sizeof(*state));
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(signal_call, deadline);
+}
+
 void
 guamp_apple80211_init(void)
 {
+	uint32_t on = 1;
+
 	lck_mtx_init(&apple80211_lock, lck_grp_alloc_init("guamp-apple80211", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
+	PE_parse_boot_argn("guamp-wifi-rssi-events", &on, sizeof(on));
+	if (on) {
+		signal_call = thread_call_allocate_with_options(signal_tick, NULL, THREAD_CALL_PRIORITY_LOW, 0);
+		if (signal_call != NULL) {
+			uint64_t deadline;
+			clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
+			thread_call_enter_delayed(signal_call, deadline);
+		}
+	}
 }
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
