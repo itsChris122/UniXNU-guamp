@@ -304,6 +304,10 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
     int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=500;   // guamp-copy-gpu-wait default 500 (verified 28/10)
     bool latestWanted=false,gpuScaled=true;unsigned trailMs=0;
+    // guamp-copy-min-ms (31/10): the shortest time between two CPU copies into the scanout. The panel is broken and only the USB
+    // mirror (about 2 frames/s) shows the screen, while backboardd swapped ~24 frames/s of 4.5 MB each (25-29 ms of copy, ~half a
+    // core of kernel_task). Frames swapped in between coalesce (latest-frame-wins), the last one is always shown. 0 = no limit.
+    unsigned copyMinMs=100;uint64_t lastCpuStart=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
@@ -322,6 +326,7 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
         latestWanted=v==1 && (asyncMode==1 || handoff==1);
         trailMs=25;PE_parse_boot_argn("guamp-copy-trail",&trailMs,sizeof trailMs);if(trailMs>200)trailMs=200;
         v=1;PE_parse_boot_argn("guamp-gpu-scaled",&v,sizeof v);gpuScaled=v!=0;
+        PE_parse_boot_argn("guamp-copy-min-ms",&copyMinMs,sizeof copyMinMs);if(copyMinMs>1000)copyMinMs=1000;
         guamp_copy_latest[9]=latestWanted?1:0;
         copyOptions=1;
         guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32|(gpuWaitMs?64:0)|
@@ -560,7 +565,16 @@ EDITS.append(('    void freeAsync() {\n', r'''    // Section 10: latest-frame-wi
         return frame.memory && (!frame.scaled || gpuScaled) &&
                native_legacy_gpu_offer(this,frame.memory,frame.stride,frame.offerWidth,frame.offerHeight);
     }
-    void latestStartCpu() {guamp_copy_split[8]=guamp_copy_split[8]+1;thread_call_enter(latestCall);}
+    void latestStartCpu() {
+        guamp_copy_split[8]=guamp_copy_split[8]+1;
+        const uint64_t now=mach_absolute_time();uint64_t gap=0;
+        if(copyMinMs)nanoseconds_to_absolutetime((uint64_t)copyMinMs*1000000ULL,&gap);
+        if(gap && lastCpuStart && now-lastCpuStart<gap) {   // too soon: start when the interval is over, newer frames coalesce meanwhile
+            lastCpuStart=lastCpuStart+gap;thread_call_enter_delayed(latestCall,lastCpuStart);
+        } else {
+            lastCpuStart=now;thread_call_enter(latestCall);
+        }
+    }
     void latestPublish() {
         guamp_copy_latest[0]=latest.started;guamp_copy_latest[1]=latest.coalesced;guamp_copy_latest[2]=latest.stale;
         guamp_copy_latest[3]=latest.gpuFrames;guamp_copy_latest[4]=latest.cpuFrames;guamp_copy_latest[6]=latest.trails;
