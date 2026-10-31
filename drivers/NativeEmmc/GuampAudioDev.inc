@@ -305,7 +305,7 @@ void start() {
   // stream, and again after the stream ran dry (GuampAudioRing.inc Stream::prerollFrames)
   unsigned prerollMs = 40;
   PE_parse_boot_argn("guamp-audio-preroll-ms", &prerollMs, sizeof(prerollMs));
-  if (prerollMs > 200) prerollMs = 40;
+  if (prerollMs > 300) prerollMs = 300;   // the ring holds 341 ms; fin20b asked 400 and fell back to 40 (35-172 underruns per sound against 1-13 at 200)
   gStream.prerollFrames = prerollMs * (GUAMP_AUDIO_RATE / 1000);
   PE_parse_boot_argn("guamp-audio-log", &gLogAll, sizeof(gLogAll));
   if (PE_parse_boot_argn("guamp-audio-cdc", &cdc, sizeof(cdc)) && cdc == 1)
