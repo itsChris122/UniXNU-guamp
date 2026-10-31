@@ -307,7 +307,7 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp-copy-min-ms (31/10): the shortest time between two CPU copies into the scanout. The panel is broken and only the USB
     // mirror (about 2 frames/s) shows the screen, while backboardd swapped ~24 frames/s of 4.5 MB each (25-29 ms of copy, ~half a
     // core of kernel_task). Frames swapped in between coalesce (latest-frame-wins), the last one is always shown. 0 = no limit.
-    unsigned copyMinMs=100;uint64_t lastCpuStart=0;
+    unsigned copyMinMs=0;uint64_t lastCpuStart=0;   // default 0 (owner 31/10: no limit, the new panel arrives on Monday)
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
