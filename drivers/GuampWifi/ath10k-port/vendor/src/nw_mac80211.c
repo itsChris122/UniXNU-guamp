@@ -127,7 +127,22 @@ void ieee80211_remain_on_channel_expired(struct ieee80211_hw *hw) { (void)hw; }
 /* transmit completion and queue control */
 unsigned nw_eapol_tx[3];
 void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; if (skb && skb->protocol == cpu_to_be16(ETH_P_PAE)) nw_eapol_tx[2]++; kfree_skb(skb); }
-void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; kfree_skb(skb); }
+/* guamp 01/11: whether the access point acknowledged our management frames (auth/assoc/deauth) at the radio level: "Unable to
+ * join" came with authentications left unanswered; acked = it heard them and ignored them, not acked = they never reached it. */
+unsigned nw_mgmt_tx[2];
+void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) {
+  (void)hw;
+  if (skb && skb->len >= 24) {
+    struct ieee80211_hdr *h = (void *)skb->data;
+    if (ieee80211_is_mgmt(h->frame_control)) {
+      static unsigned said;
+      bool ack = !!(IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK);
+      nw_mgmt_tx[!ack]++;
+      if (said < 60) { said++; lx_log(6, "wifi: management frame %04x %s (acked %u, not acked %u)", le16_to_cpu(h->frame_control),
+                                      ack ? "acked" : "NOT acked", nw_mgmt_tx[0], nw_mgmt_tx[1]); }
+    }
+  }
+  kfree_skb(skb); }
 static int gw_eapol_m4(struct sk_buff *skb, u64 *replay, u32 *cookie) {
   if (!skb || skb->len < 24) return 0;
   struct ieee80211_hdr *h = (void *)skb->data;

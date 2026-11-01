@@ -807,7 +807,7 @@ static void timer_fn(struct work_struct *w) {
       connect_done(C.hs_stage ? NW_RES_BAD_KEY : NW_RES_TIMEOUT); return; }
   }
   switch (C.state) {
-  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 15) { connect_done(NW_RES_TIMEOUT); return; }   /* 16 x 300 ms (was 8: 2.4 s) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
+  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
   case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } send_assoc(); } break;
   case NW_STA_KEYS: break;
   case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;
