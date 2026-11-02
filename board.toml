@@ -69,6 +69,7 @@ roots = [
   "com.apple.driver.AppleIISController",
   "com.apple.driver.AppleM2ScalerCSCDriver",
   "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.FairPlayIOKit",
   "com.apple.driver.ApplePMGR",
   "com.apple.driver.IODARTFamily",
   "com.apple.filesystems.apfs",

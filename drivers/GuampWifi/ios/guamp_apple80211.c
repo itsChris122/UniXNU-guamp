@@ -213,6 +213,11 @@ static lck_mtx_t apple80211_lock;       /* guamp_apple80211_init() */
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 
+/* guamp 02/11: the link rate told to iOS (RATE 8, LINK_QUALITY). WCN3950: 1 stream, HT20, so at most 72 Mbit/s; the
+ * firmware's real transmit rate is not read back yet, so a typical one. */
+#define GUAMP_LINK_RATE_MBPS 65u
+#define GUAMP_LINK_MCS 7u
+
 /* guamp: once, from guamp_wifi_bsd_network_ready() (bsd_init), before en0 can be asked anything */
 static void post(uint32_t code, const void *data, uint32_t length);
 
@@ -235,7 +240,7 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			struct {
 				int32_t rssi;
 				uint32_t rate;
-			} quality = { .rssi = state->bss.rssi, .rate = 0 };
+			} quality = { .rssi = state->bss.rssi, .rate = GUAMP_LINK_RATE_MBPS };
 
 			post(EVENT_LINK_QUALITY, &quality, sizeof(quality));
 			post(EVENT_RSSI_CHANGED, NULL, 0);
@@ -549,6 +554,31 @@ get(struct apple80211req *request)
 			int32_t each[4], all, each_ext[4], all_ext;
 		} answer = { .version = 1, .radios = 1, .each = { GUAMP_NOISE_DBM }, .all = GUAMP_NOISE_DBM,
 			     .each_ext = { GUAMP_NOISE_DBM }, .all_ext = GUAMP_NOISE_DBM };
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 8: {                               /* guamp 02/11: the link rate (apple80211_rate_data), Mbit/s per radio */
+		struct {
+			uint32_t version, radios, rate[4];
+		} answer = { .version = 1, .radios = 1, .rate = { GUAMP_LINK_RATE_MBPS } };
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 14: {                              /* guamp 02/11: PHY mode (apple80211_phymode_data): 11a 2, 11b 4, 11g 8, 11n 0x10 */
+		struct {
+			uint32_t version, phy_mode, active_phy_mode;
+		} answer = { .version = 1, .phy_mode = 0x2 | 0x4 | 0x8 | 0x10,
+			     .active_phy_mode = 0x10 };
+
+		error = give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 57: {                              /* guamp 02/11: MCS index (apple80211_mcs_data) */
+		struct {
+			uint32_t version, index;
+		} answer = { .version = 1, .index = GUAMP_LINK_MCS };
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
