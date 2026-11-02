@@ -33,7 +33,8 @@
 namespace torch {
 constexpr unsigned kSid = GP_SID_PMI632_B;      // 3
 constexpr uint16_t kBase = 0xd300;
-constexpr uint16_t kSchgmStatus2 = 0xa607, kSchgmStatus3 = 0xa608, kSchgmTorchPriority = 0xa663;   // slave 2, read only
+constexpr uint16_t kSchgmStatus2 = 0xa607, kSchgmStatus3 = 0xa608, kSchgmTorchPriority = 0xa663;   // slave 2: read only, except bit 0 of 0xa663 (setTorchSource)
+constexpr uint16_t kUsbinRt = 0x1310;   // slave 2, read only: bit 4 USBIN plug-in
 enum : uint8_t {
   kSubtype = 0x05, kStatus1 = 0x08, kStatus2 = 0x09, kRtSts = 0x10, kSafetyTmr = 0x40, kTgrCurrent = 0x43,
   kModCtrl = 0x46, kIres = 0x47, kStrobeCtrl = 0x49, kEnLedCtrl = 0x4c, kHdrmPrgm = 0x4d, kHdrmAuto = 0x50,
@@ -44,6 +45,7 @@ volatile uint32_t gReady, gOn, gMa, gRequest, gRequestSeq, gSwitches, gFaults;
 uint32_t gSeenSeq;
 unsigned gMaxMa = guamp_torch::kDefaultMa, gTimeoutS = guamp_torch::kDefaultTimeoutS;
 uint64_t gOnMs;
+unsigned gBoost = 1;   // guamp-torch-boost: 1 = with the cable in, the torch takes power from the battery boost (0 = leave the register)
 
 void publishState();   // defined after GuampTorchService
 
@@ -89,6 +91,19 @@ void off(const char *why) {
   publishState();
 }
 
+// guamp 02/11: with the cable in, the charger input from a PC port collapses every few seconds (USBIN UV COLLAPSE, AICL
+// 0-500 mA) and the torch, left in buck mode (SCHGM TORCH_PRIORITY 0xa663 bit 0 = 0), blinked with it. Linux (smb5-lib,
+// PMI632) moves the torch to boost mode (bit 0 = 1) when VBUS rises and back to buck when it falls. Same here, at switch on.
+// Only bit 0 of 0xa663 on slave 2 is ever written. Returns the bit now set, or -1.
+int setTorchSource() {
+  if (!gBoost) return -1;
+  uint8_t usbin = 0, prio = 0;
+  if (read8(kPmi632, kUsbinRt, &usbin) || read8(kPmi632, kSchgmTorchPriority, &prio)) return -1;
+  const uint8_t want = (usbin & 0x10u) ? 1u : 0u;
+  if ((prio & 1u) != want && write8(kPmi632, kSchgmTorchPriority, static_cast<uint8_t>((prio & ~1u) | want))) return -1;
+  return want;
+}
+
 // Switches on at ma, or only changes the current when already on (TGR_CURRENT is the level; Linux rewrites it the same way
 // for a torch level change).
 void on(unsigned ma, const char *why) {
@@ -104,6 +119,7 @@ void on(unsigned ma, const char *why) {
     publishState();
     return;
   }
+  const int src = setTorchSource();
   int e = wr(kHdrmPrgm, kHdrm);
   if (!e) e = update(kIres, 0x03, 0);              // first LED: 12.5 mA steps
   if (!e) e = update(kStrobeCtrl, 0x04, 0);        // software strobe
@@ -134,8 +150,9 @@ void on(unsigned ma, const char *why) {
   gSwitches = gSwitches + 1;
   uint8_t en = 0, mod = 0, cur = 0, rt = 0;
   rd(kEnLedCtrl, &en); rd(kModCtrl, &mod); rd(kTgrCurrent, &cur); rd(kRtSts, &rt);
-  IOLog("GuampTorch: on %u mA (code %u, %s), VREG_OK after %u ms, en %02x mod %02x current %02x rt %02x, auto-off %u s\n",
-        real, code, why, (waited + 1) * 5, en, mod, cur, rt, gTimeoutS);
+  IOLog("GuampTorch: on %u mA (code %u, %s), VREG_OK after %u ms, en %02x mod %02x current %02x rt %02x, source %s, auto-off %u s\n",
+        real, code, why, (waited + 1) * 5, en, mod, cur, rt,
+        src == 1 ? "boost" : src == 0 ? "buck" : "unchanged", gTimeoutS);
   publishState();
 }
 
@@ -246,6 +263,7 @@ bool init() {
   if (enabled != 1) { IOLog("GuampTorch: disabled (guamp-torch=0)\n"); return false; }
   PE_parse_boot_argn("guamp-torch-ma", &ma, sizeof(ma));
   PE_parse_boot_argn("guamp-torch-sec", &sec, sizeof(sec));
+  PE_parse_boot_argn("guamp-torch-boost", &gBoost, sizeof(gBoost));
   gMaxMa = guamp_torch::maForCode(guamp_torch::codeForMa(ma));
   gTimeoutS = guamp_torch::clampTimeoutS(sec);
   const int apid = apidOf(kSid, kBase);
