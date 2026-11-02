@@ -40,6 +40,17 @@ static int g_has_pending_connect;
 static volatile int g_radio_enabled, g_station_ready, g_link_authorized;
 static unsigned g_request_inflight, g_current_link_frames;
 static int g_disconnect_requested;
+/* guamp 02/11: the last join asked, kept to join again by itself when the link is lost (reception stops after some
+ * minutes with the firmware alive and wifid never joins again). Up to 5 tries in a row; forgotten on disconnect/power off. */
+static struct nw_request g_last_join; static int g_has_last_join; static unsigned g_rejoins;
+static void forget_last_join(void) { secure_zero(&g_last_join, sizeof(g_last_join)); g_has_last_join = 0; g_rejoins = 0; }
+static void schedule_rejoin(void) {
+  lock();
+  int ok = g_has_last_join && g_rejoins < 5 && g_req.kind == REQ_NONE && !g_disconnect_requested &&
+           __atomic_load_n(&g_radio_enabled, __ATOMIC_ACQUIRE);
+  if (ok) { g_req = g_last_join; g_req.kind = REQ_CONNECT; g_rejoins++; }
+  unlock();
+  if (ok) lx_log(4, "wifi: link lost: joining the same network again by itself (try %u of 5)", g_rejoins); }
 /* One queue slot plus per-operation admission: an accepted request keeps its
  * completion ownership until its callback. Callers receive EBUSY instead of
  * silently replacing a scan/connect/power request that another thread awaits. */
@@ -575,7 +586,7 @@ static void heartbeat(u64 now) {
   /* guamp 30/10: no frame at all (not even a beacon) for 8 s while connected: the link is gone even if the firmware never
    * reports a beacon miss. fin12 stayed "connected" for 15 minutes with nothing received from 621 s on, so wifid never
    * joined again. Reported as lost: wifid reconnects. */
-  if (C.state == NW_STA_UP && C.hb_quiet == 8) { lx_log(4, "wifi: nothing received for 8 s while connected: link lost"); teardown(1, 0); return; }
+  if (C.state == NW_STA_UP && C.hb_quiet == 8) { lx_log(4, "wifi: nothing received for 8 s while connected: link lost"); teardown(1, 0); schedule_rejoin(); return; }
   char rx[200]; nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
@@ -695,6 +706,10 @@ static void on_mgmt(struct sk_buff *skb) {
     if (set_sta_state(IEEE80211_STA_ASSOC)) { connect_done(NW_RES_FAILED); return; }
     link_changed(BSS_CHANGED_BSSID | BSS_CHANGED_BASIC_RATES | BSS_CHANGED_BEACON_INT | BSS_CHANGED_ERP_SLOT);
     vif_changed(BSS_CHANGED_ASSOC | BSS_CHANGED_IDLE | BSS_CHANGED_SSID);
+    /* guamp 02/11: ath10k put the vdev in power save while it was not started and only BSS_CHANGED_PS takes it out; mac80211
+     * sends it after the association, this port never did: the firmware stayed in power save (suspect of the reception
+     * that stops after some minutes). */
+    g_vif->cfg.ps = false; vif_changed(BSS_CHANGED_PS);
     C.started = lx_now_ms(); C.tries = 0;
     if (C.secure) { C.state = NW_STA_KEYS; lx_log(6, "wifi: associated, waiting for the key handshake"); }
     else finish_authorized();
@@ -765,7 +780,7 @@ void nw_sta_rx(struct sk_buff *skb) {
 
 /* ---- the connection's life ---- */
 static void connect_done(int res) {
-  C.result = res;
+  C.result = res; if (res == NW_RES_OK) g_rejoins = 0;
   if(res==NW_RES_OK)lx_queue_delayed(&g_timer,100);else lx_cancel_delayed(&g_timer);
   if (res != NW_RES_OK) { teardown(0, 0); C.state = NW_STA_IDLE; C.result = res; } nw_wifi_stats.last_err = -res;
   connect_request_done(res); }
@@ -927,6 +942,7 @@ void nw_sta_run(void) {
       if (!on) {
         __atomic_store_n(&g_radio_enabled,0,__ATOMIC_RELEASE);
         __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);
+        forget_last_join();
         cancel_connect_request();
         if (C.state >= NW_STA_AUTH) teardown(0, 0);
         purge_tx_queue();lx_cancel_delayed(&g_timer);
@@ -943,16 +959,18 @@ void nw_sta_run(void) {
       secure_zero(g_pending_connect.pass, sizeof(g_pending_connect.pass));
       g_pending_connect = request; g_has_pending_connect = 1;
       if (!g_connect_waits) { g_connect_waits = 1; lx_log(6, "wifi: join waits for the running scan, which is cancelled"); g_ops->cancel_hw_scan(g_hw, g_vif); } }
-    else if (kind == REQ_CONNECT) { start_connect(&request); secure_zero(request.pass, sizeof(request.pass)); }
+    else if (kind == REQ_CONNECT) { g_last_join = request; g_has_last_join = 1; start_connect(&request); secure_zero(request.pass, sizeof(request.pass)); }
     if (kind != REQ_DISCONNECT && kind != REQ_POWER && g_connect_waits && !g_scan_running) {
       g_connect_waits = 0;
       if (g_has_pending_connect) {
+        g_last_join = g_pending_connect; g_has_last_join = 1;
         start_connect(&g_pending_connect);
         secure_zero(g_pending_connect.pass, sizeof(g_pending_connect.pass));
         memset(&g_pending_connect, 0, sizeof(g_pending_connect)); g_has_pending_connect = 0;
       }
     }
     else if (kind == REQ_DISCONNECT) {
+      forget_last_join();
       cancel_connect_request();
       if (C.state >= NW_STA_AUTH)teardown(0,0);
       __atomic_store_n(&g_link_authorized,0,__ATOMIC_RELEASE);purge_tx_queue();lx_cancel_delayed(&g_timer);
@@ -971,7 +989,7 @@ void nw_sta_link_lost(void) {
 static void beacon_miss_check(u64 now) {
   if (!C.bmiss_at) return;
   if (g_current_link_frames - C.bmiss_frames >= 2) { lx_log(6, "wifi: beacon miss, but %u frames arrived from this AP: staying", g_current_link_frames - C.bmiss_frames); C.bmiss_at = 0; return; }
-  if (now - C.bmiss_at >= 5000) { lx_log(4, "wifi: beacon miss and nothing received for 5 s: link lost"); C.bmiss_at = 0; teardown(1, 0); } }
+  if (now - C.bmiss_at >= 5000) { lx_log(4, "wifi: beacon miss and nothing received for 5 s: link lost"); C.bmiss_at = 0; teardown(1, 0); schedule_rejoin(); } }
 static void release_station_setup(void) {
   if(g_vif) {
     if(g_vif_added) {nw_wifi_vif_del(g_vif);g_ops->remove_interface(g_hw,g_vif);}
