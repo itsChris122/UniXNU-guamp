@@ -798,10 +798,10 @@ static struct {
 } kinds[96];
 static unsigned kind_count;
 
-static void
+static unsigned
 note(const struct apple80211req *request, bool is_set, int error)
 {
-	unsigned i;
+	unsigned i, times = 0;
 
 	lck_mtx_lock(&apple80211_lock);
 	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
@@ -813,8 +813,10 @@ note(const struct apple80211req *request, bool is_set, int error)
 		kinds[i].times++;
 		kinds[i].answered += error == 0;
 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
+		times = kinds[i].times;
 	}
 	lck_mtx_unlock(&apple80211_lock);
+	return times;
 }
 
 void
@@ -850,9 +852,10 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
-	note(request, is_set, error);
-	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800) {
+	const unsigned times = note(request, is_set, error);
+	/* guamp 02/11: each kind of request is said its first 25 times (was: the first 800 of all, used up before the join by
+	 * CURRENT_NETWORK polling, so what wifid asks once joined -- auto-join, the bars -- was never seen) */
+	if (said < 3000 && times <= 25) {
 		said++;
 		printf("GuampWiFi: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
