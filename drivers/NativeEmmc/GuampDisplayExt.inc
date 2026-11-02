@@ -13,6 +13,14 @@ extern "C" volatile uint64_t native_legacy_copy_max __attribute__((weak_import))
 extern "C" volatile uint64_t native_legacy_copy_bytes_sum __attribute__((weak_import));
 extern "C" volatile uint32_t native_legacy_swap_accepted_count __attribute__((weak_import));
 extern "C" volatile uint32_t native_legacy_swap_rejected_count __attribute__((weak_import));
+// package/LegacyDisplayProbe.cpp: the last rejected swap (reason, surfaces, state/options, size, rects, surface class).
+extern "C" volatile uint32_t native_legacy_rej_reason __attribute__((weak_import));
+extern "C" volatile uint64_t native_legacy_rej_surfaces[4] __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_rej_state[3] __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_rej_options[3] __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_rej_size[2] __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_rej_rects[2][4] __attribute__((weak_import));
+extern "C" char native_legacy_rej_class[32] __attribute__((weak_import));
 // zzzz-guamp-ram-fb-wc.patch defines it (pmap); 0 here while that patch is out of the series (static link).
 extern "C" __attribute__((weak)) unsigned int guamp_fb_wc_enabled = 0;
 namespace dispext {
@@ -210,6 +218,18 @@ static void copyLog()
           "swaps accepted +%u rejected +%u, scanout %s%s\n", frames, n, meanUs, max * 1000000 / f,
           max > lastMax ? "new" : "same", kib, accepted - lastAccepted, rejected - lastRejected,
           guamp_fb_wc_enabled == 1 ? "write-combining" : "device", latest);
+  // guamp 02/11: a video in a Safari page froze the screen (every swap rejected from then on): say why the last one was.
+  if (rejected != lastRejected && &native_legacy_rej_reason) {
+    char cls[33] = {};
+    for (unsigned i = 0; i < 32 && native_legacy_rej_class[i]; i++) cls[i] = native_legacy_rej_class[i];
+    IOLog("GuampDisplay: last rejected swap: reason %u class %s surfaces %llx %llx %llx %llx state %x %x %x options %x %x %x "
+          "size %ux%u rect0 %u,%u,%u,%u rect1 %u,%u,%u,%u\n", native_legacy_rej_reason, cls[0] ? cls : "-",
+          native_legacy_rej_surfaces[0], native_legacy_rej_surfaces[1], native_legacy_rej_surfaces[2], native_legacy_rej_surfaces[3],
+          native_legacy_rej_state[0], native_legacy_rej_state[1], native_legacy_rej_state[2], native_legacy_rej_options[0],
+          native_legacy_rej_options[1], native_legacy_rej_options[2], native_legacy_rej_size[0], native_legacy_rej_size[1],
+          native_legacy_rej_rects[0][0], native_legacy_rej_rects[0][1], native_legacy_rej_rects[0][2], native_legacy_rej_rects[0][3],
+          native_legacy_rej_rects[1][0], native_legacy_rej_rects[1][1], native_legacy_rej_rects[1][2], native_legacy_rej_rects[1][3]);
+  }
   lastWaits = waits; lastTimeouts = timeouts; lastNoRing = noRing; lastWaitUs = waitUs; lastReady = ready;
   {
     // Mapping (and, with guamp-fast-copy=1, cache maintenance) per frame and the read-only probe of guamp-copy-probe=N.
