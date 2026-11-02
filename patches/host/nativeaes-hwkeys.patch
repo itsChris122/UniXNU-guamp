@@ -1,0 +1,67 @@
+diff --git a/NativeAES.cpp b/NativeAES.cpp
+index febdc09..e2fa82c 100644
+--- a/NativeAES.cpp
++++ b/NativeAES.cpp
+@@ -18,6 +18,15 @@ volatile uint32_t native_aes_completed = 0;
+ volatile uint32_t native_aes_unsupported_key = 0;
+ }
+ 
++// guamp: hardware-key emulation (see performAES).
++static unsigned native_aes_hwkeys = 1;
++extern "C" { volatile uint32_t native_aes_emulated_key = 0; }
++static const unsigned char kHardwareKeySeed[32] = {
++  0x67,0x75,0x61,0x6d,0x70,0x2d,0x61,0x65,0x73,0x2d,0x68,0x77,0x6b,0x65,0x79,0x2d,
++  0x9c,0x31,0x5e,0xa7,0x04,0xd2,0x6b,0xf8,0x13,0x8e,0x47,0xc5,0x2a,0xb9,0x70,0x1d};
++
++extern "C" boolean_t PE_parse_boot_argn(const char *, void *, int);
++
+ class NativeAES : public IOAESAccelerator {
+   OSDeclareDefaultStructors(NativeAES)
+ public:
+@@ -27,7 +36,7 @@ public:
+     return IOService::callPlatformFunction(name, wait, a, b, c, d);
+   }
+   const char *getAlgorithmName() override { return "AES-CBC"; }
+-  bool isKeySupported(unsigned selector) override { return selector == 0; }
++  bool isKeySupported(unsigned selector) override { return selector == 0 || native_aes_hwkeys; }
+   unsigned getSupportedOptions() override { return 1; }
+   IOReturn performAES(void *, void *, task_t, unsigned long long, IOAESIV *,
+                      IOAESOperation, IOAESKeyData *, IOAESCompletion, void *) override;
+@@ -135,9 +144,14 @@ static bool knownAnswerTest(NativeAES *provider)
+ 
+ bool NativeAES::start(IOService *provider)
+ {
++  unsigned hwkeys = 1;
++  if (PE_parse_boot_argn("guamp-aes-hwkeys", &hwkeys, sizeof(hwkeys))) native_aes_hwkeys = hwkeys;
+   if (!g_crypto_funcs || !g_crypto_funcs->ccaes_cbc_encrypt || !g_crypto_funcs->ccaes_cbc_decrypt ||
+       !IOService::start(provider)) return false;
++  const unsigned wanted = native_aes_hwkeys;
++  native_aes_hwkeys = 0;
+   native_aes_kat_status = knownAnswerTest(this) ? 1 : 2;
++  native_aes_hwkeys = wanted;
+   if (native_aes_kat_status != 1) return false;
+   setProperty("NativeAESSoftwareKeysOnly", true);
+   native_aes_registered = 1;
+@@ -150,8 +164,20 @@ IOReturn NativeAES::performAES(IOMemoryDescriptor *input, IOMemoryDescriptor *ou
+                               IOAESKeyData *key, unsigned long long inputOffset,
+                               unsigned long long outputOffset, IOAESCompletion callback, void *refcon)
+ {
+-  if (!input || !output || !key || !iv || !bytes || (bytes & 15) ||
+-      (key->bits != 128 && key->bits != 192 && key->bits != 256)) return kIOReturnBadArgument;
++  if (!input || !output || !key || !iv || !bytes || (bytes & 15)) return kIOReturnBadArgument;
++  // guamp 03/11: hardware keys (UID, GID and the other selectors) do not exist on this SoC. FairPlayIOKit asks for them
++  // (generateSeed: performAES UID/GID) and failed with -22 every 10 s. Each selector gets a fixed 256-bit key of its own,
++  // the same on every boot, so what is wrapped with it locally can be unwrapped again. guamp-aes-hwkeys=0: refused as before.
++  IOAESKeyData emulated;
++  if (key->selector && native_aes_hwkeys) {
++    emulated.bits = 256;
++    emulated.selector = 0;
++    for (unsigned i = 0; i < 32; ++i)
++      emulated.bytes[i] = static_cast<unsigned char>(kHardwareKeySeed[i] ^ ((key->selector >> ((i & 3) * 8)) & 0xff) ^ (i * 29));
++    __atomic_fetch_add(&native_aes_emulated_key, 1, __ATOMIC_RELAXED);
++    key = &emulated;
++  }
++  if (key->bits != 128 && key->bits != 192 && key->bits != 256) return kIOReturnBadArgument;
+   if (key->selector || (operation != IOAESEncrypt && operation != IOAESDecrypt)) {
+     __atomic_fetch_add(&native_aes_unsupported_key, 1, __ATOMIC_RELAXED);
+     return kIOReturnUnsupported;
