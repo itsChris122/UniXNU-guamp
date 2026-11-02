@@ -1,3 +1,44 @@
+diff --git a/emit_prelink.py b/emit_prelink.py
+index 719b8b2..7d74794 100644
+--- a/emit_prelink.py
++++ b/emit_prelink.py
+@@ -55,6 +55,10 @@ def to_xml(value):
+     return node
+ 
+ 
++# Components whose __TEXT_EXEC holds data words among the code (FairPlay obfuscation).
++OPAQUE_TEXT_COMPONENTS = frozenset({'com.apple.driver.FairPlayIOKit'})
++
++
+ def pc_relative_target(word, pc):
+     def signed(value, bits):
+         return value - (1 << bits) if value & (1 << (bits - 1)) else value
+@@ -73,7 +77,7 @@ def pc_relative_target(word, pc):
+ 
+ def instruction_inventory(original_data, parent, modules):
+     extents = [s for module in modules.values() for s in module['segments'] if s['size'] and s['name'] != '__LINKEDIT']
+-    literal_ranges, instruction_count = [], 0
++    literal_ranges, instruction_count, opaque_words = [], 0, 0
+     for identifier, module in modules.items():
+         for segment in module['segments']:
+             if segment['name'] != '__TEXT_EXEC' or not segment['filesize']:
+@@ -108,9 +112,15 @@ def instruction_inventory(original_data, parent, modules):
+                 else:
+                     internal = any(s['va'] <= target < s['va'] + s['size'] for s in extents)
+                 if not internal:
++                    if identifier in OPAQUE_TEXT_COMPONENTS:
++                        # Obfuscated text mixes data words that decode as branches to nowhere; its real kernel calls go
++                        # through pointers, which plan() binds. Counted, not rewritten.
++                        opaque_words += 1
++                        continue
+                     raise ValueError(f'External PC-relative encoding at {segment["va"] + offset:#x}; no instruction rewrite supported')
+                 instruction_count += 1
+-    return {'pc_relative_encodings_preserved': instruction_count, 'known_inline_data': literal_ranges,
++    return {'pc_relative_encodings_preserved': instruction_count, 'opaque_external_words': opaque_words,
++            'known_inline_data': literal_ranges,
+             'register_dataflow_qualified': False}
+ 
+ 
 diff --git a/native_prelink.py b/native_prelink.py
 index 3ff3095..086527a 100644
 --- a/native_prelink.py
