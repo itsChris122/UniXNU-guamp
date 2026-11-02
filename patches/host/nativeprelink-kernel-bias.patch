@@ -1,0 +1,48 @@
+diff --git a/native_prelink.py b/native_prelink.py
+index 3ff3095..086527a 100644
+--- a/native_prelink.py
++++ b/native_prelink.py
+@@ -119,12 +119,24 @@ def unserialize_xml(blob):
+     return read(ET.fromstring(blob.split(b'\0', 1)[0]))
+ 
+ 
+-def unique_kernel_binding(address, original_exports, native_by_name):
++# Obfuscated components (FairPlayIOKit) keep some kernel pointers a few bytes past the symbol (IOMallocAligned + 2) and
++# subtract the bias before use; the same bias is kept on the native address. At most 15 bytes, and only when the
++# address is not itself a symbol.
++MAX_KERNEL_BIAS = 15
++
++
++def unique_kernel_binding(address, original_exports, native_by_name, sorted_addresses=None):
+     names = original_exports.get(address, [])
++    bias = 0
++    if not names and sorted_addresses:
++        index = bisect_right(sorted_addresses, address) - 1
++        if index >= 0 and 0 < address - sorted_addresses[index] <= MAX_KERNEL_BIAS:
++            bias = address - sorted_addresses[index]
++            names = original_exports[sorted_addresses[index]]
+     choices = {new for name in names for new in native_by_name.get(name, set())}
+     if len(choices) != 1:
+         raise ValueError(f'Kernel target {address:#x} has {len(choices)} native address candidates: {names}')
+-    return next(iter(choices))
++    return next(iter(choices)) + bias
+ 
+ 
+ def plan(native_data, original_data, roots, slide):
+@@ -194,6 +206,7 @@ def plan(native_data, original_data, roots, slide):
+         for name in names:
+             native_symbols.setdefault(name, set()).add(address)
+     original_symbols = exports(original_data, original)
++    original_addresses = sorted(original_symbols)
+     packed = metadata['_PrelinkLinkKASLROffsets']
+     count, = struct.unpack_from('<I', packed)
+     if len(packed) != 4 + count * 4:
+@@ -218,7 +231,7 @@ def plan(native_data, original_data, roots, slide):
+             replacement = target + slide
+             kind = 'component'
+         else:
+-            replacement = unique_kernel_binding(target, original_symbols, native_symbols)
++            replacement = unique_kernel_binding(target, original_symbols, native_symbols, original_addresses)
+             if not any(s['va'] <= replacement < s['va'] + s['size'] for s in native['segments']):
+                 raise ValueError('Native export is outside mapped kernel segments')
+             kind = 'kernel'
