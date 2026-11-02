@@ -249,5 +249,14 @@ void nw_wifi_ring_state(char *b,int n) {
   if(!gw_ar) { snprintf(b,n,"radio off"); return; }
   struct ath10k_snoc *s=ath10k_snoc_priv(gw_ar);
   struct ath10k_ce_ring *r=s->ce.ce_states[3].src_ring;
-  snprintf(b,n,"WMI CE3 read %u write %u",r?r->sw_index:0,r?r->write_index:0);
+  int at=snprintf(b,n,"WMI CE3 read %u write %u",r?r->sw_index:0,r?r->write_index:0);
+  /* guamp 03/11: reception stops at ~512 s with WMI still working and no HTT stats answer: every receive (destination)
+   * ring with its software read index, write index and entries, to see which one is stuck. */
+  if(at<0||at>=n)return;
+  at+=snprintf(b+at,n-at,";");
+  for(int i=0;i<CE_COUNT_MAX&&at<n-40;i++){
+    struct ath10k_ce_ring *d=s->ce.ce_states[i].dest_ring;
+    if(!d)continue;
+    at+=snprintf(b+at,n-at," CE%d dst sw %u wr %u n %u",i,d->sw_index,d->write_index,d->nentries);
+  }
 }

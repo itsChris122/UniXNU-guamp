@@ -48,7 +48,7 @@ static void schedule_rejoin(void) {
   lock();
   int ok = g_has_last_join && g_rejoins < 5 && g_req.kind == REQ_NONE && !g_disconnect_requested &&
            __atomic_load_n(&g_radio_enabled, __ATOMIC_ACQUIRE);
-  if (ok) { g_req = g_last_join; g_req.kind = REQ_CONNECT; g_rejoins++; }
+  if (ok) { g_req = g_last_join; g_req.kind = REQ_CONNECT; g_request_inflight |= 1u << REQ_CONNECT; g_rejoins++; }   /* as if wifid asked: its join-done event (link up) reaches iOS */
   unlock();
   if (ok) lx_log(4, "wifi: link lost: joining the same network again by itself (try %u of 5)", g_rejoins); }
 /* One queue slot plus per-operation admission: an accepted request keeps its
@@ -587,7 +587,7 @@ static void heartbeat(u64 now) {
    * reports a beacon miss. fin12 stayed "connected" for 15 minutes with nothing received from 621 s on, so wifid never
    * joined again. Reported as lost: wifid reconnects. */
   if (C.state == NW_STA_UP && C.hb_quiet == 8) { lx_log(4, "wifi: nothing received for 8 s while connected: link lost"); teardown(1, 0); schedule_rejoin(); return; }
-  char rx[200]; nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
+  char rx[480]; nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
   lx_log(6, "wifi: tx %s", tx_reasons());
