@@ -578,7 +578,6 @@ struct Sm6115Runtime {
     return false;
 #endif
   }
-  static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
   static int boardPower(void *p,int on) {
     auto &r=*static_cast<Sm6115Runtime *>(p);
