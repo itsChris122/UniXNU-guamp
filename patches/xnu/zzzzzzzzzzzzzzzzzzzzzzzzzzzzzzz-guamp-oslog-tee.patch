@@ -1,0 +1,206 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -393,6 +393,7 @@
+ static int execargs_free(struct image_params *imgp);
+ static int exec_check_permissions(struct image_params *imgp);
+ static int exec_extract_strings(struct image_params *imgp);
++int guamp_oslog_exec_env(const char *path, const char **env);	/* guamp-oslog, sys_generic.c */
+ static int exec_add_apple_strings(struct image_params *imgp, const load_result_t *load_result);
+ static int exec_handle_sugid(struct image_params *imgp);
+ static int sugid_scripts = 0;
+@@ -5999,6 +6000,25 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* guamp-oslog (sys_generic.c): OS_ACTIVITY_DT_MODE=YES for the listed processes, so their os_log lines also go to
++	 * stderr and from there to the kernel log. ip_strings starts with the executable path (exec_save_path). */
++	{
++		const char *guamp_env[2];
++		int guamp_envn = guamp_oslog_exec_env(imgp->ip_strings, guamp_env);
++		for (int gi = 0; gi < guamp_envn; gi++) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(guamp_env[gi]), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -650,6 +650,157 @@
+ 	return fp_writev(ctx, fp, uio, flags, retval);
+ }
+ 
++#include <pexpert/pexpert.h>
++#include <os/atomic_private.h>
++/*
++ * guamp-oslog (03/11, App Store "Cannot connect"): the unified log of iOS (tracev3) is written by logd only every
++ * few minutes, and what is still in its buffers is lost when the phone goes to fastboot, so the copy of Data
++ * misses the last minutes of a test. guamp-oslog=1 sets OS_ACTIVITY_DT_MODE=YES (libtrace then also writes each
++ * os_log line to stderr) in the environment of the processes of a list, at exec (kern_exec.c), and here copies what
++ * those processes write to fd 1 and 2 (usually /dev/null for launchd jobs and apps) into the kernel log, one
++ * "guamp oslog: name[pid] text" line per line written, cut at 400 characters.
++ *   guamp-oslog=1                 on, default list (App Store chain); 0 or absent: off
++ *   guamp-oslog-procs=a,b,c       own list instead of the default (process names; p_comm keeps 16 characters)
++ *   guamp-oslog-lines=<n>         lines at most in the whole boot (default 3000)
++ *   guamp-oslog-level=1|2         also OS_ACTIVITY_MODE=info (1) or debug (2): more lines, more noise
++ * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
++ * the kernel log (kpan, USB mirror), never on the network.
++ */
++static const char guamp_oslog_default[] = "AppStore,appstored,itunesstored,amsaccountsd,amsengagementd,akd,storekitd,"
++    "adid,fairplayd.A2,mobileactivationd,lockdownd,apsd";
++static char guamp_oslog_list[512];
++static int guamp_oslog_level;
++static SInt32 guamp_oslog_left;
++static int guamp_oslog_state = -1;	/* -1 not read yet, 0 off, 1 on */
++
++static int
++guamp_oslog_enabled(void)
++{
++	int state = os_atomic_load(&guamp_oslog_state, acquire);
++	if (state >= 0) {
++		return state;
++	}
++	int on = 0, lines = 3000, level = 0;
++	if (!PE_parse_boot_argn("guamp-oslog", &on, sizeof(on)) || on == 0) {
++		os_atomic_store(&guamp_oslog_state, 0, release);
++		return 0;
++	}
++	if (!PE_parse_boot_arg_str("guamp-oslog-procs", guamp_oslog_list, sizeof(guamp_oslog_list)) ||
++	    guamp_oslog_list[0] == '\0') {
++		strlcpy(guamp_oslog_list, guamp_oslog_default, sizeof(guamp_oslog_list));
++	}
++	PE_parse_boot_argn("guamp-oslog-lines", &lines, sizeof(lines));
++	PE_parse_boot_argn("guamp-oslog-level", &level, sizeof(level));
++	guamp_oslog_left = lines > 0 ? lines : 0;
++	guamp_oslog_level = level;
++	os_atomic_store(&guamp_oslog_state, 1, release);
++	printf("guamp oslog: on, %d lines, level %d, processes %s\n", lines, level, guamp_oslog_list);
++	return 1;
++}
++
++/* name is a process name: the whole executable name at exec, p_comm (MAXCOMLEN characters at most) later. */
++static int
++guamp_oslog_match(const char *name)
++{
++	size_t len = strnlen(name, MAXCOMLEN + 1);
++	const char *tok = guamp_oslog_list;
++	if (len == 0) {
++		return 0;
++	}
++	while (*tok) {
++		const char *end = tok;
++		while (*end && *end != ',') {
++			end++;
++		}
++		size_t tlen = (size_t)(end - tok);
++		if (tlen == len && memcmp(tok, name, len) == 0) {
++			return 1;
++		}
++		if (len >= MAXCOMLEN && tlen > len && memcmp(tok, name, len) == 0) {
++			return 1;	/* name cut to MAXCOMLEN */
++		}
++		tok = *end ? end + 1 : end;
++	}
++	return 0;
++}
++
++/* Called by exec_extract_strings with the executable path; returns how many strings it put in env (0..2). */
++int guamp_oslog_exec_env(const char *path, const char **env);
++int
++guamp_oslog_exec_env(const char *path, const char **env)
++{
++	const char *base = path, *s;
++	char name[MAXCOMLEN + 1];
++	int n = 0;
++	if (path == NULL || !guamp_oslog_enabled()) {
++		return 0;
++	}
++	for (s = path; *s; s++) {
++		if (*s == '/') {
++			base = s + 1;
++		}
++	}
++	strlcpy(name, base, sizeof(name));
++	if (!guamp_oslog_match(base) && !guamp_oslog_match(name)) {
++		return 0;
++	}
++	env[n++] = "OS_ACTIVITY_DT_MODE=YES";
++	if (guamp_oslog_level == 1) {
++		env[n++] = "OS_ACTIVITY_MODE=info";
++	} else if (guamp_oslog_level >= 2) {
++		env[n++] = "OS_ACTIVITY_MODE=debug";
++	}
++	return n;
++}
++
++static void
++guamp_oslog_tee(struct proc *p, int fd, uio_t uio)
++{
++	char buf[512];
++	int iovcnt = uio_iovcnt(uio);
++	if (!uio_isuserspace(uio)) {
++		return;
++	}
++	for (int i = 0; i < iovcnt && i < 8; i++) {
++		user_addr_t base = 0;
++		user_size_t len = 0;
++		if (uio_getiov(uio, i, &base, &len) != 0 || len == 0) {
++			continue;
++		}
++		size_t take = len < sizeof(buf) - 1 ? (size_t)len : sizeof(buf) - 1;
++		if (copyin(base, buf, take) != 0) {
++			continue;
++		}
++		buf[take] = '\0';
++		char *line = buf;
++		while (*line) {
++			if (guamp_oslog_left < -16) {
++				return;
++			}
++			char *nl = line;
++			while (*nl && *nl != '\n') {
++				nl++;
++			}
++			char saved = *nl;
++			*nl = '\0';
++			if (nl != line) {
++				SInt32 left = OSAddAtomic(-1, &guamp_oslog_left);
++				if (left <= 0) {
++					if (left == 0) {
++						printf("guamp oslog: line limit reached (guamp-oslog-lines)\n");
++					}
++					return;
++				}
++				printf("guamp oslog: %s[%d] %d %.400s\n", p->p_comm, proc_getpid(p), fd, line);
++			}
++			if (saved == '\0') {
++				break;
++			}
++			line = nl + 1;
++		}
++	}
++}
++
+ static int
+ writev_internal(struct proc *p, int fd, uio_t uio, int flags,
+     guardid_t *puguard, user_ssize_t *retval)
+@@ -666,6 +817,9 @@
+ 	context = *(vfs_context_current());
+ 	context.vc_ucred = fp->fp_glob->fg_cred;
+ 
++	if ((fd == 1 || fd == 2) && guamp_oslog_enabled() && guamp_oslog_match(p->p_comm)) {
++		guamp_oslog_tee(p, fd, uio);
++	}
+ 	error = fp_writev(&context, fp, uio, flags, retval);
+ 
+ 	fp_drop(p, fd, fp, 0);
