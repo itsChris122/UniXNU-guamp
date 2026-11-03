@@ -49,6 +49,25 @@ static void beacon(void) {
   e = skb_put(skb, 6); e[0] = 5; e[1] = 4; e[2] = 0; e[3] = 2; e[4] = 0; e[5] = 0;     /* TIM with DTIM period 2 */
   if (!g_open) { u8 rsn[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 }; if (g_group_tkip) rsn[7] = 2; skb_put_data(skb, rsn, sizeof rsn); }
   inject(skb, 2437); }
+/* guamp 03/11: a beacon of another access point with its DS Parameter Set (its own channel), heard while tuned to `tuned` */
+static void beacon_ds(const u8 *bssid, int tuned, int ds_channel, int signal) {
+  struct sk_buff *skb = alloc_skb(200, 0); struct ieee80211_mgmt *m = skb_put_zero(skb, 36);
+  m->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_BEACON); memset(m->da, 0xff, 6); memcpy(m->sa, bssid, 6); memcpy(m->bssid, bssid, 6);
+  m->u.beacon.beacon_int = cpu_to_le16(100); m->u.beacon.capab_info = cpu_to_le16(0x0401);
+  u8 *e = skb_put(skb, 7); e[0] = 0; e[1] = 5; memcpy(e + 2, "Moved", 5);
+  e = skb_put(skb, 3); e[0] = 3; e[1] = 1; e[2] = (u8)ds_channel;
+  struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb); memset(st, 0, sizeof *st); st->freq = tuned; st->signal = signal; nw_sta_rx(skb); kfree_skb(skb); }
+static int find_bss(const u8 *bssid, struct nw_bss_info *out) {
+  int found = 0; for (int i = 0; i < nw_wifi_bss_count(); i++) if (!nw_wifi_bss_get(i, out) && !memcmp(out->bssid, bssid, 6)) found++;
+  if (found == 1) for (int i = 0; i < nw_wifi_bss_count(); i++) if (!nw_wifi_bss_get(i, out) && !memcmp(out->bssid, bssid, 6)) break;
+  return found; }
+static void channel_move_cases(void) {
+  static const u8 X[6] = { 0x02, 0x99, 0x88, 0x77, 0x66, 0x55 }; struct nw_bss_info b;
+  beacon_ds(X, 2412, 1, -40); beacon_ds(X, 2417, 1, -70);
+  CHECK(find_bss(X, &b) == 1 && b.freq_mhz == 2412 && b.signal_dbm == -40, "a beacon heard on the next channel keeps the access point's own channel and signal");
+  beacon_ds(X, 2462, 11, -45);
+  CHECK(find_bss(X, &b) == 1 && b.freq_mhz == 2462 && b.signal_dbm == -45, "an access point that moved channel has one entry, on its new channel");
+}
 static struct sk_buff *mgmt_to_sta(u16 stype, const void *body, unsigned n) {
   struct sk_buff *skb = alloc_skb(200 + n, 0); struct ieee80211_mgmt *m = skb_put_zero(skb, 24);
   m->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT | stype); memcpy(m->da, g_sta_mac, 6); memcpy(m->sa, AP, 6); memcpy(m->bssid, AP, 6); skb_put_data(skb, body, n); return skb; }
@@ -276,6 +295,7 @@ int main(void) {
   nw_wifi_power(1); spin(3); nw_wifi_status_get(&st);
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
   control_regression_cases();
+  channel_move_cases();
   m4_status_missing_case();
   tkip_group_case();
   ready_regression_cases(hw);

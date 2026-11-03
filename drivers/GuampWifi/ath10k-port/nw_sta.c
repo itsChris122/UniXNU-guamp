@@ -90,7 +90,7 @@ static struct {
   u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;
   u8 group_cipher;   /* the access point's RSN group cipher suite: 4 CCMP, 2 TKIP (WPA/WPA2 mixed networks) */
   /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */
-  u8 gtk[32]; int gtk_len, gtk_idx; u64 m4_replay; u32 m4_cookie; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;
+  u8 gtk[32]; int gtk_len, gtk_idx; u64 m4_replay; u32 m4_cookie; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames; unsigned join_frames;
 } C;
 static u32 g_next_m4_cookie;
 static volatile u64 g_m4_wait_replay;
@@ -131,8 +131,27 @@ static void note_bss(struct sk_buff *skb) {
   if (ssid && ssid->datalen <= 32) { b.ssid_len = ssid->datalen; memcpy(b.ssid, ssid->data, ssid->datalen); }
   b.freq = st->freq; b.signal = st->signal; b.caps = le16_to_cpu(m->u.beacon.capab_info); b.interval = le16_to_cpu(m->u.beacon.beacon_int);
   b.seen = lx_now_ms(); b.ie_len = len; memcpy(b.ie, ie, len);
+  /*
+   * guamp 03/11 (fin36, live-20261103-195840): the access point's own channel, as cfg80211 takes it (DS Parameter Set, 3;
+   * on 5 GHz the HT operation's primary channel, 61), not the one the radio was tuned to when it heard the frame: on 2.4 GHz a
+   * beacon is heard on the neighbouring channels too. One entry per access point (it was one per access point and channel):
+   * an access point that changed channel left its old entry behind with its old signal, and the join picked it -- fin36
+   * joined 20:b0:01:22:1d:85 "on 2412 MHz, signal -48 dBm", exactly the values of the first scan at 17.7 s, and none of 16
+   * authentications was acknowledged (an earlier day the same network was joined at 2462 MHz).
+   */
+  int heard_off_channel = 0;
+  { const struct element *ds = cfg80211_find_elem_match(WLAN_EID_DS_PARAMS, ie, len, 0, 0, 0);
+    const struct element *ht = cfg80211_find_elem_match(WLAN_EID_HT_OPERATION, ie, len, 0, 0, 0);
+    unsigned own = 0;
+    if (b.freq < 4000 && ds && ds->datalen >= 1 && ds->data[0] >= 1 && ds->data[0] <= 14)
+      own = ds->data[0] == 14 ? 2484 : 2407 + 5u * ds->data[0];
+    else if (b.freq >= 4900 && b.freq < 5925 && ht && ht->datalen >= 1 && ht->data[0] >= 32 && ht->data[0] <= 177)
+      own = 5000 + 5u * ht->data[0];
+    if (own && own != b.freq) { b.freq = own; heard_off_channel = 1; } }
   lock();
-  int at = -1; for (int i = 0; i < g_nbss; i++) if (!memcmp(g_bss[i].bssid, b.bssid, 6) && g_bss[i].freq == b.freq) { at = i; break; }
+  int at = -1; for (int i = 0; i < g_nbss; i++) if (!memcmp(g_bss[i].bssid, b.bssid, 6)) { at = i; break; }
+  /* heard from a neighbouring channel: the signal there is weaker than on its own; keep the one measured on its channel */
+  if (heard_off_channel && at >= 0 && g_bss[at].freq == b.freq && b.seen - g_bss[at].seen < 30000) b.signal = g_bss[at].signal;
   if (at < 0) { if (g_nbss < MAX_BSS) at = g_nbss++; else { u64 old = ~0ull; for (int i = 0; i < MAX_BSS; i++) if (g_bss[i].seen < old) { old = g_bss[i].seen; at = i; } } }
   /* a probe response carries the name even when the beacon hides it: keep a name once known */
   if (!b.ssid_len && at < g_nbss && !memcmp(g_bss[at].bssid, b.bssid, 6) && g_bss[at].ssid_len) { b.ssid_len = g_bss[at].ssid_len; memcpy(b.ssid, g_bss[at].ssid, 32); }
@@ -840,7 +859,12 @@ static void timer_fn(struct work_struct *w) {
       connect_done(C.hs_stage ? NW_RES_BAD_KEY : NW_RES_TIMEOUT); return; }
   }
   switch (C.state) {
-  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
+  case NW_STA_AUTH: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) {
+        /* guamp 03/11: what came from the access point meanwhile (0: the radio is not where the access point is) and what the
+         * firmware did (WMI commands: vdev start, peer create, management frames; events) */
+        char why[480]; nw_wifi_quiet_report(why, sizeof why, 1);
+        lx_log(4, "wifi: authentication unanswered: %u frames from the access point during the join; %s", g_current_link_frames - C.join_frames, why);
+        connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
   case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } send_assoc(); } break;
   case NW_STA_KEYS: break;
   case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;
@@ -854,8 +878,13 @@ static void start_connect(const struct nw_request *request) {
   }
   struct bss *best = 0;
   lock();
+  /* guamp 03/11: an access point heard in the last 30 s before any older one (an old entry may be gone or moved), then the
+   * strongest */
+  const u64 now_ms = lx_now_ms();
   for (int i = 0; i < g_nbss; i++) { struct bss *b = &g_bss[i]; if (b->ssid_len != request->ssid_len || memcmp(b->ssid, request->ssid, b->ssid_len)) continue;
-    if (request->has_bssid && memcmp(b->bssid, request->bssid, 6)) continue; if (!best || b->signal > best->signal) best = b; }
+    if (request->has_bssid && memcmp(b->bssid, request->bssid, 6)) continue;
+    int fresh = now_ms - b->seen <= 30000, best_fresh = best && now_ms - best->seen <= 30000;
+    if (!best || fresh > best_fresh || (fresh == best_fresh && (fresh ? b->signal > best->signal : b->seen > best->seen))) best = b; }
   if (best) C.ap = *best;
   unlock();
   memcpy(C.ssid, request->ssid, 32); C.ssid_len = request->ssid_len; C.result = 0;
@@ -876,8 +905,8 @@ static void start_connect(const struct nw_request *request) {
   r = g_ops->assign_vif_chanctx(g_hw, g_vif, &g_vif->bss_conf, C.ctx); if (r) { lx_log(3, "wifi: channel assign failed: %d", r); connect_done(NW_RES_FAILED); return; }
   r = add_station(); if (r) { lx_log(3, "wifi: station setup failed: %d", r); connect_done(NW_RES_FAILED); return; }
   link_changed(BSS_CHANGED_BSSID | BSS_CHANGED_TXPOWER);
-  C.state = NW_STA_AUTH; C.tries = 0; C.started = lx_now_ms(); nw_wifi_stats.stage = 7;
-  lx_log(6, "wifi: connecting to %02x:%02x:%02x:%02x:%02x:%02x on %u MHz, signal %d dBm, transmit power %d dBm", C.ap.bssid[0], C.ap.bssid[1], C.ap.bssid[2], C.ap.bssid[3], C.ap.bssid[4], C.ap.bssid[5], C.ap.freq, C.ap.signal, g_vif->bss_conf.txpower);
+  C.state = NW_STA_AUTH; C.tries = 0; C.started = lx_now_ms(); nw_wifi_stats.stage = 7; C.join_frames = g_current_link_frames;
+  lx_log(6, "wifi: connecting to %02x:%02x:%02x:%02x:%02x:%02x on %u MHz, signal %d dBm (heard %llu ms ago), transmit power %d dBm", C.ap.bssid[0], C.ap.bssid[1], C.ap.bssid[2], C.ap.bssid[3], C.ap.bssid[4], C.ap.bssid[5], C.ap.freq, C.ap.signal, (unsigned long long)(lx_now_ms() - C.ap.seen), g_vif->bss_conf.txpower);
   send_auth();   /* guamp 02/11: no deauthentication first: sent unassociated it jammed the firmware management queue (fin26/fin27: no tx status, WMI timeout, hardware restart, phone frozen) */ lx_queue_delayed(&g_timer, 100); }
 
 /* ---- the data path ---- */
