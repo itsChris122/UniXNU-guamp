@@ -971,7 +971,10 @@ void thread(void *param, wait_result_t) {
 
 void start() {
   unsigned stage = 0;
-  if (!PE_parse_boot_argn("guamp-touch", &stage, sizeof(stage)) || !stage) return;
+  // guamp 03/11: screen replaced (no more ghost touches) -> touch ON by default at stage 4; guamp-touch=0 turns it off.
+  stage = 4;
+  PE_parse_boot_argn("guamp-touch", &stage, sizeof(stage));
+  if (!stage) return;
   if (stage > 4) stage = 4;
   thread_t t = nullptr;
   if (kernel_thread_start(thread, reinterpret_cast<void *>(static_cast<uintptr_t>(stage)), &t) == KERN_SUCCESS) thread_deallocate(t);
