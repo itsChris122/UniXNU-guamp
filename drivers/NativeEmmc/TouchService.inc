@@ -11,6 +11,7 @@
 // firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
 // guamp-touch-wake=1 (default 0): tap-to-wake with the screen off, see the "wake" block before thread().
 // guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
+// guamp-touch-softdetect=<m> (default 0): piano B, tocchi calcolati da noi dalla mappa delta/raw (GuampSoftTouch.inc).
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
@@ -19,6 +20,7 @@
 #include "GeniSpi.h"
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
+#include "GuampSoftTouchCore.h"
 #include "GeniSpiCpp.inc"
 #include "HxProtocolCpp.inc"
 
@@ -930,6 +932,8 @@ void dump(const uint8_t *ev) {
 }
 }  // namespace rawdump
 
+#include "GuampSoftTouch.inc"
+
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
@@ -1112,6 +1116,7 @@ void thread(void *param, wait_result_t) {
         gEdgeBottom, kEdgeFade, gFlip, gMapLog);
   uint8_t ev[HX_EVENT_LEN] = {};
   rawdump::init();
+  softdetect::init();
   // guamp 03/11: new screen, the chip answers and runs but every report is an empty one even under a finger.
   // guamp-touch-raw=<n> (default 64): the event bytes are logged whenever they change, at most n times.
   uint8_t lastRaw[HX_EVENT_LEN] = {};
@@ -1175,11 +1180,12 @@ void thread(void *param, wait_result_t) {
   for (;;) {
     if (useIrq) {
       // Woken by the IRQ, or after 20 ms at the latest: works even if the IRQ line never fires.
-      assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, 20, 1000 * 1000);
+      // Con guamp-touch-softdetect anche alla scadenza della mappa seguente (softdetect::waitMs, 1..20 ms).
+      assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, softdetect::waitMs(), 1000 * 1000);
       if (gIrqEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
       else thread_block(THREAD_CONTINUE_NULL);
     } else {
-      IOSleep(10);
+      IOSleep(softdetect::active() ? softdetect::waitMs() : 10);
     }
     const bool fromIrq = useIrq && gIrqEvents != seen;
     seen = gIrqEvents;
@@ -1189,11 +1195,13 @@ void thread(void *param, wait_result_t) {
       const bool off = !gDisplayOn;
       if (off && !suspended) {
         if (down) { struct hx_report up = {}; down = false; publish(up); }
+        softdetect::suspend();
         wakeSuspend();
         suspended = true;
         gestLog = 0;
       } else if (!off && suspended) {
         wakeResume();
+        softdetect::resume();
         suspended = false;
       }
       continue;
@@ -1223,6 +1231,12 @@ void thread(void *param, wait_result_t) {
       if (diag) logStatus(polls);
     }
     rawdump::dump(ev);
+    if (softdetect::step()) {
+      // guamp-touch-softdetect=1: i contatti sono quelli calcolati dalla mappa; il pacchetto del firmware si legge ancora
+      // dopo un'interruzione (come prima), ma non si pubblica.
+      if (fromIrq) hx_read_event(&gChip, ev);
+      continue;
+    }
     if (irqOnly && useIrq && !fromIrq) {
       // No interrupt for 20 ms: only the lost "finger up" guard.
       if (down && mach_absolute_time() - lastGood > releaseTicks) {
