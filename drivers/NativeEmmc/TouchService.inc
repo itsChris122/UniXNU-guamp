@@ -776,6 +776,7 @@ int (*volatile gPanelCycle)(int which) = nullptr;
 // (_himax_chip_common_suspend / _resume without SMWP, HX_RESUME_SET_FW) before the download: panel off-command, touch
 // reset held low, panel on-command, reset 1 / 2 ms, 0 / 5 ms, 1 / 2 ms, then the full download and start. In TWRP the
 // verified working touch (S1@391,840 at 58.7 s) came after such a screen off / on cycle (second 0f at 21.6 s).
+// 4: the Linux boot order (LCD reset sequence and the full on-command before the touch), see the block in thread().
 int panelCycle(const char *when, int which = 2) {
   for (unsigned i = 0; i < 60 && !gPanelCycle; ++i) IOSleep(50);
   int (*fn)(int) = gPanelCycle;
@@ -856,6 +857,25 @@ void thread(void *param, wait_result_t) {
   {
     unsigned cyc = 0;
     PE_parse_boot_argn("guamp-touch-panelcycle", &cyc, sizeof(cyc));
+    if (cyc == 4) {
+      // Linux (TWRP 03/11, touch working without any suspend): dsi_panel_disable 2.475, post_unprepare 2.576 (LCD
+      // reset low, rails down), power_on 2.592 (rails up, reset sequence 1/5, 0/2, 1/60 ms of the dtsi), enable 2.724
+      // (on-command), then the touch probe at 4.8 s. Here without the rails (L9A / LCDB stay on: no safe SPMI write
+      // path for them in this service): touch reset low, LCD reset low 20 ms, the reset sequence, the full on-command
+      // over DSI while the MDSS video stream keeps running, touch reset released, identify again, download, start.
+      pinWrite(GT_GPIO_RESET, 4, 0u);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 0u); IOSleep(20);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(5);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 0u); IOSleep(2);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(60);
+      panelCycle("lcd reset + on-command", 3);
+      IOSleep(100);
+      pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(50);
+      const int id = hx_identify(&gChip);
+      IOLog("GuampTouch: after panel re-init: lcd-rst %u, identify rc %d id %02x%02x%02x central %02x\n",
+            pinRead(GT_GPIO_LCD_RESET, 4) & 1u, id, gChip.id[3], gChip.id[2], gChip.id[1], gChip.central_state);
+      regDump("panel-reinit");
+    }
     if (cyc == 3 && !keepFw) {
       panelCycle("resume order: off-command", 0);
       pinWrite(GT_GPIO_RESET, 4, 0u);                    // himax_rst_gpio_set(rst, 0) in suspend
