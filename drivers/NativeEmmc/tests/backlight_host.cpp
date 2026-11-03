@@ -3,8 +3,11 @@
 // against a fake controller (register order, restore, refusals, timeouts).
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <initializer_list>
 #include "../GuampBacklightCore.h"
+#include "../GuampPanelCycleCore.h"
 using namespace guamp_backlight;
 
 static int failures;
@@ -248,6 +251,189 @@ int main() {
     f.doneAfter = 60;                                           // 40 x 25 us spin, then 1 ms sleeps
     Diag d;
     check(sendBrightness(f, 0x300, d) == kSent && d.waitedUs < kDoneTimeoutUs, "slow done", d.waitedUs);
+  }
+
+  // Command-mode LP transfer (panel power cycle): no schedule, LOW_POWER at the trigger, all restored; refused (no write)
+  // while the video engine is on
+  {
+    FakeDsi f;
+    f.bootLoaderState();
+    f.r(rCtrl) = (f.r(rCtrl) & ~kCtrlVideo) | kCtrlCmd;
+    f.r(rDmaSchedule) = kScheduleEnable | 1615u;
+    f.r(rDmaCtrl) = kDmaEmbedded;
+    const uint32_t ctrl0 = f.r(rCtrl), sched0 = f.r(rDmaSchedule), dma0 = f.r(rDmaCtrl), mask0 = f.r(rErrIntMask0);
+    Diag d;
+    const uint8_t c11[] = {0x11};
+    check(sendDcsCmd(f, c11, 1, true, d) == kSent, "LP command sent");
+    const uint32_t *t = f.atTrigger;
+    check(!(t[rDmaSchedule / 4] & kScheduleEnable), "no DMA schedule in command mode", t[rDmaSchedule / 4]);
+    check(t[rDmaCtrl / 4] == (kDmaEmbedded | kDmaLpm), "DMA ctrl embedded + LP", t[rDmaCtrl / 4]);
+    check(t[rTpgCtrl / 4] == kTpgCmdFifo && t[rDmaLength / 4] == 8, "FIFO mode, length 8");
+    check(f.r(rCtrl) == ctrl0 && f.r(rDmaSchedule) == sched0 && f.r(rDmaCtrl) == dma0 && f.r(rErrIntMask0) == mask0 &&
+          f.r(rTpgCtrl) == 0 && f.fifoCount == 0, "command-mode transfer restores everything");
+    check(sendDcsCmd(f, c11, 1, false, d) == kSent && f.atTrigger[rDmaCtrl / 4] == kDmaEmbedded, "HS variant: no LP bit");
+    FakeDsi g;
+    g.bootLoaderState();
+    check(sendDcsCmd(g, c11, 1, true, d) == kVideoOn && g.writes == 0, "video on: refused, no write");
+    g.r(rCtrl) = 0;
+    check(sendDcsCmd(g, c11, 1, true, d) == kCtrlOff && g.writes == 0, "controller off: refused");
+  }
+
+  // LCDB voltage codes (qpnp_lcdb_set_voltage / get_voltage / set_bst_voltage) and the TWRP probe values
+  {
+    using namespace guamp_panelcycle;
+    check(voutCode(4000) == 0 && voutCode(4500) == 5 && voutCode(4900) == 9 && voutCode(4950) == 10, "vout codes, 100 mV range");
+    check(voutCode(5000) == 11 && voutCode(5500) == 21 && voutCode(5600) == 23 && voutCode(6000) == 31, "vout codes, 50 mV range",
+          voutCode(5600));
+    check(voutMv(21) == 5500 && voutMv(23) == 5600 && voutMv(5) == 4500 && voutMv(0xe0 | 21) == 5500, "vout decode (mask)");
+    for (uint32_t mv = 4000; mv <= 6000; mv += 50)
+      check(voutMv(voutCode(mv)) >= mv && voutMv(voutCode(mv)) < mv + 100, "vout round up", mv, voutMv(voutCode(mv)));
+    check(bstCode(5500) == 38 && bstMv(38) == 5650, "bst 5650 mV for 5.5 V (TWRP lcdb probe)", bstCode(5500));
+    check(bstCode(5600) == 42 && bstMv(42) == 5750, "bst 5750 mV for 5.6 V", bstCode(5600));
+    check(bstCode(4000) == 0 && bstCode(7000) == (6275 - 4700 + 24) / 25, "bst clamps");
+  }
+
+  // Panel power cycle on a fake platform
+  {
+    struct Plat : FakeDsi {
+      uint32_t intf[0x300 / 4] = {};
+      uint8_t lcdb[0x100] = {};
+      bool writable = true, lcdOut = true, vregNeverOk = false, cycled = false, enStuck = false;   // vregNeverOk: after the rails went down
+      unsigned lcd = 1, tp = 1, spmiWrites = 0, intfWrites = 0, lcdLowWhileRailsOff = 0, events = 0;
+      char ev[64] = {};                                         // L lcd low, H lcd high, D rails down, U rails up, t/T touch
+      void mark(char c) { if (events < sizeof(ev) - 1) ev[events++] = c; }
+      bool railsOn() const { return (lcdb[guamp_panelcycle::rEnableCtl1] & 0x80) != 0; }
+      uint32_t intfRd(uint32_t o) { return intf[o / 4]; }
+      void intfWr(uint32_t o, uint32_t v) { intfWrites = intfWrites + 1; intf[o / 4] = v; }
+      int spmiRd(uint16_t off, uint8_t *v) {
+        if (off == guamp_panelcycle::rIntRtSts) lcdb[off] = (railsOn() && !(vregNeverOk && cycled)) ? 1 : 0;
+        *v = lcdb[off];
+        return 0;
+      }
+      int spmiWr(uint16_t off, uint8_t v) {
+        spmiWrites = spmiWrites + 1;
+        if (!writable) return -1;
+        const bool was = railsOn();
+        if (enStuck && off == guamp_panelcycle::rEnableCtl1) return 0;   // accepted, module stays on
+        lcdb[off] = v;
+        if (was && !railsOn()) { mark('D'); cycled = true; if (!lcd) lcdLowWhileRailsOff = lcdLowWhileRailsOff + 1; }
+        if (!was && railsOn()) mark('U');
+        return 0;
+      }
+      bool spmiWritable() { return writable; }
+      bool lcdResetIsOutput() { return lcdOut; }
+      unsigned lcdResetLevel() { return lcd; }
+      void lcdReset(bool h) { lcd = h; mark(h ? 'H' : 'L'); }
+      void tpReset(bool h) { tp = h; mark(h ? 'T' : 't'); }
+      void sleepMs(uint32_t n) {
+        us += n * 1000ull;
+        if (intf[0] & 1) intf[guamp_panelcycle::rIntfFrameCount / 4] += (n + 15) / 16;
+      }
+      void log(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {   // PANEL_LOG=1: print the cycle
+        if (!getenv("PANEL_LOG")) return;
+        va_list ap;
+        va_start(ap, fmt);
+        vprintf(fmt, ap);
+        va_end(ap);
+      }
+      void boot() {
+        bootLoaderState();
+        r(rCtrl) |= kCtrlCmd;
+        intf[0] = 1;
+        intf[guamp_panelcycle::rIntfFrameLineEn / 4] = 3;
+        lcdb[guamp_panelcycle::rEnableCtl1] = 0x80;
+        lcdb[guamp_panelcycle::rLdoVout] = 21;
+        lcdb[guamp_panelcycle::rNcpVout] = 21;
+        lcdb[guamp_panelcycle::rBstVout] = 38;
+      }
+    };
+    using namespace guamp_panelcycle;
+    {
+      Plat p;
+      p.boot();
+      const uint32_t ctrl0 = p.r(rCtrl);
+      Options o;
+      Report rep;
+      const int res = run(p, o, rep);
+      check(res == kDone, "cycle done", res);
+      check(p.r(rCtrl) == ctrl0 && p.intf[0] == 1, "DSI ctrl and timing engine restored", p.r(rCtrl), p.intf[0]);
+      check(rep.frames[5] != rep.frames[4], "video runs again");
+      check(p.lcdb[rEnableCtl1] == 0x80 && p.lcdb[rLdoForcePd] == 0, "LCDB on, force pull-down released", p.lcdb[rEnableCtl1]);
+      check(p.lcdb[rLdoVout] == 23 && p.lcdb[rNcpVout] == 23 && p.lcdb[rBstVout] == 42, "5.6 V, boost 5.75 V", p.lcdb[rLdoVout],
+            p.lcdb[rBstVout]);
+      check(rep.railsDown && p.lcdLowWhileRailsOff == 1, "rails down with the LCD reset low");
+      check(p.lcd == 1 && p.tp == 1, "resets released");
+      check(!strcmp(p.ev, "tLDUHLHT"), "order: touch low, lcd low, rails down, up, reset 1/0/1, touch high");
+      if (strcmp(p.ev, "tLDUHLHT")) printf("  events %s\n", p.ev);
+    }
+    {   // the boot loader's voltage kept, reset high as Linux
+      Plat p;
+      p.boot();
+      Options o;
+      o.targetMv = 0;
+      o.resetLow = false;
+      Report rep;
+      check(run(p, o, rep) == kDone, "cycle done (keep voltage)");
+      check(p.lcdb[rLdoVout] == 21 && p.lcdb[rBstVout] == 38, "5.5 V kept, boost unchanged", p.lcdb[rLdoVout], p.lcdb[rBstVout]);
+      check(p.lcdLowWhileRailsOff == 0 && !strcmp(p.ev, "tDUHLHT"), "reset high while the rails are off");
+    }
+    {   // refusals: not a single write anywhere
+      Options o;
+      Report rep;
+      Plat p;
+      p.boot();
+      p.writable = false;
+      check(run(p, o, rep) == kSpmiReadOnly && p.writes == 0 && p.intfWrites == 0 && p.spmiWrites == 0 && !p.events,
+            "SPMI read-only: refused before any write");
+      Plat q;
+      q.boot();
+      q.lcdb[rEnableCtl1] = 0;
+      check(run(q, o, rep) == kLcdbOff && q.writes == 0 && q.intfWrites == 0 && q.spmiWrites == 0, "LCDB off: refused");
+      Plat s;
+      s.boot();
+      s.intf[0] = 0;
+      check(run(s, o, rep) == kIntfOff && s.writes == 0 && s.intfWrites == 0, "timing engine off: refused");
+      Plat u;
+      u.boot();
+      u.lcdOut = false;
+      check(run(u, o, rep) == kResetPin && u.writes == 0 && u.intfWrites == 0, "reset pin not an output: refused");
+      Plat v;
+      v.boot();
+      v.r(rCtrl) &= ~kCtrlVideo;
+      check(run(v, o, rep) == kDsiNotReady && v.intfWrites == 0, "DSI not in video mode: refused");
+      Plat w2;
+      w2.boot();
+      w2.clocks = false;
+      check(run(w2, o, rep) == kNoClocks && w2.intfWrites == 0, "clocks off: refused");
+    }
+    {   // no VREG_OK: one retry, then the rest of the cycle still runs to the video
+      Plat p;
+      p.boot();
+      p.vregNeverOk = true;
+      Options o;
+      Report rep;
+      const int res = run(p, o, rep);
+      check((res & kWarnLcdbUp) && p.intf[0] == 1 && p.lcd == 1 && p.tp == 1 && p.lcdb[rEnableCtl1] == 0x80,
+            "no VREG_OK: warned, module left on, video and resets back", res);
+    }
+    {   // the module refuses to go off: no voltage ramp on live rails, warned, video back
+      Plat p;
+      p.boot();
+      p.enStuck = true;
+      Options o;
+      Report rep;
+      const int res = run(p, o, rep);
+      check((res & kWarnLcdbDown) && !(res & kWarnLcdbUp) && p.lcdb[rLdoVout] == 21 && p.lcdb[rNcpVout] == 21 &&
+            p.lcdb[rLdoForcePd] == 0 && p.intf[0] == 1 && p.lcd == 1, "LCDB stuck on: no ramp, pull-down released", res);
+    }
+    {   // DSI only
+      Plat p;
+      p.boot();
+      Options o;
+      o.lcdb = false;
+      Report rep;
+      check(run(p, o, rep) == kDone && p.spmiWrites == 0 && p.intf[0] == 1, "lcdb off: no SPMI write");
+    }
   }
 
   // Rate limit: burst, then one per refill period, dropped lines counted

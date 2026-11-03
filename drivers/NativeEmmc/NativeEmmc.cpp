@@ -1318,6 +1318,7 @@ static void usbProbe()
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
 #include "GuampScanout.inc"     // differential copy / double-buffered scanout of the legacy display (guamp-copy-diff, guamp-scanout-flip)
+#include "GuampPanelCycle.inc"  // guamp-touch-panelcycle=5: Linux panel power cycle (LCDB, DSI LP), after GuampScanout.inc
 #include "GuampCpufreq.inc"
 #include "GuampAudioHw.inc"    // audio output HW (guamp-audio-hw=1|2): aw882xx speaker amp, LPI i2s1, RX macro; before GuampAdsp.inc
 #define GUAMP_AUDIO_SHM_PROVIDED 1  // guamp_audio_shm_get/put: GuampAudioPlay.inc (stream 0x1c1 buffer for the capture)

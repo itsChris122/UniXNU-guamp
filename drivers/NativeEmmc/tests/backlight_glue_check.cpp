@@ -10,6 +10,11 @@ void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 void nanoseconds_to_absolutetime(uint64_t, uint64_t *);
 void IODelay(unsigned us);
 void IOSleep(unsigned ms);
+typedef struct _IORecursiveLock IORecursiveLock;
+IORecursiveLock *IORecursiveLockAlloc(void);
+void IORecursiveLockLock(IORecursiveLock *);
+void IORecursiveLockUnlock(IORecursiveLock *);
+void IOLogv(const char *format, __builtin_va_list ap) __attribute__((format(printf, 1, 0)));
 }
 void *IOMallocZero(size_t);
 typedef int IOReturn;
@@ -70,4 +75,20 @@ volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
 // TouchService.inc (included before GuampBacklight.inc in NativeEmmc.cpp): display state for the touch wake.
 namespace touch { extern volatile uint32_t gWakeArmed, gWakeDsi; void displayState(bool on); extern int (*volatile gPanelCycle)(int); }
 #include "../GuampBacklight.inc"
-void use() { backlight::start(); }
+// GuampPanelCycle.inc (after GuampScanout.inc in NativeEmmc.cpp): stand-ins for the PMIC arbiter, the touch pins and the
+// scanout hold it uses.
+#define GT_GPIO_LCD_RESET 82
+#define GT_GPIO_RESET 66
+#define GT_PIN_OE (1u << 9)
+namespace touch { void pinWrite(unsigned gpio, uint32_t off, uint32_t v); uint32_t pinRead(unsigned gpio, uint32_t off); }
+namespace pmic {
+extern volatile int gArbReady;
+struct Arb { uint8_t write_owner[512]; };
+extern Arb gArb;
+int read8(unsigned sid, uint16_t addr, uint8_t *v);
+int write8(unsigned sid, uint16_t addr, uint8_t v);
+int apidOf(unsigned sid, uint16_t addr);
+}
+namespace gscan { void hold(bool on); }
+#include "../GuampPanelCycle.inc"
+void use() { backlight::start(); panelcycle::run(); }

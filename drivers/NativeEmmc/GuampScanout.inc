@@ -29,6 +29,10 @@ constexpr Pipe kPipes[] = {{"VIG0", 0x5000, 1u << 0}, {"DMA0", 0x25000, 1u << 11
 constexpr uint64_t kRegionBase = 0x5C000000ULL, kRegionEnd = 0x5D000000ULL;   // guampPkg MemoryMapLib "Display Reserved"
 constexpr unsigned kLatchUs = 50000;
 constexpr uint32_t kFlushCtl = 1u << 17;   // dpu_hw_ctl CTL_FLUSH_MASK_CTL, sent with every plane flush by Linux
+// guamp-touch-panelcycle=5 (GuampPanelCycle.inc) stops the INTF timing engine for ~0.6 s: no flip may wait for a latch
+// then. While held, present() answers 0 (the variant copies into the GOP frame itself, which the copy counter notices)
+// and the idle catch-up / external paths leave the pipe alone.
+volatile int gHold = 0;
 
 struct Kernel {
   bool read = false, diff = false, neon = false, flipWanted = false;
@@ -107,8 +111,17 @@ static void readOptions()
   if (handoff == 1) gK.flipWanted = false;
   gK.lock = IOLockAlloc();
   if (!gK.lock) gK.diff = gK.flipWanted = false;
-  gK.read = true;
+  __atomic_store_n(&gK.read, true, __ATOMIC_SEQ_CST);   // after the lock: hold() takes it once read is seen
 }
+
+// GuampPanelCycle.inc, around the panel power cycle: on = no present / catch-up / external touches the pipe from now on
+// (one in flight is waited for through the lock); off = back to normal.
+void hold(bool on)
+{
+  __atomic_store_n(&gHold, on ? 1 : 0, __ATOMIC_SEQ_CST);
+  if (on && __atomic_load_n(&gK.read, __ATOMIC_SEQ_CST) && gK.lock) { IOLockLock(gK.lock); IOLockUnlock(gK.lock); }
+}
+static bool held() { return __atomic_load_n(&gHold, __ATOMIC_SEQ_CST) != 0; }
 
 static bool clocksOn()
 {
@@ -212,7 +225,7 @@ static void probeFlip(volatile uint8_t *gopVa, uint64_t gopPa, uint64_t stride, 
       gK.idleCall = thread_call_allocate_with_options([](thread_call_param_t, thread_call_param_t) {
         IOLockLock(gK.lock);
         // No frame since the flip to the second buffer: the GOP frame catches up from it and is shown again.
-        if (gK.flipOn && gK.shown == 1 && gK.va[0] && gK.va[1] && clocksOn() && waitLatch()) {
+        if (!held() && gK.flipOn && gK.shown == 1 && gK.va[0] && gK.va[1] && clocksOn() && waitLatch()) {
           catchUp(gK.st, 0, gK.va[0], gK.va[1], gK.stride);
           __asm__ volatile("dsb sy" ::: "memory");
           point(0);
@@ -265,7 +278,9 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
   using namespace gscan;
   readOptions();
   if (!gK.diff && !gK.flipWanted) return 0;
+  if (held()) return 0;
   IOLockLock(gK.lock);
+  if (held()) { IOLockUnlock(gK.lock); return 0; }
   int result = 1;
   do {
     if (!dst || !src || ((uintptr_t)dst & 7) || ((uintptr_t)src & 7) || (dstStride & 7) || (srcStride & 7) ||
@@ -319,7 +334,7 @@ extern "C" void guamp_scanout_external(void)
   if (!gK.read || (!gK.diff && !gK.flipWanted)) return;
   IOLockLock(gK.lock);
   gK.externals = gK.externals + 1;
-  if (gK.flipOn && gK.shown != 0 && clocksOn() && waitLatch()) { point(0); waitLatch(); }
+  if (!held() && gK.flipOn && gK.shown != 0 && clocksOn() && waitLatch()) { point(0); waitLatch(); }
   gK.st.bufValid[0] = false;
   IOLockUnlock(gK.lock);
 }

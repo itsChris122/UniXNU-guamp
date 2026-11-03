@@ -29,6 +29,13 @@ using namespace guamp_backlight;
 volatile uint8_t *gDsi, *gDispcc, *gGccDisp;
 volatile uint32_t gRequests, gSends, gFailures;
 volatile uint32_t gLastLevel = guamp_backlight::kDefaultLevel;   // last level the panel was sent (panel re-init)
+// One DSI command user at a time: the backlight work loop, the touch thread's panel commands and the panel power cycle
+// (GuampPanelCycle.inc, which holds it across its whole sequence while the link is in command mode). Recursive: apply()
+// sends the wake commands under it.
+IORecursiveLock *gDsiLock;
+void dsiLock() { if (gDsiLock) IORecursiveLockLock(gDsiLock); }
+void dsiUnlock() { if (gDsiLock) IORecursiveLockUnlock(gDsiLock); }
+struct DsiGuard { DsiGuard() { dsiLock(); } ~DsiGuard() { dsiUnlock(); } };
 
 uint32_t rd32(volatile uint8_t *base, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(base + off); }
 uint64_t nowUs() {
@@ -91,6 +98,7 @@ class GuampBacklight : public IOService {
   }
   void apply(uint32_t next) {
     if (broken || (known && next == level)) return;
+    backlight::DsiGuard guard;
     guamp_backlight::Diag d;
     backlight::Io io;
     if (next && panelAsleep) {                         // wake the panel before its first visible level
@@ -254,6 +262,7 @@ int panelInit() {
                 c53[] = {0x53, 0x2C}, cB9[] = {0xB9, 0x83, 0x10, 0x2D}, cCD[] = {0xCD, 0x01};
   struct Step { const uint8_t *p; unsigned n, wait; };
   const Step steps[] = {{c11, 1, 160}, {c29, 1, 50}, {c51, 3, 0}, {c55, 2, 0}, {c53, 2, 0}, {cB9, 4, 0}, {cCD, 2, 10}};
+  DsiGuard guard;
   guamp_backlight::Diag d;
   Io io;
   for (const Step &s : steps) {
@@ -272,6 +281,7 @@ int panelCycle(int which) {
   static const uint32_t cmds[] = {guamp_backlight::kDcsDisplayOff, guamp_backlight::kDcsSleepIn, guamp_backlight::kDcsSleepOut,
                                   guamp_backlight::kDcsDisplayOn};
   static const uint32_t waits[] = {20, 120, 160, 50};
+  DsiGuard guard;
   guamp_backlight::Diag d;
   Io io;
   const unsigned first = which == 1 ? 2u : 0u, last = which == 0 ? 2u : 4u;
@@ -292,6 +302,7 @@ void start() {
   gDispcc = mapPhysical(kDispccPhys, 0x3000);
   gDsi = mapPhysical(kDsiPhys, 0x1000);
   if (!gGccDisp || !gDispcc || !gDsi) { IOLog("GuampBacklight: mapping failed\n"); gDsi = nullptr; return; }
+  gDsiLock = IORecursiveLockAlloc();
   touch::gPanelCycle = &panelCycle;
   GuampBacklight *service = OSTypeAlloc(GuampBacklight);
   if (!service || !service->init() || !service->attach(IOService::getPlatform())) {

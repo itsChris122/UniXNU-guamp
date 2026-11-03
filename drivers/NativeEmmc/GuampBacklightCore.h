@@ -35,6 +35,7 @@ enum : uint32_t {
   rHwVersion = 0x000, rCtrl = 0x004, rStatus = 0x008, rFifoStatus = 0x00c, rActiveV = 0x028, rTotal = 0x02c,
   rDmaCtrl = 0x03c, rDmaLength = 0x04c, rAckErr = 0x068, rTrigCtrl = 0x084, rSwTrigger = 0x090, rTimeoutStatus = 0x0c0,
   rDmaSchedule = 0x100, rErrIntMask0 = 0x10c, rIntCtrl = 0x110, rTpgCtrl = 0x15c, rTpgFifo = 0x17c, rTpgFifoReset = 0x1ec,
+  rVideoModeCtrl = 0x010, rLaneStatus = 0x0a8, rLaneCtrl = 0x0ac, rDln0PhyErr = 0x0b4, rClkCtrl = 0x11c, rClkStatus = 0x120,
 };
 constexpr uint32_t kCtrlEnable = 1u << 0, kCtrlVideo = 1u << 1, kCtrlCmd = 1u << 2;        // ctrl_en, video/cmd_engine_en
 constexpr uint32_t kStatusDmaBusy = 1u << 1;                                               // DSI_STATUS0_CMD_MODE_DMA_BUSY
@@ -120,6 +121,7 @@ constexpr uint32_t scheduleLine(uint32_t activeV, uint32_t total) {
 
 enum Result : int {
   kSent = 0, kClocksOff = 1, kCtrlOff = 2, kNotVideo = 3, kBadVersion = 4, kBadTiming = 5, kBusy = 6, kTimeout = 7,
+  kVideoOn = 8,
 };
 inline const char *resultName(int r) {
   switch (r) {
@@ -131,6 +133,7 @@ inline const char *resultName(int r) {
   case kBadTiming: return "video timing implausible";
   case kBusy: return "command DMA busy";
   case kTimeout: return "DMA_DONE timeout";
+  case kVideoOn: return "video engine still on";
   default: return "?";
   }
 }
@@ -205,6 +208,74 @@ template <class Io> int sendPacket(Io &io, const uint32_t words[2], Diag &d) {
   if ((trig & kTrigMask) != kTrigSw) io.wr(rTrigCtrl, trig);
   if (!(d.ctrl & kCtrlCmd)) io.wr(rCtrl, io.rd(rCtrl) & ~kCtrlCmd);
   return done ? kSent : kTimeout;
+}
+// Command-mode transfer (guamp-touch-panelcycle=5): the MDSS timing engine is stopped and the DSI video engine is off, as
+// Linux has them when dsi_panel_disable / dsi_panel_enable send the off- and on-command (sde_encoder_phys_vid_disable then
+// dsi_display_vid_engine_disable before dsi_panel_disable; dsi_panel_enable before dsi_display_vid_engine_enable). Same
+// FIFO sequence as sendPacket, but nothing to schedule (DMA_SCHEDULE enable cleared: the DMA leaves at once) and, for an
+// LP transfer, DMA_CTRL LOW_POWER bit 26 (kickoff_fifo_command use_lpm; on-command-state dsi_lp_mode). Everything changed
+// is restored on every path after the trigger, DMA_CTRL included.
+template <class Io> int sendPacketCmd(Io &io, const uint32_t words[2], bool lp, Diag &d) {
+  d = Diag{};
+  if (!io.clocksOn()) return kClocksOff;
+  d.hw = io.rd(rHwVersion);
+  d.ctrl = io.rd(rCtrl);
+  if (!(d.ctrl & kCtrlEnable)) return kCtrlOff;
+  if (d.ctrl & kCtrlVideo) return kVideoOn;
+  if ((d.hw >> 28) != 2 || ((d.hw >> 16) & 0xfffu) < 2) return kBadVersion;
+  const uint64_t t0 = io.nowUs();
+  while (io.rd(rStatus) & kStatusDmaBusy) {
+    if (io.nowUs() - t0 >= kBusyTimeoutUs) { d.status = io.rd(rStatus); return kBusy; }
+    io.delayUs(50);
+  }
+  const uint32_t trig = io.rd(rTrigCtrl), schedule = io.rd(rDmaSchedule), mask0 = io.rd(rErrIntMask0), dma = io.rd(rDmaCtrl);
+  if (!(d.ctrl & kCtrlCmd)) io.wr(rCtrl, d.ctrl | kCtrlCmd);
+  if ((trig & kTrigMask) != kTrigSw) io.wr(rTrigCtrl, (trig & ~kTrigMask) | kTrigSw);
+  io.wr(rErrIntMask0, mask0 | kOverflowMask);
+  io.wr(rIntCtrl, ackDmaDone(io.rd(rIntCtrl)));
+  io.wr(rTpgCtrl, 0);                                   // reset_cmd_fifo
+  io.wr(rTpgFifoReset, 1);
+  io.delayUs(1);
+  io.wr(rTpgFifoReset, 0);
+  io.wr(rTpgCtrl, kTpgCmdFifo);
+  io.wr(rTpgFifo, words[0]);
+  io.wr(rTpgFifo, words[1]);
+  io.wr(rDmaCtrl, dmaCtrlFor(dma) | (lp ? kDmaLpm : 0u));
+  if (schedule & kScheduleEnable) io.wr(rDmaSchedule, schedule & ~kScheduleEnable);
+  io.wr(rDmaLength, kPacketBytes);
+  io.wr(rSwTrigger, 1);
+  const uint64_t t1 = io.nowUs();
+  bool done = false;
+  for (;;) {
+    d.intCtrl = io.rd(rIntCtrl);
+    if (d.intCtrl & kIntDmaDone) { done = true; break; }
+    const uint64_t waited = io.nowUs() - t1;
+    if (waited >= kDoneTimeoutUs) break;
+    if (waited < 1000) io.delayUs(25);
+    else io.sleepMs(1);
+  }
+  d.waitedUs = (uint32_t)(io.nowUs() - t1);
+  d.status = io.rd(rStatus);
+  d.fifo = io.rd(rFifoStatus);
+  d.ack = io.rd(rAckErr);
+  d.timeouts = io.rd(rTimeoutStatus);
+  if (done) io.wr(rIntCtrl, ackDmaDone(d.intCtrl));
+  io.wr(rTpgCtrl, 0);                                   // reset_cmd_fifo
+  io.wr(rTpgFifoReset, 1);
+  io.delayUs(1);
+  io.wr(rTpgFifoReset, 0);
+  io.wr(rFifoStatus, io.rd(rFifoStatus) | kOverflowClear);
+  io.wr(rErrIntMask0, mask0);
+  io.wr(rDmaCtrl, dma);
+  if (schedule & kScheduleEnable) io.wr(rDmaSchedule, schedule);
+  if ((trig & kTrigMask) != kTrigSw) io.wr(rTrigCtrl, trig);
+  if (!(d.ctrl & kCtrlCmd)) io.wr(rCtrl, io.rd(rCtrl) & ~kCtrlCmd);
+  return done ? kSent : kTimeout;
+}
+template <class Io> int sendDcsCmd(Io &io, const uint8_t *p, unsigned n, bool lp, Diag &d) {
+  uint32_t words[2];
+  if (!encodeDcs(p, n, words)) return kBadTiming;
+  return sendPacketCmd(io, words, lp, d);
 }
 template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
   uint32_t words[2];
