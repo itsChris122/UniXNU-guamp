@@ -219,6 +219,26 @@ int hx_read_event(struct hx_chip *c, uint8_t *buf);
 // otherwise. Valid points: x < x_max, y <= y_max (the chin row y = max is kept and clamped by the owner).
 int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *out);
 
+// Dati diagnostici (mappa mutual + self) dalla DSRAM, come /proc/android_touch/diag/{iir_s,dc_s,bank_s} del driver
+// Motorola (himax_sram_read -> himax_mcu_diag_register_set + himax_mcu_get_DSRAM_data, himax_ts_diag_func):
+// raw out select 0x800204F4 = tipo | 0x08 (uscita in DSRAM), parola 0x10000000 = 5AA5 finche' il firmware risponde A55A
+// (dato pronto), lettura di (rx*tx + rx + tx) * 2 + 4 byte da 0x10000000 a pezzi di 128 (MAX_I2C_TRANS_SZ), stop
+// dell'uscita (0x10000000 = 0000 con i byte alti letti), somma a 16 bit delle mezze parole da 2 in poi = 0.
+// Tipi (raw_out_sel): 1 IIR (delta, iir_s = 9), 2 DC (raw, dc_s = 0x0A), 3 bank (bank_s = 0x0B); 4..7 come diag,X.
+// Mutual a 16 bit con segno (self senza segno), riga per riga di TX (tx righe da rx valori), poi self: rx valori RX, tx valori TX.
+#define HX_ADDR_RAWDATA 0x10000000u          // sram_adr_rawdata_addr
+#define HX_RAW_PWD_START 0x5AA5u             // sram_passwrd_start
+#define HX_RAW_PWD_END 0xA55Au               // sram_passwrd_end
+#define HX_RAW_CHUNK 128u                    // MAX_I2C_TRANS_SZ
+#define HX_RAW_DSRAM 0x08u                   // storage_type > 0: uscita in DSRAM
+#define HX_RAW_BYTES(rx, tx) (((rx) * (tx) + (rx) + (tx)) * 2u + 4u)
+// Scrive e rilegge il raw out select (fino a 50 volte, come himax_mcu_diag_register_set). Ritorna il valore riletto.
+uint32_t hx_diag_select(struct hx_chip *c, uint8_t sel);
+// Un frame dalla DSRAM in buf (almeno HX_RAW_BYTES(rx, tx) byte), poi mutual[tx * rx] e self[rx + tx] (puntatori nulli:
+// solo buf). *wait_ms: attesa del dato pronto. HX_ERR_TIMEOUT senza A55A entro ~1 s, HX_ERR_CHECKSUM con somma errata.
+int hx_diag_read(struct hx_chip *c, unsigned rx, unsigned tx, uint8_t *buf, size_t cap, int32_t *mutual, int32_t *self,
+                 unsigned *wait_ms);
+
 #ifdef __cplusplus
 }
 #endif
