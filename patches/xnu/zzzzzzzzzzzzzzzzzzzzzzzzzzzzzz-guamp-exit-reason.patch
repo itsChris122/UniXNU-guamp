@@ -1,7 +1,7 @@
 diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -2026,6 +2026,42 @@
+@@ -2026,6 +2026,43 @@
  	}
  }
 +/* guamp 03/11: the exit reason of a crashing process (namespace, code and the description string a dyld or
@@ -26,16 +26,17 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 +			break;
 +		}
 +		if (type == EXIT_REASON_USER_DESC && size) {
-+			char text[240];
-+			uint32_t n = size < sizeof(text) - 1 ? size : (uint32_t)sizeof(text) - 1;
-+			memcpy(text, buffer + at + 16, n);
-+			text[n] = 0;
-+			for (uint32_t i = 0; i < n && text[i]; i++) {
-+				if (text[i] < 0x20 || text[i] > 0x7e) {
-+					text[i] = '.';
++			const char *desc = buffer + at + 16;
++			uint32_t total = size < 1024 ? size : 1024;
++			for (uint32_t off = 0; off < total && desc[off]; off += 200) {
++				char text[201];
++				uint32_t n = 0;
++				for (; n < 200 && off + n < total && desc[off + n]; n++) {
++					text[n] = desc[off + n] < 0x20 || desc[off + n] > 0x7e ? '.' : desc[off + n];
 +				}
++				text[n] = 0;
++				printf("guamp exit: %s[%d] reason%s \"%s\"\n", p->p_comm, proc_getpid(p), off ? " (cont)" : "", text);
 +			}
-+			printf("guamp exit: %s[%d] reason \"%s\"\n", p->p_comm, proc_getpid(p), text);
 +		}
 +		at += 16 + size;
 +	}
@@ -44,7 +45,7 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
  
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
-@@ -2186,3 +2222,4 @@
+@@ -2186,3 +2223,4 @@
  	if (create_corpse == TRUE) {
  		guamp_exit_trace(p, rv, code, subcode);
 +		guamp_exit_reason(p);

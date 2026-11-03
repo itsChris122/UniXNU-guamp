@@ -709,14 +709,31 @@ void thread(void *param, wait_result_t) {
     if (data) { fwData = static_cast<const uint8_t *>(data->getBytesNoCopy()); fwSize = data->getLength(); }
   }
   if (!fwSize) { fail(4, -2); return; }
-  struct hx_fw fw;
-  int r = hx_fw_parse(&fw, fwData, fwSize);
-  IOLog("GuampTouch: firmware %u bytes, %u partitions, overlay %d (rc %d)\n", fwSize, fw.count, fw.overlay, r);
-  if (r) { fail(4, r); return; }
-  r = hx_download(&gChip, &fw, gCfg);
-  IOLog("GuampTouch: download rc %d stage %d cfg crc hw %08x sw %08x\n", r, gChip.stage, gChip.cfg_crc_hw, gChip.cfg_crc_sw);
-  if (r) { fail(41, r); return; }
+  // guamp 03/11: in TWRP (Linux himax driver) the new screen's touch works with the same firmware and the same config CRC,
+  // here it never reports. On 28/10 events arrived only after Linux had loaded the firmware (info "fallback"): with
+  // guamp-touch-keepfw=1 the firmware left in the chip's SRAM by Linux is kept (no download), only sense on is redone.
+  unsigned keepFw = 0;
+  PE_parse_boot_argn("guamp-touch-keepfw", &keepFw, sizeof(keepFw));
+  int r = 0;
+  if (!keepFw) {
+    struct hx_fw fw;
+    r = hx_fw_parse(&fw, fwData, fwSize);
+    IOLog("GuampTouch: firmware %u bytes, %u partitions, overlay %d (rc %d)\n", fwSize, fw.count, fw.overlay, r);
+    if (r) { fail(4, r); return; }
+    r = hx_download(&gChip, &fw, gCfg);
+    IOLog("GuampTouch: download rc %d stage %d cfg crc hw %08x sw %08x\n", r, gChip.stage, gChip.cfg_crc_hw, gChip.cfg_crc_sw);
+    if (r) { fail(41, r); return; }
+  } else {
+    IOLog("GuampTouch: keepfw: no download, the firmware already in the chip is used\n");
+  }
   r = hx_start(&gChip);
+  {
+    uint32_t central = 0, isr = 0, reload = 0;
+    hx_reg_read32(&gChip, HX_ADDR_CENTRAL_STATE, &central);
+    hx_reg_read32(&gChip, HX_ADDR_CTRL_FW_ISR, &isr);
+    hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
+    IOLog("GuampTouch: after start: central state %08x (05 = running), fw isr %08x, reload %08x\n", central, isr, reload);
+  }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);
   if (r) { fail(42, r); return; }
   gStep = 5;
