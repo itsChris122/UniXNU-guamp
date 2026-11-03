@@ -555,6 +555,10 @@ bool openBus() {
             v, k.mode, r, gChip.stage, gChip.dbg_dummy[0], gChip.dbg_dummy[1], gChip.dbg_dummy[2], gChip.dbg_dummy[3],
             gChip.dbg_conti, gChip.dbg_incr4, gChip.id[3], gChip.id[2], gChip.id[1], gChip.id[0], gChip.central_state);
   }
+  // guamp 03/11: variant 0 (no reset) answers first and left reset_skip = 1 for the whole session, so the pin reset in
+  // hx_start (sense on after the download) was skipped: the chip stayed in the safe mode entered by sense_off (central
+  // state 0C after start) and never ran the firmware -> no IRQ, empty event stack. Linux always resets (status 04).
+  gChip.reset_skip = 0;
   const PadFloat miso1 = r ? padFloat(GT_GPIO_SPI_A) : miso0;
   const int off = panelOff();
   const char *verdict = !r ? "OK: HX83102D answered"
