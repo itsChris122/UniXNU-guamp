@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -4305,6 +4305,14 @@ SYSCTL_INT(_vm, OID_AUTO, lopage_free_count, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_lo
+  * tagged by VM_LEDGER_TAG_DEFAULT and flagged by VM_LEDGER_FLAG_EXCLUDE_FOOTPRINT_DEBUG from its phys_footprint ledger.
+  */
+ 
++/*
++ * guamp (zzzz-guamp-release-footprint-sysctl.patch, 04/11): this debug-only sysctl does not exist in the RELEASE kernels
++ * of real iPhones. MallocStackLogging (lite mode, switched on near a memory limit) reads it; here the name resolves, so the
++ * sandbox is asked and refuses it (deny sysctl-read vm.task_no_footprint_for_debug: fitcored, remoted, chronod, nearbyd,
++ * liveactivitiesd, siriactionsd). Without the OID sysctlbyname answers ENOENT before any MAC check, as on a release kernel.
++ */
++#define GUAMP_DEBUG_FOOTPRINT_SYSCTL 0
++#if GUAMP_DEBUG_FOOTPRINT_SYSCTL
+ STATIC int
+ sysctl_rw_task_no_footprint_for_debug(struct sysctl_oid *oidp __unused, void *arg1 __unused, int arg2 __unused, struct sysctl_req *req)
+ {
+@@ -4335,6 +4343,7 @@ sysctl_rw_task_no_footprint_for_debug(struct sysctl_oid *oidp __unused, void *ar
+ SYSCTL_PROC(_vm, OID_AUTO, task_no_footprint_for_debug,
+     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
+     0, 0, &sysctl_rw_task_no_footprint_for_debug, "I", "Allow debug memory to be excluded from this task's memory footprint (debug only)");
++#endif /* GUAMP_DEBUG_FOOTPRINT_SYSCTL */
+ 
+ #endif /* DEVELOPMENT || DEBUG */
+ 
