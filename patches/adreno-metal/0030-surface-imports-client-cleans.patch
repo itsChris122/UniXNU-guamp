@@ -1,0 +1,51 @@
+guamp: surface texture imports bracketed with Turnip tu_darwin_client_cleans_begin/_end, so the kernel leaves their cleaning to flushSurfaces (needs mesa-turnip 0002 + native-adreno 0012; without them nothing changes)
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f02a3b0..90ed34b 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -878,6 +878,32 @@ static void trimHeldImports(bool all) {
+  gone.clear();   // the imports' last frontend references go here, outside the lock
+ }
+ extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(false);}
++// guamp (UniXNU-guamp patches/adreno-metal/0030; Turnip: patches/mesa-turnip/0002, kernel: patches/native-adreno/0012): a surface's pages
++// are cleaned here before every command buffer that uses the surface after a CPU write (flushSurfaces, by seed), and the kernel cleaned
++// every read-only import again at every submission (fin43: 220-320 MB, 6-14 ms of each submission, nearly all of them these surfaces).
++// The import of a surface texture's pages is bracketed with Turnip's tu_darwin_client_cleans_begin/_end on this thread, so Turnip maps it
++// with the kernel's "client cleans" flag and the kernel leaves it to flushSurfaces. A Turnip or kernel without the flag ignores the
++// bracket (begin returns 0) and nothing changes. NMB_CLIENT_CLEANS=0 never brackets.
++static int (*gClientCleansBegin)(const void *,uint64_t);
++static void (*gClientCleansEnd)(void);
++static std::atomic<uint64_t> gClientCleansImports;
++static void resolveClientCleans() {
++ static dispatch_once_t once;
++ dispatch_once(&once,^{
++  const char *v=getenv("NMB_CLIENT_CLEANS");
++  if(v && !strtoul(v,nullptr,0))return;
++  Dl_info info={};
++  if(!dladdr((const void *)&native_bridge_metal_trim_surface_imports,&info) || !info.dli_fname)return;
++  char path[1024];snprintf(path,sizeof path,"%s",info.dli_fname);
++  char *slash=strrchr(path,'/');if(!slash)return;
++  snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"libvulkan_freedreno.dylib");
++  void *lib=dlopen(path,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);   // the device opened it already; never load a second copy
++  if(!lib)return;
++  auto begin=(int (*)(const void *,uint64_t))dlsym(lib,"tu_darwin_client_cleans_begin");
++  auto end=(void (*)(void))dlsym(lib,"tu_darwin_client_cleans_end");
++  if(begin && end){gClientCleansBegin=begin;gClientCleansEnd=end;}
++ });
++}
+ static void watchImportPressure() {
+  static dispatch_once_t once;
+  dispatch_once(&once,^{
+@@ -910,7 +936,11 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+  if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
++ resolveClientCleans();
++ const bool cleans=gClientCleansBegin && gClientCleansBegin(base,bytes);   // guamp 0030: flushSurfaces is this import's cleaning
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
++ if(gClientCleansEnd)gClientCleansEnd();
++ if(cleans && handle)gClientCleansImports++;
+  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+  if(key) {
