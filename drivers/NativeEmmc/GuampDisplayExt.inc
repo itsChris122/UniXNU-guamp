@@ -23,6 +23,7 @@ extern "C" volatile uint32_t native_legacy_rej_rects[2][4] __attribute__((weak_i
 extern "C" char native_legacy_rej_class[32] __attribute__((weak_import));
 // zzzz-guamp-ram-fb-wc.patch defines it (pmap); 0 here while that patch is out of the series (static link).
 extern "C" __attribute__((weak)) unsigned int guamp_fb_wc_enabled = 0;
+namespace gscan { void log(); }   // GuampScanout.inc (guamp-copy-diff / guamp-scanout-flip)
 namespace dispext {
 static volatile uint32_t gSeen = 0, gExternalBefore = 0, gBuiltIn = 0, gForced = 0;
 static bool gForce = true;
@@ -248,6 +249,7 @@ static void copyLog()
             guamp_copy_split[6] >> 10, probes - lastProbes);
     lastMaps = maps; lastMapTicks = mapTicks; lastProbes = probes; lastProbeTicks = probeTicks;
   }
+  gscan::log();
   lastN = n; lastSum = sum; lastBytes = bytes; lastMax = max;
   lastAccepted = accepted; lastRejected = rejected;
 }
