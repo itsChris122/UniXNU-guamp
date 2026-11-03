@@ -712,7 +712,15 @@ int naAccelerator() {
                                                  : "backboardd,iconservicesagent,Preferences,PosterBoard,AegirPoster,KaleidoscopePoster,"
                                                    "ScreenshotServicesService");
   accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
-  accelerator->setProperty("NativeTurnipDebug", "nocb,noconform,sysmem");
+  // guamp-turnip-debug=<words> replaces the default TU_DEBUG words (A/B tests: "nocb,noconform" lets Turnip pick GMEM tiling instead of
+  // forcing sysmem/bypass rendering); at most 63 characters, commas only (no spaces in a boot argument).
+  {
+    static char turnipDebug[64] = "nocb,noconform,sysmem";
+    char asked[64] = {};
+    if (PE_parse_boot_argn("guamp-turnip-debug", asked, sizeof(asked)) && asked[0]) strlcpy(turnipDebug, asked, sizeof(turnipDebug));
+    accelerator->setProperty("NativeTurnipDebug", turnipDebug);
+    IOLog("GuampAdreno: NativeTurnipDebug \"%s\"\n", turnipDebug);
+  }
   accelerator->setProperty("NativeMetalWithhold", "apple-families");
   if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return GuampAdrenoAccelerator;}
   accelerator->registerService();
