@@ -24,6 +24,7 @@ extern "C" char native_legacy_rej_class[32] __attribute__((weak_import));
 // zzzz-guamp-ram-fb-wc.patch defines it (pmap); 0 here while that patch is out of the series (static link).
 extern "C" __attribute__((weak)) unsigned int guamp_fb_wc_enabled = 0;
 namespace gscan { void log(); }   // GuampScanout.inc (guamp-copy-diff / guamp-scanout-flip)
+namespace gpacing { void log(); } // GuampPacing.inc (frame pacing: CA swap rate, vsync to the render server, panel timing)
 namespace dispext {
 static volatile uint32_t gSeen = 0, gExternalBefore = 0, gBuiltIn = 0, gForced = 0;
 static bool gForce = true;
@@ -320,6 +321,7 @@ static void log()
 {
   static unsigned reports = 0;
   copyLog();
+  gpacing::log();
   metalLog();
   if (reports++ >= 30) return;
   IOLog("GuampDisplay: IOMFB seen %u external-before %u (0 absent 1 true 2 false 3 other) builtin %u forced %u\n",

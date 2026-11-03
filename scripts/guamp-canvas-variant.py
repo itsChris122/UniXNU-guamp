@@ -16,11 +16,13 @@ Without the two arguments the canvas is off. Section 11: the guamp display argum
 are code defaults since 28/10; an explicit key still wins.
 Section 12 (guamp-compose, default 1): swaps with several layers (a video in a page) or a partial rectangle, which froze the screen
 when refused, are composed in software.
+Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and follows the panel's INTF_1 counters
+(guamp-vsync-hw); swap rate, swap -> completion latency and vsync messages are counted for the 'GuampPacing:' line.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '4679af6bc5d436e2b55a70a8e8b728ead70d2c5110a21070284466eb24a00797'
+PATCHED_SHA256 = '7c078d7257eeab12caf63a6095abb14c3d0dc214761aaf7f848141571a97a6c2'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1233,6 +1235,162 @@ EDITS.append(('        if(frame.layers)return composeOnce(frame);   // section 1
 EDITS.append(('            guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled\n',
               '            guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled\n'
               '            __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 13\n'))
+# 14. Frame pacing (guamp 04/11). The render server had no vsync at all on this port: the refresh tick (sheng-vsync, the original
+#     family's type-5 message to the clients queued at +5592) was never on the guamp boot line, so the display links of the apps
+#     (UIKit scrolling and animations) had no display timing, and the interface ran at ~10 fps even with the copy at 4-9 ms. Now:
+#     - sheng-vsync defaults to 60 (the panel's rate; sheng-vsync=0 turns the tick off, other values as before). The tick only runs
+#       while a client has vsync notifications enabled (vsyncWanted), as before.
+#     - the tick follows the panel (guamp-vsync-hw, default 1; 0 = plain timer): guamp_display_scan (drivers/NativeEmmc/GuampPacing.inc)
+#       reads the INTF_1 frame and line counters of the video-mode timing engine; the vblank that just began is
+#       at - line * period / vtotal, the period is measured on the frame counter (at least 30 frames apart, within 10% of the
+#       nominal one), the message carries that timestamp and that period, and the next tick is set at the next real vblank. Without
+#       readable counters (panel power cycle, clocks off, counter stuck) the tick is the timer of before, at the nominal interval.
+#     - swaps keep retiring at once when the validated head is taken (section 10, latest-frame-wins: the copy, the GPU wait and the
+#       composition happen afterwards in the copy thread), so the render server never waits on the copy; section 14 measures it.
+#     guamp_pacing: [0] swaps accepted, [1] sum of the intervals between accepted swaps under 250 ms (mach ticks), [2] longest such
+#     interval since the last report, [3] swaps retired with a known accept time, [4] sum of accept->retire latencies, [5] longest
+#     latency since the last report, [6] distinct surfaces in the last 16 accepted swaps (buffers the render server rotates), [7] vsync
+#     messages sent, [8] of which on the panel's timing, [9] on the timer, [10] sent more than half a period after the vblank, [11]
+#     sum of the delays after the vblank (panel-timed, mach ticks), [12] measured period (mach ticks), [13] vtotal, [14] last frame
+#     counter, [15] client queues in use (bit i: the queue at +5512 + 16 i), [16] vsync wanted at the last kick, [17] tick rate (Hz),
+#     [18] period measurements, [19] intervals of 250 ms or more (idle gaps), [20] the nominal interval (mach ticks), [21] intervals
+#     under 250 ms. drivers/NativeEmmc/GuampPacing.inc logs them every 10 s ('GuampPacing:').
+EDITS.append(('__attribute__((weak)) void guamp_scanout_external(void){}}',
+              '__attribute__((weak)) void guamp_scanout_external(void){}}\n'
+              '// Section 14 (frame pacing): counters, and the INTF_1 counter reader of drivers/NativeEmmc/GuampPacing.inc (weak here: kernels\n'
+              '// without it keep the plain timer). 1 = frame, line and vtotal read at mach time *at; 0 = not available.\n'
+              'extern "C" {volatile uint64_t guamp_pacing[24];\n'
+              '__attribute__((weak)) int guamp_display_scan(uint32_t *,uint32_t *,uint32_t *,uint64_t *){return 0;}}'))
+EDITS.append(('''        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;''',
+              '''        unsigned hz=60;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));   // guamp default 60 (section 14), sheng-vsync=0 off
+        guamp_pacing[17]=hz;
+        if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;'''))
+EDITS.append(('''        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+        vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);''',
+              '''        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+        vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);guamp_pacing[20]=vsyncInterval;'''))
+EDITS.append(('''        const uint64_t now=mach_absolute_time();
+        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
+        native_legacy_vsync_observed(1,vsyncHz);
+        vsyncNext+=vsyncInterval;
+        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+        vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);''',
+              '''        // Section 14: on the panel's own timing when its counters can be read, else the timer as before.
+        uint64_t stamp=0,period=0;
+        if(guampPanelVblank(&stamp,&period)) {
+            const uint64_t abs=mach_absolute_time(),cont=mach_continuous_time();
+            native_legacy_vsync_notify(this,stamp,cont-(abs>stamp?abs-stamp:0),period);
+            native_legacy_vsync_observed(1,vsyncHz);
+            guamp_pacing[7]=guamp_pacing[7]+1;guamp_pacing[8]=guamp_pacing[8]+1;
+            const uint64_t late=abs>stamp?abs-stamp:0;
+            guamp_pacing[11]=guamp_pacing[11]+late;
+            if(late>period/2){guamp_pacing[10]=guamp_pacing[10]+1;native_legacy_vsync_observed(3,vsyncHz);}
+            uint64_t next=stamp+period;
+            while(next<=abs+period/8)next+=period;   // the next real vblank, never one that is (almost) here already
+            vsyncNext=next;
+            vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);return;
+        }
+        const uint64_t now=mach_absolute_time();
+        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
+        native_legacy_vsync_observed(1,vsyncHz);
+        guamp_pacing[7]=guamp_pacing[7]+1;guamp_pacing[9]=guamp_pacing[9]+1;
+        vsyncNext+=vsyncInterval;
+        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+        vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);'''))
+EDITS.append(('    IOTimerEventSource *vsyncTimer=nullptr;\n',
+              r'''    // Section 14: the vblank that just began and the panel's period (mach ticks), from the INTF_1 counters; false = not available.
+    int panelTiming=-1;uint32_t panelRefFrame=0;uint64_t panelRefVblank=0,panelPeriod=0;bool panelRef=false;
+    bool guampPanelVblank(uint64_t *stamp,uint64_t *period) {
+        if(panelTiming<0){unsigned v=1;PE_parse_boot_argn("guamp-vsync-hw",&v,sizeof v);panelTiming=v?1:0;}
+        uint32_t frame=0,line=0,vtotal=0;uint64_t at=0;
+        if(!panelTiming || guamp_display_scan(&frame,&line,&vtotal,&at)!=1 || !vtotal || line>=vtotal || !at || !vsyncInterval) {
+            panelRef=false;return false;
+        }
+        const uint64_t nominal=vsyncInterval,use=panelPeriod?panelPeriod:nominal;
+        const uint64_t back=(uint64_t)line*use/vtotal;
+        if(back>=at){panelRef=false;return false;}
+        const uint64_t vblank=at-back;
+        // The period on the frame counter, from vblank to vblank at least 30 frames apart (a reset counter starts again).
+        const uint32_t frames=frame-panelRefFrame;
+        if(!panelRef || !frames || frames>100000 || vblank<=panelRefVblank){panelRef=true;panelRefFrame=frame;panelRefVblank=vblank;}
+        else if(frames>=30) {
+            const uint64_t measured=(vblank-panelRefVblank)/frames;
+            if(measured>nominal-nominal/10 && measured<nominal+nominal/10) {
+                panelPeriod=panelPeriod?(3*panelPeriod+measured)/4:measured;
+                guamp_pacing[12]=panelPeriod;guamp_pacing[18]=guamp_pacing[18]+1;
+            }
+            panelRefFrame=frame;panelRefVblank=vblank;
+        }
+        guamp_pacing[13]=vtotal;guamp_pacing[14]=frame;
+        *stamp=vblank;*period=panelPeriod?panelPeriod:nominal;return true;
+    }
+    // Section 14: swaps accepted (rate, intervals, buffers in rotation) and retired (latency from the acceptance).
+    struct PacingEntry {const OriginalLegacySwapRequest *request;uint64_t at;};
+    PacingEntry pacingEntries[8]={};uint64_t pacingLastAccept=0,pacingIdleGap=0;
+    const void *pacingSurfaces[16]={};unsigned pacingSurfaceAt=0;
+    void guampPacingAccepted(const OriginalLegacySwapRequest *request) {
+        const uint64_t now=mach_absolute_time();
+        guamp_pacing[0]=guamp_pacing[0]+1;
+        if(!pacingIdleGap)nanoseconds_to_absolutetime(250000000ull,&pacingIdleGap);
+        if(pacingLastAccept) {
+            const uint64_t gap=now-pacingLastAccept;
+            if(gap<pacingIdleGap) {
+                guamp_pacing[1]=guamp_pacing[1]+gap;guamp_pacing[21]=guamp_pacing[21]+1;
+                if(gap>guamp_pacing[2])guamp_pacing[2]=gap;
+            } else guamp_pacing[19]=guamp_pacing[19]+1;
+        }
+        pacingLastAccept=now;
+        // The entry of this request, else a free one, else the oldest.
+        PacingEntry *slot=nullptr;
+        for(auto &e: pacingEntries)if(e.request==request){slot=&e;break;}
+        if(!slot)for(auto &e: pacingEntries)if(!e.request){slot=&e;break;}
+        if(!slot){slot=&pacingEntries[0];for(auto &e: pacingEntries)if(e.at<slot->at)slot=&e;}
+        *slot={request,now};
+        const void *surfaces[4]={};memcpy(surfaces,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surfaces));
+        const void *surface=nullptr;
+        for(auto s: surfaces)if(s){surface=s;break;}
+        pacingSurfaces[pacingSurfaceAt%16]=surface;pacingSurfaceAt=pacingSurfaceAt+1;
+        unsigned distinct=0;
+        for(unsigned i=0;i<16;++i) {
+            if(!pacingSurfaces[i])continue;
+            bool seen=false;
+            for(unsigned j=0;j<i && !seen;++j)seen=pacingSurfaces[j]==pacingSurfaces[i];
+            if(!seen)distinct=distinct+1;
+        }
+        guamp_pacing[6]=distinct;
+    }
+    void guampPacingRetired(const OriginalLegacySwapRequest *request) {
+        for(auto &e: pacingEntries)if(e.request==request) {
+            const uint64_t latency=mach_absolute_time()-e.at;
+            guamp_pacing[3]=guamp_pacing[3]+1;guamp_pacing[4]=guamp_pacing[4]+latency;
+            if(latency>guamp_pacing[5])guamp_pacing[5]=latency;
+            e={};break;
+        }
+    }
+    // Section 14: which client notification queues are in use (the vsync one is +5592, type 5).
+    void guampPacingClients() {
+        uint64_t mask=0;
+        for(unsigned i=0;i<8;++i) {
+            const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5512+16*i,sizeof(head));
+            if(head)mask|=1ull<<i;
+        }
+        guamp_pacing[15]=mask;guamp_pacing[16]=vsyncWanted()?1:0;
+    }
+    IOTimerEventSource *vsyncTimer=nullptr;
+'''))
+EDITS.append(('''    void kickSwapQueue() override {
+        armVsync();''', '''    void kickSwapQueue() override {
+        guampPacingClients();   // section 14
+        armVsync();'''))
+EDITS.append(('''        if(isValidated(request))return;
+        for(auto &entry: validated)if(!entry){entry=request;return;}''', '''        if(isValidated(request))return;
+        guampPacingAccepted(request);   // section 14
+        for(auto &entry: validated)if(!entry){entry=request;return;}'''))
+EDITS.append(('''        IOMobileFramebufferLegacy::completeCurrentSwap();
+        native_legacy_retirement_observed(this);''', '''        IOMobileFramebufferLegacy::completeCurrentSwap();
+        native_legacy_retirement_observed(this);
+        guampPacingRetired(request);   // section 14'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
