@@ -2559,6 +2559,9 @@ int ath10k_wmi_event_mgmt_rx(struct ath10k *ar, struct sk_buff *skb)
 	if ((test_bit(ATH10K_CAC_RUNNING, &ar->dev_flags)) ||
 	    (rx_status & (WMI_RX_STATUS_ERR_DECRYPT |
 	    WMI_RX_STATUS_ERR_KEY_CACHE_MISS | WMI_RX_STATUS_ERR_CRC))) {
+		/* guamp 03/11: why a management frame (a beacon) is dropped here (gw_snoc_tail.inc, "wifi: quiet") */
+		gw_note_mgmt_drop(test_bit(ATH10K_CAC_RUNNING, &ar->dev_flags) ? 0 : (rx_status & WMI_RX_STATUS_ERR_DECRYPT) ? 1 :
+				  (rx_status & WMI_RX_STATUS_ERR_KEY_CACHE_MISS) ? 2 : 3);
 		dev_kfree_skb(skb);
 		return 0;
 	}
@@ -2584,6 +2587,7 @@ int ath10k_wmi_event_mgmt_rx(struct ath10k *ar, struct sk_buff *skb)
 		 * mac80211 has been changed.
 		 */
 		WARN_ON_ONCE(1);
+		gw_note_mgmt_drop(4);	/* guamp: a channel outside 2.4/5 GHz */
 		dev_kfree_skb(skb);
 		return 0;
 	}
@@ -2652,6 +2656,7 @@ int ath10k_wmi_event_mgmt_rx(struct ath10k *ar, struct sk_buff *skb)
 		   status->freq, status->band, status->signal,
 		   status->rate_idx);
 
+	gw_note_mgmt_drop(5);	/* guamp: handed on (to nw_sta_rx) */
 	ieee80211_rx_ni(ar->hw, skb);
 
 	return 0;

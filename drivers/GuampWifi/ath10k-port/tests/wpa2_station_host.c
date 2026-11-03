@@ -160,7 +160,7 @@ static int g_scan_done, g_conn_done = -1, g_rx_n; static u8 g_rx_eth[200]; stati
 static int g_power_done, g_power_on, g_power_result;
 static void ev_scan(int result) { g_scan_result=result; g_scan_done++; }
 static void ev_conn(int r) { g_conn_done = r; }
-static void ev_lost(int r) { (void)r; }
+static int g_lost_events; static void ev_lost(int r) { (void)r; g_lost_events++; }
 static void ev_rx(const u8 *e, size_t n) { g_rx_n++; g_rx_len = n; memcpy(g_rx_eth, e, n); }
 static void ev_power(int on, int result) { g_power_on=on; g_power_result=result; g_power_done++; }
 static void ev_disconnect(int result) { CHECK(result==NW_RES_OK,"disconnect completion result"); }

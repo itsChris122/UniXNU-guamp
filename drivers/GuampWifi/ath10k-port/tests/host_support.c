@@ -16,6 +16,7 @@ void nw_wifi_htt_stats(int type) { (void)type; }
 void nw_wifi_tx_reasons(char *p,int n) { if(n) p[0]=0; }
 void nw_wifi_rx_state(char *p,int n) { if(n) p[0]=0; }
 void nw_wifi_ring_state(char *p,int n) { if(n) p[0]=0; }
+void nw_wifi_quiet_report(char *p,int n,int commands) { (void)commands; if(n) p[0]=0; }
 size_t strlcat(char *dst,const char *src,size_t n) {
   size_t used=0,len=strlen(src); while(used<n&&dst[used]) used++;
   if(used<n) { size_t copy=len<n-used-1?len:n-used-1; memcpy(dst+used,src,copy); dst[used+copy]=0; }
