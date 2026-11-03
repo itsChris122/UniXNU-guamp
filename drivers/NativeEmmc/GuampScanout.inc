@@ -166,12 +166,12 @@ static void flipOff(unsigned why)
 }
 
 // Finds the source pipe that scans the GOP frame (read only). Logged once.
-static void probeFlip(uint64_t gopPa, uint64_t stride, uint32_t w, uint32_t h, uint64_t gopBytes)
+static void probeFlip(volatile uint8_t *gopVa, uint64_t gopPa, uint64_t stride, uint32_t w, uint32_t h, uint64_t gopBytes)
 {
   gK.probe = -1;
   const uint64_t frame = stride * h;
   const uint64_t back = gopPa + gK.flipOffset;
-  if (gopPa < kRegionBase || back < gopPa + frame || back + frame > kRegionEnd || (back & 0xfff) || (gopPa >> 32)) {
+  if (!gopVa || gopPa < kRegionBase || back < gopPa + frame || back + frame > kRegionEnd || (back & 0xfff) || (gopPa >> 32)) {
     gK.probe = -2;
   } else {
     gK.gccDisp = mapPhysical(guamp_backlight::kGccDispAhbPage, 0x1000);
@@ -206,12 +206,13 @@ static void probeFlip(uint64_t gopPa, uint64_t stride, uint32_t w, uint32_t h, u
     else { gK.va[1] = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress()); gK.pa[1] = back; }   // kept for good
   }
   if (gK.probe == -1) {
-    gK.pa[0] = gopPa; gK.stride = stride; gK.probe = 1; gK.flipOn = true; gK.shown = 0;
+    // fin37 (03/11): va[0] was never set and the idle catch-up wrote the GOP frame at address 0 (panic in the thread call).
+    gK.va[0] = gopVa; gK.pa[0] = gopPa; gK.stride = stride; gK.probe = 1; gK.flipOn = true; gK.shown = 0;
     if (!gK.idleCall)
       gK.idleCall = thread_call_allocate_with_options([](thread_call_param_t, thread_call_param_t) {
         IOLockLock(gK.lock);
         // No frame since the flip to the second buffer: the GOP frame catches up from it and is shown again.
-        if (gK.flipOn && gK.shown == 1 && clocksOn() && waitLatch()) {
+        if (gK.flipOn && gK.shown == 1 && gK.va[0] && gK.va[1] && clocksOn() && waitLatch()) {
           catchUp(gK.st, 0, gK.va[0], gK.va[1], gK.stride);
           __asm__ volatile("dsb sy" ::: "memory");
           point(0);
@@ -274,8 +275,8 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     // Someone else wrote the GOP frame since our last frame (the variant's own copy, a blank fill counted by the copy counter).
     const uint64_t copies = &native_legacy_copy_n ? native_legacy_copy_n : 0;
     if (copies != gK.expectCopyN) gK.st.bufValid[0] = false;
-    if (gK.flipWanted && !gK.probe) probeFlip(dstPhys, dstStride, dstW, dstH, dstBytes);
-    if (gK.flipOn && (dstPhys != gK.pa[0] || dstStride != gK.stride)) flipOff(3);
+    if (gK.flipWanted && !gK.probe) probeFlip(reinterpret_cast<volatile uint8_t *>(dst), dstPhys, dstStride, dstW, dstH, dstBytes);
+    if (gK.flipOn && (dstPhys != gK.pa[0] || dst != gK.va[0] || dstStride != gK.stride)) flipOff(3);
     if (gK.flipOn && !clocksOn()) flipOff(4);
     if (gK.fullEvery && ++gK.sinceFull >= gK.fullEvery) {
       gK.sinceFull = 0; gK.st.hashValid = false; gK.st.bufValid[0] = gK.st.bufValid[1] = false; gK.full = gK.full + 1;
