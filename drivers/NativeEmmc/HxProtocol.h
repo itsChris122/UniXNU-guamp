@@ -40,7 +40,15 @@ extern "C" {
 #define HX_ADDR_RELOAD_CRC32 0x80050018u
 #define HX_ADDR_RELOAD_FROM 0x80050020u
 #define HX_ADDR_RELOAD_CMD_BEAT 0x80050028u  // 00 99 <words high> <words low>: hardware CRC over SRAM
-#define HX_ADDR_FLASH_RELOAD 0x10007F00u     // 0 = reload enabled (the zero-flash flow writes 0 before sensing)
+#define HX_ADDR_FLASH_RELOAD 0x10007F00u     // driver_addr_fw_define_flash_reload / zf_addr_dis_flash_reload
+// zf_data_dis_flash_reload: the zero-flash build maps fp_reload_disable to hx_dis_rload_0f, which ignores its argument
+// and always writes this word ("Diable Flash Reload"), so after the download Linux leaves A9 9A 00 00 here before the
+// sense on (TWRP: read_FW_ver data[0]=0xA9 data[1]=0x9A, 0x10007F00 = A9 9A 9A A9 at run time).
+#define HX_ZF_DIS_RELOAD 0x00009AA9u
+#define HX_ADDR_FW_MODE_STATUS 0x10007088u   // fw_addr_fw_mode_status: byte 0 = 0x17 idle off, 0x1F idle on (file: 0x3F)
+#define HX_FW_IDLE_DIS 0x17u                 // fw_data_idle_dis_pwd (himax_mcu_idle_mode(1))
+#define HX_ADDR_MAX_DC 0x10007FC8u           // fw_addr_max_dc: TWRP 0000FDE8 at run time, never written here
+#define HX_ADDR_FRAME_CNT 0x900000CCu        // unnamed; TWRP 0x181 -> 0x1CD between two reads, always 0 here
 #define HX_ADDR_SET_FRAME 0x10007294u
 #define HX_ADDR_RX_TX_MAXPT 0x100070F4u
 #define HX_ADDR_XY_RES_ENABLE 0x100070F8u
@@ -128,6 +136,8 @@ struct hx_chip {
     int usb_in;                     // 1: tell the firmware a USB cable is in (himax_mcu_usb_detect_set, IN)
     int ovl_force;                  // >0: load this partition index as the code overlay instead of the border one
     int no_recode;                  // 1: skip the second write of the firmware entity (Linux does it, see hx_download)
+    int zf_dis_reload;              // 1: 0x10007F00 = HX_ZF_DIS_RELOAD before the sense on (hx_dis_rload_0f), 0: 0
+    int no_smwp_write;              // 1: leave 0x10007F10 as found (TWRP: never written, still power-on contents)
     // Results for the boot log.
     int ovl_loaded;                 // partition index of the code overlay written, -1 none
     uint8_t ovl_reply;              // reply written to HX_ADDR_OVL_HANDSHAKE
