@@ -20,7 +20,7 @@ when refused, are composed in software.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '983cf08cc7a348a39f5ed7acff99f83b0db2ae14fe9654477a5acd50aa3f269d'
+PATCHED_SHA256 = '44bbed9cdab890a1f329e0132413d2651a09d854b0dfb4eabcfca16fe2e4373c'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -722,7 +722,11 @@ EDITS.append(('''        if(frame.blank) {
 #     guamp_compose: [0] composed swaps accepted, [1] composed frames handed over, [2] frames composed, [3] compose failures, [4] BGRA
 #     layers drawn, [5] 4:2:0 layers drawn, [6] layers skipped: format, [7] skipped: transform, [8] skipped: geometry, [9] last skipped
 #     format, [10] compose ticks, [11] map failures, [12] swaps the composition refused too, [13] background fills, [14] most layers in a
-#     frame, [15] 4:2:0 planes whose +0x10 and +0x18 offsets differ. guamp_compose_layer[i]: format, planes, surface width, height, src
+#     frame, [15] 4:2:0 planes whose +0x10 and +0x18 offsets differ, [16] composed swaps without a drawable layer (retired, the screen
+#     keeps the previous frame instead of turning black: fin37d showed only such swaps during a video), [17] requests dumped.
+#     guamp-compose-dump=<n> (default 6, at most 64): the first n composed requests are logged raw ('GuampDisplay: compose dump'):
+#     the key fields, then hex rows of bytes 0x000-0x160 (rects and regions), 0x1c0-0x260 (counts, per-layer words, transforms),
+#     0x300-0x340 (masks, options, size) and 0xa40-0xa60 (surfaces), to check the layout against the real requests. guamp_compose_layer[i]: format, planes, surface width, height, src
 #     x, y, w, h, dst x, y, w, h, transform, result of the last swap that updated layer i (0 drawable, 1 format, 2 transform, 3 geometry,
 #     4 no IOSurface, 5 disabled).
 EDITS.append(('''struct GuampFrame {
@@ -846,7 +850,7 @@ static inline void guampComposeFill(uint32_t *out,uint64_t pixels,uint32_t value
     for(;i<pixels;++i)out[i]=value;
 }
 // guamp-compose-core-end
-extern "C" {volatile uint64_t guamp_compose[16];volatile uint32_t guamp_compose_layer[4][14];}
+extern "C" {volatile uint64_t guamp_compose[20];volatile uint32_t guamp_compose_layer[4][14];}
 // The layers of one composed frame, shared by the frames that show them (latest-frame-wins keeps the one on screen): each surface's
 // memory stays retained until the last frame holding the set lets it go.
 struct GuampLayerSource {IOMemoryDescriptor *memory;uint64_t allocation;GuampComposeLayer layer;};
@@ -981,6 +985,33 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         }
         return true;
     }
+    // guamp-compose-dump: the first composed requests, raw.
+    int composeDumpLeft=-1;
+    void composeDumpRows(unsigned n,const unsigned char *bytes,unsigned from,unsigned to) {
+        for(unsigned at=from;at<to;at+=32) {
+            char hex[32*3+1];unsigned k=0;
+            for(unsigned j=0;j<32;++j)k+=snprintf(hex+k,sizeof(hex)-k,"%02x%s",bytes[at+j],j==31?"":((j&3)==3?" ":""));
+            IOLog("GuampDisplay: compose dump %u +0x%03x: %s\n",n,at,hex);
+        }
+    }
+    void composeDump(const unsigned char *bytes) {
+        if(composeDumpLeft<0){unsigned v=6;PE_parse_boot_argn("guamp-compose-dump",&v,sizeof v);composeDumpLeft=(int)(v>64?64:v);}
+        if(!composeDumpLeft)return;
+        composeDumpLeft=composeDumpLeft-1;
+        const unsigned n=(unsigned)guamp_compose[17];guamp_compose[17]=guamp_compose[17]+1;
+        uint32_t w[12]={};memcpy(w,bytes+792,sizeof(w));   // 792..836
+        uint64_t surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));
+        const char *names[4]={"-","-","-","-"};
+        for(unsigned i=0;i<4;++i)if(surfaces[i]) {
+            const OSMetaClass *meta=reinterpret_cast<const OSObject *>(surfaces[i])->getMetaClass();
+            names[i]=meta && meta->getClassName()?meta->getClassName():"?";
+        }
+        IOLog("GuampDisplay: compose dump %u: updated %x disabled %x background %x options %x %x %x size %ux%u; words 824.. %x %x %x %x; "
+              "surfaces %llx %llx %llx %llx (%s %s %s %s)\n",n,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],
+              surfaces[0],surfaces[1],surfaces[2],surfaces[3],names[0],names[1],names[2],names[3]);
+        composeDumpRows(n,bytes,0x000,0x160);composeDumpRows(n,bytes,0x1c0,0x260);
+        composeDumpRows(n,bytes,0x300,0x340);composeDumpRows(n,bytes,0xa40,0xa60);
+    }
     // The validated head of a composed swap: its layers update the persistent ones, a snapshot of them becomes the frame.
     void kickComposed(const OriginalLegacySwapRequest *request) {
         const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
@@ -1005,6 +1036,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
         }
         if(updated&0x80000000U)composeBackground=0xff000000U|(background&0x00ffffffU);
+        composeDump(bytes);
         GuampLayers *set=static_cast<GuampLayers *>(IOMalloc(sizeof(GuampLayers)));
         if(!set){native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;}
         bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;
@@ -1018,6 +1050,12 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             set->count=set->count+1;
         }
         if(set->count>guamp_compose[14])guamp_compose[14]=set->count;
+        if(!set->count) {
+            // Nothing to draw: retire the swap and leave the screen as it is (a black fill hid the page, fin37d).
+            set->release();guamp_compose[16]=guamp_compose[16]+1;
+            native_legacy_swap_stage(1);transferred=true;native_legacy_transfer_observed(kIOReturnSuccess,request,0);
+            finishTransfer(request,true);return;
+        }
         guamp_compose[1]=guamp_compose[1]+1;
         const GuampFrame frame={nullptr,0,0,length,video.v_rowBytes,gopWidth,gopHeight,gopWidth,gopHeight,false,false,set};
         latestRetire(request,frame);
