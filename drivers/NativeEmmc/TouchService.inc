@@ -11,6 +11,7 @@
 // firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
 // guamp-touch-wake=1 (default 0): tap-to-wake with the screen off, see the "wake" block before thread().
 // guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
+// guamp-touch-hwcfg=1 (default 0): pin, IRQ, SPI e pin del pannello come li lascia Linux, vedi namespace hwcfg.
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
@@ -183,6 +184,99 @@ void logPanel() {
         panelOff() ? "PANEL OFF" : "panel on/unknown");
 }
 
+// --- guamp-touch-hwcfg ----------------------------------------------------------------------------------------------
+// guamp-touch-hwcfg=1 (default 0): la configurazione hardware del touch e del pannello allineata a quella che Linux
+// (TWRP, himax_0flash_mmi + spi-geni-qcom + dsi_panel) usa davvero. guamp-touch-hwcfg-mask=<bit> (default 0x1f) per
+// spegnere le singole voci quando si cerca quale conta:
+//  bit 0  IRQ gpio67: fronte di DISCESA come msm_gpio_irq_set_type(IRQ_TYPE_EDGE_FALLING) con intr_detection_width 2,
+//         cioe' detection 2 + bit di polarita' 1 (finora polarita' 0). Himax: HX_INT_IS_EDGE = 1 nel dmesg TWRP,
+//         request_threaded_irq(IRQF_TRIGGER_FALLING); dtbo interrupts = <0x43 2>.
+//  bit 1  gpio66/gpio67 come li ha lasciati il bootloader: il nodo himax ha pinctrl-names "pmx_ts_active",
+//         "pmx_ts_suspend" e nessuno stato "default", e himax_0flash_mmi non chiama pinctrl: sotto Linux i due pin
+//         restano quelli dell'ABL (gpio66 0x2c3, gpio67 0x001 = 2 mA pull-down) e cambia solo la direzione
+//         (gpio_direction_output/input). Finora qui: ts_reset_active / ts_int_active (8 mA, pull-up).
+//  bit 2  impulso di reset di himax_gpio_power_config (CONFIG_HMX_DB, regolatori vdd/avdd "dummy" nel dmesg TWRP,
+//         niente himax,3v3-gpio): reset basso, irq in ingresso, 2 ms, reset alto; poi attesa
+//         guamp-touch-hwcfg-wait ms (default 800: in TWRP la prima transazione SPI arriva ~0,83 s dopo) prima
+//         dell'identificazione. Finora la variante 0 parlava al chip senza nessun reset.
+//  bit 3  registri SPI che spi-geni-qcom lascia a 0 (nessun controller-data nel DT): SE_SPI_DELAY_COUNTERS (ritardo
+//         CS->clock e tra parole), SE_SPI_PRE_POST_CMD_DLY, SE_SPI_SLAVE_EN (master). Scritti a 0 solo se diversi.
+//         Velocita' (10 MHz esatti), modo 3, 8 bit, CS 0 e livello DFS (il primo multiplo intero di 10 MHz, come
+//         geni_se_clk_freq_match) erano gia' uguali: solo controllati nel log.
+//  bit 4  pin del pannello negli stati che dsi_panel_pinctrl_enable sceglie ("panel_active"): gpio82 (reset LCD)
+//         sde_dsi_active = gpio, 8 mA, bias-disable (ABL: pull-up), livello e uscita invariati; gpio81 (TE)
+//         sde_te_active = funzione mdp_vsync, 2 mA, pull-down.
+// Regolatori: il touch non ne ha (vdd/avdd dummy, nessun 3v3-gpio); quelli del TDDI sono del pannello: vddio = L9A
+// (RPM, 1,8 V, carico 62 mA) NON toccato per decisione del proprietario, lab/ibb = LCDB PMI632 (5,6 V) gestiti dal
+// ciclo del pannello (guamp-touch-panelcycle=5). Qui solo lettura nel log del pannello.
+namespace hwcfg {
+unsigned gOn, gMask = 0x1f, gWaitMs = 800;
+uint32_t gAbl66, gAbl67, gAbl81, gAbl82;
+bool on(unsigned bit) { return gOn == 1 && (gMask & (1u << bit)); }
+// snapshot(): argomenti di avvio e configurazione dei pin come la trova XNU (= ABL/UEFI).
+void capture() {
+  PE_parse_boot_argn("guamp-touch-hwcfg", &gOn, sizeof(gOn));
+  PE_parse_boot_argn("guamp-touch-hwcfg-mask", &gMask, sizeof(gMask));
+  PE_parse_boot_argn("guamp-touch-hwcfg-wait", &gWaitMs, sizeof(gWaitMs));
+  if (gWaitMs > 5000) gWaitMs = 5000;
+  gAbl66 = pinRead(GT_GPIO_RESET, 0); gAbl67 = pinRead(GT_GPIO_IRQ, 0);
+  gAbl81 = pinRead(GT_GPIO_LCD_TE, 0); gAbl82 = pinRead(GT_GPIO_LCD_RESET, 0);
+  IOLog("GuampTouch: hwcfg %u mask %02x wait %u | boot pins gpio66 %08x/%x gpio67 %08x/%x intr67 %08x gpio81 %08x/%x gpio82 %08x/%x\n",
+        gOn, gMask, gWaitMs, gAbl66, pinRead(GT_GPIO_RESET, 4), gAbl67, pinRead(GT_GPIO_IRQ, 4), pinRead(GT_GPIO_IRQ, 8),
+        gAbl81, pinRead(GT_GPIO_LCD_TE, 4), gAbl82, pinRead(GT_GPIO_LCD_RESET, 4));
+}
+// enable(), dopo la configurazione dei pin SPI/touch: bit 1 e bit 4.
+void pins() {
+  if (gOn != 1) return;
+  if (on(1)) {
+    // gpio_direction_output(reset, 1) / gpio_direction_input(irq) sulla configurazione dell'ABL (funzione gpio).
+    pinWrite(GT_GPIO_RESET, 4, 2u);
+    pinWrite(GT_GPIO_RESET, 0, (gAbl66 & ~(15u << 2)) | GT_PIN_OE);
+    pinWrite(GT_GPIO_IRQ, 0, gAbl67 & ~((15u << 2) | GT_PIN_OE));
+  }
+  if (on(4)) {
+    const uint32_t c82 = pinRead(GT_GPIO_LCD_RESET, 0);
+    if (((c82 >> 2) & 15u) == 0 && (c82 & GT_PIN_OE))             // solo se e' gia' un'uscita gpio: livello invariato
+      pinWrite(GT_GPIO_LCD_RESET, 0, gt_pin_cfg(0, GT_DRIVE_8MA, 0) | GT_PIN_OE);
+    pinWrite(GT_GPIO_LCD_TE, 0, gt_pin_cfg(GT_FUNC_MDP_VSYNC, GT_DRIVE_2MA, 1));
+  }
+  IOLog("GuampTouch: hwcfg pins: gpio66 %08x/%x gpio67 %08x/%x gpio81 %08x/%x gpio82 %08x/%x\n",
+        pinRead(GT_GPIO_RESET, 0), pinRead(GT_GPIO_RESET, 4), pinRead(GT_GPIO_IRQ, 0), pinRead(GT_GPIO_IRQ, 4),
+        pinRead(GT_GPIO_LCD_TE, 0), pinRead(GT_GPIO_LCD_TE, 4), pinRead(GT_GPIO_LCD_RESET, 0), pinRead(GT_GPIO_LCD_RESET, 4));
+}
+// openBus(), dopo clock e modo: bit 3 (sempre il log dei registri, anche con hwcfg 0, per il confronto).
+void spi(const struct gt_clock_choice &c) {
+  const uint32_t dly = rd(gSe, GT_SE_SPI_DELAY_COUNTERS), pp = rd(gSe, GT_SE_SPI_PRE_POST_CMD_DLY),
+                 slv = rd(gSe, GT_SE_SPI_SLAVE_EN);
+  unsigned fixed = 0;
+  if (on(3)) {
+    if (dly) { wr(gSe, GT_SE_SPI_DELAY_COUNTERS, 0); fixed |= 1; }
+    if (pp) { wr(gSe, GT_SE_SPI_PRE_POST_CMD_DLY, 0); fixed |= 2; }
+    if (slv & 1u) { wr(gSe, GT_SE_SPI_SLAVE_EN, slv & ~1u); fixed |= 4; }
+  }
+  // Scelta di Linux (geni_se_clk_freq_match, exact = false): il primo livello che e' multiplo intero della velocita'.
+  int linuxLevel = -1;
+  for (unsigned l = 0; l < GT_DFS_LEVELS && linuxLevel < 0; ++l)
+    if (gLevelHz[l] && !(gLevelHz[l] % GT_SPI_MAX_HZ)) linuxLevel = static_cast<int>(l);
+  IOLog("GuampTouch: hwcfg spi: delay %08x pre/post %08x slave %08x -> fixed %x | cpha %x cpol %x word %08x demux %x | "
+        "level %u (Linux %d) div %u sclk %llu\n", dly, pp, slv, fixed, rd(gSe, SE_SPI_CPHA), rd(gSe, SE_SPI_CPOL),
+        rd(gSe, SE_SPI_WORD_LEN), rd(gSe, SE_SPI_DEMUX_SEL), c.level, linuxLevel, c.div, (unsigned long long)c.sclk_hz);
+}
+// openBus(), prima dell'identificazione: bit 2.
+void powerConfigReset() {
+  if (!on(2)) return;
+  pinWrite(GT_GPIO_RESET, 4, 0u);                                  // gpio_direction_output(gpio_reset, 0)
+  pinWrite(GT_GPIO_IRQ, 0, pinRead(GT_GPIO_IRQ, 0) & ~GT_PIN_OE);  // gpio_direction_input(gpio_irq)
+  IODelay(2000);                                                   // usleep_range(2000, 2001)
+  pinWrite(GT_GPIO_RESET, 4, 2u);                                  // gpio_direction_output(gpio_reset, 1)
+  if (gWaitMs) IOSleep(gWaitMs);
+  IOLog("GuampTouch: hwcfg reset pulse (himax_gpio_power_config) done, waited %u ms, rst %u irq %u\n", gWaitMs,
+        pinRead(GT_GPIO_RESET, 4) & 1u, pinRead(GT_GPIO_IRQ, 4) & 1u);
+}
+// armIrq(): bit 0, il bit di polarita' che Linux mette per ogni fronte.
+uint32_t irqPolarity() { return on(0) ? GT_INTR_POLARITY : 0u; }
+}  // namespace hwcfg
+
 bool snapshot() {
   gStep = 1;
   gGcc = mapPhysical(GT_GCC_BASE, 0x80000);
@@ -198,6 +292,7 @@ bool snapshot() {
   IOLog("GuampTouch: gcc vote %08x s2 %08x dfs %d level0 %llu, gpio6 %08x gpio66 %08x/%x gpio67 %08x/%x\n", rd(gGcc, GT_GCC_VOTE_ENABLE),
         rd(gGcc, GT_HALT_S2), gDfs, (unsigned long long)gLevelHz[0], pinRead(GT_GPIO_SPI_A, 0), pinRead(GT_GPIO_RESET, 0),
         pinRead(GT_GPIO_RESET, 4), pinRead(GT_GPIO_IRQ, 0), pinRead(GT_GPIO_IRQ, 4));
+  hwcfg::capture();
   panelProbe();
   logPanel();
   return true;
@@ -229,6 +324,7 @@ bool enable() {
   pinWrite(GT_GPIO_RESET, 4, 2u);
   pinWrite(GT_GPIO_RESET, 0, gt_pin_cfg(0, GT_DRIVE_8MA, 3) | GT_PIN_OE);
   pinWrite(GT_GPIO_IRQ, 0, gt_pin_cfg(0, GT_DRIVE_8MA, 3));
+  hwcfg::pins();
   IOLog("GuampTouch: pins after config: gpio6 %08x gpio7 %08x gpio71 %08x gpio80 %08x gpio66 %08x/%08x gpio67 %08x/%08x\n",
         pinRead(GT_GPIO_SPI_A, 0), pinRead(GT_GPIO_SPI_B, 0), pinRead(GT_GPIO_SPI_C, 0), pinRead(GT_GPIO_SPI_D, 0),
         pinRead(GT_GPIO_RESET, 0), pinRead(GT_GPIO_RESET, 4), pinRead(GT_GPIO_IRQ, 0), pinRead(GT_GPIO_IRQ, 4));
@@ -512,6 +608,7 @@ bool openBus() {
   r = geni_spi_set_clock(&gSpi, static_cast<unsigned>(c.actual_hz), static_cast<unsigned>(c.sclk_hz), gDfs ? c.level : 0);
   if (!r) r = geni_spi_setup(&gSpi, GENI_SPI_CPHA | GENI_SPI_CPOL, 0);
   if (r) { fail(3, r); return false; }
+  hwcfg::spi(c);
   static const uint8_t pattern[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
   uint8_t back[8] = {};
   geni_spi_setup(&gSpi, GENI_SPI_LOOP | GENI_SPI_CPHA | GENI_SPI_CPOL, 0);
@@ -542,6 +639,7 @@ bool openBus() {
     IOLog("GuampTouch: lcd reset cycle done, lcd-rst %u tp-rst %u irq %u\n", pinRead(GT_GPIO_LCD_RESET, 4) & 1u,
           pinRead(GT_GPIO_RESET, 4) & 1u, pinRead(GT_GPIO_IRQ, 4) & 1u);
   }
+  hwcfg::powerConfigReset();
   // Electrical check before any chip access: engine idle, CS high, reset released.
   const PadFloat miso0 = padFloat(GT_GPIO_SPI_A), irq0 = padFloat(GT_GPIO_IRQ);
   r = HX_ERR_CHIP;
@@ -650,12 +748,13 @@ bool armIrq() {
   gIrqPin = reinterpret_cast<volatile uint32_t *>(gTlmm + gt_pin(GT_GPIO_IRQ));
   uint32_t cfg = gIrqPin[0x8 / 4];
   cfg &= ~((7u << 5) | (3u << 2) | (1u << 1) | 1u);
-  cfg |= (3u << 5) | (2u << 2) | (1u << 4);
+  cfg |= (3u << 5) | (2u << 2) | (1u << 4) | hwcfg::irqPolarity();
   gIrqPin[0x8 / 4] = cfg;
   gIrqPin[0xc / 4] = 0;
   __asm__ volatile("dsb sy" ::: "memory");
   if (!&armcpu_spi_attach || armcpu_spi_attach(32 + GT_TLMM_SUMMARY_SPI, false, irq, nullptr, nullptr, nullptr)) return false;
   gIrqPin[0x8 / 4] = cfg | 1u;
+  if (hwcfg::gOn) IOLog("GuampTouch: hwcfg irq gpio67 intr_cfg %08x (falling edge, polarity %u)\n", gIrqPin[0x8 / 4], (gIrqPin[0x8 / 4] >> 1) & 1u);
   return true;
 }
 
