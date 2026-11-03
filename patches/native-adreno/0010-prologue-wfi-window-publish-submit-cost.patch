@@ -1,0 +1,161 @@
+guamp: A6XX job prologue waits for idle; a submission maintains only its client window; submission cost counters
+
+diff -ru b/NativeAdrenoRing.cpp c/NativeAdrenoRing.cpp
+--- b/NativeAdrenoRing.cpp	2026-11-03 21:15:03.696111931 +0100
++++ c/NativeAdrenoRing.cpp	2026-11-03 23:25:04.160117156 +0100
+@@ -86,9 +86,14 @@
+     if(generation!=6 && generation!=7)return kIOReturnBadArgument;
+     generation_=generation;return kIOReturnSuccess;
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0010): the A6XX prologue starts with CP_WAIT_FOR_IDLE, so a job runs after every earlier
++ * one finished and the invalidates that follow see their writes: a Turnip that no longer waits on the CPU for the fences of this ring
++ * (patches/mesa-turnip/0001, as msm_gem_submit() skips them) keeps Vulkan's ordering. native_adreno_a6xx_prologue_wfi=0 (board,
++ * guamp-adreno-wfi=0) leaves it out. One more word a job. */
++extern "C" {volatile uint32_t native_adreno_a6xx_prologue_wfi=1;}
+ uint32_t NativeAdrenoRing::prologueWords(bool reset) const
+ {
+-    return generation_==6?RingA6xxPrologueWords:RingPrologueWords+(reset?RingResetWords:0);
++    return generation_==6?RingA6xxPrologueWords+(native_adreno_a6xx_prologue_wfi?1u:0u):RingPrologueWords+(reset?RingResetWords:0);
+ }
+ /* WPTR as a fenced register write: the GMU drops a write to CP_RB_WPTR that arrives while the GPU domain is not ready and flags it in
+  * its AHB fence status; the write is then given again, at most 200 times. i491: a fence stalled on almost every submission until the
+@@ -180,12 +185,14 @@
+         /* A6XX: one CP thread and one page table, so the context entry is only the UCHE invalidate a6xx_set_pagetable() ends
+          * with, then the CCU invalidates a6xx_submit() puts before the IBs. */
+         const uint32_t uche=RingA6xxCacheInvalidate,depth=RingA6xxCcuInvalidateDepth,color=RingA6xxCcuInvalidateColor;
+-        size_t n=packet(words,0,RingFenceOpcode,&uche,1);
++        const uint32_t total=prologueWords(false);
++        size_t n=total>RingA6xxPrologueWords?packet(words,0,RingWaitForIdle,nullptr,0):0;
++        n=packet(words,n,RingFenceOpcode,&uche,1);
+         if(n)n=packet(words,n,RingFenceOpcode,&depth,1);
+         if(n)n=packet(words,n,RingFenceOpcode,&color,1);
+-        if(n!=RingA6xxPrologueWords)return poison();
+-        for(uint32_t i=0;i<RingA6xxPrologueWords;++i)ring_[(at+i)&mask]=words[i];
+-        *end=(at+RingA6xxPrologueWords)&mask;return kIOReturnSuccess;
++        if(n!=total)return poison();
++        for(uint32_t i=0;i<total;++i)ring_[(at+i)&mask]=words[i];
++        *end=(at+total)&mask;return kIOReturnSuccess;
+     }
+     const uint32_t br=RingSyncThreads|RingThreadBr,syncBoth=RingSyncThreads|RingThreadBoth,both=RingThreadBoth,marker=0x101;
+     const uint32_t count=RingPrologueWords+(reset?RingResetWords:0);
+diff -ru b/NativeAdrenoSubmit.cpp c/NativeAdrenoSubmit.cpp
+--- b/NativeAdrenoSubmit.cpp	2026-11-03 21:15:03.696111931 +0100
++++ c/NativeAdrenoSubmit.cpp	2026-11-03 23:25:34.460111882 +0100
+@@ -2,6 +2,7 @@
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+@@ -108,9 +109,25 @@
+ {
+     size_t count=0;for(const auto &job:jobs_)if(job.active)++count;return count;
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0010): the cost of each submission, for the board's 10 s line: [0] submissions, [1] us in
++ * submit() in all, [2] us of it in the cache maintenance (publishMapped), [3] KiB maintained, [4] the longest submit() in us, [5] the
++ * longest maintenance in us. native_adreno_publish_window (board: guamp-adreno-publish-window, default 1) keeps a submission's
++ * maintenance to its client's window; 0 walks every client's mappings on every submission, as before. */
++extern "C" {volatile uint64_t native_adreno_submit_cost[6];volatile uint32_t native_adreno_publish_window=1;}
++static uint64_t submitNowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
+ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+-    uint32_t queue,uint32_t *fence)
++    uint32_t queue,uint32_t *fence,uint64_t window_start,uint64_t window_bytes)
+ {
++    const uint64_t submit_began=submitNowUs();
++    struct CostNote {
++        uint64_t began;
++        ~CostNote() {
++            const uint64_t spent=submitNowUs()-began;
++            native_adreno_submit_cost[0]=native_adreno_submit_cost[0]+1;native_adreno_submit_cost[1]=native_adreno_submit_cost[1]+spent;
++            if(spent>native_adreno_submit_cost[4])native_adreno_submit_cost[4]=spent;
++        }
++    } cost_note{submit_began};
++    if(!native_adreno_publish_window)window_bytes=0;
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
+@@ -197,7 +214,13 @@
+     static uint32_t coherence_turn;
+     const bool sample=!(coherence_turn++&63);
+     if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+-    IOReturn status=vm_->publishMapped();
++    const uint64_t publish_began=submitNowUs();uint64_t maintained=0;
++    IOReturn status=vm_->publishMapped(window_start,window_bytes,&maintained);
++    {
++        const uint64_t spent=submitNowUs()-publish_began;
++        native_adreno_submit_cost[2]=native_adreno_submit_cost[2]+spent;native_adreno_submit_cost[3]=native_adreno_submit_cost[3]+(maintained>>10);
++        if(spent>native_adreno_submit_cost[5])native_adreno_submit_cost[5]=spent;
++    }
+     if(!status && sample) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
+diff -ru b/NativeAdrenoSubmit.h c/NativeAdrenoSubmit.h
+--- b/NativeAdrenoSubmit.h	2026-11-03 21:15:03.696111931 +0100
++++ c/NativeAdrenoSubmit.h	2026-11-03 23:25:04.160117156 +0100
+@@ -64,8 +64,10 @@
+     IOReturn detach();
+     /* queue is bookkeeping for one shared ring; it never reorders or isolates
+      * submissions and is validated by the caller's open queue set. */
++    /* guamp 0010: window_bytes nonzero names the submitting client's GPU window, the only mappings the submission's cache
++     * maintenance walks (native_adreno_publish_window, default 1). */
+     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,
+-        uint32_t *fence);
++        uint32_t *fence,uint64_t window_start=0,uint64_t window_bytes=0);
+     bool queueOutstanding(uint32_t queue) const;
+     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
+      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
+diff -ru b/NativeAdrenoUserClient.cpp c/NativeAdrenoUserClient.cpp
+--- b/NativeAdrenoUserClient.cpp	2026-11-03 21:15:03.716111931 +0100
++++ c/NativeAdrenoUserClient.cpp	2026-11-03 23:25:04.160117156 +0100
+@@ -384,7 +384,7 @@
+     used_=true;
+     ring_->useContext(context_);
+     const IOReturn status=submit_->submit(buffers,request->buffer_count,
+-        queue_base_+static_cast<uint32_t>(request->queue),&fence);
++        queue_base_+static_cast<uint32_t>(request->queue),&fence,window_start_,window_bytes_);   /* guamp 0010: its window */
+     if(status)return status;
+     reply->fence=fence;
+     return kIOReturnSuccess;
+diff -ru b/NativeAdrenoVm.cpp c/NativeAdrenoVm.cpp
+--- b/NativeAdrenoVm.cpp	2026-11-03 21:15:03.696111931 +0100
++++ c/NativeAdrenoVm.cpp	2026-11-03 23:25:04.160117156 +0100
+@@ -424,14 +424,22 @@
+         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
+     return status?fail(status):kIOReturnSuccess;
+ }
+-IOReturn NativeAdrenoVm::publishMapped()
++/* guamp 0010: mappings outside the submitter's window that publishMapped left alone, and their bytes (MiB). */
++extern "C" {volatile uint64_t native_adreno_publish_skipped[2];}
++IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_bytes,uint64_t *maintained_bytes)
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback) || importedUntouched(m.memory,m.permissions)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
++        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes)) {
++            native_adreno_publish_skipped[0]=native_adreno_publish_skipped[0]+1;
++            native_adreno_publish_skipped[1]=native_adreno_publish_skipped[1]+m.memory->bytes();
++            continue;
++        }
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
++        if(maintained_bytes)*maintained_bytes+=m.memory->bytes();
+     }
+     return kIOReturnSuccess;
+ }
+diff -ru b/NativeAdrenoVm.h c/NativeAdrenoVm.h
+--- b/NativeAdrenoVm.h	2026-11-03 21:15:03.696111931 +0100
++++ c/NativeAdrenoVm.h	2026-11-03 23:25:04.160117156 +0100
+@@ -101,7 +101,9 @@
+     /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
+      * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
+      * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
+-    IOReturn publishMapped();
++    /* guamp 0010: window_bytes nonzero maintains only the mappings inside [window_start, +window_bytes) (the submitting client's
++     * GPU window: its jobs reach no other client's mappings); *maintained_bytes (optional) adds the bytes maintained. */
++    IOReturn publishMapped(uint64_t window_start=0,uint64_t window_bytes=0,uint64_t *maintained_bytes=nullptr);
+     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
+      * like any other (sticky; the safe behaviour of int-070..097). */
+     void distrustWriteCombined() {distrust_write_combined_=true;}

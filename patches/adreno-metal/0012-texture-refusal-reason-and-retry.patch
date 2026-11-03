@@ -1,0 +1,83 @@
+guamp: the whole reason of a refused texture to the kernel, and one retry after letting held imports go (Maps, fin40b)
+
+fin40b (live-20261103-195840, 22:04 boot): Maps still aborts ("VectorKit received null texture from Metal"); 0011's lines show the
+descriptor, "texref a f10 t2 u1 s0 1024x1024 m1 n1" and the same for the fallback: an ordinary R8Unorm 2D shared 1024x1024 texture,
+refused as asked and with the usages trimmed, after "texture over buffer refused" in the same process; the surface refusals read
+"Invalid(Invalid { ca..." cut at 46 characters. So not a format: the reason is needed.
+- sendWhy: the reason of each refusal (texture "texwhy", the retry "trywhy", over a buffer "bufwhy", over a surface "srfwhy") goes to
+  the kernel in pieces of 38 characters, "problem texwhy0 ...", "problem texwhy1 ...", up to 6 pieces, each reason once, at most 8 a
+  process; native-adreno 0009 prints them as "GuampMetal: client <process>: problem texwhyK ...".
+- Before the other fallbacks, the held surface imports (0010) are let go and the descriptor is tried again as asked
+  ("native-metal: texture made after letting held imports go").
+Applies after 0001, 0002, 0003, 0009, 0010 and 0011; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 72fe9d2..ef3e87f 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -959,6 +959,19 @@ static uint32_t substituteFormat(uint32_t f) {
+  if(f==255)return 252u;
+  return 0;
+ }
++// guamp 0012: a refusal's whole reason to the kernel, in pieces of 38 characters ("problem <tag><k> <piece>", at most 6 pieces, each
++// distinct reason once, at most 8 a process): the 46-character problem lines cut "Invalid(Invalid { ca..." short (fin40b).
++static void sendWhy(const char *tag,NSString *why) {
++ if(!why || !native_bridge_metal_problem_hook)return;
++ static std::mutex lock;static std::set<std::string> said;
++ const char *text=why.UTF8String;if(!text)return;
++ {std::lock_guard<std::mutex> guard(lock);if(said.size()>=8 || !said.insert(std::string(tag)+text).second)return;}
++ const size_t length=strlen(text);
++ for(unsigned k=0;k<6 && (size_t)k*38<length;k++) {
++  char line[48];snprintf(line,sizeof line,"%.6s%u %.38s",tag,k,text+(size_t)k*38);
++  native_bridge_metal_problem_hook(line);
++ }
++}
+ static void reportTextureRefusal(const NmbTextureDescriptor &d,const char *stage,NSString *why) {
+  const unsigned storage=(unsigned)((d.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);
+  NBLOG(@"native-metal: texture refused fmt %llu type %llu usage 0x%llx storage %u %llux%llux%llu mips %llu samples %llu array %llu (%s): %@",
+@@ -970,8 +983,11 @@ static void reportTextureRefusal(const NmbTextureDescriptor &d,const char *stage
+  snprintf(line,sizeof line,"texref %.1s f%llu t%llu u%llx s%u %llux%llu m%llu n%llu",stage,(unsigned long long)d.format,
+           (unsigned long long)d.type,(unsigned long long)d.usage,storage,(unsigned long long)d.width,(unsigned long long)d.height,
+           (unsigned long long)d.levels,(unsigned long long)d.samples);
+- std::lock_guard<std::mutex> guard(lock);
+- if(said.size()<16 && said.insert(line).second && native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(line);
++ {
++  std::lock_guard<std::mutex> guard(lock);
++  if(said.size()<16 && said.insert(line).second && native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(line);
++ }
++ sendWhy("texwhy",why);
+ }
+ static NmbTexture *textureFallback(NmbTextureDescriptor &d,uint32_t *substituted) {
+  *substituted=0;
+@@ -979,7 +995,12 @@ static NmbTexture *textureFallback(NmbTextureDescriptor &d,uint32_t *substituted
+  if(!textureFallbackOn())return nullptr;
+  NmbTextureDescriptor t=d;
+  const uint64_t storage=(t.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift;
+- NmbTexture *handle=nullptr;
++ // guamp 0012: an ordinary descriptor (fin40b: R8Unorm 1024x1024 shared, refused as asked and as every fallback) points at the process's
++ // GPU resources, not the format: the held surface imports (0010) are let go and the descriptor tried again, as asked, once.
++ trimHeldImports(false);
++ NmbTexture *handle=nmb_texture_new(gDevice,&t);
++ if(handle){gTextureFallbacks++;NBLOG(@"native-metal: texture made after letting held imports go (fmt %llu)",(unsigned long long)d.format);return handle;}
++ sendWhy("trywhy",lastError());
+  if(storage==MTLStorageModeMemoryless) {
+   t.options=(t.options&~(uint64_t)MTLResourceStorageModeMask)|((uint64_t)MTLStorageModePrivate<<MTLResourceStorageModeShift);
+   handle=nmb_texture_new(gDevice,&t);
+@@ -1189,7 +1210,7 @@ static void invalidateWrittenSurfaces(NSMutableSet *written,bool completed) {
+ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
+- if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
++ if(!handle){NSString *why=lastError();NBLOG(@"native-metal: texture over buffer refused: %@",why);sendWhy("bufwhy",why);return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+ }
+@@ -1199,7 +1220,7 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+  const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+  NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));
+- if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
++ if(!handle){NSString *why=lastError();NBLOG(@"native-metal: texture over surface refused: %@",why);sendWhy("srfwhy",why);return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+ }

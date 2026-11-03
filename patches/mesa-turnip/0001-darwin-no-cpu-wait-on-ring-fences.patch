@@ -1,0 +1,25 @@
+turnip darwin: no CPU wait before a submission on a sync already resolved to a ring fence (needs native-adreno 0010)
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc	2026-11-03 23:24:04.888114020 +0100
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc	2026-11-03 23:24:04.920114020 +0100
+@@ -860,9 +860,19 @@
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    struct tu_device *dev = queue->device;
+ 
+-   /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
++   /* The kernel client has one ring, which runs every job in order. guamp (UniXNU-guamp patches/mesa-turnip/0001): a wait on a sync
++    * already resolved to a ring fence is met by the ring itself, as msm_gem_submit() skips the fences of its own ring: the A6XX job
++    * prologue waits for idle and invalidates the GPU caches before the job's buffers run (UniXNU-guamp patches/native-adreno/0010), so
++    * the CPU no longer waits for that work to complete before submitting (it did on every metal2vulkan batch: about 19.5 ms of each of
++    * backboardd's commits in fin40). A sync not yet resolved is still waited for on the CPU, and TU_DARWIN_CPU_WAITS=1 waits for every
++    * one as before (a kernel without the prologue wait). */
++   static int cpu_waits = -1;
++   if (cpu_waits < 0)
++      cpu_waits = debug_get_bool_option("TU_DARWIN_CPU_WAITS", false) ? 1 : 0;
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++      if (!cpu_waits && (s->state == DARWIN_SYNC_FENCE || s->state == DARWIN_SYNC_SIGNALED))
++         continue;
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+          return vk_device_set_lost(&dev->vk, "wait before submit failed");
