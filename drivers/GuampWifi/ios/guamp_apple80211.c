@@ -865,16 +865,16 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	/* guamp 03/11: a short scan also says which channels (wifid's auto-join scans the channels it knows a network on: fin34
 	 * asked 3 channels at 58.9 s and never joined; which ones tells whether the saved network's channel was among them) */
-	char channels_said[64] = "";
+	char channels_said[80] = "";
 	if (asked->channel_count <= 13) {
 		for (unsigned i = 0, at = 0; i < asked->channel_count && at + 5 < sizeof(channels_said); i++) {
-			at += (unsigned)snprintf(channels_said + at, sizeof(channels_said) - at, "%s%u", i ? "," : " on ",
-			    asked->channels[i].channel);
+			at += (unsigned)snprintf(channels_said + at, sizeof(channels_said) - at, i ? ",%u" : " on %u/%#x", asked->channels[i].channel,
+			    asked->channels[i].flags);   /* (guamp 03/11: and the first one's flags: wifid filters cached results by them) */
 		}
 	}
 	snprintf(said, said_size, " (a scan: type %u, %u channels%s of which %u are not the radio's, %u ms on each, a name of %u bytes, "
-	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, channels_said, unknown, asked->dwell_ms,
-	    asked->ssid_length, asked->name_count, asked->flags);
+	    "%u more names, flags %#llx, words 0x1310 %#x %#x)", asked->scan_type, asked->channel_count, channels_said, unknown, asked->dwell_ms,
+	    asked->ssid_length, asked->name_count, asked->flags, asked->unused_2, asked->name_count);
 	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
 		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 	} else {
