@@ -1,0 +1,36 @@
+diff --git a/osfmk/vm/vm_compressor_backing_store.c b/osfmk/vm/vm_compressor_backing_store.c
+index 4820a8b..6158f1b 100644
+--- a/osfmk/vm/vm_compressor_backing_store.c
++++ b/osfmk/vm/vm_compressor_backing_store.c
+@@ -799,6 +799,31 @@ vm_swapfile_create_thread(void)
+ 			break;
+ 		}
+ 
++		/*
++		 * guamp 04/11: this thread runs once as soon as vm_compressor_swap_init starts it, at ~1 s, before launchd
++		 * has mounted the Data volume: the swap file /private/var/vm/swapfile0 then lands on the read-only system
++		 * volume ("Failed to open swap file 30" = EROFS, "vm_swap_create_file failed @ N secs" twice). Nothing has
++		 * asked for swap space at that point, and with the guamp default pager mode (no kern.vm_compressor in the
++		 * ADT: VM_PAGER_FREEZER_DEFAULT, neither swap nor freezer swap active) nothing ever will. So the first,
++		 * unrequested run and every run without an active swap backend create no file; vm_swap_put and the delayed
++		 * trims still wake the thread when a backend is active and needs a file (Data is mounted by then).
++		 * Boot-arg guamp-swap-early=1 restores the original behaviour.
++		 */
++		{
++			static int guamp_swap_early = -1;
++
++			if (guamp_swap_early < 0) {
++				uint32_t early = 0;
++
++				PE_parse_boot_argn("guamp-swap-early", &early, sizeof(early));
++				guamp_swap_early = early ? 1 : 0;
++			}
++			if (!guamp_swap_early && (vm_swapfile_create_thread_awakened == 1 ||
++			    (!VM_CONFIG_SWAP_IS_ACTIVE && !VM_CONFIG_FREEZER_SWAP_IS_ACTIVE))) {
++				break;
++			}
++		}
++
+ 		clock_get_system_nanotime(&sec, &nsec);
+ 
+ 		if (VM_SWAP_SHOULD_CREATE(sec) == 0) {

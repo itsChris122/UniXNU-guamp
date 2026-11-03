@@ -1,0 +1,68 @@
+diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
+index e8c8ed7..2262873 100644
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -205,6 +205,53 @@ bad:
+ 	return error;
+ }
+ 
++#include <pexpert/pexpert.h>
++
++/*
++ * guamp 04/11: the writable APFS volumes of this phone (owner Data on /private/var and the other eMMC windows) are
++ * mounted without content protection: there is no Secure Enclave (ADT DoNotUseSEP), so no class keys exist and APFS
++ * mounts them "unencrypted" without MNT_CPROTECT. A create that asks for a protection class there
++ * (open_dprotected_np / openat_dprotected_np / guarded_open_dprotected_np with O_CREAT, e.g. class 2 =
++ * NSFileProtectionCompleteUnlessOpen from attributionkitd, mobilerepaird, widget extensions) is refused by APFS
++ * ("apfs_is_valid_class: ... rejecting class open (class 2) because we're not content protected"): the file is
++ * not created and the caller fails (30+ refusals per boot in fin43). On such a volume every file is readable at
++ * any time, which is what the class asks for at best, so the create proceeds without the class, as a plain
++ * open(2) with O_CREAT would (the file reads back as class D through zzzz-guamp-dp-class-d). Only creates on
++ * writable APFS mounts without MNT_CPROTECT change; a volume with content protection still gets the class.
++ * Boot-arg guamp-dp-create=0 passes the class through again.
++ */
++static int native_guamp_dp_create_mode = -1;	/* -1 boot-arg not read yet, 0 off, 1 on */
++static volatile uint32_t native_guamp_dp_create_count = 0;
++
++static void
++native_guamp_dp_create(vnode_t dvp, struct vnode_attr *vap, vfs_context_t ctx)
++{
++	mount_t mp;
++	uint32_t count;
++
++	if (!VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
++		return;
++	}
++	if (native_guamp_dp_create_mode < 0) {
++		uint32_t enabled = 1;
++
++		PE_parse_boot_argn("guamp-dp-create", &enabled, sizeof(enabled));
++		native_guamp_dp_create_mode = enabled ? 1 : 0;
++	}
++	mp = dvp != NULLVP ? vnode_mount(dvp) : NULL;
++	if (!native_guamp_dp_create_mode || mp == NULL || (mp->mnt_flag & (MNT_CPROTECT | MNT_RDONLY)) ||
++	    strcmp(mp->mnt_vfsstat.f_fstypename, "apfs") != 0) {
++		return;
++	}
++	count = ++native_guamp_dp_create_count;
++	if (count <= 3 || (count & (count - 1)) == 0) {
++		printf("guamp: dp create: %s[%d] class %d on %s (apfs, not content protected) created without class (%u so far); "
++		    "guamp-dp-create=0 disables\n", proc_best_name(vfs_context_proc(ctx)), proc_getpid(vfs_context_proc(ctx)),
++		    (int)vap->va_dataprotect_class, mp->mnt_vfsstat.f_mntonname, count);
++	}
++	VATTR_CLEAR_ACTIVE(vap, va_dataprotect_class);
++}
++
+ /*
+  * May do nameidone() to allow safely adding an FSEvent.  Cue off of ni_dvp to
+  * determine whether that has happened.
+@@ -243,6 +290,9 @@ vn_open_auth_do_create(struct nameidata *ndp, struct vnode_attr *vap, int fmode,
+ 		}
+ 	}
+ 
++	/* guamp: no protection class on a volume without content protection, see native_guamp_dp_create */
++	native_guamp_dp_create(dvp, vap, ctx);
++
+ 	error = vn_create(dvp, &ndp->ni_vp, ndp, vap, VN_CREATE_DOOPEN, fmode, &status, ctx);
+ 	if (error != 0) {
+ 		if (batched) {
