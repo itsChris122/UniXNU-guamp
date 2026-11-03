@@ -20,7 +20,7 @@ when refused, are composed in software.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '44bbed9cdab890a1f329e0132413d2651a09d854b0dfb4eabcfca16fe2e4373c'
+PATCHED_SHA256 = 'e0269ee84ef19f707ddc0598e686a16095da4911ce97aa80be5ae522fc3ec83c'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -889,20 +889,24 @@ EDITS.append(('        latest.clear(*this);\n', '        latest.clear(*this);\n 
 EDITS.append(('GuampMapSlot mapSlots[4]={};', 'GuampMapSlot mapSlots[8]={};'))
 EDITS.append(('    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;}',
               '    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;\n'
-              '        for(auto &entry: composedValidated)if(entry==request)entry=nullptr;}'))
+              '        for(auto &entry: composedValidated)if(entry.request==request)entry={};}'))
 EDITS.append(('transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;',
-              'transferred=false;for(auto &entry: validated)entry=nullptr;for(auto &entry: composedValidated)entry=nullptr;gpuRequest=nullptr;'))
+              'transferred=false;for(auto &entry: validated)entry=nullptr;for(auto &entry: composedValidated)entry={};gpuRequest=nullptr;'))
 EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: software composition of multi-layer swaps.
-    const OriginalLegacySwapRequest *composedValidated[8]={};
-    bool isComposed(const OriginalLegacySwapRequest *request) const {
-        if(!request)return false;
-        for(auto entry: composedValidated)if(entry==request)return true;
-        return false;
+    // The layer masks are taken when the swap is validated: by the time the queue reaches it the family has rewritten the word at 796
+    // (fin40b dumps: 7/1 at validation, 7/7 at the kick, every layer read as disabled and nothing drawn).
+    struct ComposedEntry {const OriginalLegacySwapRequest *request;uint32_t updated,disabled,background;};
+    ComposedEntry composedValidated[8]={};
+    const ComposedEntry *composedEntry(const OriginalLegacySwapRequest *request) const {
+        if(!request)return nullptr;
+        for(auto &entry: composedValidated)if(entry.request==request)return &entry;
+        return nullptr;
     }
-    void addComposed(const OriginalLegacySwapRequest *request) {
-        if(isComposed(request))return;
-        for(auto &entry: composedValidated)if(!entry){entry=request;return;}
-        composedValidated[0]=request;
+    void addComposed(const OriginalLegacySwapRequest *request,const unsigned char *bytes) {
+        ComposedEntry e={request,0,0,0};memcpy(&e.updated,bytes+792,4);memcpy(&e.disabled,bytes+796,4);memcpy(&e.background,bytes+800,4);
+        for(auto &entry: composedValidated)if(entry.request==request){entry=e;return;}
+        for(auto &entry: composedValidated)if(!entry.request){entry=e;return;}
+        composedValidated[0]=e;
     }
     int composeWanted=-1;
     GuampLayerSource composeCurrent[4]={};uint32_t composeBackground=0xff000000U;
@@ -994,7 +998,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             IOLog("GuampDisplay: compose dump %u +0x%03x: %s\n",n,at,hex);
         }
     }
-    void composeDump(const unsigned char *bytes) {
+    void composeDump(const unsigned char *bytes,const ComposedEntry &validatedMasks) {
         if(composeDumpLeft<0){unsigned v=6;PE_parse_boot_argn("guamp-compose-dump",&v,sizeof v);composeDumpLeft=(int)(v>64?64:v);}
         if(!composeDumpLeft)return;
         composeDumpLeft=composeDumpLeft-1;
@@ -1006,14 +1010,14 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             const OSMetaClass *meta=reinterpret_cast<const OSObject *>(surfaces[i])->getMetaClass();
             names[i]=meta && meta->getClassName()?meta->getClassName():"?";
         }
-        IOLog("GuampDisplay: compose dump %u: updated %x disabled %x background %x options %x %x %x size %ux%u; words 824.. %x %x %x %x; "
-              "surfaces %llx %llx %llx %llx (%s %s %s %s)\n",n,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],
+        IOLog("GuampDisplay: compose dump %u: validated updated %x disabled %x background %x; now updated %x disabled %x background %x options %x %x %x size %ux%u; words 824.. %x %x %x %x; "
+              "surfaces %llx %llx %llx %llx (%s %s %s %s)\n",n,validatedMasks.updated,validatedMasks.disabled,validatedMasks.background,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],
               surfaces[0],surfaces[1],surfaces[2],surfaces[3],names[0],names[1],names[2],names[3]);
         composeDumpRows(n,bytes,0x000,0x160);composeDumpRows(n,bytes,0x1c0,0x260);
         composeDumpRows(n,bytes,0x300,0x340);composeDumpRows(n,bytes,0xa40,0xa60);
     }
     // The validated head of a composed swap: its layers update the persistent ones, a snapshot of them becomes the frame.
-    void kickComposed(const OriginalLegacySwapRequest *request) {
+    void kickComposed(const OriginalLegacySwapRequest *request,const ComposedEntry &validatedMasks) {
         const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
         PE_Video video={};
         const uint64_t length=(uint64_t)gopWidth*gopHeight*4;
@@ -1025,7 +1029,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         uint32_t displayWidth=0,displayHeight=0;getDisplayDimensions(&displayWidth,&displayHeight);
         if(!displayWidth || !displayHeight){native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
-        uint32_t updated=0,disabled=0,background=0;memcpy(&updated,bytes+792,4);memcpy(&disabled,bytes+796,4);memcpy(&background,bytes+800,4);
+        const uint32_t updated=validatedMasks.updated,disabled=validatedMasks.disabled,background=validatedMasks.background;
         for(unsigned i=0;i<4;++i) {
             const uint32_t bit=1u<<i;
             if(!(updated&bit))continue;
@@ -1036,7 +1040,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
         }
         if(updated&0x80000000U)composeBackground=0xff000000U|(background&0x00ffffffU);
-        composeDump(bytes);
+        composeDump(bytes,validatedMasks);
         GuampLayers *set=static_cast<GuampLayers *>(IOMalloc(sizeof(GuampLayers)));
         if(!set){native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;}
         bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;
@@ -1118,12 +1122,12 @@ EDITS.append(('''        if(accepted)addValidated(request);else removeValidated(
             else guamp_compose[12]=guamp_compose[12]+1;
         }
         if(accepted)addValidated(request);else removeValidated(request);
-        if(composed)addComposed(request);
+        if(composed)addComposed(request,bytes);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;'''))
 EDITS.append(('''        if(!request || !isValidated(request))return;
 ''', '''        if(!request || !isValidated(request))return;
         // guamp composition (canvas variant section 12): a composed swap; any other frame replaces the persistent layers.
-        if(isComposed(request)){kickComposed(request);return;}
+        if(const ComposedEntry *entry=composedEntry(request)){const ComposedEntry masks=*entry;kickComposed(request,masks);return;}
         composeReset();
 '''))
 def apply(data):
