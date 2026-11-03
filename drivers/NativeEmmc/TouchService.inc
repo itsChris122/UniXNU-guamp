@@ -767,10 +767,23 @@ void logStatus(uint32_t polls) {
 // guamp-touch-regdump=0 turns it off (default on): the regions of the TWRP reference read (log-xnu/twrp-himax-reg-*.txt,
 // /proc/android_touch/debug register reads), 64 bytes each, at the named moment, to compare with Linux byte by byte.
 unsigned gRegDump = 1;
+// GuampBacklight registers it once DSI0 is mapped: the panel's off-command then on-command (28, 10, 11, 29 with the
+// dtbo waits) from this thread. Returns the GuampBacklightCore result (0 = sent).
+int (*volatile gPanelCycle)() = nullptr;
+// guamp-touch-panelcycle=1|2 (TDDI experiment, default 0): under Linux the panel's sleep out / display on comes from
+// the kernel before the touch reset; here UEFI sent it long before. 1: cycle the panel after the download, before the
+// sense on; 2: after the start, then wait 1 s for the reload markers again. Logs the outcome either way.
+int panelCycle(const char *when) {
+  for (unsigned i = 0; i < 60 && !gPanelCycle; ++i) IOSleep(50);
+  int (*fn)() = gPanelCycle;
+  const int r = fn ? fn() : -1;
+  IOLog("GuampTouch: panel cycle %s: %s (%d)\n", when, !fn ? "no DSI (GuampBacklight absent)" : r == 0 ? "sent" : "refused", r);
+  return r;
+}
 void regDump(const char *when) {
   if (!gRegDump) return;
   static const uint32_t regions[] = {0x10007000u, 0x10007080u, 0x100072C0u, 0x10007F00u, 0x10007FC0u, 0x10005800u,
-                                     0x900000A8u, 0x90000048u, 0x80050000u};
+                                     0x900000A8u, 0x90000048u, 0x80050000u, 0x90000080u, 0x900000C0u};
   for (uint32_t a : regions) {
     uint8_t b[64] = {};
     const int r = hx_reg_read(&gChip, a, b, sizeof(b));
@@ -871,8 +884,24 @@ void thread(void *param, wait_result_t) {
     if (PE_parse_boot_argn("guamp-touch-reload-tries", &v, sizeof(v)) && v && v <= 10) gChip.reload_tries = v;
   }
   regDump("download");
+  unsigned cycle = 0;
+  PE_parse_boot_argn("guamp-touch-panelcycle", &cycle, sizeof(cycle));
+  if (cycle == 1) panelCycle("before sense on");
   r = hx_start(&gChip);
   regDump("start");
+  if (cycle == 2 && !r) {
+    panelCycle("after start");
+    uint32_t a = 0, b = 0;
+    unsigned i = 0;
+    for (; i < 100; ++i) {
+      hx_reg_read32(&gChip, HX_ADDR_FLASH_RELOAD, &a);
+      hx_reg_read32(&gChip, HX_ADDR_2ND_FLASH_RELOAD, &b);
+      if ((a & 0xFFFF) == 0x9AA9 || (a & 0xFFFF) == 0x3AA3 || (b & 0xFFFF) == 0x72C0) break;
+      IOSleep(10);
+    }
+    IOLog("GuampTouch: after panel cycle: reload %s (7f00 %08x 72c0 %08x after %u polls)\n", i < 100 ? "seen" : "NOT seen", a, b, i);
+    regDump("cycle");
+  }
   unsigned redl = 1;
   PE_parse_boot_argn("guamp-touch-redl", &redl, sizeof(redl));
   if (!r && !keepFw && redl && gChip.reload_polls >= 200) {

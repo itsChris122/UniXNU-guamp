@@ -242,6 +242,20 @@ public:
 OSDefineMetaClassAndStructors(GuampBacklight, IOService)
 
 namespace backlight {
+// Touch service experiment (guamp-touch-panelcycle): off-command then on-command, from the touch thread at boot.
+int panelCycle() {
+  static const uint32_t cmds[] = {guamp_backlight::kDcsDisplayOff, guamp_backlight::kDcsSleepIn, guamp_backlight::kDcsSleepOut,
+                                  guamp_backlight::kDcsDisplayOn};
+  static const uint32_t waits[] = {20, 120, 160, 50};
+  guamp_backlight::Diag d;
+  Io io;
+  for (unsigned i = 0; i < 4; ++i) {
+    const int r = guamp_backlight::sendDcsShort(io, cmds[i], d);
+    if (r != guamp_backlight::kSent) return r;
+    IOSleep(waits[i]);
+  }
+  return guamp_backlight::kSent;
+}
 void start() {
   unsigned enabled = 1, control = 1, selfTest = 0;   // default on (owner 28/10); guamp-backlight=0 to disable
   PE_parse_boot_argn("guamp-backlight", &enabled, sizeof(enabled));
@@ -252,6 +266,7 @@ void start() {
   gDispcc = mapPhysical(kDispccPhys, 0x3000);
   gDsi = mapPhysical(kDsiPhys, 0x1000);
   if (!gGccDisp || !gDispcc || !gDsi) { IOLog("GuampBacklight: mapping failed\n"); gDsi = nullptr; return; }
+  touch::gPanelCycle = &panelCycle;
   GuampBacklight *service = OSTypeAlloc(GuampBacklight);
   if (!service || !service->init() || !service->attach(IOService::getPlatform())) {
     IOLog("GuampBacklight: service not created\n");
