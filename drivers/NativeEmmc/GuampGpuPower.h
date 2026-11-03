@@ -392,7 +392,27 @@ static inline unsigned gp_dcvs_next(const gp_state *s, gp_action a) {
 #define GP_SPEED_BIN_DWORD 0x6004u
 static inline uint32_t gp_speed_bin(uint32_t dword6004) { return (dword6004 >> 21) & 0xffu; }
 
-struct gp_gov { unsigned quiet = 0; };
+// up: the busy samples of a window that send the GPU to the top (GP_GOV_UP; guamp-gpu-up=<percent> lowers it, GuampGpuDcvs.inc).
+struct gp_gov { unsigned quiet = 0; unsigned up = GP_GOV_UP; };
+// guamp-gpu-up=<percent> as samples of a window: 1..100 %, anything else keeps GP_GOV_UP; never under one sample.
+static inline unsigned gp_gov_up_samples(unsigned percent) {
+  if (!percent || percent > 100u) return GP_GOV_UP;
+  const unsigned n = (percent * GP_GOV_WINDOW + 99u) / 100u;
+  return n ? n : 1u;
+}
+// guamp-gpu-min=<MHz>: the slowest level the governor goes down to, the slowest at or above minMhz and never faster than top
+// (0 or anything up to 320 MHz: the 320 MHz level, as before).
+static inline unsigned gp_gov_bottom(unsigned top, uint32_t minMhz) {
+  unsigned bottom = GP_LEVEL_320;
+  while (minMhz && bottom > top && kGpLevels[bottom].mhz < minMhz) bottom = bottom - 1;
+  return bottom;
+}
+// A CPU thread blocked on a GPU fence (guamp-gpu-boost=1, the wait boost): the GPU is on the critical path whatever its busy share
+// says, so straight to the top; the quiet run restarts and the usual steps down follow.
+static inline unsigned gp_gov_boost(gp_gov *g, const gp_state *s) {
+  g->quiet = 0;
+  return s->top;
+}
 static inline bool gp_gov_busy(uint32_t rbbmStatus) { return (rbbmStatus & GP_GOV_BUSY_MASK) != 0; }
 // Fastest level for a speed bin under a MHz cap (guamp-gpu-max, 0 = none); never slower than the 320 MHz level.
 static inline unsigned gp_gov_top(uint32_t speedBin, uint32_t capMhz) {
@@ -403,7 +423,7 @@ static inline unsigned gp_gov_top(uint32_t speedBin, uint32_t capMhz) {
 // One window with busy samples out of GP_GOV_WINDOW: the level to go to (s->level when nothing changes). A GPU left on
 // XO by a failed switch comes back to the slowest DCVS level.
 static inline unsigned gp_gov_window(gp_gov *g, const gp_state *s, unsigned busy) {
-  if (busy >= GP_GOV_UP) {
+  if (busy >= g->up) {
     g->quiet = 0;
     return s->top;
   }
