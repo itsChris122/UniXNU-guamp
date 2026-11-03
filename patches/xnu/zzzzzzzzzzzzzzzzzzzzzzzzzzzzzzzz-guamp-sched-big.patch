@@ -1,0 +1,290 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -9203,3 +9203,286 @@
+ }
+ 
+ #endif /* DEVELOPMENT || DEBUG */
++
++/*
++ * guamp 03/11 (ag-sys): scheduling and CPU accounting for the Moto G9 Play (SM6115: cpu0-3 Silver, Cortex-A53 at 1804 MHz;
++ * cpu4-7 Gold, Kryo 260 Gold / A73 class at 2016 MHz). The BCM2837 configuration puts all eight cores in one pset without
++ * cluster types (clutch scheduler, generic SMP) and choose_processor takes the least numbered idle core, so the Silver
++ * cores ran most of the work while the faster Gold cores idled (fin36 at rest, timer interrupts per second on cpu0..7:
++ * 860 910 720 490 385 200 124 100).
++ *
++ * guamp-sched-big=<mask> (default 0xf0; 0 = off, the original least-numbered order): pset0's perfcontrol preferred mask,
++ * the cores choose_processor tries first among the idle ones (round robin), and its complement as migration mask (an idle
++ * last-processor hint outside the mask is dropped when a preferred core is idle). These are the fields CLPC programs on
++ * Apple parts (sched_perfcontrol_edge_cpu_rotation_bitmasks_set). Realtime threads and the search among busy cores are
++ * unchanged: with every Gold core busy, work still goes to the Silver ones.
++ *
++ * guamp-kthr=1 (default; 0 = off): every 30 s one line with the busy and interrupt share of every core and one with the
++ * kernel_task threads that used the most CPU (thread name, or continuation and wait event when unnamed), to find what
++ * keeps kernel_task at 25-40 % of a core at rest.
++ *
++ * guamp-bg-procs-cpu=<percent> (default 0 = off; 1..100): the processes whose name starts with one of the guamp-bg-procs
++ * prefixes (default MusicWidgets,StocksWidget,CalendarWidget: the widget extensions that loop in CoreText at ~97 % of a core
++ * each for 2-3 minutes after every boot) get a task-wide limit of <percent> % of one core per 100 ms (proc_set_task_ruse_cpu,
++ * ledger action block): they keep running, slower. Checked every 15 s for the first 20 minutes, from 20 s after boot.
++ */
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++
++#define GUAMP_SYS_PERIOD_S      15
++#define GUAMP_SYS_KTHR_SLOTS    512
++#define GUAMP_SYS_TOP           6
++#define GUAMP_SYS_CAP_MAX       16
++
++static thread_call_t guamp_sys_call;
++static uint32_t guamp_sys_round;
++static uint32_t guamp_sys_kthr = 1;
++static uint32_t guamp_sys_cap_pct;
++static char guamp_sys_cap_names[96] = "MusicWidgets,StocksWidget,CalendarWidget";
++static int guamp_sys_cap_done[GUAMP_SYS_CAP_MAX];
++static uint32_t guamp_sys_cap_count;
++static uint64_t guamp_sys_kthr_tid[GUAMP_SYS_KTHR_SLOTS];
++static uint64_t guamp_sys_kthr_time[GUAMP_SYS_KTHR_SLOTS];
++static uint64_t guamp_sys_core_active[MAX_SCHED_CPUS];
++static uint64_t guamp_sys_core_intr[MAX_SCHED_CPUS];
++static uint64_t guamp_sys_kthr_last;
++
++/* For the kernel PC sampler of GuampPerf (guamp-prof): 1 when the current thread is a processor's idle thread. */
++int guamp_sys_current_is_idle(void);
++int
++guamp_sys_current_is_idle(void)
++{
++	thread_t self = current_thread();
++	return self != THREAD_NULL && (self->state & TH_IDLE) ? 1 : 0;
++}
++
++static bool
++guamp_sys_cap_wanted(const char *comm)
++{
++	const char *at = guamp_sys_cap_names;
++
++	while (*at) {
++		const char *end = at;
++		while (*end && *end != ',') {
++			end++;
++		}
++		size_t len = (size_t)(end - at);
++		if (len && strncmp(comm, at, len) == 0) {
++			return true;
++		}
++		at = *end ? end + 1 : end;
++	}
++	return false;
++}
++
++static void
++guamp_sys_cap(void)
++{
++	task_t found[GUAMP_SYS_CAP_MAX];
++	int pids[GUAMP_SYS_CAP_MAX];
++	char names[GUAMP_SYS_CAP_MAX][17];
++	uint32_t n = 0;
++	task_t task;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *bsd_info = get_bsdtask_info(task);
++		if (bsd_info == NULL || n >= GUAMP_SYS_CAP_MAX || guamp_sys_cap_count + n >= GUAMP_SYS_CAP_MAX) {
++			continue;
++		}
++		const char *comm = proc_name_address(bsd_info);
++		if (!guamp_sys_cap_wanted(comm)) {
++			continue;
++		}
++		int pid = task_pid(task);
++		bool seen = false;
++		for (uint32_t i = 0; i < guamp_sys_cap_count; i++) {
++			seen = seen || guamp_sys_cap_done[i] == pid;
++		}
++		if (seen) {
++			continue;
++		}
++		task_reference(task);
++		found[n] = task;
++		pids[n] = pid;
++		strlcpy(names[n], comm, sizeof(names[n]));
++		n++;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	for (uint32_t i = 0; i < n; i++) {
++		int error = proc_set_task_ruse_cpu(found[i], TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE, (uint8_t)guamp_sys_cap_pct,
++		    100 * NSEC_PER_MSEC, 0, 0);
++		task_deallocate(found[i]);
++		if (guamp_sys_cap_count < GUAMP_SYS_CAP_MAX) {
++			guamp_sys_cap_done[guamp_sys_cap_count++] = pids[i];
++		}
++		printf("guamp-bg-procs-cpu: %s[%d] limited to %u%% of one core (error %d)\n", names[i], pids[i], guamp_sys_cap_pct, error);
++	}
++}
++
++struct guamp_sys_top {
++	uint64_t delta;
++	uint64_t tid;
++	vm_offset_t cont;
++	vm_offset_t event;
++	int pri;
++	char name[24];
++};
++
++static void
++guamp_sys_kthr_report(void)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t span = guamp_sys_kthr_last && now > guamp_sys_kthr_last ? now - guamp_sys_kthr_last : 0;
++	guamp_sys_kthr_last = now;
++
++	/* Cores: busy (not idle) and interrupt share of the period, from the per-processor recount tracks. */
++	char line[480];
++	int len = scnprintf(line, sizeof(line), "GuampCore: busy%%/irq%% per core:");
++	int max_cpu = ml_get_max_cpu_number();
++	for (int cpu = 0; cpu <= max_cpu && cpu < MAX_SCHED_CPUS; cpu++) {
++		processor_t pr = processor_array[cpu];
++		if (pr == PROCESSOR_NULL) {
++			continue;
++		}
++		struct recount_usage usage = { 0 };
++		uint64_t idle = 0;
++		recount_processor_usage(&pr->pr_recount, &usage, &idle);
++		uint64_t active = recount_usage_time_mach(&usage);
++		uint64_t intr = pr->pr_recount.rpr_interrupt_duration_mach;
++		uint64_t da = active >= guamp_sys_core_active[cpu] ? active - guamp_sys_core_active[cpu] : 0;
++		uint64_t di = intr >= guamp_sys_core_intr[cpu] ? intr - guamp_sys_core_intr[cpu] : 0;
++		guamp_sys_core_active[cpu] = active;
++		guamp_sys_core_intr[cpu] = intr;
++		if (span) {
++			len += scnprintf(line + len, sizeof(line) - (size_t)len, " c%d %llu/%llu", cpu,
++			    (unsigned long long)(da * 100 / span), (unsigned long long)(di * 100 / span));
++		}
++	}
++	if (span) {
++		printf("%s (guamp-sched-big %llx)\n", line, (unsigned long long)pset0.perfcontrol_cpu_preferred_bitmask);
++	}
++
++	/* kernel_task threads by CPU time used since the previous report. */
++	struct guamp_sys_top top[GUAMP_SYS_TOP];
++	bzero(top, sizeof(top));
++	uint64_t total = 0;
++	uint32_t nthreads = 0, untracked = 0;
++	char name[64];   /* MAXTHREADNAMESIZE (bsd/sys/proc_info.h) */
++	thread_t th;
++
++	task_lock(kernel_task);
++	queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
++		nthreads++;
++		if (th->state & TH_IDLE) {
++			continue;
++		}
++		uint64_t t = recount_thread_time_mach(th);
++		uint64_t tid = thread_tid(th);
++		uint32_t slot = (uint32_t)(tid % GUAMP_SYS_KTHR_SLOTS), probe = 0;
++		while (probe < 16 && guamp_sys_kthr_tid[slot] != 0 && guamp_sys_kthr_tid[slot] != tid) {
++			slot = (slot + 1) % GUAMP_SYS_KTHR_SLOTS;
++			probe++;
++		}
++		if (probe == 16) {
++			untracked++;
++			continue;
++		}
++		uint64_t delta = guamp_sys_kthr_tid[slot] == tid && t >= guamp_sys_kthr_time[slot] ? t - guamp_sys_kthr_time[slot] : 0;
++		guamp_sys_kthr_tid[slot] = tid;
++		guamp_sys_kthr_time[slot] = t;
++		total += delta;
++		int at = GUAMP_SYS_TOP;
++		while (at > 0 && top[at - 1].delta < delta) {
++			at--;
++		}
++		if (at >= GUAMP_SYS_TOP || delta == 0) {
++			continue;
++		}
++		for (int k = GUAMP_SYS_TOP - 1; k > at; k--) {
++			top[k] = top[k - 1];
++		}
++		top[at].delta = delta;
++		top[at].tid = tid;
++		top[at].cont = VM_KERNEL_ADDRHIDE(th->continuation);
++		top[at].event = VM_KERNEL_ADDRHIDE(th->wait_event);
++		top[at].pri = th->sched_pri;
++		name[0] = '\0';
++		thread_get_thread_name(th, name);
++		strlcpy(top[at].name, name[0] ? name : "-", sizeof(top[at].name));
++	}
++	task_unlock(kernel_task);
++
++	if (!span) {
++		return;
++	}
++	len = scnprintf(line, sizeof(line), "GuampKthr: kernel_task %llu.%llu%% of one core, %u threads (%u untracked); top",
++	    (unsigned long long)(total * 100 / span), (unsigned long long)(total * 1000 / span % 10), nthreads, untracked);
++	for (int k = 0; k < GUAMP_SYS_TOP && top[k].delta; k++) {
++		uint64_t pm = top[k].delta * 1000 / span;
++		len += scnprintf(line + len, sizeof(line) - (size_t)len, " %s[%llu pri %d cont %lx ev %lx] %llu.%llu",
++		    top[k].name, (unsigned long long)top[k].tid, top[k].pri, (unsigned long)top[k].cont,
++		    (unsigned long)top[k].event, (unsigned long long)(pm / 10), (unsigned long long)(pm % 10));
++	}
++	printf("%s %% of one core\n", line);
++}
++
++static void
++guamp_sys_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	guamp_sys_round++;
++	if (guamp_sys_cap_pct && guamp_sys_round <= 80) {
++		guamp_sys_cap();
++	}
++	if (guamp_sys_kthr && (guamp_sys_round % 2) == 0) {
++		guamp_sys_kthr_report();
++	}
++	if (guamp_sys_kthr || guamp_sys_round < 80) {
++		uint64_t deadline;
++		clock_interval_to_deadline(GUAMP_SYS_PERIOD_S, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(guamp_sys_call, deadline);
++	}
++}
++
++__startup_func
++static void
++guamp_sys_init(void)
++{
++	uint64_t big = 0xf0;
++	uint32_t value = 0;
++	char names[sizeof(guamp_sys_cap_names)];
++
++	if (PE_parse_boot_argn("guamp-sched-big", &value, sizeof(value))) {
++		big = value;
++	}
++	big &= 0xffULL;
++	if (big) {
++		pset0.perfcontrol_cpu_preferred_bitmask = big;
++		pset0.perfcontrol_cpu_migration_bitmask = 0xffULL & ~big;
++		pset0.cpu_preferred_last_chosen = -1;
++	}
++	printf("guamp-sched-big: preferred cores %llx, avoided when a preferred one is idle %llx\n",
++	    (unsigned long long)pset0.perfcontrol_cpu_preferred_bitmask, (unsigned long long)pset0.perfcontrol_cpu_migration_bitmask);
++
++	if (PE_parse_boot_argn("guamp-kthr", &value, sizeof(value))) {
++		guamp_sys_kthr = value ? 1 : 0;
++	}
++	if (PE_parse_boot_argn("guamp-bg-procs-cpu", &value, sizeof(value)) && value) {
++		guamp_sys_cap_pct = value > 100 ? 100 : value;
++	}
++	if (PE_parse_boot_argn("guamp-bg-procs", names, sizeof(names))) {
++		if (!strcmp(names, "0")) {
++			guamp_sys_cap_pct = 0;
++		} else {
++			strlcpy(guamp_sys_cap_names, names, sizeof(guamp_sys_cap_names));
++		}
++	}
++	if (!guamp_sys_kthr && !guamp_sys_cap_pct) {
++		return;
++	}
++	guamp_sys_call = thread_call_allocate_with_options(guamp_sys_fire, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++	uint64_t deadline;
++	clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(guamp_sys_call, deadline);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, guamp_sys_init);
