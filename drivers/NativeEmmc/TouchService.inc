@@ -10,6 +10,7 @@
 // overlay, default the border one), guamp-touch-recode=0, guamp-touch-diag=<n> (raw stack of the first n interrupts and
 // firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
 // guamp-touch-wake=1 (default 0): tap-to-wake with the screen off, see the "wake" block before thread().
+// guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
@@ -809,6 +810,126 @@ void regDump(const char *when) {
   }
 }
 
+// guamp 03/11 (fin37/38): sotto XNU il firmware gira e manda pacchetti validi, ma con punti fantasma sulla riga TX0
+// (y = 20, x a passi di 50 = centro di ogni RX su 1600) e il dito non compare. Per capire se il sensore vede il dito:
+// la mappa diagnostica come /proc/android_touch/diag/{iir_s,dc_s,bank_s} del driver Motorola (hx_diag_read).
+// guamp-touch-rawdump=<tipo> (default 0 = spento): 1 delta (IIR), 2 raw (DC), 3 bank (baseline), 4..7 gli altri diag,X,
+// 8 = a turno 1, 2, 3. guamp-touch-rawdump-ms=<ms> (default 2000, minimo 200) tra due mappe, guamp-touch-rawdump-n=<n>
+// (default 90, 0 = senza fine) mappe in tutto, guamp-touch-rawdump-thr=<v> (default 30) soglia per il conteggio dei nodi
+// "accesi", guamp-touch-rawdump-diff=1 righe come differenza dalla prima mappa dello stesso tipo (a riposo; il delta
+// IIR resta com'e'), guamp-touch-rawdump-keep=1 lascia il raw out select acceso tra due mappe (default 0: rimesso a 0
+// come fa himax_sram_read). Righe: "rawdump #n" (riepilogo: min/max con posizione t<TX>,r<RX>, media, nodi oltre
+// soglia, self, differenza dalla mappa di riferimento, byte di stato del pacchetto), poi "rd<n> t<TX>:" 32 valori RX per
+// riga (le ripetizioni come valore*volte), "rd<n> srx:" / "rd<n> stx:" i self RX e TX.
+namespace rawdump {
+constexpr unsigned kCells = 1024, kSelf = 96;
+uint8_t gBuf[HX_RAW_BYTES(32u, 32u)];
+int32_t gMut[kCells], gSelf[kSelf], gRef[8][kCells];
+bool gHaveRef[8];
+unsigned gMode, gEveryMs = 2000, gLeft = 90, gThr = 30, gDiff, gKeep, gSeq;
+uint64_t gNext, gGap;
+
+void row(unsigned seq, const char *tag, const int32_t *v, unsigned n) {
+  char line[768];
+  unsigned len = 0;
+  line[0] = 0;
+  for (unsigned i = 0; i < n;) {
+    unsigned run = 1;
+    while (i + run < n && v[i + run] == v[i]) ++run;
+    const int w = run >= 3 ? snprintf(line + len, sizeof(line) - len, " %d*%u", v[i], run)
+                           : snprintf(line + len, sizeof(line) - len, " %d", v[i]);
+    if (w < 0 || static_cast<unsigned>(w) >= sizeof(line) - len) break;
+    len += static_cast<unsigned>(w);
+    i += run >= 3 ? run : 1;
+  }
+  IOLog("GuampTouch: rd%u %s:%s\n", seq, tag, line);
+}
+
+void init() {
+  PE_parse_boot_argn("guamp-touch-rawdump", &gMode, sizeof(gMode));
+  PE_parse_boot_argn("guamp-touch-rawdump-ms", &gEveryMs, sizeof(gEveryMs));
+  PE_parse_boot_argn("guamp-touch-rawdump-n", &gLeft, sizeof(gLeft));
+  PE_parse_boot_argn("guamp-touch-rawdump-thr", &gThr, sizeof(gThr));
+  PE_parse_boot_argn("guamp-touch-rawdump-diff", &gDiff, sizeof(gDiff));
+  PE_parse_boot_argn("guamp-touch-rawdump-keep", &gKeep, sizeof(gKeep));
+  if (gMode > 8) gMode = 0;
+  if (gEveryMs < 200) gEveryMs = 200;
+  if (!gLeft) gLeft = ~0u;
+  nanoseconds_to_absolutetime(static_cast<uint64_t>(gEveryMs) * 1000 * 1000, &gGap);
+  gNext = mach_absolute_time() + gGap;
+  if (gMode)
+    IOLog("GuampTouch: rawdump tipo %u ogni %u ms, %u mappe, soglia %u, diff %u, keep %u, rx %u tx %u (righe t<TX>: valori RX)\n",
+          gMode, gEveryMs, gLeft, gThr, gDiff, gKeep, gChip.rx_num, gChip.tx_num);
+}
+
+// ev: l'ultimo pacchetto letto (byte di stato hx_state_info a HX_EVENT_LEN - 3, come himax_distribute_touch_data).
+void dump(const uint8_t *ev) {
+  if (!gMode || !gLeft || mach_absolute_time() < gNext) return;
+  gLeft--;
+  const unsigned seq = ++gSeq;
+  const unsigned rx = gChip.rx_num, tx = gChip.tx_num;
+  const unsigned type = gMode == 8 ? 1 + (seq - 1) % 3 : gMode;
+  if (!rx || !tx || rx * tx > kCells || rx + tx > kSelf || HX_RAW_BYTES(rx, tx) > sizeof(gBuf)) {
+    IOLog("GuampTouch: rawdump #%u: canali %ux%u fuori misura\n", seq, rx, tx);
+    gLeft = 0;
+    return;
+  }
+  const uint8_t sel = static_cast<uint8_t>(type | HX_RAW_DSRAM);
+  const uint32_t back = hx_diag_select(&gChip, sel);
+  unsigned waitMs = 0;
+  const int rc = hx_diag_read(&gChip, rx, tx, gBuf, sizeof(gBuf), gMut, gSelf, &waitMs);
+  if (!gKeep) hx_diag_select(&gChip, 0);
+  gNext = mach_absolute_time() + gGap;
+  if (rc) {
+    IOLog("GuampTouch: rawdump #%u tipo %u sel %02x (letto %08x) rc %d dopo %u ms, testa %02x%02x%02x%02x\n", seq, type, sel,
+          back, rc, waitMs, gBuf[0], gBuf[1], gBuf[2], gBuf[3]);
+    return;
+  }
+  const unsigned n = rx * tx;
+  int32_t mn = gMut[0], mx = gMut[0];
+  unsigned mnAt = 0, mxAt = 0, over = 0;
+  int64_t sum = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    if (gMut[i] < mn) { mn = gMut[i]; mnAt = i; }
+    if (gMut[i] > mx) { mx = gMut[i]; mxAt = i; }
+    sum += gMut[i];
+  }
+  // Riferimento: la prima mappa riuscita di ogni tipo (a riposo, se nessuno tocca all'avvio).
+  const bool first = !gHaveRef[type];
+  if (first) { for (unsigned i = 0; i < n; ++i) gRef[type][i] = gMut[i]; gHaveRef[type] = true; }
+  int32_t dmn = 0, dmx = 0;
+  unsigned dmnAt = 0, dmxAt = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const int32_t d = type == 1 ? gMut[i] : gMut[i] - gRef[type][i];
+    if (d < dmn) { dmn = d; dmnAt = i; }
+    if (d > dmx) { dmx = d; dmxAt = i; }
+    if ((d < 0 ? -d : d) >= static_cast<int32_t>(gThr)) over++;
+  }
+  int32_t sxMn = gSelf[0], sxMx = gSelf[0], styMn = gSelf[rx], styMx = gSelf[rx];
+  for (unsigned i = 0; i < rx; ++i) { sxMn = gSelf[i] < sxMn ? gSelf[i] : sxMn; sxMx = gSelf[i] > sxMx ? gSelf[i] : sxMx; }
+  for (unsigned i = rx; i < rx + tx; ++i) { styMn = gSelf[i] < styMn ? gSelf[i] : styMn; styMx = gSelf[i] > styMx ? gSelf[i] : styMx; }
+  const uint8_t s0 = ev[HX_EVENT_LEN - 3], s1 = ev[HX_EVENT_LEN - 2];
+  IOLog("GuampTouch: rawdump #%u tipo %u sel %02x attesa %u ms | mutual min %d@t%u,r%u max %d@t%u,r%u media %d | %s min %d@t%u,r%u "
+        "max %d@t%u,r%u, |v|>=%u: %u nodi | self rx %d..%d tx %d..%d | stato %02x %02x (recal %u palm %u ac %u water %u "
+        "glove %u txhop %u base %u osrhop %u) irqs %u\n", seq, type, sel, waitMs, mn, mnAt / rx, mnAt % rx, mx, mxAt / rx,
+        mxAt % rx, static_cast<int>(sum / static_cast<int64_t>(n)), type == 1 ? "delta" : first ? "rif (questa)" : "diff dal rif",
+        dmn, dmnAt / rx, dmnAt % rx, dmx, dmxAt / rx, dmxAt % rx, gThr, over, sxMn, sxMx, styMn, styMx, s0, s1, s0 & 1u,
+        (s0 >> 1) & 1u, (s0 >> 2) & 1u, (s0 >> 3) & 1u, (s0 >> 4) & 1u, (s0 >> 5) & 1u, (s0 >> 6) & 1u, (s1 >> 3) & 1u, gIrqs);
+  int32_t line[kSelf];
+  char tag[8];
+  for (unsigned t = 0; t < tx; ++t) {
+    for (unsigned r = 0; r < rx; ++r) {
+      const unsigned i = t * rx + r;
+      line[r] = gDiff && type != 1 && !first ? gMut[i] - gRef[type][i] : gMut[i];
+    }
+    snprintf(tag, sizeof(tag), "t%02u", t);
+    row(seq, tag, line, rx);
+  }
+  row(seq, "srx", gSelf, rx);
+  row(seq, "stx", gSelf + rx, tx);
+}
+}  // namespace rawdump
+
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
@@ -989,7 +1110,8 @@ void thread(void *param, wait_result_t) {
   IOLog("GuampTouch: map %dx%d px -> HID 0..32767 (360x800 pt), edge bands top %d side %d bottom %d px, fade %d, flip %d, "
         "log %u contacts\n", gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, gEdgeTop, gEdgeSide,
         gEdgeBottom, kEdgeFade, gFlip, gMapLog);
-  uint8_t ev[HX_EVENT_LEN];
+  uint8_t ev[HX_EVENT_LEN] = {};
+  rawdump::init();
   // guamp 03/11: new screen, the chip answers and runs but every report is an empty one even under a finger.
   // guamp-touch-raw=<n> (default 64): the event bytes are logged whenever they change, at most n times.
   uint8_t lastRaw[HX_EVENT_LEN] = {};
@@ -1100,6 +1222,7 @@ void thread(void *param, wait_result_t) {
             empties, phantoms, repeats);
       if (diag) logStatus(polls);
     }
+    rawdump::dump(ev);
     if (irqOnly && useIrq && !fromIrq) {
       // No interrupt for 20 ms: only the lost "finger up" guard.
       if (down && mach_absolute_time() - lastGood > releaseTicks) {

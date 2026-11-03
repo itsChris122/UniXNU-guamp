@@ -524,3 +524,50 @@ int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *o
     }
     return HX_OK;
 }
+
+uint32_t hx_diag_select(struct hx_chip *c, uint8_t sel)
+{
+    uint32_t v = 0;
+    hx_interface_on(c);
+    for (unsigned i = 0; i < 50; ++i) {
+        hx_reg_write32(c, HX_ADDR_RAW_OUT_SEL, sel);
+        if (!hx_reg_read32(c, HX_ADDR_RAW_OUT_SEL, &v) && (v & 0xFF) == sel) break;
+    }
+    return v;
+}
+
+int hx_diag_read(struct hx_chip *c, unsigned rx, unsigned tx, uint8_t *buf, size_t cap, int32_t *mutual, int32_t *self,
+                 unsigned *wait_ms)
+{
+    const size_t total = HX_RAW_BYTES(rx, tx);
+    uint32_t v = 0;
+    unsigned i;
+    if (wait_ms) *wait_ms = 0;
+    if (!rx || !tx || total > cap) return HX_ERR_FW;
+    // Dato pronto: 5AA5 scritto, 10 ms, riletto; il firmware risponde A55A (himax_write_read_reg).
+    for (i = 0; i < 100; ++i) {
+        if (hx_reg_write32(c, HX_ADDR_RAWDATA, HX_RAW_PWD_START)) return HX_ERR_BUS;
+        sleep_ms(c, 10);
+        if (hx_reg_read32(c, HX_ADDR_RAWDATA, &v)) return HX_ERR_BUS;
+        if ((v & 0xFFFF) == HX_RAW_PWD_END) break;
+    }
+    if (wait_ms) *wait_ms = (i + 1) * 10;
+    if (i == 100) return HX_ERR_TIMEOUT;
+    for (size_t done = 0; done < total;) {
+        const size_t n = total - done > HX_RAW_CHUNK ? HX_RAW_CHUNK : total - done;
+        if (hx_reg_read(c, HX_ADDR_RAWDATA + (uint32_t)done, buf + done, n)) return HX_ERR_BUS;
+        done += n;
+    }
+    // Fine dell'uscita: mezza parola bassa a 0, alta come letta.
+    hx_reg_write32(c, HX_ADDR_RAWDATA, (uint32_t)buf[2] << 16 | (uint32_t)buf[3] << 24);
+    unsigned sum = 0;
+    for (size_t k = 2; k < total; k += 2) sum += (unsigned)buf[k + 1] << 8 | buf[k];
+    if (sum & 0xFFFF) return HX_ERR_CHECKSUM;
+    const uint8_t *p = buf + 4;
+    if (mutual)
+        for (unsigned k = 0; k < rx * tx; ++k) mutual[k] = (int16_t)(uint16_t)(p[2 * k] | p[2 * k + 1] << 8);
+    p += 2 * rx * tx;
+    if (self)
+        for (unsigned k = 0; k < rx + tx; ++k) self[k] = (int32_t)(p[2 * k] | p[2 * k + 1] << 8);
+    return HX_OK;
+}
