@@ -31,23 +31,33 @@ int hx_fw_parse(struct hx_fw *fw, const uint8_t *data, size_t size)
     fw->count = table[12];
     if (fw->count < 2 || fw->count > HX_ZF_MAX_PARTS || (size_t)(table - data) + 16u * fw->count > size) return HX_ERR_FW;
     uint32_t lo = 0xFFFFFFFFu, hi = 0, hi_size = 0;
-    fw->overlay = -1;
+    unsigned next = 0;
+    fw->overlay = fw->ovl[0] = fw->ovl[1] = fw->ovl[2] = -1;
     for (unsigned i = 0; i < fw->count; ++i) {
         const uint8_t *e = table + 16u * i;
         struct hx_zf_part *p = &fw->part[i];
         p->sram = rd_le32(e);
         p->size = rd_le32(e + 4);
         p->offset = rd_le32(e + 8);
-        if (i && !p->size) continue;                 // empty entry (the guamp image has an empty overlay slot)
+        // Code overlays (HX_CODE_OVERLAY, hx_parse_bin_cfg_data for HX83102D): marker 66 55 in bytes 14..15 and the type
+        // in byte 13, or (previous mechanism) SRAM 0x20008CE0 and the type from the order. guamp: index 10 sorting
+        // (empty), 11 gesture, 12 border, all at 0x20007800.
+        if (i && ((e[14] == 0x66 && e[15] == 0x55) || p->sram == 0x20008CE0u)) {
+            unsigned type = e[14] == 0x66 && e[15] == 0x55 ? e[13] : next++;
+            if (type < 3 && fw->ovl[type] < 0) fw->ovl[type] = (int)i;
+            if (p->size && (p->offset > size || p->size > size - p->offset)) return HX_ERR_FW;
+            continue;
+        }
+        if (i && !p->size) continue;                 // empty entry
         if (!p->size || p->offset > size || p->size > size - p->offset) return HX_ERR_FW;
         if (i == 0) continue;
-        // Code overlays (HX_CODE_OVERLAY: sorting, gesture, border) load into instruction SRAM like the firmware itself,
-        // not into the config window; the first one (sorting, normal touch) is written after the config.
-        if (p->sram >= 0x20000000u) { if (fw->overlay < 0) fw->overlay = (int)i; continue; }
+        if (p->sram >= 0x20000000u) continue;        // other instruction SRAM entries stay out of the config window
         p->sram &= ~3u;                          // config windows are word aligned (the vendor rounds down the same way)
         if (p->sram < lo) lo = p->sram;
         if (p->sram >= hi) {hi = p->sram; hi_size = p->size;}
     }
+    // himax_zf_part_info boots with the border overlay (ovl_idx[2]); the gesture one is for suspend (smart wake-up).
+    fw->overlay = fw->ovl[2];
     uint32_t span = hi - lo + hi_size;
     span = (span + 15u) & ~15u;
     if (span > HX_ZF_CFG_MAX) return HX_ERR_FW;
@@ -62,7 +72,7 @@ int hx_fw_config(const struct hx_fw *fw, uint8_t *out, size_t cap)
     for (size_t i = 0; i < fw->cfg_size; ++i) out[i] = 0;
     for (unsigned i = 1; i < fw->count; ++i) {
         const struct hx_zf_part *p = &fw->part[i];
-        if (!p->size || p->sram >= 0x20000000u) continue;
+        if (!p->size || p->sram >= 0x20000000u || (int)i == fw->ovl[0] || (int)i == fw->ovl[1] || (int)i == fw->ovl[2]) continue;
         uint32_t at = p->sram - fw->cfg_base;
         if (at > fw->cfg_size || p->size > fw->cfg_size - at) return HX_ERR_FW;
         copy(out + at, fw->data + p->offset, p->size);
@@ -229,48 +239,82 @@ static int sram_crc(struct hx_chip *c, uint32_t addr, uint32_t len, uint32_t *cr
     return HX_ERR_TIMEOUT;
 }
 
+// himax_sram_write_crc_check: write, hardware CRC (0 = matches the CRC the partition carries), at most 3 times.
+static int sram_write_crc(struct hx_chip *c, const struct hx_fw *fw, const struct hx_zf_part *e, uint32_t *crc)
+{
+    unsigned tries = 0;
+    do {
+        if (hx_reg_write(c, e->sram, fw->data + e->offset, e->size)) return HX_ERR_BUS;
+        if (sram_crc(c, e->sram, e->size, crc)) return HX_ERR_BUS;
+    } while (*crc && ++tries < 3);
+    return *crc ? HX_ERR_CRC : HX_OK;
+}
+
+// Write and read back one word, HIMAX_REG_RETRY_TIMES (5) attempts, as set_SMWP_enable / usb_detect_set / the overlay
+// reply do. Returns the last value read.
+static uint32_t write32_verify(struct hx_chip *c, uint32_t addr, uint32_t value)
+{
+    uint32_t back = ~value;
+    for (unsigned i = 0; i < 5 && back != value; ++i) {
+        hx_reg_write32(c, addr, value);
+        if (hx_reg_read32(c, addr, &back)) back = ~value;
+    }
+    return back;
+}
+
 int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg)
 {
+    // himax_mcu_firmware_update_0f: system reset, sense off, then himax_zf_part_info (HX83102D, HX_CODE_OVERLAY).
     c->stage = 10;
+    c->ovl_loaded = -1;
     hx_reg_write32(c, HX_ADDR_SYSTEM_RESET, 0x55);
     sleep_ms(c, 10);
     int r = hx_sense_off(c);
     if (r) return r;
-    // The firmware entity (entry 0), checked by the reload engine: the image already carries its own CRC, so the
-    // hardware result over the whole partition is 0 (himax_sram_write_crc_check).
+    // The firmware entity (entry 0), checked by the reload engine: the image already carries its own CRC.
     c->stage = 11;
-    const struct hx_zf_part *e = &fw->part[0];
-    unsigned tries = 0;
-    do {
-        if (hx_reg_write(c, e->sram, fw->data + e->offset, e->size)) return HX_ERR_BUS;
-        if (sram_crc(c, e->sram, e->size, &c->fw_crc_hw)) return HX_ERR_BUS;
-    } while (c->fw_crc_hw && ++tries < 3);
-    if (c->fw_crc_hw) return HX_ERR_CRC;
+    if ((r = sram_write_crc(c, fw, &fw->part[0], &c->fw_crc_hw)) != HX_OK) return r;
     // The config partitions, packed into one window and compared with the software CRC of the same bytes.
     c->stage = 12;
     if (hx_fw_config(fw, cfg, HX_ZF_CFG_MAX)) return HX_ERR_FW;
     c->cfg_size = fw->cfg_size;
     c->parts = fw->count;
     c->cfg_crc_sw = hx_crc(cfg, fw->cfg_size);
-    tries = 0;
+    unsigned tries = 0;
     do {
         if (hx_reg_write(c, fw->cfg_base, cfg, fw->cfg_size)) return HX_ERR_BUS;
         if (sram_crc(c, fw->cfg_base, fw->cfg_size, &c->cfg_crc_hw)) return HX_ERR_BUS;
     } while (c->cfg_crc_hw != c->cfg_crc_sw && ++tries < 4);
     if (c->cfg_crc_hw != c->cfg_crc_sw) return HX_ERR_CRC;
-    if (fw->overlay > 0) {
-        const struct hx_zf_part *o = &fw->part[fw->overlay];
+    // The HX83102D branch of himax_zf_part_info writes zf_info_arr[ovl_sidx] with ovl_sidx still 0, i.e. the firmware
+    // entity a second time ("write size=40928, write addr = 0x20000000" twice in the TWRP dmesg). Kept for fidelity.
+    c->stage = 14;
+    if (!c->no_recode && (r = sram_write_crc(c, fw, &fw->part[0], &c->recode_crc)) != HX_OK) return r;
+    // fp_resend_cmd_func (HX_SMART_WAKEUP, HX_USB_DETECT_GLOBAL): smart wake-up off, cable state. These DSRAM words lie
+    // outside the config window, so without this they keep whatever the SRAM held before (a gesture mode left on by
+    // Android, power-on contents).
+    c->stage = 15;
+    c->smwp_word = write32_verify(c, HX_ADDR_SMWP_ENABLE, 0);
+    c->usb_word = write32_verify(c, HX_ADDR_USB_DETECT, c->usb_in ? HX_HANDSHAKE_PWD : 0);
+    // The boot overlay: ovl_idx[2] (border, normal touch reporting) and the reply 0x66 in the handshake word, so the
+    // firmware starts with that overlay (ovl_fault 0xFF when the section is missing or its CRC fails).
+    c->stage = 16;
+    int idx = c->ovl_force > 0 && (unsigned)c->ovl_force < fw->count ? c->ovl_force : fw->overlay;
+    c->ovl_reply = idx == fw->ovl[1] ? HX_OVL_GESTURE_REPLY : idx == fw->ovl[0] ? HX_OVL_SORTING_REPLY : HX_OVL_BORDER_REPLY;
+    int any = fw->ovl[0] >= 0 || fw->ovl[1] >= 0 || fw->ovl[2] >= 0 || idx > 0;
+    if (idx > 0 && fw->part[idx].size) {
         uint32_t crc = 1;
-        tries = 0;
-        do {
-            if (hx_reg_write(c, o->sram, fw->data + o->offset, o->size)) return HX_ERR_BUS;
-            if (sram_crc(c, o->sram, o->size, &crc)) return HX_ERR_BUS;
-        } while (crc && ++tries < 3);
-        if (crc) return HX_ERR_CRC;
+        if (sram_write_crc(c, fw, &fw->part[idx], &crc) != HX_OK) c->ovl_reply = HX_OVL_FAULT;
+        else c->ovl_loaded = idx;
+    } else if (any) {
+        c->ovl_reply = HX_OVL_FAULT;                 // "WRONG overlay section, plese check FW!"
     }
+    if (any) c->ovl_handshake = write32_verify(c, HX_ADDR_OVL_HANDSHAKE, c->ovl_reply);
+    // himax_mcu_power_on_init (Linux runs it at probe, before this download): raw output select and sorting mode cleared.
+    hx_reg_write32(c, HX_ADDR_RAW_OUT_SEL, 0);
+    c->sort_word = write32_verify(c, HX_ADDR_SORTING_MODE, 0);
     c->stage = 13;
     if (hx_reg_write32(c, HX_ADDR_SET_FRAME, 1)) return HX_ERR_BUS;               // n frame = 1 (firmware_update_0f)
-    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;            // reload enabled (reload_disable(0))
     return HX_OK;
 }
 
@@ -286,21 +330,39 @@ static int reload_to_active(struct hx_chip *c)
     return HX_ERR_TIMEOUT;
 }
 
-int hx_start(struct hx_chip *c)
+int hx_sense_on(struct hx_chip *c)
 {
-    uint8_t d[8];
-    c->stage = 20;
-    // Sense on (himax_hx83102d_sense_on, FlashMode 0 with HX_RST_PIN_FUNC): clear the ISR, pin reset, reload to active.
+    // himax_hx83102d_sense_on(FlashMode 0, HX_RST_PIN_FUNC): clear the ISR, ic_reset (pin reset), reload to active.
     if (hx_interface_on(c)) return HX_ERR_CHIP;
     hx_reg_write32(c, HX_ADDR_CTRL_FW_ISR, 0);
     sleep_ms(c, 10);
     hx_pin_reset(c);
+    return reload_to_active(c);
+}
+
+int hx_start(struct hx_chip *c)
+{
+    uint8_t d[8];
+    // himax_mcu_0f_operation after the download: reload_disable(0), read_FW_ver, touch_information, sense_on.
+    c->stage = 20;
+    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;            // reload enabled
+    // himax_mcu_read_FW_ver: sense on, wait until the firmware reports the reload (A3 3A at 0x10007F00 or C0 72 at
+    // 0x100072C0, 10 ms polls, 200 at most), sense off, versions.
     c->stage = 21;
-    int r = reload_to_active(c);
+    int r = hx_sense_on(c);
     if (r) return r;
-    sleep_ms(c, 50);
-    // Touch information (himax_mcu_touch_information) from the running firmware.
+    for (c->reload_polls = 0; c->reload_polls < 200; ++c->reload_polls) {
+        if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
+            return HX_ERR_BUS;
+        if ((c->reload1 & 0xFFFF) == 0x3AA3 || (c->reload2 & 0xFFFF) == 0x72C0) break;
+        sleep_ms(c, 10);
+    }
     c->stage = 22;
+    if ((r = hx_sense_off(c)) != HX_OK) return r;
+    if (!hx_reg_read(c, HX_ADDR_FW_VER, d, 4)) {c->panel_ver = d[0]; c->fw_ver = (uint16_t)(d[1] << 8 | d[2]);}
+    if (!hx_reg_read(c, HX_ADDR_FW_CFG, d, 4)) {c->touch_cfg_ver = d[2]; c->display_cfg_ver = d[3];}
+    if (!hx_reg_read(c, HX_ADDR_FW_VENDOR, d, 4)) c->cid_ver = (uint16_t)(d[2] << 8 | d[3]);
+    // Touch information (himax_mcu_touch_information), in safe mode as Linux reads it.
     if (hx_reg_read(c, HX_ADDR_RX_TX_MAXPT, d, 8)) return HX_ERR_BUS;
     c->rx_num = d[2]; c->tx_num = d[3]; c->max_pt = d[4];
     if (hx_reg_read(c, HX_ADDR_XY_RES_ENABLE, d, 4)) return HX_ERR_BUS;
@@ -318,6 +380,9 @@ int hx_start(struct hx_chip *c)
         c->x_res = 720; c->y_res = 1600; c->int_is_edge = 1;
     }
     c->stage = 23;
+    if ((r = hx_sense_on(c)) != HX_OK) return r;
+    sleep_ms(c, 50);
+    c->stage = 24;
     return HX_OK;
 }
 
