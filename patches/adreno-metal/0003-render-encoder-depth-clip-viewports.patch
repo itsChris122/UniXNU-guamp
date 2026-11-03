@@ -1,0 +1,192 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index a094204..ed25b64 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -804,6 +804,10 @@ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleas
+  nmb_buffer_release(_handle);
+ }
+ - (NSUInteger)length {return nmb_buffer_length(_handle);}
++// guamp: debug markers only label ranges for tools, and a resource here is never aliasable (isAliasable answers no).
++- (void)addDebugMarker:(NSString *)marker range:(NSRange)range {(void)marker;(void)range;}
++- (void)removeAllDebugMarkers {}
++- (void)makeAliasable {}
+ - (void *)contents {return nmb_buffer_contents(_handle);}
+ - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
+ - (MTLResourceOptions)resourceOptions {return _options;}
+@@ -884,6 +888,26 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  return (MTLPurgeableState)answer;
+ }
+ NB_RESOURCE_SPI
++// guamp: MTLTexture properties Photos (PhotosUICore, PhotoImaging) references and the texture lacked; an unrecognized selector is an
++// Objective-C exception, and in a run loop callout it aborts the app. Values of a plain texture: not shareable across processes, not
++// sparse, lossless (no) compression, GPU-optimized contents allowed, the identity swizzle.
++- (BOOL)isShareable {return NO;}
++- (BOOL)isSparse {return NO;}
++- (NSUInteger)firstMipmapInTail {return 0;}
++- (NSUInteger)tailSizeInBytes {return 0;}
++- (MTLTextureCompressionType)compressionType {return MTLTextureCompressionTypeLossless;}
++- (BOOL)allowGPUOptimizedContents {return YES;}
++- (MTLTextureSwizzleChannels)swizzle {return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);}
++- (MTLSharedTextureHandle *)newSharedTextureHandle {return nil;}
++- (void)makeAliasable {}
++- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
++                                         swizzle:(MTLTextureSwizzleChannels)swizzle {
++ if(swizzle.red!=MTLTextureSwizzleRed || swizzle.green!=MTLTextureSwizzleGreen || swizzle.blue!=MTLTextureSwizzleBlue || swizzle.alpha!=MTLTextureSwizzleAlpha) {
++  static std::atomic<bool> told{false};
++  if(!told.exchange(true))NBLOG(@"native-metal: texture view swizzle %u%u%u%u drawn unswizzled",(unsigned)swizzle.red,(unsigned)swizzle.green,(unsigned)swizzle.blue,(unsigned)swizzle.alpha);
++ }
++ return [self newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
++}
+ - (id<MTLTexture>)view:(NmbTexture *)handle {
+  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+@@ -1384,6 +1408,8 @@ static void waitForResource(id resource) {
+  uint32_t rasterCull,rasterWinding,rasterFill,rasterPushed;
+  uint32_t stencilFrontValue,stencilBackValue;
+  float blendColor[4];
++ uint32_t depthClipPushed;                  // the depth clip mode last pushed (Metal's default clip, 0, until set)
++ BOOL depthClipSet;
+ }
+ @end
+ // The draw's bucket by what it costs (A3): the first of its encoder, then the later ones by whether the pipeline state changed since the draw
+@@ -1492,6 +1518,44 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
+  gTimeState[kStateOther].add(began);
+ }
++// guamp: Maps (VectorKit ggl::MetalRenderItemEncoder::encode) sets the depth clip mode for every item and aborted on the missing selector.
++// The runtime takes it (clamp needs the device's depthClamp); a refusal keeps clipping and does not fail the command buffer, since the two
++// differ only for geometry past the near and far planes. Logged once.
++- (void)setDepthClipMode:(MTLDepthClipMode)mode {
++ const uint32_t value=(uint32_t)mode;
++ if(depthClipSet && depthClipPushed==value){++gStateSkipped[kStateOther];return;}
++ depthClipPushed=value;depthClipSet=true;
++ const uint64_t began=nowUs();
++ if(!nmb_render_set_depth_clip_mode(self.handle,value)){
++  static std::atomic<bool> told{false};
++  if(!told.exchange(true))NBLOG(@"native-metal: setDepthClipMode:%u kept as clip: %@",value,lastError());
++ }
++ gTimeState[kStateOther].add(began);
++}
++// guamp: the array setters VectorKit references. One element is the single setter (and its skip of an unchanged value); more go to the
++// runtime's own setViewports:count: and setScissorRects:count:, after which the single setters push again.
++- (void)setViewports:(const MTLViewport [])v count:(NSUInteger)n {
++ if(n==1 && v){[self setViewport:v[0]];return;}
++ if(!v || !n || n>16){[self.commandBuffer refuse:[NSString stringWithFormat:@"setViewports:count: %lu",(unsigned long)n]];return;}
++ double values[16*6];
++ for(NSUInteger k=0;k<n;k++){
++  values[k*6]=v[k].originX;values[k*6+1]=v[k].originY;values[k*6+2]=v[k].width;values[k*6+3]=v[k].height;values[k*6+4]=v[k].znear;values[k*6+5]=v[k].zfar;
++ }
++ lastViewportSet=false;
++ const uint64_t began=nowUs();
++ [self check:nmb_render_set_viewports(self.handle,values,n) what:"setViewports"];
++ gTimeState[kStateViewport].add(began);
++}
++- (void)setScissorRects:(const MTLScissorRect [])r count:(NSUInteger)n {
++ if(n==1 && r){[self setScissorRect:r[0]];return;}
++ if(!r || !n || n>256){[self.commandBuffer refuse:[NSString stringWithFormat:@"setScissorRects:count: %lu",(unsigned long)n]];return;}
++ std::vector<uint64_t> values(n*4);
++ for(NSUInteger k=0;k<n;k++){values[k*4]=r[k].x;values[k*4+1]=r[k].y;values[k*4+2]=r[k].width;values[k*4+3]=r[k].height;}
++ lastScissorSet=false;
++ const uint64_t began=nowUs();
++ [self check:nmb_render_set_scissors(self.handle,values.data(),n) what:"setScissorRects"];
++ gTimeState[kStateScissor].add(began);
++}
+ - (void)setLineWidth:(float)width {
+  const uint64_t began=nowUs();
+  [self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];
+@@ -1511,6 +1575,9 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ - (NSUInteger)tileHeight {return 0;}
+ - (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+ - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
++- (void)setTileBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {(void)b;(void)o;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
++- (void)setTileBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {(void)b;(void)o;(void)r;[self.commandBuffer refuse:@"tile shaders are not supported"];}
++- (void)setTileSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {(void)s;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+ - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+ - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+ - (void)setStencilReferenceValue:(uint32_t)v {[self stencilFront:v back:v];}
+@@ -1568,6 +1635,11 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ @interface NBBlitEncoder : NBEncoder
+ @end
+ @implementation NBBlitEncoder
++// guamp: optimizeContentsForGPUAccess:/CPUAccess: (VectorKit) only hint at a layout; the textures here have one, so there is nothing to do.
++- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)t {(void)t;}
++- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l {(void)t;(void)s;(void)l;}
++- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)t {(void)t;}
++- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l {(void)t;(void)s;(void)l;}
+ // The arguments are passed as a plain array: an NSArray literal raises on a nil element, and a nil resource (a refused allocation) must fail the
+ // command buffer like any invalid argument, not abort the host process.
+ #define NB_OBJECTS(...) ((__unsafe_unretained id[]){__VA_ARGS__})
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index c4cc05d..352faaf 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -259,6 +259,10 @@ bool nmb_render_set_raster(NmbEncoder *, uint64_t cull_mode, uint64_t winding, u
+ bool nmb_render_set_stencil_reference(NmbEncoder *, uint32_t front, uint32_t back);
+ bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
+ bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
++// guamp: MTLDepthClipMode (0 clip, 1 clamp); count viewports of six values and count rectangles of four values.
++bool nmb_render_set_depth_clip_mode(NmbEncoder *, uint64_t mode);
++bool nmb_render_set_viewports(NmbEncoder *, const double *viewports, uint64_t count);
++bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *rects, uint64_t count);
+ bool nmb_render_set_line_width(NmbEncoder *, float width);
+ bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
+ bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 2ac5496..638e357 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -8,7 +8,7 @@ use metal2vulkan::bind::SamplerDescriptor;
+ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+ use metal2vulkan::metal::{
+-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
++    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
+     PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+     TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+ };
+@@ -2113,6 +2113,45 @@ pub extern "C" fn nmb_render_set_scissor(encoder: *mut NmbEncoder, rect: *const
+     })
+ }
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_viewports(encoder: *mut NmbEncoder, viewports: *const f64, count: u64) -> bool {
++    guard(false, || {
++        // The runtime takes 1 to 16 viewports (set_viewports); a larger count is refused here before the read.
++        if viewports.is_null() || count == 0 || count > 16 {
++            return Err(format!("{count} viewports"));
++        }
++        // SAFETY: the header's six values for each of the count viewports.
++        let v = unsafe { std::slice::from_raw_parts(viewports, count as usize * 6) };
++        let list: Vec<Viewport> = v.chunks_exact(6).map(|v| Viewport::new(v[0], v[1], v[2], v[3], v[4], v[5])).collect();
++        render(encoder)?.set_viewports(&list).map_err(e("viewports"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_scissors(encoder: *mut NmbEncoder, rects: *const u64, count: u64) -> bool {
++    guard(false, || {
++        if rects.is_null() || count == 0 || count > 256 {
++            return Err(format!("{count} scissor rectangles"));
++        }
++        // SAFETY: the header's four values for each of the count rectangles.
++        let r = unsafe { std::slice::from_raw_parts(rects, count as usize * 4) };
++        let list: Vec<ScissorRect> = r.chunks_exact(4).map(|r| ScissorRect::new(r[0], r[1], r[2], r[3])).collect();
++        render(encoder)?.set_scissor_rects(&list).map_err(e("scissor rectangles"))?;
++        Ok(true)
++    })
++}
++
++/// `setDepthClipMode:` (Maps' VectorKit sets it for every render item). `Clamp` is the runtime's own: refused where the device has no
++/// depthClamp, and the frontend then keeps clipping.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_depth_clip_mode(encoder: *mut NmbEncoder, mode: u64) -> bool {
++    guard(false, || {
++        render(encoder)?.set_depth_clip_mode(raw::<DepthClipMode>(mode, "depth clip mode")?).map_err(e("depth clip mode"))?;
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_raster(encoder: *mut NmbEncoder, cull_mode: u64, winding: u64, fill_mode: u64) -> bool {
+     guard(false, || {
