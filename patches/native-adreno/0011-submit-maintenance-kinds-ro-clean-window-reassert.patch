@@ -1,0 +1,87 @@
+guamp: maintenance by kind, read-only mappings only cleaned, write-combine re-assertion kept to the submitter window
+
+diff -ru c/NativeAdrenoSubmit.cpp d/NativeAdrenoSubmit.cpp
+--- c/NativeAdrenoSubmit.cpp	2026-11-03 23:25:34.460111882 +0100
++++ d/NativeAdrenoSubmit.cpp	2026-11-04 00:12:50.000069141 +0100
+@@ -113,7 +113,7 @@
+  * submit() in all, [2] us of it in the cache maintenance (publishMapped), [3] KiB maintained, [4] the longest submit() in us, [5] the
+  * longest maintenance in us. native_adreno_publish_window (board: guamp-adreno-publish-window, default 1) keeps a submission's
+  * maintenance to its client's window; 0 walks every client's mappings on every submission, as before. */
+-extern "C" {volatile uint64_t native_adreno_submit_cost[6];volatile uint32_t native_adreno_publish_window=1;}
++extern "C" {volatile uint64_t native_adreno_submit_cost[8];volatile uint32_t native_adreno_publish_window=1;}
+ static uint64_t submitNowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
+ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+     uint32_t queue,uint32_t *fence,uint64_t window_start,uint64_t window_bytes)
+@@ -184,7 +184,10 @@
+         /* int-100: the dirty IB page was back at XNU's default (cacheable) attribute. Write-combine every such page again first; the
+          * pmap writes its lines back on the way, so the audit below should then find none. */
+         uint32_t reset=0;
+-        IOReturn audited=vm_->reassertWriteCombined(&reset);
++        /* guamp 0011: only the submitter's window (its jobs reach no other mapping), timed in native_adreno_submit_cost[6]. */
++        const uint64_t reassert_began=submitNowUs();
++        IOReturn audited=vm_->reassertWriteCombinedIn(window_start,window_bytes,&reset);
++        native_adreno_submit_cost[6]=native_adreno_submit_cost[6]+(submitNowUs()-reassert_began);
+         native_adreno_wc_audit[5]=native_adreno_wc_audit[5]+reset;
+         uint32_t lines=0,dirty=0,stale=0;size_t budget=SubmitAuditBytes;
+         /* The re-assertion above is the correction and runs every time; the audit only detects. It found no dirty line in int-141's
+diff -ru c/NativeAdrenoVm.cpp d/NativeAdrenoVm.cpp
+--- c/NativeAdrenoVm.cpp	2026-11-03 23:25:04.160117156 +0100
++++ d/NativeAdrenoVm.cpp	2026-11-04 00:12:50.000069141 +0100
+@@ -426,6 +426,11 @@
+ }
+ /* guamp 0010: mappings outside the submitter's window that publishMapped left alone, and their bytes (MiB). */
+ extern "C" {volatile uint64_t native_adreno_publish_skipped[2];}
++/* guamp 0011: the bytes publishMapped maintained by kind: [0] imported (the owner's cacheable pages), [1] write-combined BOs (only while
++ * write combining is distrusted), [2] other owned BOs; [3] 1 once write combining was distrusted. And native_adreno_publish_ro_clean
++ * (default 1): a mapping the GPU only reads is cleaned (DC CVAC) instead of cleaned and invalidated: nothing the GPU writes can be under
++ * it, and the owner's CPU keeps its lines (Core Animation's backing stores were invalidated on every submission). */
++extern "C" {volatile uint64_t native_adreno_publish_kinds[4];volatile uint32_t native_adreno_publish_ro_clean=1;}
+ IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_bytes,uint64_t *maintained_bytes)
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -438,8 +443,12 @@
+             native_adreno_publish_skipped[1]=native_adreno_publish_skipped[1]+m.memory->bytes();
+             continue;
+         }
+-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
++        const bool writes=!native_adreno_publish_ro_clean || (m.permissions&ArmSmmu4KWrite);
++        if(m.memory->publishForDevice(0,m.memory->bytes(),writes,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+         if(maintained_bytes)*maintained_bytes+=m.memory->bytes();
++        const unsigned kind=m.memory->imported()?0u:m.memory->writeCombined()?1u:2u;
++        if(kind!=1 || distrust_write_combined_)native_adreno_publish_kinds[kind]=native_adreno_publish_kinds[kind]+m.memory->bytes();
++        native_adreno_publish_kinds[3]=distrust_write_combined_?1:0;
+     }
+     return kIOReturnSuccess;
+ }
+@@ -489,6 +498,19 @@
+         const IOReturn status=m.memory->reassertWriteCombined(reset);
+         if(status)return status;
+     }
++    return kIOReturnSuccess;
++}
++IOReturn NativeAdrenoVm::reassertWriteCombinedIn(uint64_t window_start,uint64_t window_bytes,uint32_t *reset) const
++{
++    if(!reset)return kIOReturnBadArgument;
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    for(size_t i=0;i<high_;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory)continue;
++        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
++        const IOReturn status=m.memory->reassertWriteCombined(reset);
++        if(status)return status;
++    }
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const
+diff -ru c/NativeAdrenoVm.h d/NativeAdrenoVm.h
+--- c/NativeAdrenoVm.h	2026-11-03 23:25:04.160117156 +0100
++++ d/NativeAdrenoVm.h	2026-11-04 00:12:50.000069141 +0100
+@@ -104,6 +104,8 @@
+     /* guamp 0010: window_bytes nonzero maintains only the mappings inside [window_start, +window_bytes) (the submitting client's
+      * GPU window: its jobs reach no other client's mappings); *maintained_bytes (optional) adds the bytes maintained. */
+     IOReturn publishMapped(uint64_t window_start=0,uint64_t window_bytes=0,uint64_t *maintained_bytes=nullptr);
++    /* guamp 0011: the write-combine re-assertion kept to the submitter's window, as publishMapped (window_bytes 0: every mapping). */
++    IOReturn reassertWriteCombinedIn(uint64_t window_start,uint64_t window_bytes,uint32_t *reset) const;
+     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
+      * like any other (sticky; the safe behaviour of int-070..097). */
+     void distrustWriteCombined() {distrust_write_combined_=true;}
