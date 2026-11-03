@@ -89,7 +89,7 @@ type_name(int32_t type)
 		{ 115, "POWER_DEBUG_INFO?" }, { 346, "HE_CAPABILITY?" }, { 353, "NSS?" }, { 365, "DISPLAY_STATE" },
 		{ 383, "SET_PROPERTY?" }, { 386, "LQM_SUMMARY?" }, { 387, "COLOCATED_NETWORK_SCOPE_ID?" },
 		{ 389, "USERSPACE_P2P_OPTIONS?" }, { 470, "MOVING_NETWORK?" }, { 471, "BATTERY_POWERSAVE_CONFIG?" },
-		{ 473, "WCL_CONFIG_BG_MOTIONPROFILE?" },
+		{ 473, "WCL_CONFIG_BG_MOTIONPROFILE?" }, { 422, "6G_MODE?" }, { 423, "COUNTRY_BAND_SUPPORT?" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -511,6 +511,20 @@ get(struct apple80211req *request)
 		return give_value(request, 0);
 	case 18:                                /* guamp 03/11: interrupt mitigation: APPLE80211_INT_MIT_AUTO (the firmware's own) */
 		return give_value(request, 1);
+	case 353:                               /* guamp 03/11: NSS? (no buffer): one spatial stream (WCN3950: 1x1) */
+		return give_value(request, 1);
+	case 423: {
+		/*
+		 * guamp 03/11: COUNTRY_BAND_SUPPORT? (name inferred from the IOC table, no buffer). wifid asks it right after every
+		 * COUNTRY_CODE (17 times in fin37d) and auto-join never started; a guess that may gate it: the bands this radio
+		 * runs in the country, 2.4 and 5 GHz, given both as bits 0/1 and as the channel flags 0x8/0x10 (0x1b).
+		 * guamp-wifi-band-support=<value>, 0: refused as before.
+		 */
+		uint32_t bands = 0x1b;
+
+		PE_parse_boot_argn("guamp-wifi-band-support", &bands, sizeof(bands));
+		return bands ? give_value(request, bands) : EOPNOTSUPP;
+	}
 	case 6: {                               /* guamp 03/11: protection (apple80211_protmode_data): APPLE80211_PROTMODE_AUTO */
 		const uint32_t answer[3] = { 1, 1, 0 };
 
