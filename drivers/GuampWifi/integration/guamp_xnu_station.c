@@ -568,6 +568,16 @@ static void wifi_worker(void *arg, wait_result_t result)
 {
   (void)arg; (void)result;
   thread_set_thread_name(current_thread(), "guamp-wifi");
+  /*
+   * 03/11 (GuampKthr: this worker is the largest kernel_task thread, 10-14 % of a core at rest): it polls the copy engines
+   * every 1 ms, about 1000 wake-ups a second also with nothing to do. guamp-wifi-poll-max=<ms> (1..8, default 1 = as before):
+   * after 64 idle steps in a row (~64 ms without work) the pause doubles up to <ms>; any work brings it back to 1 ms at once,
+   * so traffic keeps the 1 ms polling and only an idle link waits longer (at most <ms> for its first frame).
+   */
+  uint32_t poll_max = 1, idle = 0, pause = 1;
+  PE_parse_boot_argn("guamp-wifi-poll-max", &poll_max, sizeof(poll_max));
+  if (poll_max < 1) poll_max = 1;
+  if (poll_max > 8) poll_max = 8;
   while (1) {
     int work = nw_wifi_step();
     if (work < 0) {
@@ -575,7 +585,16 @@ static void wifi_worker(void *arg, wait_result_t result)
       worker_failed(EIO);
       break;
     }
-    if (work == 0) g_platform->sleep_ms(1);
+    if (work == 0) {
+      if (++idle >= 64 && pause < poll_max) {
+        pause = pause * 2 > poll_max ? poll_max : pause * 2;
+        idle = 0;
+      }
+      g_platform->sleep_ms(pause);
+    } else {
+      idle = 0;
+      pause = 1;
+    }
   }
 }
 
