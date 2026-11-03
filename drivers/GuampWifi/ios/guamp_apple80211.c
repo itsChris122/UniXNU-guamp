@@ -231,11 +231,19 @@ static thread_call_t signal_call;
 static void
 signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	static unsigned said;
+	static unsigned said, fast, was_joined;
+	unsigned interval = 5;
 	struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
 
 	if (state != NULL) {
 		hakios_sta_state(state);
+		/* guamp 03/11: the bars showed up only a while after the join (wifid read the RSSI once, right at the join, and
+		 * then waited for these events): once joined, every second for 30 s, then every 5 s; every 2 s until a join. */
+		if (state->phase == HAKIOS_STA_JOINED && !was_joined) {
+			fast = 30;
+		}
+		was_joined = state->phase == HAKIOS_STA_JOINED;
+		interval = !was_joined ? 2 : fast ? (fast--, 1) : 5;
 		if (state->phase == HAKIOS_STA_JOINED) {
 			struct {
 				int32_t rssi;
@@ -252,7 +260,7 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		IOFreeData(state, sizeof(*state));
 	}
 	uint64_t deadline;
-	clock_interval_to_deadline(5, NSEC_PER_SEC, &deadline);
+	clock_interval_to_deadline(interval, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(signal_call, deadline);
 }
 

@@ -1,0 +1,51 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2026,6 +2026,42 @@
+ 	}
+ }
++/* guamp 03/11: the exit reason of a crashing process (namespace, code and the description string a dyld or
++ * abort_with_payload exit carries, e.g. "Symbol not found: ..."), printed after the guamp exit line. Watch (Bridge)
++ * died inside dyld with no message on the console. */
++static void
++guamp_exit_reason(proc_t p)
++{
++	os_reason_t reason = p->p_exit_reason;
++	if (reason == OS_REASON_NULL) {
++		return;
++	}
++	printf("guamp exit: %s[%d] reason namespace %u code 0x%llx\n", p->p_comm, proc_getpid(p), reason->osr_namespace,
++	    (unsigned long long)reason->osr_code);
++	const char *buffer = reason->osr_kcd_buf;
++	uint32_t length = buffer ? reason->osr_bufsize : 0, at = 0;
++	while (at + 16 <= length) {
++		uint32_t type = 0, size = 0;
++		memcpy(&type, buffer + at, 4);
++		memcpy(&size, buffer + at + 4, 4);
++		if (type == KCDATA_TYPE_BUFFER_END || size > length - at - 16) {
++			break;
++		}
++		if (type == EXIT_REASON_USER_DESC && size) {
++			char text[240];
++			uint32_t n = size < sizeof(text) - 1 ? size : (uint32_t)sizeof(text) - 1;
++			memcpy(text, buffer + at + 16, n);
++			text[n] = 0;
++			for (uint32_t i = 0; i < n && text[i]; i++) {
++				if (text[i] < 0x20 || text[i] > 0x7e) {
++					text[i] = '.';
++				}
++			}
++			printf("guamp exit: %s[%d] reason \"%s\"\n", p->p_comm, proc_getpid(p), text);
++		}
++		at += 16 + size;
++	}
++}
+ #endif /* __arm64__ */
+ 
+ void
+ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+@@ -2186,3 +2222,4 @@
+ 	if (create_corpse == TRUE) {
+ 		guamp_exit_trace(p, rv, code, subcode);
++		guamp_exit_reason(p);
+ 	} else if (guamp_exit_trace_named(p)) {

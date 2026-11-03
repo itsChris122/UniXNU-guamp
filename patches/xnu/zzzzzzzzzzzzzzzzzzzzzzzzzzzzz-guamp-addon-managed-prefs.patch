@@ -1,0 +1,15 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7634,4 +7634,10 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		const char *name = (const char *)(addon + at);
+ 		at += (name_bytes + 7) & ~7ULL;
+-		snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
++		/* guamp 03/11: "@mp/<file>" goes to the managed preferences of mobile (forced CFPreferences: CoreAnimation
++		 * DisableDetach against the screen frozen by a video), the one addon target outside /private/var/ngpu. */
++		if (!strncmp(name, "@mp/", 4)) {
++			snprintf(path, sizeof(path), "/private/var/Managed Preferences/mobile/%s", name + 4);
++		} else {
++			snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
++		}
+ 		struct native_gpu_manifest_record *record = records ? native_gpu_manifest_find(records, n_records, name) : NULL;
