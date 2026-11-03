@@ -1,0 +1,70 @@
+guamp: initLimits fills _MTLDevice's limits with this GPU's values (Photos: every image scaled to 0x0)
+
+-initLimits was empty, so the _limits struct -[_MTLDevice limits] points at stayed 0: PhotosUICore reads maxTextureWidth2D/Height2D
+(+132/+136) and scaled every image to 0x0 (assert '!PXPixelSizeAreaIsZero(roundedSize)' in PXGCreateContext). Layout from the iPadOS
+17.7.11 Metal.framework (_MTLDevice ivar _limits: 64 32-bit fields, maxLineWidth/maxPointSize floats at 26/27, then the 64-bit
+maxBufferLength), found with class_getInstanceVariable and checked against its type encoding. Values: the runtime's answers where it
+has them (maxThreadgroupMemoryLength, threads per threadgroup, maxBufferLength, the linear row alignment of RGBA8), else an Apple3
+(A10X) device's within Turnip's A610 limits: 16384 1D/2D/cube, 2048 3D and layers, 8 colour attachments, 31 buffers and textures and
+16 samplers a stage, 16 viewports, no tile shading. NMB_LIMITS=0 leaves it at 0. One NSLog line "native-metal: limits filled ...".
+Applies after 0001-0003 and 0009-0012; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index ef3e87f..a0fdd2b 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2492,7 +2492,53 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
+ // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
+ // by this file's own answers (installAnswers) and any other stays the base class's neutral 0/NO. Nothing is claimed that nothing measured.
+-- (void)initLimits {}
++// guamp 0013: initLimits fills _MTLDevice's _limits (the struct -limits points at) with this GPU's values: left at 0, every framework that
++// reads it directly saw a 0x0 largest texture (PhotosUICore +132/+136, maxTextureWidth2D/Height2D: every image scaled to 0x0, assert
++// '!PXPixelSizeAreaIsZero(roundedSize)' in PXGCreateContext). Layout from the iPadOS 17.7.11 Metal.framework (_MTLDevice ivar _limits:
++// 64 32-bit fields, two of them floats, then maxBufferLength); found by name at run time and checked against its type encoding.
++// Values: the runtime's own answers where it has them (threads, threadgroup memory, buffer length, linear row alignment), else an
++// Apple3 (A10X) device's, never more than Turnip gives on the A610 (16384 texels, 2048 layers, 16 viewports). NMB_LIMITS=0 leaves
++// _limits at 0 as before.
++- (void)initLimits {
++ {const char *v=getenv("NMB_LIMITS");if(v && !strtoul(v,nullptr,0))return;}
++ Ivar ivar=class_getInstanceVariable([self class],"_limits");
++ const char *type=ivar?ivar_getTypeEncoding(ivar):nullptr;
++ if(!type || type[0]!='{' || !strstr(type,"Q}")){NSLog(@"native-metal: limits: no _limits ivar of the known layout (%s)",type?type:"none");return;}
++ uint32_t *f=(uint32_t *)((char *)(__bridge void *)self+ivar_getOffset(ivar));
++ auto answer=[](const char *name,uint64_t fallback)->uint64_t {uint64_t v=0;return gDevice && nmb_device_answer(gDevice,name,0,&v) && v?v:fallback;};
++ uint64_t threads[3]={};const bool measured=gDevice && nmb_device_max_threads_per_threadgroup(gDevice,threads);
++ const uint64_t linear=gDevice?nmb_device_linear_bytes_per_row(gDevice,70,1):0;   // RGBA8Unorm, one texel: the row alignment
++ const uint32_t align=linear>=4 && linear<=4096?(uint32_t)linear:64u;
++ const uint32_t page=(uint32_t)getpagesize();
++ const uint32_t v[64]={
++  512,align,1,                 // maxFramebufferStorageBits, linearTextureArrayAlignmentBytes/Slice
++  0,0,0,0,0,                   // tile shading: none (Apple4 and later)
++  8,31,31,31,16,4096,          // colour attachments; vertex attributes, buffers, textures, samplers, inline bytes
++  31,                          // maxInterpolants
++  31,31,16,4096,               // fragment buffers, textures, samplers, inline bytes
++  31,31,16,4096,               // compute buffers, textures, samplers, inline bytes
++  (uint32_t)answer("maxThreadgroupMemoryLength",16384),   // maxComputeLocalMemorySizes
++  (uint32_t)(measured && threads[0]?threads[0]:512),      // maxTotalComputeThreadsPerThreadgroup
++  (uint32_t)answer("maxThreadgroupMemoryLength",16384),   // maxComputeThreadgroupMemory
++  0,0,                         // maxLineWidth, maxPointSize (floats, below)
++  65528,0,4,page,              // maxVisibilityQueryOffset, pad, minConstantBufferAlignmentBytes, minBufferNoCopyAlignmentBytes
++  16384,16384,16384,           // maxTextureWidth1D, maxTextureWidth2D, maxTextureHeight2D
++  2048,2048,2048,16384,2048,   // 3D width, height, depth; cube; layers
++  align,align,align,align,align, // linear, IOSurface, IOSurface read-only, device linear, device linear read-only alignments
++  65536,16,60,16,              // function constants, threadgroup memory alignment, interpolated components, tessellation factor
++  31,31,16,16,                 // argument buffer buffers, textures, samplers, samplers a device
++  32768,16,0,1,1,              // fences, viewports, custom sample positions, vertex amplification factor and count
++  1u<<26,31,0,0,0,31           // texture buffer width, compute attributes, IO commands, predication depth, AS levels, constant buffers
++ };
++ memcpy(f,v,sizeof v);
++ const float lineWidth=1.0f,pointSize=511.0f;
++ memcpy(&f[26],&lineWidth,4);memcpy(&f[27],&pointSize,4);
++ const uint64_t maxBuffer=gDevice?nmb_device_max_buffer_length(gDevice):0;
++ const uint64_t bufferLength=maxBuffer?maxBuffer:256ull<<20;
++ memcpy(&f[64],&bufferLength,8);
++ NSLog(@"native-metal: limits filled: 2D %u, 3D %u, layers %u, threads %u, threadgroup memory %u, alignment %u, buffer %llu",f[33],f[35],
++       f[39],f[24],f[25],align,(unsigned long long)bufferLength);
++}
+ - (void)initFeatureQueries {}
+ - (void)initGPUFamilySupport {}
+ - (void)initWorkarounds {}
