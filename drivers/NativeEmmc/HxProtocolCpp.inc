@@ -294,7 +294,8 @@ int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg)
     // outside the config window, so without this they keep whatever the SRAM held before (a gesture mode left on by
     // Android, power-on contents).
     c->stage = 15;
-    c->smwp_word = write32_verify(c, HX_ADDR_SMWP_ENABLE, 0);
+    if (!c->no_smwp_write) c->smwp_word = write32_verify(c, HX_ADDR_SMWP_ENABLE, 0);
+    else hx_reg_read32(c, HX_ADDR_SMWP_ENABLE, &c->smwp_word);
     c->usb_word = write32_verify(c, HX_ADDR_USB_DETECT, c->usb_in ? HX_HANDSHAKE_PWD : 0);
     // The boot overlay: ovl_idx[2] (border, normal touch reporting) and the reply 0x66 in the handshake word, so the
     // firmware starts with that overlay (ovl_fault 0xFF when the section is missing or its CRC fails).
@@ -348,10 +349,14 @@ int hx_sense_on(struct hx_chip *c)
     return reload_to_active(c);
 }
 
+// The word the driver leaves at 0x10007F00 before the sense on: 0, or the zero-flash "disable flash reload" word.
+static uint32_t reload_word(const struct hx_chip *c) {return c->zf_dis_reload ? HX_ZF_DIS_RELOAD : 0;}
+
 static int reload_seen(const struct hx_chip *c)
 {
     const uint32_t a = c->reload1 & 0xFFFF;
-    return a == 0x3AA3 || a == 0x9AA9 || (c->reload2 & 0xFFFF) == 0x72C0;
+    // With zf_dis_reload 9AA9 is our own write: only A3 3A or C0 72 (the firmware marker Linux tests) count.
+    return a == 0x3AA3 || (!c->zf_dis_reload && a == 0x9AA9) || (c->reload2 & 0xFFFF) == 0x72C0;
 }
 
 // The markers are transient (TWRP 03/11: zero again a few seconds later; Linux reads them within ~1 ms of
@@ -369,7 +374,7 @@ static int reload_tight(struct hx_chip *c)
 int hx_reload_probe(struct hx_chip *c, unsigned polls)
 {
     int r;
-    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;
+    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, reload_word(c))) return HX_ERR_BUS;
     if ((r = hx_sense_on(c)) != HX_OK) return r;
     if (reload_tight(c)) return 1;
     for (unsigned i = 0; i < polls; ++i) {
@@ -386,7 +391,8 @@ int hx_start(struct hx_chip *c)
     uint8_t d[8];
     // himax_mcu_0f_operation after the download: reload_disable(0), read_FW_ver, touch_information, sense_on.
     c->stage = 20;
-    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;            // reload enabled
+    // fp_reload_disable(0): 0 (reload enabled, flash build) or HX_ZF_DIS_RELOAD (hx_dis_rload_0f, zero-flash build).
+    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, reload_word(c))) return HX_ERR_BUS;
     // himax_mcu_read_FW_ver: sense on, wait until the firmware reports the reload (A3 3A at 0x10007F00 or C0 72 at
     // 0x100072C0, 10 ms polls, 200 at most), sense off, versions.
     c->stage = 21;
@@ -406,7 +412,7 @@ int hx_start(struct hx_chip *c)
         if (!ok && c->reload_attempts < tries) {
             // Not reloaded: back to safe mode and the reload enable word, then sense on again.
             if ((r = hx_sense_off(c)) != HX_OK) return r;
-            hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0);
+            hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, reload_word(c));
         }
     }
     c->reload_attempts--;

@@ -792,11 +792,15 @@ int panelCycle(const char *when, int which = 2) {
   IOLog("GuampTouch: panel cycle %s: %s (%d)\n", when, !fn ? "no DSI (GuampBacklight absent)" : r == 0 ? "sent" : "refused", r);
   return r;
 }
+unsigned gHxfw = 0;   // guamp-touch-hxfw, see thread()
+
 void regDump(const char *when) {
   if (!gRegDump) return;
   static const uint32_t regions[] = {0x10007000u, 0x10007080u, 0x100072C0u, 0x10007F00u, 0x10007FC0u, 0x10005800u,
-                                     0x900000A8u, 0x90000048u, 0x80050000u, 0x90000080u, 0x900000C0u};
+                                     0x900000A8u, 0x90000048u, 0x80050000u, 0x90000080u, 0x900000C0u,
+                                     0x100070C0u, 0x10007100u};
   for (uint32_t a : regions) {
+    if (!gHxfw && (a == 0x100070C0u || a == 0x10007100u)) continue;
     uint8_t b[64] = {};
     const int r = hx_reg_read(&gChip, a, b, sizeof(b));
     char hex[2 * 64 + 16 + 1] = "";
@@ -807,6 +811,39 @@ void regDump(const char *when) {
     }
     hex[n] = 0;
     IOLog("GuampTouch: reg %s %08x rc %d: %s\n", when, a, r, hex);
+  }
+}
+
+// guamp-touch-hxfw: what the running firmware did with the config, compared with TWRP (log-xnu/twrp-himax-reg-*.txt):
+// 7F00 A9 9A 9A A9 (upper half = the firmware's acknowledge), 7F04 99 99 (normal mode acknowledged), 72C0 C0 72,
+// 7FC8 max DC 0000FDE8, 900000CC a running counter. 100070F8 byte 1 bit 2 = XY swap in the file (07); Linux reads
+// HX_XY_REVERSE 0 at run time. Optional idle off (bit 2) as himax_mcu_idle_mode(1).
+void hxfwAfterStart() {
+  uint32_t f00 = 0, f04 = 0, c0 = 0, dc = 0, cnt0 = 0, cnt1 = 0, xy = 0, mode = 0, mode1 = 0;
+  hx_reg_read32(&gChip, HX_ADDR_FLASH_RELOAD, &f00);
+  hx_reg_read32(&gChip, HX_ADDR_SORTING_MODE, &f04);
+  hx_reg_read32(&gChip, HX_ADDR_2ND_FLASH_RELOAD, &c0);
+  hx_reg_read32(&gChip, HX_ADDR_MAX_DC, &dc);
+  hx_reg_read32(&gChip, HX_ADDR_XY_RES_ENABLE, &xy);
+  hx_reg_read32(&gChip, HX_ADDR_FW_MODE_STATUS, &mode);
+  hx_reg_read32(&gChip, HX_ADDR_FRAME_CNT, &cnt0);
+  IOSleep(100);
+  hx_reg_read32(&gChip, HX_ADDR_FRAME_CNT, &cnt1);
+  IOLog("GuampTouch: hxfw after start: 7f00 %08x (ack %s) 7f04 %08x (normal %s) 72c0 %08x max-dc %08x | 100070f8 %08x "
+        "(xy swap bit %u, info xyrev %d) mode 10007088 %08x | counter 900000cc %08x -> %08x in 100 ms (%s)\n", f00,
+        (f00 >> 16) == 0xA99Au ? "yes" : "no", f04, (f04 & 0xFFFFu) == 0x9999u ? "yes" : "no", c0, dc, xy,
+        (xy >> 10) & 1u, gChip.xy_reverse, mode, cnt0, cnt1, cnt0 != cnt1 ? "running" : "still");
+  if (gHxfw & 2u) {
+    unsigned i = 0;
+    for (; i < 20; ++i) {
+      hx_reg_read32(&gChip, HX_ADDR_FW_MODE_STATUS, &mode);
+      hx_reg_write32(&gChip, HX_ADDR_FW_MODE_STATUS, (mode & ~0xFFu) | HX_FW_IDLE_DIS);
+      hx_reg_read32(&gChip, HX_ADDR_FW_MODE_STATUS, &mode1);
+      if ((mode1 & 0xFFu) == HX_FW_IDLE_DIS) break;
+      IOSleep(10);
+    }
+    IOLog("GuampTouch: hxfw idle off: 10007088 %08x -> %08x after %u tries (%s)\n", mode, mode1, i + 1,
+          (mode1 & 0xFFu) == HX_FW_IDLE_DIS ? "ok" : "not taken");
   }
 }
 
@@ -978,6 +1015,21 @@ void thread(void *param, wait_result_t) {
   struct hx_fw &fw = gFw;
   gFwOk = hx_fw_parse(&gFw, fwData, fwSize) == HX_OK;
   PE_parse_boot_argn("guamp-touch-regdump", &gRegDump, sizeof(gRegDump));
+  // guamp 04/11 (firmware/config analysis, agent hxfw): guamp-touch-hxfw=<bits> (default 0 = previous behaviour).
+  // 1: 0x10007F00 = 0x00009AA9 before every sense on instead of 0. The zero-flash build of himax_0flash_mmi maps
+  //    fp_reload_disable to hx_dis_rload_0f, which writes zf_data_dis_flash_reload whatever the argument: Linux tells
+  //    the firmware "no flash reload, the config is already in SRAM" (TWRP read_FW_ver data A9 9A, C0 72 at 0x100072C0,
+  //    0x10007F00 = A9 9A 9A A9 at run time). With 0 the firmware never writes C0 72 nor its run-time words (max DC
+  //    0x10007FC8, 0x10007FD0.., counter 0x900000CC) and reports unscaled electrode-grid points on TX0.
+  // 2: idle mode off after the start (himax_mcu_idle_mode(1): byte 0 of 0x10007088 = 0x17; the file has 0x3F).
+  // 4: leave the SMWP word 0x10007F10 as found (TWRP never writes it at boot).
+  // Any bit: "hxfw:" rows after the start (markers, firmware run-time words, XY flags, counter 100 ms apart) and the
+  // extra regions 0x100070C0 / 0x10007100 in the reg dumps.
+  PE_parse_boot_argn("guamp-touch-hxfw", &gHxfw, sizeof(gHxfw));
+  gChip.zf_dis_reload = (gHxfw & 1u) != 0;
+  gChip.no_smwp_write = (gHxfw & 4u) != 0;
+  if (gHxfw) IOLog("GuampTouch: hxfw %u: 7f00 word %08x, idle off %d, smwp write %d\n", gHxfw,
+                   gChip.zf_dis_reload ? HX_ZF_DIS_RELOAD : 0u, (gHxfw & 2u) != 0, !gChip.no_smwp_write);
   regDump("identify");
   // guamp 03/11 (fin38 + TWRP reference): in TWRP the running chip holds a config that is NOT the one uploaded (CID
   // 1205, TOUCH 03, date 20200925 at 0x10007000; the file carries 1206 / 06 / 20210219, same CRC 3D3C19AF in the TWRP
@@ -1070,6 +1122,7 @@ void thread(void *param, wait_result_t) {
   if (cycle == 1) panelCycle("before sense on");
   r = hx_start(&gChip);
   regDump("start");
+  if (gHxfw && !r) hxfwAfterStart();
   if (cycle == 2 && !r) {
     panelCycle("after start");
     uint32_t a = 0, b = 0;
