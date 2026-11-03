@@ -1,0 +1,153 @@
+guamp: refused textures logged with their descriptor, and made in a format this GPU holds (Maps: VectorKit received null texture)
+
+fin37d (live-20261103-195840, 479.99 and 502.70 s): Maps aborts with "VectorKit received null texture from Metal". The abort is in
+ggl::MetalResourceManager's texture creation (VectorKit 0x1a3760360 in the iPad 17.7.11 cache): newTextureWithDescriptor: (or
+newTextureWithDescriptor:iosurface:plane:) returned nil and VectorKit traps. ggl::getPixelFormat asks for A8, R8, R16, R16F, RG8, B5G6R5,
+BGR5A1, R32F, RG16, RG16F, RGBA8(_sRGB), BGRA8(_sRGB), RG32F, RGBA16, RGBA16F, RGBA32F, PVRTC (160), ASTC 4x4..12x12 LDR and sRGB,
+Depth16/32F, Stencil8, Depth32Float_Stencil8 and YCbCr8_420_2P (500); private storage for depth, stencil and multisample textures,
+shared otherwise. Turnip has no VK_IMG_format_pvrtc, and the YCbCr and packed formats depend on the device's answers.
+- Every refusal of the device's newTextureWithDescriptor: is logged ("native-metal: texture refused fmt .. type .. usage .. storage ..
+  WxHxD mips .. samples .. array ..: why") and sent once per distinct descriptor through the plugin's problem hook ("problem texref a
+  f160 t2 u1 s0 256x256 m1 n1"), which patches/native-adreno/0009 prints in the kernel log as "GuampMetal: client Maps: ...".
+- Then (NMB_TEXTURE_FALLBACK=0 turns it off): memoryless as private; without shader write, pixel format view and atomic usages; a
+  compressed, packed 16-bit or YCbCr format as RGBA8 (sRGB for sRGB) of the same size; Depth32Float_Stencil8 as Depth24Unorm_Stencil8,
+  then Depth32Float. A substituted texture reports the asked format, its views use the real one, and its uploads (replaceRegion,
+  buffer-to-texture blits) are dropped: it samples clear instead of aborting the app. "native-metal: texture fallback fmt A -> B ...".
+Applies after 0001, 0002, 0003, 0009 and 0010; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 4351d66..72fe9d2 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -791,6 +791,8 @@ static void waitForResource(id resource);
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
++// guamp 0011: the pixel format the caller asked for when the texture was made in another one (textureFallback): 0 for every other texture.
++@property(nonatomic) uint32_t substitutedFrom;
+ @end
+ // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
+ // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
+@@ -932,10 +934,76 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+  return true;
+ }
++// ---- guamp 0011: textures the runtime refuses (Maps: "VectorKit received null texture from Metal", fin37d) ----
++// Every refusal of the device's newTextureWithDescriptor: is logged with what was asked ("native-metal: texture refused fmt F type T usage U
++// storage S WxHxD mips M samples N array A (stage): why"), and once per distinct descriptor to the kernel through the plugin's problem hook
++// ("texref ...", 46 characters, printed by the kernel as "GuampMetal: client <process>: problem texref ..."). Then, unless
++// NMB_TEXTURE_FALLBACK=0, the descriptor is retried: memoryless storage as private; without the usages the format may lack here (shader
++// write, pixel format view, atomics); a pixel format no image of this GPU holds (PVRTC, ASTC, ETC2/EAC, BC, the packed 16-bit ones, the
++// YCbCr ones) as RGBA8 of the same size (sRGB for an sRGB one); Depth32Float_Stencil8 as Depth24Unorm_Stencil8, then Depth32Float.
++// A substituted texture reports the asked format; its uploads (replaceRegion, buffer-to-texture blits) are dropped, their bytes being in
++// the asked format: it samples clear, where a nil texture aborted the app. "native-metal: texture fallback ..." for each texture made so.
++static std::atomic<uint64_t> gTextureFallbacks,gSubstitutedUploads;
++static bool textureFallbackOn() {static const bool on=[]{const char *v=getenv("NMB_TEXTURE_FALLBACK");return !v || strtoul(v,nullptr,0)!=0;}();return on;}
++static bool srgbFormat(uint32_t f) {
++ return f==71 || f==81 || f==161 || f==163 || f==165 || f==167 || (f>=186 && f<=200) || f==131 || f==133 || f==135 || f==153 ||
++        (f>=179 && f<=183);
++}
++// The pixel format a texture of format f is made in when the runtime refuses f, or 0 when nothing stands in for it.
++static uint32_t substituteFormat(uint32_t f) {
++ const bool compressed=(f>=130 && f<=153) || (f>=160 && f<=167) || (f>=170 && f<=183) || (f>=186 && f<=233);
++ const bool packed=f>=40 && f<=43;
++ const bool ycbcr=(f>=240 && f<=241) || (f>=500 && f<=520);
++ if(compressed || packed || ycbcr)return srgbFormat(f)?71u:70u;
++ if(f==260)return 255u;
++ if(f==255)return 252u;
++ return 0;
++}
++static void reportTextureRefusal(const NmbTextureDescriptor &d,const char *stage,NSString *why) {
++ const unsigned storage=(unsigned)((d.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);
++ NBLOG(@"native-metal: texture refused fmt %llu type %llu usage 0x%llx storage %u %llux%llux%llu mips %llu samples %llu array %llu (%s): %@",
++       (unsigned long long)d.format,(unsigned long long)d.type,(unsigned long long)d.usage,storage,(unsigned long long)d.width,
++       (unsigned long long)d.height,(unsigned long long)d.depth,(unsigned long long)d.levels,(unsigned long long)d.samples,
++       (unsigned long long)d.array_length,stage,why);
++ static std::mutex lock;static std::set<std::string> said;
++ char line[48];
++ snprintf(line,sizeof line,"texref %.1s f%llu t%llu u%llx s%u %llux%llu m%llu n%llu",stage,(unsigned long long)d.format,
++          (unsigned long long)d.type,(unsigned long long)d.usage,storage,(unsigned long long)d.width,(unsigned long long)d.height,
++          (unsigned long long)d.levels,(unsigned long long)d.samples);
++ std::lock_guard<std::mutex> guard(lock);
++ if(said.size()<16 && said.insert(line).second && native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(line);
++}
++static NmbTexture *textureFallback(NmbTextureDescriptor &d,uint32_t *substituted) {
++ *substituted=0;
++ reportTextureRefusal(d,"asked",lastError());
++ if(!textureFallbackOn())return nullptr;
++ NmbTextureDescriptor t=d;
++ const uint64_t storage=(t.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift;
++ NmbTexture *handle=nullptr;
++ if(storage==MTLStorageModeMemoryless) {
++  t.options=(t.options&~(uint64_t)MTLResourceStorageModeMask)|((uint64_t)MTLStorageModePrivate<<MTLResourceStorageModeShift);
++  handle=nmb_texture_new(gDevice,&t);
++ }
++ if(!handle) {
++  const uint64_t usage=t.usage&~(uint64_t)(MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView|0x20u);   // 0x20: ShaderAtomic
++  if(usage!=t.usage){NmbTextureDescriptor u=t;u.usage=usage;if((handle=nmb_texture_new(gDevice,&u)))t=u;}
++ }
++ for(uint32_t f=substituteFormat((uint32_t)t.format),tries=0;!handle && f && tries<2;f=substituteFormat(f),tries++) {
++  NmbTextureDescriptor u=t;u.format=f;
++  if(f==70 || f==71)u.usage&=~(uint64_t)(MTLTextureUsageShaderWrite|MTLTextureUsagePixelFormatView);
++  if((handle=nmb_texture_new(gDevice,&u))){*substituted=(uint32_t)d.format;t=u;}
++ }
++ if(!handle){reportTextureRefusal(t,"fallback",lastError());return nullptr;}
++ gTextureFallbacks++;
++ NBLOG(@"native-metal: texture fallback fmt %llu -> %llu usage 0x%llx -> 0x%llx storage %llu -> %llu (%llux%llu)",(unsigned long long)d.format,
++       (unsigned long long)t.format,(unsigned long long)d.usage,(unsigned long long)t.usage,(unsigned long long)storage,
++       (unsigned long long)((t.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift),(unsigned long long)d.width,(unsigned long long)d.height);
++ return handle;
++}
+ @implementation NBTexture
+ - (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+-- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
++- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_substitutedFrom?_substitutedFrom:_descriptor.format);}
+ - (NSUInteger)width {return _descriptor.width;}
+ - (NSUInteger)height {return _descriptor.height;}
+ - (NSUInteger)depth {return _descriptor.depth;}
+@@ -988,13 +1056,20 @@ NB_RESOURCE_SPI
+  return (id<MTLTexture>)view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+- return [self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
++ if(_substitutedFrom)format=(MTLPixelFormat)_descriptor.format;   // guamp 0011: a substituted texture is viewed in the format it has
++ id<MTLTexture> view=[self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
++ if(_substitutedFrom && view)((NBTexture *)view).substitutedFrom=_substitutedFrom;
++ return view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
+  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+- return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
++ if(_substitutedFrom)format=(MTLPixelFormat)_descriptor.format;
++ id<MTLTexture> view=[self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
++ if(_substitutedFrom && view)((NBTexture *)view).substitutedFrom=_substitutedFrom;
++ return view;
+ }
+ - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
++ if(_substitutedFrom){gSubstitutedUploads++;return;}   // guamp 0011: bytes in the asked format; the texture stays clear
+  ++tTextureOps;
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+@@ -1779,6 +1854,7 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+      destinationOrigin:(MTLOrigin)dO {
++ if([(id)d isKindOfClass:[NBTexture class]] && [(NBTexture *)d substitutedFrom]){gSubstitutedUploads++;return;}   // guamp 0011, as replaceRegion
+  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+  [self wrote:d];
+  ++tBufferOps;
+@@ -2480,8 +2556,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  ++tTextureOps;
+  const uint64_t began=nowUs();
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);gTimeCreate.add(began);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+- if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
++ uint32_t substituted=0;
++ if(!handle)handle=textureFallback(descriptor,&substituted);   // guamp 0011: logs the refusal, then the fallbacks
++ if(!handle)return nil;
++ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
++ texture.substitutedFrom=substituted;return (id<MTLTexture>)texture;
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
