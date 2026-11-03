@@ -20,7 +20,7 @@ when refused, are composed in software.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '4679af6bc5d436e2b55a70a8e8b728ead70d2c5110a21070284466eb24a00797'
+PATCHED_SHA256 = '889aa2bb70a59170254019ffb0569748686f022ed2090fbaaa3265e97ec5db1d'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1210,9 +1210,12 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
 # The composed path in the validator (after the single-layer and blank checks) and in the queue kick.
 EDITS.append(('''        if(accepted)addValidated(request);else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;''',
-              '''        // guamp composition (canvas variant section 12): what the single-layer path refused for its layers or geometry.
+              '''        // guamp composition (canvas variant section 12): what the single-layer path refused for its layers, geometry or format.
+        // reason 4 is a single full-screen layer whose surface this port cannot draw directly (the boot compositor frame is an
+        // AGX tile-compressed 'b3a8' BGRA, 2 planes): the composition skips the unsupported format and keeps the previous frame
+        // instead of a hard reject, which the family logs as "verify_swap failed for swap id" once per swap (2111 at boot, fin43).
         bool composed=false;
-        if(!accepted && enabled==1 && request && (reason==2 || reason==3)) {
+        if(!accepted && enabled==1 && request && (reason==2 || reason==3 || reason==4)) {
             if(composeAccepts(bytes)){reason=6;accepted=composed=true;guamp_compose[0]=guamp_compose[0]+1;}
             else guamp_compose[12]=guamp_compose[12]+1;
         }
