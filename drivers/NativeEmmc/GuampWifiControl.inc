@@ -14,6 +14,12 @@
 #include "GuampSim.inc"
 #include "GuampSnocCe.inc"
 #include "GuampWifiRpm.inc"
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+// guamp 04/11: the cellular bridge of UniXNU (drivers/QcomBaseband, UniXNU/QcomBaseband 43d85fb, by HoshinoYumeka): publishes
+// AppleBaseband/AppleBasebandPCI* to iOS and carries ABM/CommCenter's QMUX clients over this QRTR link (local ports
+// 0x4100..0x413f). Built with scripts/build-arm-driver.py NativeEmmc --wifi-runtime --baseband; on at boot only with guamp-baseband=1.
+#include "QcomBaseband.h"
+#endif
 namespace guampwifi {
 struct WifiControl {
   enum Stage { Off,Prepared,AwaitModem,AwaitFifo,Running,Failed };
@@ -37,6 +43,8 @@ struct WifiControl {
     void (*servregTrace)(void *,const char *,const char *,int,uint64_t,uint64_t,uint64_t);
     // Optional per-packet QRTR control log (rx and tx), see Qrtr::trace.
     void (*qrtrTrace)(void *,bool tx,const Qrtr::Header &,const uint8_t *,uint32_t,int);
+    // guamp 04/11, optional cellular bridge (guamp-baseband=1, only in a --baseband build): ABM's QMUX clients on this link.
+    bool baseband;
   };
   // Gate timeouts after the modem PAS start (Linux: subsys err_ready 10 s; icnss has no WLFW timeout, the WLAN PD
   // only registers 0x45 after the modem has fetched wlanmdsp.mbn over QRTR TFTP).
@@ -46,6 +54,8 @@ struct WifiControl {
   GuampServreg servreg={}; Rmtfs rmtfs={}; Wlfw wlan={};
   struct TftpPort { WifiControl *control; uint32_t port; } tftpPorts[Qftp::Sessions]={};
   guampsim::SimProbe sim={}; bool simOn=false;
+  // Cellular bridge (GUAMP_BASEBAND builds, ops.baseband): counters for the heartbeat and the next report second.
+  bool bbOn=false,bbConfigured=false; uint32_t bbSent=0,bbDropped=0,bbReleased=0,bbServers=0,bbNextReport=10;
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
   uint64_t deadline=0,now=0,started=0,beat=0;
@@ -91,6 +101,16 @@ struct WifiControl {
       e=sim.start(&qrtr,0);if(e)return fail(e);
       simOn=true;
     }
+    bbOn=false;bbConfigured=false;bbSent=bbDropped=bbReleased=bbServers=0;bbNextReport=10;
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+    if(ops.baseband) {
+      // Directory and unclaimed-port hooks before qrtr.start(), like the SIM clients: NEW_SERVER follows our HELLO at once.
+      basebandOwner()=this;
+      qrtr.observerCtx=this; qrtr.observer=bbDirectory;
+      qrtr.unclaimedCtx=this; qrtr.unclaimed=bbReceive;
+      bbOn=true;
+    }
+#endif
     smemSummary();
     // qcom_smp2p probe (before the modem boots): outbound 428 in the APPS-MPSS partition, kick bit 14.
     gate="smem 428 smp2p out"; e=smp.start(arena,ops.smpKick,ops.ctx); if(e) return fail(e);
@@ -179,6 +199,14 @@ struct WifiControl {
     // modem keeps needing RMTFS, TFTP, SERVREG_LOC (and the SIM clients); the owner decides how long WLFW is awaited.
     if(!routerStarted&&now>=deadline) return fail(Timeout);
     if(routerStarted&&simOn) { e=sim.pump(now); if(e&&e!=Again&&e!=NotReady&&e!=Busy) trace("sim pump",e,sim.step,0,0); }
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+    // The bridge's requests and DEL_CLIENTs, on this (the QRTR owner) thread, before the queue is handed to GLINK.
+    if(routerStarted&&bbOn) {
+      coachz_baseband_poll();
+      const uint32_t second=uint32_t((now-started)/1000);
+      if(second>=bbNextReport) { coachz_baseband_report(second); bbNextReport=second<120?second-second%10+10:second-second%60+60; }
+    }
+#endif
     if(routerStarted) { e=qrtr.step(); if(e!=Again&&e) return fail(e); }
     if(wlanStarted) { e=wlan.step(now); if(e) return fail(e); }
     return Ok;
@@ -228,6 +256,8 @@ private:
     trace(" qrtr hello rx/tx control sent/rx control",0,qrtr.helloReceived,qrtr.txControl,qrtr.rxControl);
     trace(" qrtr queued/link busy (again)/data traced",0,qrtr.count,qrtr.txAgain,qrtr.dataTraced);
     trace(" wlfw node/port/state",0,qrtr.serverNode,qrtr.serverPort,wlan.state);
+    if(bbOn) trace(" baseband configured/servers seen/requests sent",0,bbConfigured,bbServers,bbSent),
+             trace(" baseband requests dropped/clients released",0,bbDropped,bbReleased,0);
     if(rmtfs.ready) trace(" rmtfs requests/failures/overlay bytes",0,rmtfs.requests,rmtfs.failures,rmtfs.shadowBytes);
     if(simOn) {
       trace(" sim dms/uim/nas known",0,sim.ready(0),sim.ready(1),sim.ready(2));
@@ -312,6 +342,10 @@ private:
     c.channel=id;
     int e=c.qrtr.start(c.allocator,&c,glinkTx,serviceEvent,qrtrRx);
     if(e) c.error=e; else c.routerStarted=true;
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+    // QRTR is up: the bridge publishes the services ABM looks for (once per boot; it ignores later calls).
+    if(!e&&c.bbOn&&!c.bbConfigured) { coachz_baseband_configure(bbSend,bbDelClient); c.bbConfigured=true; }
+#endif
   }
   static void serviceEvent(void *p,bool up) {
     auto &c=*static_cast<WifiControl *>(p);
@@ -336,6 +370,34 @@ private:
     auto &c=*static_cast<WifiControl *>(p);
     int e=c.wlan.receive(v,n); if(e!=NotFound&&e) c.error=e;
   }
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+  // The bridge's callbacks carry no context: the one WifiControl that turned it on.
+  static WifiControl *&basebandOwner() { static WifiControl *owner=nullptr; return owner; }
+  static void bbDirectory(void *p,bool up,uint32_t service,uint32_t instance,uint32_t node,uint32_t port) {
+    auto &c=*static_cast<WifiControl *>(p);
+    if(up) { c.bbServers++; coachz_baseband_new_server(service,instance,node,port); }
+    else coachz_baseband_del_server(service,node,port);
+  }
+  static bool bbReceive(void *,uint32_t dstPort,uint32_t node,uint32_t port,const uint8_t *v,uint32_t n) {
+    return coachz_baseband_qrtr(dstPort,node,port,v,n)!=0;
+  }
+  // af_qrtr sendmsg from the client's own port. A full queue is drained to GLINK once and the send retried; a request that
+  // still does not fit is dropped and counted (QMI clients time out and retry; the heartbeat shows the count).
+  static void bbSend(uint32_t localPort,uint32_t node,uint32_t port,const void *message,uint32_t bytes) {
+    WifiControl *c=basebandOwner(); if(!c) return;
+    const auto *m=static_cast<const uint8_t *>(message);
+    int e=c->qrtr.sendFrom(localPort,node,port,m,bytes);
+    if(e==Again) { (void)c->qrtr.step(Qrtr::QueueSlots); e=c->qrtr.sendFrom(localPort,node,port,m,bytes); }
+    if(e) { if(c->bbDropped++<8) c->trace("baseband request dropped: local port/node/port",e,localPort,node,port); }
+    else c->bbSent++;
+  }
+  static void bbDelClient(uint32_t localPort) {
+    WifiControl *c=basebandOwner(); if(!c) return;
+    int e=c->qrtr.delClient(localPort);
+    if(e==Again) { (void)c->qrtr.step(Qrtr::QueueSlots); e=c->qrtr.delClient(localPort); }
+    if(!e) c->bbReleased++;
+  }
+#endif
 };
 } // namespace guampwifi
 #endif

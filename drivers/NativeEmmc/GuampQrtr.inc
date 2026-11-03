@@ -14,6 +14,9 @@ struct Qrtr {
   enum Type : uint32_t { Data=1,Hello=2,Bye=3,NewServer=4,DelServer=5,DelClient=6,
     Resume=7,Exit=8,Ping=9,NewLookup=10,DelLookup=11,DelProc=13 };
   struct Datagram { uint8_t *data; uint32_t bytes,type; };
+  // guamp 04/11: 64 (was 16). The cellular bridge (guamp-baseband=1) hands over up to 16 QMI requests per poll next to
+  // QFTP/RMTFS/SIM traffic; a full queue makes sendFrom return Again.
+  static constexpr uint32_t QueueSlots=64;
   struct LocalService { uint32_t service,instance,port; void *ctx; void (*receive)(void *,uint32_t,uint32_t,const uint8_t *,uint32_t); bool used; bool client; };
   struct Header { uint32_t type,sn,sp,dn,dp,size,header; bool confirm; };
   Allocator allocator={};
@@ -21,7 +24,7 @@ struct Qrtr {
   int (*transmit)(void *,const uint8_t *,uint32_t)=nullptr;
   void (*serviceEvent)(void *,bool)=nullptr;
   void (*received)(void *,const uint8_t *,uint32_t)=nullptr;
-  Datagram queue[16]={};
+  Datagram queue[QueueSlots]={};
   LocalService local[16]={};   // services (QFTP, SERVREG, RMTFS), QFTP session ports, SIM clients
   // Optional directory of every remote server (NEW/DEL_SERVER of any service).
   // up=false with service 0 means the whole remote node went away (BYE/DEL_PROC).
@@ -31,6 +34,13 @@ struct Qrtr {
   // DATA packets to local service ports. body/bytes is the payload after the QRTR header (nullptr on a refusal).
   void *traceCtx=nullptr;
   void (*trace)(void *,bool tx,const Header &h,const uint8_t *body,uint32_t bytes,int e)=nullptr;
+  // guamp 04/11, optional second directory (the cellular bridge): every NEW/DEL_SERVER of a remote service, after `directory`.
+  void *observerCtx=nullptr;
+  void (*observer)(void *,bool up,uint32_t service,uint32_t instance,uint32_t node,uint32_t port)=nullptr;
+  // guamp 04/11, optional owner of DATA for local ports that are not in local[] (the bridge's QMI clients 0x4100..0x413f):
+  // returns true when it took the packet (a confirm is then answered with RESUME, as for local[]).
+  void *unclaimedCtx=nullptr;
+  bool (*unclaimed)(void *,uint32_t dstPort,uint32_t node,uint32_t port,const uint8_t *body,uint32_t bytes)=nullptr;
   uint32_t read=0,write=0,count=0,remoteNode=0,serverNode=0,serverPort=0;
   uint32_t flow=0,txControl=0,rxControl=0,txAgain=0,dataTraced=0,dataTxTraced=0;
   bool running=false,helloSent=false,remoteKnown=false,helloReceived=false;
@@ -55,6 +65,11 @@ struct Qrtr {
     read=write=count=flow=0;
   }
   bool serviceReady() const { return running&&serverPort; }
+  // af_qrtr.c qrtr_port_remove: a closed local client is announced to the peer as DEL_CLIENT {node, port}.
+  int delClient(uint32_t port) {
+    if(!running||!remoteKnown||!port||port>=Ctrl) return NotReady;
+    return control(DelClient,remoteNode,Ctrl,LocalNode,port,0,0);
+  }
   int addLocalService(uint32_t service,uint32_t instance,uint32_t port,void *opaque,
                      void (*handler)(void *,uint32_t,uint32_t,const uint8_t *,uint32_t)) {
     if(!service||!port||port>=Ctrl||!handler)return Invalid;
@@ -110,7 +125,7 @@ struct Qrtr {
         }
       }
       if(e) return e;
-      allocator.free(allocator.ctx,p.data,p.bytes); p={}; read=(read+1)%16; count--;
+      allocator.free(allocator.ctx,p.data,p.bytes); p={}; read=(read+1)%QueueSlots; count--;
     }
     return Ok;
   }
@@ -155,6 +170,10 @@ struct Qrtr {
         s.receive(s.ctx,h.sn,h.sp,p,h.size);return Ok;
       }
     }
+    if(h.type==Data&&h.dp!=LocalPort&&h.dp!=Ctrl&&unclaimed&&unclaimed(unclaimedCtx,h.dp,h.sn,h.sp,p,h.size)) {
+      if(h.confirm) { e=control(Resume,h.sn,h.sp,LocalNode,h.dp,0,0); if(e) return e; }
+      return Ok;
+    }
     if(h.type==Data&&h.dp==LocalPort) {
       if(!serviceReady()||h.sn!=serverNode||h.sp!=serverPort) return NotFound;
       if(h.confirm) {
@@ -180,6 +199,8 @@ struct Qrtr {
         uint32_t service=le32(p+4),instance=le32(p+8),node=le32(p+12),port=le32(p+16);
         if(directory&&port&&port<Ctrl&&node!=LocalNode&&node!=Broadcast)
           directory(directoryCtx,cmd==NewServer,service,instance,node,port);
+        if(observer&&port&&port<Ctrl&&node!=LocalNode&&node!=Broadcast)
+          observer(observerCtx,cmd==NewServer,service,instance,node,port);
         if(service!=Service||instance!=ServiceInstance) return Ok;
         if(!node&&!port)return Ok; // namespace lookup EOF, not a service
         if(node==LocalNode||node==Broadcast||!port||port>=Ctrl) return Protocol;
@@ -241,13 +262,13 @@ private:
               const uint8_t *data,uint32_t n,bool confirm=false) {
     if(!running) return NotReady;
     if(n>MaxPacket-32||(!data&&n)) return Range;
-    if(count==16) return Again;
+    if(count==QueueSlots) return Again;
     uint32_t bytes=32+((n+3)&~3u);
     auto *p=static_cast<uint8_t *>(allocator.alloc(allocator.ctx,bytes)); if(!p) return NoMemory;
     memset(p,0,bytes); put32(p,1); put32(p+4,type); put32(p+8,LocalNode); put32(p+12,sp);
     put32(p+16,confirm?1u:0u); put32(p+20,n); put32(p+24,dn); put32(p+28,dp);
     if(n) memcpy(p+32,data,n);
-    queue[write]={p,bytes,type}; write=(write+1)%16; count++;
+    queue[write]={p,bytes,type}; write=(write+1)%QueueSlots; count++;
     return Ok;
   }
   int control(uint32_t cmd,uint32_t dn,uint32_t dp,uint32_t a,uint32_t b,uint32_t c,uint32_t d) {

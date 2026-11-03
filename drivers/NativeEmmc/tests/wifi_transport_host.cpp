@@ -424,12 +424,39 @@ static void qrtrTest() {
   CHECK(local.qrtr.step()==Ok&&le32(local.sent.back().data()+4)==Qrtr::Resume);
   CHECK(le32(local.sent.back().data()+36)==Qrtr::LocalNode&&le32(local.sent.back().data()+40)==4096);
   const uint8_t one=1;
-  for(unsigned i=0;i<16;i++)CHECK(local.qrtr.sendFrom(4096,7,700,&one,1)==Ok);
+  for(unsigned i=0;i<Qrtr::QueueSlots;i++)CHECK(local.qrtr.sendFrom(4096,7,700,&one,1)==Ok);
   CHECK(local.qrtr.addLocalService(55,0,5000,&local,RouterPeer::localRx)==Again);
   bool silent=false;for(const auto &s:local.qrtr.local)if(s.used&&s.port==5000)silent=true;CHECK(!silent);
-  CHECK(local.qrtr.step(16)==Ok);
+  CHECK(local.qrtr.step(Qrtr::QueueSlots)==Ok);
   CHECK(local.qrtr.addLocalService(55,0,5000,&local,RouterPeer::localRx)==Ok);
   CHECK(local.qrtr.step()==Ok&&le32(local.sent.back().data()+36)==55);
+  // guamp 04/11, the cellular bridge hooks: DATA to a port outside local[] goes to `unclaimed` (with RESUME for a confirm),
+  // a refused one stays NotFound; NEW/DEL_SERVER reach `observer` after `directory`; delClient sends DEL_CLIENT {node, port}.
+  {
+    struct Hooks { uint32_t port=0,node=0,from=0,bytes=0,seen=0,servers=0,gone=0,service=0,instance=0; bool take=true; } hooks;
+    local.qrtr.unclaimedCtx=&hooks;
+    local.qrtr.unclaimed=[](void *p,uint32_t dp,uint32_t node,uint32_t port,const uint8_t *,uint32_t n) {
+      auto &h=*static_cast<Hooks *>(p); h.seen++; if(!h.take) return false; h.port=dp; h.node=node; h.from=port; h.bytes=n; return true; };
+    local.qrtr.observerCtx=&hooks;
+    local.qrtr.observer=[](void *p,bool up,uint32_t service,uint32_t instance,uint32_t,uint32_t) {
+      auto &h=*static_cast<Hooks *>(p); if(up) h.servers++; else h.gone++; h.service=service; h.instance=instance; };
+    incoming=qrtrPacket(Qrtr::Data,701,0x4105,{1,2,3,4},true);
+    CHECK(local.qrtr.receive(incoming.data(),incoming.size())==Ok&&hooks.port==0x4105&&hooks.node==7&&hooks.from==701&&hooks.bytes==4);
+    CHECK(local.qrtr.step()==Ok&&le32(local.sent.back().data()+4)==Qrtr::Resume&&le32(local.sent.back().data()+40)==0x4105);
+    hooks.take=false;
+    incoming=qrtrPacket(Qrtr::Data,701,0x4106,{1,0,0,0},false);
+    CHECK(local.qrtr.receive(incoming.data(),incoming.size())==NotFound&&hooks.seen==2);
+    incoming=qrtrPacket(Qrtr::Data,700,4096,{3,2,1},false);   // a local[] port never reaches the hook
+    CHECK(local.qrtr.receive(incoming.data(),incoming.size())==Ok&&hooks.seen==2);
+    incoming=qrtrPacket(Qrtr::NewServer,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(Qrtr::NewServer,3,0x101,7,0x31));
+    CHECK(local.qrtr.receive(incoming.data(),incoming.size())==Ok&&hooks.servers==1&&hooks.service==3&&hooks.instance==0x101);
+    incoming=qrtrPacket(Qrtr::DelServer,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(Qrtr::DelServer,3,0x101,7,0x31));
+    CHECK(local.qrtr.receive(incoming.data(),incoming.size())==Ok&&hooks.gone==1);
+    CHECK(local.qrtr.delClient(0x4105)==Ok&&local.qrtr.step()==Ok);
+    CHECK(le32(local.sent.back().data()+4)==Qrtr::DelClient&&le32(local.sent.back().data()+24)==7);
+    CHECK(le32(local.sent.back().data()+36)==Qrtr::LocalNode&&le32(local.sent.back().data()+40)==0x4105);
+    local.qrtr.unclaimed=nullptr; local.qrtr.observer=nullptr;
+  }
   RouterPeer zero;
   incoming=qrtrPacket(Qrtr::NewServer,Qrtr::Ctrl,Qrtr::Ctrl,ctrl(Qrtr::NewServer,0x45,1,0,900));
   put32(incoming.data()+8,0);

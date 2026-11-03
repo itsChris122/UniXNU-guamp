@@ -1,0 +1,102 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ee466f2..73ff0f2 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9286,6 +9286,89 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
+ 		native_guamp_lsv_watch_start();	/* keeps a good copy of the stores lsd writes in this boot */
+ 	}
+ }
++/* guamp 04/11: the cellular bridge (drivers/QcomBaseband of the device repository, UniXNU/QcomBaseband by HoshinoYumeka; boot-arg
++ * guamp-baseband=1, NativeEmmc built with build-arm-driver.py --baseband). ABM boots the modem through the bridge's SAHARA channel
++ * only when BBUpdater finds the Mav16 firmware of this IPSW (Firmware/vinyl_02_Mav16-11.00.01.Release.bbfw) in its firmware folder;
++ * the bridge consumes that exchange, the Qualcomm modem keeps running its own firmware. The bbfw's files come in the payload addon
++ * (scripts/make-guamp-baseband-addon.py, names baseband/standalone/Baseband/Mav16/...), written into Data's /private/var/ngpu by
++ * native_gpu_addon_install (persistent: a later addon without them leaves them in place). /private/var/ngpu/baseband/standalone is
++ * then shown over /usr/standalone/firmware through the read-only union bindfs view of the GPU addon (stage 5: the sealed folder and
++ * Baseband/Mav16/Info.plist both visible). guamp-baseband=2 also gives BBUpdater the personalized path
++ * /private/preboot/<boot-manifest-hash>/usr/local/standalone/firmware/Baseband/Mav16 (upstream coachz_baseband_prepare): an empty
++ * directory tree unioned over /private/preboot and the Mav16 folder mounted on its last directory; without a boot-manifest-hash it is
++ * skipped. ABM's log ("FW base path", "FW path ... exists") says which path it takes. As upstream, the ABM, baseband (QMUX trace) and
++ * CommCenter logging subsystems get private data enabled: those logs can then hold device identifiers and stay on the phone.
++ * CommCenter itself runs only with guamp-slim-commcenter=1 (setup skip). Never panics: every step only records its status. */
++#include <pexpert/device_tree.h>
++volatile int native_guamp_baseband_stage = 0;
++volatile int native_guamp_baseband_status = -1;
++volatile int native_guamp_baseband_preboot_stage = 0;
++volatile int native_guamp_baseband_preboot_status = -1;
++volatile int native_guamp_baseband_folder_stage = 0;
++volatile int native_guamp_baseband_folder_status = -1;
++static void
++native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
++{
++	uint32_t mode = 0;
++	if (!PE_parse_boot_argn("guamp-baseband", &mode, sizeof(mode)) || (mode != 1 && mode != 2)) {
++		return;
++	}
++	static const char source[] = "/private/var/ngpu/baseband/standalone", point[] = "/usr/standalone/firmware";
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point,
++	    "/usr/standalone/firmware/Baseband/Mav16/Info.plist", &native_guamp_baseband_stage, &native_guamp_baseband_status);
++	static const char *const logging_paths[] = {"/private/var/preferences/Logging/Subsystems/com.apple.telephony.abm.plist",
++	                                            "/private/var/preferences/Logging/Subsystems/com.apple.telephony.bb.plist",
++	                                            "/private/var/preferences/Logging/Subsystems/com.apple.CommCenter.plist"};
++	static const char logging[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>DEFAULT-OPTIONS</key><dict>"
++	    "<key>Enable-Private-Data</key><true/><key>Privacy-Enable-Level</key><string>Private</string></dict></dict></plist>\n";
++	int logging_error = 0;
++	for (unsigned i = 0; i < sizeof(logging_paths) / sizeof(logging_paths[0]); i++) {
++		int written = native_gpu_addon_write(logging_paths[i], (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++		if (written == ENOENT && !(written = native_gpu_addon_parents(p, scratch, logging_paths[i]))) {
++			written = native_gpu_addon_write(logging_paths[i], (const uint8_t *)logging, sizeof(logging) - 1, 0644, vfs_context_current());
++		}
++		if (written > 0 && !logging_error) {
++			logging_error = written;
++		}
++	}
++	char hash[97] = "";
++	if (mode == 2) {
++		DTEntry chosen = NULL;
++		const void *value = NULL;
++		unsigned int value_size = 0;
++		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++		    SecureDTGetProperty(chosen, "boot-manifest-hash", &value, &value_size) == kSuccess && value_size && value_size <= 48) {
++			for (unsigned i = 0; i < value_size; i++) {
++				snprintf(hash + 2 * i, 3, "%02X", ((const uint8_t *)value)[i]);
++			}
++		}
++		if (!hash[0]) {
++			native_guamp_baseband_preboot_status = ENOENT;
++		} else {
++			static const char preboot_source[] = "/private/var/ngpu/baseband/preboot", preboot_point[] = "/private/preboot";
++			static const char folder[] = "/private/var/ngpu/baseband/standalone/Baseband/Mav16";
++			char entry[192], own[224], mount_point[192];
++			snprintf(entry, sizeof(entry), "%s/%s/usr/local/standalone/firmware/Baseband/Mav16/", preboot_source, hash);
++			int error = native_gpu_addon_parents(p, scratch, entry);
++			if (error) {
++				native_guamp_baseband_preboot_status = error;
++			} else {
++				snprintf(mount_point, sizeof(mount_point), "%s/%s/usr/local/standalone/firmware/Baseband/Mav16", preboot_point, hash);
++				snprintf(own, sizeof(own), "%s/Info.plist", mount_point);
++				native_gpu_addon_mount(p, scratch, 0x400, preboot_source, sizeof(preboot_source), preboot_point, sizeof(preboot_point),
++				    preboot_point, mount_point, &native_guamp_baseband_preboot_stage, &native_guamp_baseband_preboot_status);
++				native_gpu_addon_mount(p, scratch, 0x400, folder, sizeof(folder), mount_point, strlen(mount_point) + 1, mount_point, own,
++				    &native_guamp_baseband_folder_stage, &native_guamp_baseband_folder_status);
++			}
++		}
++	}
++	printf("guamp-baseband=%u: addon files %d, written %d, same %d, failed %d (last error %d); %s stage %d status %d; preboot %s "
++	    "stage %d status %d, folder stage %d status %d; private telephony logging %d\n", mode, native_gpu_addon_files,
++	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error, point,
++	    native_guamp_baseband_stage, native_guamp_baseband_status, mode == 2 ? (hash[0] ? hash : "(no boot-manifest-hash)") : "(off)",
++	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
++	    native_guamp_baseband_folder_status, logging_error);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -9315,6 +9398,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	if (audio_plugin) {
+ 		native_guamp_audio_plugin_mount(p, scratch);
+ 	}
++	native_guamp_baseband_mount(p, scratch);	/* guamp-baseband=1|2: Mav16 firmware views for ABM (04/11) */
+ 	if (enabled != 1) {
+ 		return;
+ 	}

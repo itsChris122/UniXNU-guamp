@@ -14,7 +14,10 @@
 namespace guampwifi {
 struct Qftp {
   // QMI/QRTR packs version in bits7:0, instance in bits31:8: v1/i0 =>1.
-  static constexpr uint32_t Service=4096,ServiceInstance=1,Port=0x4100,Sessions=4,FirstSessionPort=0x4101;
+  // guamp 04/11: 0x4400 and up (were 0x4100..0x4104): 0x4100..0x413f are the QMI client ports of the cellular bridge
+  // (drivers/QcomBaseband CBQ_PORT_BASE, guamp-baseband=1). Local port numbers are our choice: the modem learns them from
+  // NEW_SERVER (QFTP) and from the source of every session reply.
+  static constexpr uint32_t Service=4096,ServiceInstance=1,Port=0x4400,Sessions=4,FirstSessionPort=0x4401;
   static constexpr uint32_t MaxBlock=4096,MaxFile=64u*1024u*1024u,MaxWindow=64;
   static constexpr uint32_t StoreFiles=8,StoreFileBytes=128u*1024u,PathBytes=96;
   enum Op : uint16_t { Rrq=1,Wrq=2,DataOp=3,AckOp=4,ErrorOp=5,OackOp=6 };

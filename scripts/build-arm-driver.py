@@ -15,7 +15,10 @@ parser.add_argument('--verified-root-bundle', action='store_true', help='Select 
 parser.add_argument('--negative-verified-block', action='store_true', help='Negative own-buffer control: corrupt only the completed DMA snapshot')
 parser.add_argument('--wifi-runtime', action='store_true', help='guamp NativeEmmc: GUAMP_WIFI_RUNTIME=1 plus the SM6115/WCN3990 provider (drivers/GuampWifi) in the same archive; still opt-in at boot (guamp-wifi-start=1)')
 parser.add_argument('--wifi-redwood', action='store_true', help='with --wifi-runtime: GUAMP_WIFI_REDWOOD=1, Wi-Fi mode 2 (iOS station, en0, Apple80211 ioctls, GuampWLAN registry entries); still opt-in at boot (guamp-wifi-start=2)')
+parser.add_argument('--baseband', action='store_true', help='with --wifi-runtime: GUAMP_BASEBAND=1 plus the UniXNU cellular bridge (drivers/QcomBaseband, AppleBaseband services for ABM/CommCenter over the QRTR link) in the same archive; still opt-in at boot (guamp-baseband=1)')
 args = parser.parse_args()
+if args.baseband and not args.wifi_runtime:
+    parser.error('The cellular bridge (--baseband) runs on the Wi-Fi runtime transport (--wifi-runtime)')
 if args.wifi_runtime and args.component != 'NativeEmmc':
     parser.error('The Wi-Fi runtime is part of NativeEmmc')
 if args.wifi_redwood and not args.wifi_runtime:
@@ -99,6 +102,12 @@ if args.wifi_runtime:
 if args.wifi_redwood:
     # Mode 2 in the same three C++ objects: the runtime's iOS worker, NativeEmmc's GuampWlanNub.inc and the Prep start.
     command += ['-DGUAMP_WIFI_REDWOOD=1', '-I', str(wifi / 'ios')]
+baseband = ROOT / 'drivers/QcomBaseband'
+if args.baseband:
+    # guamp 04/11: the bridge's entry points in the same C++ objects (WifiControl's QRTR hooks, the runtime's switch and packet stubs).
+    if not (baseband / 'baseband/QcomBaseband.h').is_file():
+        raise SystemExit('drivers/QcomBaseband is missing: git submodule update --init drivers/QcomBaseband')
+    command += ['-DGUAMP_BASEBAND=1', '-I', str(baseband / 'baseband')]
 (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
 result = subprocess.run(command, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 (out / 'compile.log').write_text(result.stdout)
@@ -195,6 +204,25 @@ if args.wifi_redwood:
             raise SystemExit(str(path) + ':\n' + run.stdout[-3500:])
         objects.append(target)
     (out / 'compile-redwood-flags.json').write_text(json.dumps(xnu_c, indent=2) + '\n')
+bridge = []
+if args.baseband:
+    # UniXNU/QcomBaseband (HoshinoYumeka, BSD-2-Clause): coachz_baseband.cpp (it includes coachz_bb_pdp.cpp) with exactly the NativeEmmc
+    # C++ command, as drivers/QcomBaseband/scripts/build.py builds it from the same IOPlatformExpert record: -mgeneral-regs-only and
+    # its own include paths added; third-party code, so -Werror is dropped (warnings stay in the log). Only the control bridge: the
+    # SC7180 IPA v4.2 adapter (--coachz upstream) is board code for another SoC; WifiControl and the runtime supply the QRTR and
+    # packet hooks. Its IOKit classes (AppleBaseband, AppleBasebandPCIControl/Interface, the PDP manager, AppleIPAppender) register
+    # through the kernel's static constructors like NativeEmmc's own, so this object is exempt from the initialiser audit below.
+    target = out / 'qcom-baseband.o'
+    cxx = [str(baseband / 'baseband/coachz_baseband.cpp') if value == str(source) else value for value in command if value != '-Werror']
+    cxx[cxx.index('-o') + 1] = str(target)
+    cxx += ['-mgeneral-regs-only', '-I', str(baseband / 'ipa'), '-Wno-unused-function', '-Wno-sign-compare']
+    run = subprocess.run(cxx, cwd=record['directory'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    (out / 'compile-qcom-baseband.log').write_text(run.stdout)
+    (out / 'compile-qcom-baseband.json').write_text(json.dumps(cxx, indent=2) + '\n')
+    if run.returncode:
+        raise SystemExit('drivers/QcomBaseband/baseband/coachz_baseband.cpp:\n' + run.stdout[-3500:])
+    objects.append(target)
+    bridge.append(target)
 for obj in objects:
     data = obj.read_bytes()
     magic, cpu, subtype, kind, count, size = struct.unpack_from('<6I', data)
@@ -231,18 +259,22 @@ if args.wifi_runtime:
                                                                     '_guamp_wifi_firmware_', '_guamp_ath10k_', '_lx_', '_gGuampXnuDma',
                                                                     '_guamp_smem_hwlock_', '_hakios_', '_guamp_xnu_wifi_',
                                                                     '_guamp_wlan_', '_guamp_sta_', '_guamp_apple80211_',
-                                                                    '_guamp_wifi_bsd_')))
+                                                                    '_guamp_wifi_bsd_', '_coachz_')))
     if duplicates or missing or '_strstr' in undefined:
         raise SystemExit(f'Wi-Fi archive symbols: duplicates {duplicates[:20]} missing {missing[:20]} strstr {"_strstr" in undefined}')
     if args.wifi_redwood and '_guamp_wifi_bsd_network_ready' not in defined:
         raise SystemExit('Wi-Fi mode 2: the bsd_init hook guamp_wifi_bsd_network_ready is not defined')
+    if args.baseband and not {'_coachz_baseband_configure', '_coachz_baseband_poll', '_coachz_modem_data_send'} <= defined.keys():
+        raise SystemExit('Cellular bridge: coachz_baseband_configure/poll or the packet hooks are not defined')
     for obj in objects[1:]:
+        if obj in bridge:
+            continue
         sections = subprocess.run(['xcrun', 'otool', '-l', obj], capture_output=True, text=True).stdout
         if '__mod_init_func' in sections:
             raise SystemExit(f'Static initialiser in {obj.name}')
         # XNU-private startup/kalloc registrations would only work compiled as part of XNU itself
         if any(name in sections for name in ('__init_entry_set', '__kalloc_type', '__kalloc_var', '__zone_view')):
             raise SystemExit(f'XNU startup or kalloc registration section in {obj.name}')
-    print(f'NativeEmmc Wi-Fi runtime{" + mode 2 (iOS station)" if args.wifi_redwood else ""}: {len(objects) - 1} '
+    print(f'NativeEmmc Wi-Fi runtime{" + mode 2 (iOS station)" if args.wifi_redwood else ""}{" + cellular bridge" if args.baseband else ""}: {len(objects) - 1} '
           f'provider/ath10k objects archived, {len(undefined - defined.keys())} kernel imports')
 print(f'{component}: -Werror build and actual ARM64/iOS 17 object audit passed')

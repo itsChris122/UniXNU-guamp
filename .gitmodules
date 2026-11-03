@@ -10,3 +10,6 @@
 [submodule "kits/ArmSmmu4K"]
 	path = kits/ArmSmmu4K
 	url = https://github.com/xVanTuring/ArmSmmu4K.git
+[submodule "drivers/QcomBaseband"]
+	path = drivers/QcomBaseband
+	url = https://github.com/UniXNU/QcomBaseband.git
