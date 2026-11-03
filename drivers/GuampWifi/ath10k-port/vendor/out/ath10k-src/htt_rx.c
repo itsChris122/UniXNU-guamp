@@ -4081,6 +4081,7 @@ bool ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 	if (!IS_ALIGNED((unsigned long)skb->data, 4))
 		ath10k_warn(ar, "unaligned htt message, expect trouble\n");
 
+	gw_note_htt_t2h(resp->hdr.msg_type);	/* guamp 03/11: HTT messages by type ("wifi: quiet") */
 	ath10k_dbg(ar, ATH10K_DBG_HTT, "htt rx, msg_type: 0x%0X\n",
 		   resp->hdr.msg_type);
 

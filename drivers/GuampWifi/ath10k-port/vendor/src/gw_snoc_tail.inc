@@ -242,6 +242,41 @@ int gw_snoc_stop(void) {
   extern void gw_devm_release(struct device *);
   gw_devm_release(&gw_device.dev); ath10k_core_destroy(gw_ar); gw_ar=0; return 0;
 }
+/* guamp 03/11: what still comes from the firmware while nothing is received (WMI kept moving at the beacon rate, HTT stopped),
+ * and the WMI commands that went out just before (two, every time, right at the stall). Counted from the trace hooks
+ * (trace.h); said by nw_sta.c's heartbeat with the 10-second line and in every quiet second. */
+static struct { unsigned id, count; } gw_wmi_events[10]; static unsigned gw_wmi_events_other;
+static struct { unsigned id; u64 ms; } gw_wmi_cmds[16]; static unsigned gw_wmi_cmd_count;
+static unsigned gw_mgmt_drops[6], gw_mgmt_drops_said[6];     /* CAC, decrypt error, key cache miss, CRC, channel; 5: handed on */
+static unsigned gw_htt_types[24], gw_htt_types_said[24];
+void gw_note_wmi_cmd(unsigned id) { unsigned at=gw_wmi_cmd_count++&15; gw_wmi_cmds[at].id=id; gw_wmi_cmds[at].ms=lx_now_ms(); }
+void gw_note_wmi_event(unsigned id) {
+  for(unsigned i=0;i<10;i++) {
+    if(gw_wmi_events[i].count&&gw_wmi_events[i].id==id) { gw_wmi_events[i].count++; return; }
+    if(!gw_wmi_events[i].count) { gw_wmi_events[i].id=id; gw_wmi_events[i].count=1; return; }
+  }
+  gw_wmi_events_other++;
+}
+void gw_note_mgmt_drop(int why) { if(why>=0&&why<6) gw_mgmt_drops[why]++; }
+void gw_note_htt_t2h(unsigned type) { gw_htt_types[type<23?type:23]++; }
+/* Everything since the last call: WMI events by id, management frames dropped by reason, HTT messages by type; with
+ * commands, the last WMI commands (id and how long ago). */
+void nw_wifi_quiet_report(char *b,int n,int commands) {
+  int at=snprintf(b,n,"WMI events");
+  for(unsigned i=0;i<10&&at>=0&&at<n;i++) if(gw_wmi_events[i].count) at+=snprintf(b+at,n-at," %#x x%u",gw_wmi_events[i].id,gw_wmi_events[i].count);
+  if(at>=0&&at<n&&gw_wmi_events_other) at+=snprintf(b+at,n-at," other x%u",gw_wmi_events_other);
+  memset(gw_wmi_events,0,sizeof(gw_wmi_events)); gw_wmi_events_other=0;
+  unsigned d[6]; for(unsigned i=0;i<6;i++) { d[i]=gw_mgmt_drops[i]-gw_mgmt_drops_said[i]; gw_mgmt_drops_said[i]=gw_mgmt_drops[i]; }
+  if(at>=0&&at<n) at+=snprintf(b+at,n-at,"; mgmt rx handed on %u, dropped CAC %u decrypt %u key miss %u CRC %u channel %u; HTT",
+    d[5],d[0],d[1],d[2],d[3],d[4]);
+  for(unsigned i=0;i<24&&at>=0&&at<n;i++) { unsigned k=gw_htt_types[i]-gw_htt_types_said[i]; gw_htt_types_said[i]=gw_htt_types[i];
+    if(k) at+=snprintf(b+at,n-at," t%u x%u",i,k); }
+  if(!commands) return;
+  u64 now=lx_now_ms();
+  if(at>=0&&at<n) at+=snprintf(b+at,n-at,"; last WMI commands (id, ms ago):");
+  for(unsigned k=gw_wmi_cmd_count>16?gw_wmi_cmd_count-16:0;k<gw_wmi_cmd_count&&at>=0&&at<n;k++)
+    at+=snprintf(b+at,n-at," %#x %llu",gw_wmi_cmds[k&15].id,(unsigned long long)(now-gw_wmi_cmds[k&15].ms));
+}
 void nw_wifi_htt_stats(int type) { (void)type; /* ath12k-only diagnostic request intentionally not sent to ath10k */ }
 void nw_wifi_tx_reasons(char *b,int n) { snprintf(b,n,"ath10k state %u error %d",nw_wifi_stats.stage,nw_wifi_stats.last_err); }
 void nw_wifi_rx_state(char *b,int n) { snprintf(b,n,"rx %u beacons %u",nw_wifi_stats.frames,nw_wifi_stats.beacons); }
@@ -250,6 +285,13 @@ void nw_wifi_ring_state(char *b,int n) {
   struct ath10k_snoc *s=ath10k_snoc_priv(gw_ar);
   struct ath10k_ce_ring *r=s->ce.ce_states[3].src_ring;
   int at=snprintf(b,n,"WMI CE3 read %u write %u",r?r->sw_index:0,r?r->write_index:0);
+  /* guamp 03/11: the HTT side too: its transmit ring (CE4: data frames, EAPOL) and the host receive ring the firmware
+   * writes every received frame into (filled by the host, separate from the CE rings): an empty one stops all reception */
+  { struct ath10k_ce_ring *h=s->ce.ce_states[4].src_ring; struct ath10k_htt *t=&gw_ar->htt;
+    if(at>=0&&at<n) at+=snprintf(b+at,n-at,", HTT CE4 read %u write %u, HTT rx ring %d of %d (alloc %u, read %u, retry %s)",
+      h?h->sw_index:0,h?h->write_index:0,t->rx_ring.fill_cnt,t->rx_ring.fill_level,
+      t->rx_ring.alloc_idx.vaddr?(unsigned)__le32_to_cpu(*t->rx_ring.alloc_idx.vaddr):0u,t->rx_ring.sw_rd_idx.msdu_payld,
+      t->rx_ring.refill_retry_timer.d.armed?"armed":"idle"); }
   /* guamp 03/11: reception stops at ~512 s with WMI still working and no HTT stats answer: every receive (destination)
    * ring with its software read index, write index and entries, to see which one is stuck. */
   if(at<0||at>=n)return;

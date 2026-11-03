@@ -511,6 +511,7 @@ static void send_eapol(const struct eapol_key *k, unsigned total, u32 tx_cookie)
   skb->protocol = cpu_to_be16(ETH_P_PAE); skb->mark=tx_cookie; /* TX completion identifies this handshake message */
   tx_frame(skb); }
 void nw_wifi_htt_stats(int type); void nw_wifi_rx_state(char *b, int n); void nw_wifi_ring_state(char *b, int n);
+void nw_wifi_quiet_report(char *b, int n, int commands);
 static void sign(struct eapol_key *k, unsigned total) {
   u8 h[20]; memset(k->mic, 0, 16); nw_hmac_sha1(C.ptk, 16, (const u8 *)k, total, h); memcpy(k->mic, h, 16); }
 static int install_key(int pairwise, int idx, const u8 *key, int len) {
@@ -577,17 +578,31 @@ static void finish_authorized(void) {
 /* guamp 30/10: why data frames from the access point do not reach the interface (fin12: every TCP connection stops near
  * 12 KB, right after the server's first flight). Said with the 10-second statistics line. */
 static struct { unsigned delivered, frag, not_decrypted, no_snap, too_long, amsdu, short_frame, not_up, max_len; } g_rxd;
+/* guamp 03/11: frames the radio handed over flagged bad (FCS/PLCP CRC, MIC, monitor only) and dropped by nw_sta_rx */
+static unsigned g_rx_flagged;
+/* guamp 03/11: the link is given up after this many seconds with nothing at all received. The stall that comes back every
+ * ~600 s (fin28 593/1210 s, live 03/11 3151/3751 s) is cured by the rejoin in 0.1-0.2 s. Kept at 8: the host tests model
+ * silent access points for up to 8 s (pairwise rekey timeout) and the beacon-miss grace period is 5 s. */
+#define QUIET_LINK_LOST_S 8
 static void heartbeat(u64 now) {
   if (now - C.hb_at < 1000) return;
   unsigned f = nw_wifi_stats.frames - C.hb_frames, bc = nw_wifi_stats.beacons - C.hb_beacons; static unsigned n;
   C.hb_at = now; C.hb_frames = nw_wifi_stats.frames; C.hb_beacons = nw_wifi_stats.beacons; n++;
-  if (f || bc) { if (C.hb_quiet) lx_log(6, "wifi: frames arrive again after %u quiet seconds", C.hb_quiet); C.hb_quiet = 0; if (n % 10) return; nw_wifi_htt_stats(37); }
+  char rx[480];
+  if (f || bc) { if (C.hb_quiet) lx_log(6, "wifi: frames arrive again after %u quiet seconds", C.hb_quiet); C.hb_quiet = 0;
+    if (n % 10) { nw_wifi_quiet_report(rx, sizeof rx, 0); return; }   /* (the counters are per second: the last one is said) */
+    nw_wifi_htt_stats(37); }
   else C.hb_quiet++;
   /* guamp 30/10: no frame at all (not even a beacon) for 8 s while connected: the link is gone even if the firmware never
    * reports a beacon miss. fin12 stayed "connected" for 15 minutes with nothing received from 621 s on, so wifid never
    * joined again. Reported as lost: wifid reconnects. */
-  if (C.state == NW_STA_UP && C.hb_quiet == 8) { lx_log(4, "wifi: nothing received for 8 s while connected: link lost"); teardown(1, 0); schedule_rejoin(); return; }
-  char rx[480]; nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
+  if (C.state == NW_STA_UP && C.hb_quiet == QUIET_LINK_LOST_S) {
+    lx_log(4, "wifi: nothing received for %u s while connected: link lost", QUIET_LINK_LOST_S); teardown(1, 0); schedule_rejoin(); return; }
+  /* guamp 03/11: in the last second, what the firmware still sent and why management frames went nowhere; in the first quiet
+   * second also the last WMI commands (two went out right before every stall) */
+  nw_wifi_quiet_report(rx, sizeof rx, C.hb_quiet == 1);
+  lx_log(6, "wifi: %s %s; station dropped %u flagged frames", C.hb_quiet ? "quiet:" : "rx sources:", rx, g_rx_flagged);
+  nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
   lx_log(6, "wifi: tx %s", tx_reasons());
@@ -673,7 +688,10 @@ static void handle_eapol(const u8 *p, unsigned len) {
       o->len[0]=body>>8; o->len[1]=body; o->info[0]=0x03; o->info[1]=0x02; memcpy(o->replay,k->replay,8); sign(o,sizeof *o); send_eapol(o,sizeof *o,0); return;
     }
     if (!gtk || gtklen!=(C.group_cipher == 2 ? 32u : 16u)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
-    if (install_key(0, gtkid, gtk, gtklen)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    /* guamp 03/11: said every time (the access point renews the group key on its own timer, often every 600 s: the period of
+     * the reception stalls) -- the index and length only, never the key */
+    if (install_key(0, gtkid, gtk, gtklen)) { lx_log(4, "wifi: group key update (index %d): install failed", gtkid); C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    lx_log(6, "wifi: group key update: index %d, %u bytes, installed", gtkid, gtklen);
     C.group_replay=rc; C.group_replay_valid=1; C.retry_replay_valid=0;
     struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;
     o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o,0); } }
@@ -723,7 +741,7 @@ void nw_sta_rx(struct sk_buff *skb) {
   struct ieee80211_rx_status *rs=IEEE80211_SKB_RXCB(skb);
   // This shim replaces mac80211 RX, so its station admission checks are not
   // performed elsewhere. HTT explicitly marks extra management as monitor-only.
-  if(rs->flag&(RX_FLAG_FAILED_FCS_CRC|RX_FLAG_FAILED_PLCP_CRC|RX_FLAG_MMIC_ERROR|RX_FLAG_ONLY_MONITOR))return;
+  if(rs->flag&(RX_FLAG_FAILED_FCS_CRC|RX_FLAG_FAILED_PLCP_CRC|RX_FLAG_MMIC_ERROR|RX_FLAG_ONLY_MONITOR)){g_rx_flagged++;return;}
   if(rs->flag&RX_FLAG_8023) {
     // The present ath10k SNOC path reconstructs 802.11; retain a correct path
     // for drivers that supply Ethernet. Its metadata must still identify

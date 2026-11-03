@@ -83,6 +83,13 @@ type_name(int32_t type)
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		/* guamp 03/11: from the APPLE80211_IOC_ name table of IO80211.framework (iPadOS 17.7.11 dyld cache, subcache .29), which
+		 * runs 2 behind the request numbers from 365 on (365 = DISPLAY_STATE: value 0 when the backlight went off at 72.6 s in
+		 * fin34, 1 when it came back); "?" where the offset is inferred */
+		{ 115, "POWER_DEBUG_INFO?" }, { 346, "HE_CAPABILITY?" }, { 353, "NSS?" }, { 365, "DISPLAY_STATE" },
+		{ 383, "SET_PROPERTY?" }, { 386, "LQM_SUMMARY?" }, { 387, "COLOCATED_NETWORK_SCOPE_ID?" },
+		{ 389, "USERSPACE_P2P_OPTIONS?" }, { 470, "MOVING_NETWORK?" }, { 471, "BATTERY_POWERSAVE_CONFIG?" },
+		{ 473, "WCL_CONFIG_BG_MOTIONPROFILE?" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -204,7 +211,7 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10, EVENT_LINK_QUALITY = 17, EVENT_RSSI_CHANGED = 39 };
+       EVENT_SCAN_DONE = 10, EVENT_COUNTRY_CODE_CHANGED = 11, EVENT_LINK_QUALITY = 17, EVENT_RSSI_CHANGED = 39 };
 /* (17 and 39: positions in IO80211.framework's APPLE80211_M_ name table of iPadOS 17.7.11, read from the dyld cache 31/10) */
 
 static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes one interface, and that is its name) */
@@ -228,10 +235,14 @@ static void post(uint32_t code, const void *data, uint32_t length);
  */
 static thread_call_t signal_call;
 
+static struct apple80211_link_changed link_up_event(int rssi);
+static uint32_t link_rssi_events = 1;          /* guamp-wifi-link-rssi */
+
 static void
 signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	static unsigned said, fast, was_joined;
+	static int rssi_told = 1;                       /* (1: none yet; a real one is below 0) */
 	unsigned interval = 5;
 	struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
 
@@ -243,6 +254,9 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			fast = 30;
 		}
 		was_joined = state->phase == HAKIOS_STA_JOINED;
+		if (!was_joined) {
+			rssi_told = 1;
+		}
 		interval = !was_joined ? 2 : fast ? (fast--, 1) : 5;
 		if (state->phase == HAKIOS_STA_JOINED) {
 			struct {
@@ -252,6 +266,18 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 
 			post(EVENT_LINK_QUALITY, &quality, sizeof(quality));
 			post(EVENT_RSSI_CHANGED, NULL, 0);
+			/*
+			 * guamp 03/11: fin34: after these events wifid read the RSSI only once (at the join) and the bars stayed grey.
+			 * The signal also goes in a link event (up, with RSSI, noise and SNR) when it moves by 3 dB or more and at the
+			 * first tick of a link, as UniXNU-sheng does from its on_link_update() (package/WifiNet.cpp, 790232e).
+			 * guamp-wifi-link-rssi=0: not.
+			 */
+			if (link_rssi_events && (rssi_told > 0 || state->bss.rssi - rssi_told >= 3 || rssi_told - state->bss.rssi >= 3)) {
+				struct apple80211_link_changed link = link_up_event(state->bss.rssi);
+
+				rssi_told = state->bss.rssi;
+				post(EVENT_LINK_CHANGED, &link, sizeof(link));
+			}
 			if (said < 4) {
 				said++;
 				printf("GuampWiFi: apple80211: signal events posted, rssi %d dBm\n", (int)state->bss.rssi);
@@ -271,6 +297,7 @@ guamp_apple80211_init(void)
 
 	lck_mtx_init(&apple80211_lock, lck_grp_alloc_init("guamp-apple80211", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
 	PE_parse_boot_argn("guamp-wifi-rssi-events", &on, sizeof(on));
+	PE_parse_boot_argn("guamp-wifi-link-rssi", &link_rssi_events, sizeof(link_rssi_events));
 	if (on) {
 		signal_call = thread_call_allocate_with_options(signal_tick, NULL, THREAD_CALL_PRIORITY_LOW, 0);
 		if (signal_call != NULL) {
@@ -317,6 +344,59 @@ give(const struct apple80211req *request, const void *data, size_t length)
 {
 	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
 	       request->req_len);
+}
+
+/*
+ * guamp 03/11: a get that brings no buffer (req_len 0) wants its answer in req_val; one with a buffer gets {version, value}.
+ * RATE (8) and MCS (57) come with req_len 0 (fin34: "gets 8 (RATE), value 0, 0 bytes"), so the rate written with give() never
+ * reached wifid (it saw 0 Mbit/s: a suspect of the grey bars), and STATE (13) comes with 8 bytes that were never filled. Same
+ * rule as answer_value() in UniXNU-sheng package/WifiNet.cpp (github.com/UniXNU/UniXNU-sheng, 790232e).
+ */
+static int
+give_value(struct apple80211req *request, uint32_t value)
+{
+	const uint32_t answer[2] = { 1, value };
+
+	request->req_val = (int32_t)value;
+	return request->req_len == 0 || request->req_data == USER_ADDR_NULL ? 0 : give(request, answer, sizeof(answer));
+}
+
+/*
+ * guamp 03/11: the regulatory country. wifid asks for it (3 bytes: two letters and a NUL) and sets it (8 bytes: version, the
+ * letters) again every second while it is refused (fin34: 35.7-40.8 s, 144-149 s). Kept as set; before any set, the country the
+ * strongest access point announces (802.11d Country element, 7), else "XX" -- the idea of country() in UniXNU-sheng
+ * WifiNet.cpp. The radio itself stays on its world table.
+ */
+static char country_set[3];
+
+static void
+country_now(char cc[3])
+{
+	struct hakios_sta_bss *bss;
+	int best = -200;
+
+	cc[0] = 'X'; cc[1] = 'X'; cc[2] = 0;
+	lck_mtx_lock(&apple80211_lock);
+	if (country_set[0] != 0) {
+		memcpy(cc, country_set, 3);
+		best = 0;
+	}
+	lck_mtx_unlock(&apple80211_lock);
+	if (best == 0 || (bss = IOMallocData(sizeof(*bss))) == NULL) {
+		return;
+	}
+	for (unsigned i = 0; hakios_sta_heard(i, bss); i++) {
+		for (unsigned at = 0; bss->rssi > best && at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <=
+		    bss->elements_length; at += 2 + bss->elements[at + 1]) {
+			const uint8_t *e = bss->elements + at;
+
+			if (e[0] == 7 && e[1] >= 2 && e[2] >= 'A' && e[2] <= 'Z' && e[3] >= 'A' && e[3] <= 'Z') {
+				cc[0] = (char)e[2]; cc[1] = (char)e[3]; best = bss->rssi;
+				break;
+			}
+		}
+	}
+	IOFreeData(bss, sizeof(*bss));
 }
 
 /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
@@ -421,6 +501,21 @@ get(struct apple80211req *request)
 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
 		request->req_val = 1;
 		return 0;
+	case 51: {                              /* guamp 03/11: the country (see country_now) */
+		char cc[3];
+
+		country_now(cc);
+		return give(request, cc, sizeof(cc));
+	}
+	case 5:                                 /* guamp 03/11: power save: off (nw_sta.c turns it off once associated) */
+		return give_value(request, 0);
+	case 18:                                /* guamp 03/11: interrupt mitigation: APPLE80211_INT_MIT_AUTO (the firmware's own) */
+		return give_value(request, 1);
+	case 6: {                               /* guamp 03/11: protection (apple80211_protmode_data): APPLE80211_PROTMODE_AUTO */
+		const uint32_t answer[3] = { 1, 1, 0 };
+
+		return give(request, answer, sizeof(answer));
+	}
 	case 27:
 	case 254: {                             /* the channels the radio may tune to */
 		struct apple80211_channels *answer;
@@ -519,8 +614,8 @@ get(struct apple80211req *request)
 	hakios_sta_state(state);
 	switch (request->req_type) {
 	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
-		request->req_val = state->phase == HAKIOS_STA_JOINED ? 4 : state->phase == HAKIOS_STA_JOINING ? 2 :
-		    state->phase == HAKIOS_STA_SCANNING ? 1 : 0;
+		error = give_value(request, state->phase == HAKIOS_STA_JOINED ? 4 : state->phase == HAKIOS_STA_JOINING ? 2 :
+		    state->phase == HAKIOS_STA_SCANNING ? 1 : 0);
 		break;
 	case 1:                                 /* its name; the length goes back in the request */
 		if (state->phase != HAKIOS_STA_JOINED) {
@@ -550,8 +645,9 @@ get(struct apple80211req *request)
 		struct {
 			uint32_t version, radios, unit;
 			int32_t each[4], all, each_ext[4], all_ext;
-		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi }, .all = state->bss.rssi,
-			     .each_ext = { state->bss.rssi }, .all_ext = state->bss.rssi };
+		} answer = { .version = 1, .radios = 1, .each = { state->bss.rssi, state->bss.rssi, state->bss.rssi, state->bss.rssi },
+			     .all = state->bss.rssi, .each_ext = { state->bss.rssi, state->bss.rssi, state->bss.rssi, state->bss.rssi },
+			     .all_ext = state->bss.rssi };   /* (guamp 03/11: every chain, as UniXNU-sheng fills them) */
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
@@ -560,8 +656,9 @@ get(struct apple80211req *request)
 		struct {
 			uint32_t version, radios, unit;
 			int32_t each[4], all, each_ext[4], all_ext;
-		} answer = { .version = 1, .radios = 1, .each = { GUAMP_NOISE_DBM }, .all = GUAMP_NOISE_DBM,
-			     .each_ext = { GUAMP_NOISE_DBM }, .all_ext = GUAMP_NOISE_DBM };
+		} answer = { .version = 1, .radios = 1, .each = { GUAMP_NOISE_DBM, GUAMP_NOISE_DBM, GUAMP_NOISE_DBM, GUAMP_NOISE_DBM },
+			     .all = GUAMP_NOISE_DBM, .each_ext = { GUAMP_NOISE_DBM, GUAMP_NOISE_DBM, GUAMP_NOISE_DBM, GUAMP_NOISE_DBM },
+			     .all_ext = GUAMP_NOISE_DBM };
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 		break;
@@ -571,7 +668,9 @@ get(struct apple80211req *request)
 			uint32_t version, radios, rate[4];
 		} answer = { .version = 1, .radios = 1, .rate = { GUAMP_LINK_RATE_MBPS } };
 
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		/* (guamp 03/11: asked with no buffer: in req_val) */
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : request->req_len == 0 ? give_value(request, GUAMP_LINK_RATE_MBPS) :
+		    give(request, &answer, sizeof(answer));
 		break;
 	}
 	case 14: {                              /* guamp 02/11: PHY mode (apple80211_phymode_data): 11a 2, 11b 4, 11g 8, 11n 0x10 */
@@ -588,7 +687,8 @@ get(struct apple80211req *request)
 			uint32_t version, index;
 		} answer = { .version = 1, .index = GUAMP_LINK_MCS };
 
-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : request->req_len == 0 ? give_value(request, GUAMP_LINK_MCS) :
+		    give(request, &answer, sizeof(answer));
 		break;
 	}
 	case 103:                               /* all of it, as a scan's result */
@@ -652,9 +752,18 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 			unknown++;
 		}
 	}
-	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
-	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
-	    asked->name_count, asked->flags);
+	/* guamp 03/11: a short scan also says which channels (wifid's auto-join scans the channels it knows a network on: fin34
+	 * asked 3 channels at 58.9 s and never joined; which ones tells whether the saved network's channel was among them) */
+	char channels_said[64] = "";
+	if (asked->channel_count <= 13) {
+		for (unsigned i = 0, at = 0; i < asked->channel_count && at + 5 < sizeof(channels_said); i++) {
+			at += (unsigned)snprintf(channels_said + at, sizeof(channels_said) - at, "%s%u", i ? "," : " on ",
+			    asked->channels[i].channel);
+		}
+	}
+	snprintf(said, said_size, " (a scan: type %u, %u channels%s of which %u are not the radio's, %u ms on each, a name of %u bytes, "
+	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, channels_said, unknown, asked->dwell_ms,
+	    asked->ssid_length, asked->name_count, asked->flags);
 	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
 		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 	} else {
@@ -751,6 +860,47 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 51: {                              /* guamp 03/11: the country wifid wants (see country_now); the radio is not retuned */
+		uint8_t asked[8] = { 0 };
+		bool changed;
+		int error;
+
+		if (request->req_len < 6 || (error = copyin(request->req_data, asked, request->req_len < sizeof(asked) ?
+		    request->req_len : sizeof(asked))) != 0) {
+			return request->req_len < 6 ? EINVAL : error;
+		}
+		if (!(asked[4] >= 'A' && asked[4] <= 'Z' && ((asked[5] >= 'A' && asked[5] <= 'Z') || (asked[4] == 'X' && asked[5] == '0')))) {
+			snprintf(said, said_size, " (country %#x %#x: not two letters)", asked[4], asked[5]);
+			return EINVAL;
+		}
+		lck_mtx_lock(&apple80211_lock);
+		changed = country_set[0] != (char)asked[4] || country_set[1] != (char)asked[5];
+		country_set[0] = (char)asked[4]; country_set[1] = (char)asked[5]; country_set[2] = 0;
+		lck_mtx_unlock(&apple80211_lock);
+		snprintf(said, said_size, " (country %c%c%s)", asked[4], asked[5], changed ? ", new" : "");
+		if (changed) {
+			post(EVENT_COUNTRY_CODE_CHANGED, NULL, 0);
+		}
+		return 0;
+	}
+	/*
+	 * guamp 03/11: settings wifid sends over and over that this radio has nothing to do with, taken as done (as UniXNU-sheng
+	 * WifiNet.cpp does with LOCALE, COUNTRY_CODE, POWERSAVE...): POWERSAVE 5, LOCALE 28, DISPLAY_STATE 365 and -- names
+	 * inferred from the IOC table -- SET_PROPERTY 383, MOVING_NETWORK 470, BATTERY_POWERSAVE_CONFIG 471,
+	 * WCL_CONFIG_BG_MOTIONPROFILE 473. guamp-wifi-accept-sets=0 refuses them as before.
+	 */
+	case 5:
+	case 28:
+	case 365:
+	case 383:
+	case 470:
+	case 471:
+	case 473: {
+		uint32_t accept = 1;
+
+		PE_parse_boot_argn("guamp-wifi-accept-sets", &accept, sizeof(accept));
+		return accept ? 0 : EOPNOTSUPP;
+	}
 	default:
 		return EOPNOTSUPP;
 	}
@@ -773,6 +923,16 @@ post(uint32_t code, const void *data, uint32_t length)
 		message.dv[1].data_ptr = __DECONST(void *, data);
 	}
 	kev_post_msg(&message);
+}
+
+/* An "up" link event with the signal (as at a join) */
+static struct apple80211_link_changed
+link_up_event(int rssi)
+{
+	struct apple80211_link_changed link = { .down = 0, .rssi = rssi, .noise = (uint16_t)(int16_t)GUAMP_NOISE_DBM,
+		                                .snr = (uint16_t)(rssi - GUAMP_NOISE_DBM) };
+
+	return link;
 }
 
 /* What the station side says has happened (bsd/dev/hakios.sta.c calls this, on its thread or the station's). */
@@ -803,6 +963,11 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		post(EVENT_ASSOC_DONE, NULL, 0);
 		break;
 	case HAKIOS_STA_LINK: {
+		/* guamp 03/11: the signal events start at once (they waited up to 2 s for the next tick: fin34 joined at 155.13 s,
+		 * first events at 157.1 s) */
+		if (status == 1 && signal_call != NULL) {
+			thread_call_enter(signal_call);
+		}
 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
 			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
 		struct hakios_sta_state *state = IOMallocZeroData(sizeof(*state));
@@ -881,7 +1046,7 @@ hakios_apple80211_ioctl(u_long command, void *data)
 {
 	static unsigned said;
 	struct apple80211req *request = data;
-	char who[32] = "?", what[200] = "";
+	char who[32] = "?", what[256] = "";
 	bool is_set = command == SIOCSA80211;
 	int error;
 
@@ -893,7 +1058,7 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	const unsigned times = note(request, is_set, error);
 	/* guamp 02/11: each kind of request is said its first 25 times (was: the first 800 of all, used up before the join by
 	 * CURRENT_NETWORK polling, so what wifid asks once joined -- auto-join, the bars -- was never seen) */
-	if (said < 3000 && times <= 25) {
+	if (said < 3000 && (times <= 25 || ((request->req_type == 10 || request->req_type == 51) && is_set && times <= 150))) {
 		said++;
 		printf("GuampWiFi: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==

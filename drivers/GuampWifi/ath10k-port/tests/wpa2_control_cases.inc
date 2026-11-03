@@ -23,6 +23,7 @@ static void control_regression_cases(void) {
   CHECK(st.state==NW_STA_IDLE&&!nw_sta_tx_pending()&&n_tx==sent,"disconnect purges queued data before another association");
   CHECK(nw_wifi_tx(packet,sizeof packet)==-ENETDOWN,"disconnected station refuses new Ethernet data");
   beacon();CHECK(nw_wifi_connect((const u8 *)SSID,strlen(SSID),NULL,NULL,0)==0,"rejoin accepted after TX purge");spin(20);
+  const int lost_before=g_lost_events;
   nw_sta_link_lost();
   for(int i=0;i<6;i++) {
     const u8 body[12]={0};struct sk_buff *foreign=mgmt_to_sta(IEEE80211_STYPE_BEACON,body,sizeof body);
@@ -30,7 +31,10 @@ static void control_regression_cases(void) {
     inject(foreign,2437);spin(1000);
   }
   nw_wifi_status_get(&st);
-  CHECK(st.state==NW_STA_IDLE,"open-network timer detects lost link despite beacons from a different BSSID");
+  /* guamp 03/11: since 359a3b9 the station joins the same network again by itself after a lost link: the loss is the
+   * link-lost event (the state may be UP again: the fake access point answers the rejoin) */
+  CHECK(g_lost_events>lost_before,"open-network timer detects lost link despite beacons from a different BSSID");
+  nw_wifi_disconnect();spin(3);   /* (ends the rejoined link, so the next join is accepted) */
   beacon();CHECK(nw_wifi_connect((const u8 *)SSID,strlen(SSID),NULL,NULL,0)==0,"reconnect after real link-loss works");spin(20);
   nw_sta_link_lost();beacon();beacon();spin(5100);nw_wifi_status_get(&st);
   CHECK(st.state==NW_STA_UP,"valid current-AP traffic cancels beacon-miss grace period");
