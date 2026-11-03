@@ -12,7 +12,7 @@ echo "== kernel glue: arm64-apple-ios, -Werror, integer registers only"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 \
   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/backlight_glue_check.cpp" -o "$WORK/glue.o" && echo "glue: compiled" || rc=1
 echo "== no raw newline inside a string literal of the new kernel sources"
-(cd "$HERE/.." && python3 -I tests/check_literals.py GuampBacklight.inc GuampBacklightCore.h) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GuampBacklight.inc GuampBacklightCore.h GuampPanelCycle.inc GuampPanelCycleCore.h) || rc=1
 echo "== host build (clang and gcc)"
 clang++ $FLAGS "$HERE/backlight_host.cpp" -o "$WORK/backlight_host" || exit 1
 g++ ${FLAGS/-Wdeprecated-volatile/-Wvolatile} "$HERE/backlight_host.cpp" -o "$WORK/backlight_host_gcc" || rc=1

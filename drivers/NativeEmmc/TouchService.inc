@@ -37,6 +37,10 @@ namespace pmic {
 extern volatile int gArbReady;
 int read8(unsigned sid, uint16_t addr, uint8_t *v);
 }
+// Panel power cycle (GuampPanelCycle.inc, included after GuampScanout.inc): guamp-touch-panelcycle=5.
+namespace panelcycle {
+int run();
+}
 
 namespace touch {
 volatile uint8_t *gGcc, *gTlmm, *gWrap, *gSe;
@@ -777,6 +781,8 @@ int (*volatile gPanelCycle)(int which) = nullptr;
 // reset held low, panel on-command, reset 1 / 2 ms, 0 / 5 ms, 1 / 2 ms, then the full download and start. In TWRP the
 // verified working touch (S1@391,840 at 58.7 s) came after such a screen off / on cycle (second 0f at 21.6 s).
 // 4: the Linux boot order (LCD reset sequence and the full on-command before the touch), see the block in thread().
+// 5: the full Linux panel power cycle with the LCDB rails (video stopped, LP off-command, rails down / up, reset, LP
+// on-command, video back) before the SPI bus is opened: GuampPanelCycle.inc / GuampPanelCycleCore.h.
 int panelCycle(const char *when, int which = 2) {
   for (unsigned i = 0; i < 60 && !gPanelCycle; ++i) IOSleep(50);
   int (*fn)(int) = gPanelCycle;
@@ -809,7 +815,21 @@ void thread(void *param, wait_result_t) {
   unsigned delay = 0;
   PE_parse_boot_argn("guamp-touch-delay", &delay, sizeof(delay));
   if (delay && delay <= 600) IOSleep(delay * 1000);
-  if (!snapshot() || stage < 2 || !enable() || stage < 3) return;
+  if (!snapshot() || stage < 2 || !enable()) return;
+  {
+    // guamp-touch-panelcycle=5: the Linux panel power cycle (GuampPanelCycle.inc) as early as the touch pins allow,
+    // before the SPI bus, the reset, the download and the start (all unchanged after it), and long before the first
+    // frame of the display copy (the scanout is held anyway). Then the panel probe again.
+    unsigned cyc = 0;
+    PE_parse_boot_argn("guamp-touch-panelcycle", &cyc, sizeof(cyc));
+    if (cyc == 5) {
+      const int pc = panelcycle::run();
+      IOLog("GuampTouch: panel power cycle (panelcycle 5): result %d\n", pc);
+      panelProbe();
+      logPanel();
+    }
+  }
+  if (stage < 3) return;
   if (!openBus()) {
     // The boot-time panel line is gone from kpan and the USB mirror connects later: repeat it once a minute for 15 minutes.
     for (unsigned i = 0; i < 15 && gPanelProbe; ++i) { IOSleep(60000); panelProbe(); logPanel(); }
