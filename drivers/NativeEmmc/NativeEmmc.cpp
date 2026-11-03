@@ -1321,6 +1321,7 @@ static void usbProbe()
 #include "GuampDsiState.inc"    // guamp-dsi-dump=1: MDSS/DSI/PHY register dump + DCS reads at boot and 60 s (TWRP: strumenti/twrp-dsi-stato.sh)
 #include "GuampScanout.inc"     // differential copy / double-buffered scanout of the legacy display (guamp-copy-diff, guamp-scanout-flip)
 #include "GuampPanelCycle.inc"  // guamp-touch-panelcycle=5: Linux panel power cycle (LCDB, DSI LP), after GuampScanout.inc
+#include "GuampPacing.inc"      // frame pacing: INTF_1 counters for the refresh tick (variant section 14), 'GuampPacing:' every 10 s
 #include "GuampCpufreq.inc"
 #include "GuampAudioHw.inc"    // audio output HW (guamp-audio-hw=1|2): aw882xx speaker amp, LPI i2s1, RX macro; before GuampAdsp.inc
 #define GUAMP_AUDIO_SHM_PROVIDED 1  // guamp_audio_shm_get/put: GuampAudioPlay.inc (stream 0x1c1 buffer for the capture)
