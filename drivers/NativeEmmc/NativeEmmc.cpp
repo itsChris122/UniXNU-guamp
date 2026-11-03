@@ -180,19 +180,33 @@ constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for th
 // K KiB command whose blocks are kept in a small slot cache (32 slots, at most 2 MiB); later reads entirely inside a slot
 // are served from memory. Card gate held for every access. Writes invalidate overlapping slots (Card::writeBlocks and
 // writeLogBlock), so even a range written later through another device is never served stale.
+// 03/11 (fin36 boot, 11-45 s: card 70-80 % busy, 33-39 MB/s asked, while the fills read 340-440 MB per 10 s ahead and the
+// hits used only 180-230 MB of it):
+// guamp-emmc-ra-slots=N (8..256, default 32): slots of the cache (N x K KiB). Many concurrent streams at boot evict a slot
+//   before it is read.
+// guamp-emmc-ra-adapt=1 (default 0 = always K KiB): a read that does not continue one of the last 8 streams only reads up to
+//   the end of its 16 KiB block (the userland page size: its other 4 KiB pages are the next faults), K KiB only for streams.
+// The "ra" line now also counts the blocks read ahead that left the cache (evicted or invalidated) without ever being
+// served ("unused"), the measure of the wasted card time.
 namespace emmcra {
-constexpr unsigned kSlots = 32, kStreams = 8;
-struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint8_t *data; };
-static Slot gSlot[kSlots];
-static uint32_t gBlocks = 0, gClock = 0, gHistOn = 1;
-static uint64_t gHits = 0, gFills = 0, gHitBlocks = 0, gExtraBlocks = 0, gBypass = 0;
+constexpr unsigned kMaxSlots = 256, kStreams = 8, kSmallBlocks = 32;   // 32 blocks = 16 KiB
+struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint32_t used; uint8_t *data; };
+static Slot gSlot[kMaxSlots];
+static unsigned kSlots = 32;   // guamp-emmc-ra-slots (the name of the former constant, so the loops read the same)
+static uint32_t gBlocks = 0, gClock = 0, gHistOn = 1, gAdapt = 0;
+static bool gLastSeq = false;
+static uint64_t gHits = 0, gFills = 0, gHitBlocks = 0, gExtraBlocks = 0, gBypass = 0, gUnused = 0, gSmall = 0;
 static uint64_t gHist[6] = {}, gSeq = 0, gReqs = 0, gEnds[kStreams] = {};
 static unsigned gEndAt = 0;
 static void configure() {
-  uint32_t hist = 1, kib = 0;
+  uint32_t hist = 1, kib = 0, slots = 32, adapt = 0;
   PE_parse_boot_argn("guamp-emmc-hist", &hist, sizeof(hist));
   gHistOn = hist ? 1 : 0;
   PE_parse_boot_argn("guamp-emmc-ra", &kib, sizeof(kib));
+  PE_parse_boot_argn("guamp-emmc-ra-slots", &slots, sizeof(slots));
+  PE_parse_boot_argn("guamp-emmc-ra-adapt", &adapt, sizeof(adapt));
+  gAdapt = adapt ? 1 : 0;
+  kSlots = slots < 8 ? 8 : slots > kMaxSlots ? kMaxSlots : slots;
   if (kib && (kib < 8 || kib > kBounceBlocks * kBlock / 1024)) kib = 0;
   uint32_t blocks = kib * 1024 / kBlock;
   for (unsigned i = 0; blocks && i < kSlots; i = i + 1) {
@@ -203,24 +217,32 @@ static void configure() {
     }
   }
   gBlocks = blocks;
-  IOLog("NativeEmmc: request histogram %s, read-ahead %s (%u KiB x %u slots on read-only windows; guamp-emmc-ra=K)\n",
-        gHistOn ? "on" : "off", gBlocks ? "on" : "off", gBlocks * kBlock / 1024, gBlocks ? kSlots : 0);
+  IOLog("NativeEmmc: request histogram %s, read-ahead %s (%u KiB x %u slots on read-only windows, %s; guamp-emmc-ra=K "
+        "guamp-emmc-ra-slots=N guamp-emmc-ra-adapt=1)\n", gHistOn ? "on" : "off", gBlocks ? "on" : "off",
+        gBlocks * kBlock / 1024, gBlocks ? kSlots : 0, gAdapt ? "16 KiB for non-stream reads" : "always full");
 }
-// Card gate held: one read request of count blocks at the card's lba.
+// Card gate held: one read request of count blocks at the card's lba. gLastSeq: it continues one of the last 8 streams.
 static void note(uint64_t lba, uint64_t count) {
-  if (!gHistOn) return;
-  gReqs = gReqs + 1;
-  gHist[count <= 1 ? 0 : count <= 8 ? 1 : count <= 16 ? 2 : count <= 32 ? 3 : count <= 128 ? 4 : 5] += 1;
+  if (!gHistOn && !(gBlocks && gAdapt)) return;
+  if (gHistOn) {
+    gReqs = gReqs + 1;
+    gHist[count <= 1 ? 0 : count <= 8 ? 1 : count <= 16 ? 2 : count <= 32 ? 3 : count <= 128 ? 4 : 5] += 1;
+  }
+  gLastSeq = false;
   for (unsigned i = 0; i < kStreams; i = i + 1)
-    if (gEnds[i] == lba) { gSeq = gSeq + 1; gEnds[i] = lba + count; return; }
+    if (gEnds[i] == lba) { if (gHistOn) gSeq = gSeq + 1; gEnds[i] = lba + count; gLastSeq = true; return; }
   gEnds[gEndAt] = lba + count;
   gEndAt = (gEndAt + 1) % kStreams;
+}
+static void retire(Slot &slot) {   // the slot leaves the cache: count what was read and never served
+  if (slot.count > slot.used) gUnused += slot.count - slot.used;
+  slot.count = 0;
 }
 // Card gate held: drops every slot overlapping [lba, lba + count).
 static void invalidate(uint64_t lba, uint64_t count) {
   if (!gBlocks) return;
   for (unsigned i = 0; i < kSlots; i = i + 1)
-    if (gSlot[i].count && lba < gSlot[i].lba + gSlot[i].count && gSlot[i].lba < lba + count) gSlot[i].count = 0;
+    if (gSlot[i].count && lba < gSlot[i].lba + gSlot[i].count && gSlot[i].lba < lba + count) retire(gSlot[i]);
 }
 static Slot *find(uint64_t lba, uint32_t count) {
   for (unsigned i = 0; i < kSlots; i = i + 1)
@@ -235,8 +257,18 @@ static Slot *victim() {
   }
   return &gSlot[best];
 }
+// Blocks to read for a run of count blocks at lba: the full slot, or with guamp-emmc-ra-adapt=1 and a read outside the
+// recent streams only up to the end of its 16 KiB block.
+static uint64_t fillBlocks(uint64_t lba, uint32_t count, uint64_t room) {
+  uint64_t blocks = room < gBlocks ? room : gBlocks;
+  if (gAdapt && !gLastSeq) {
+    const uint64_t small = (lba + count + kSmallBlocks - 1) / kSmallBlocks * kSmallBlocks - lba;
+    if (small < blocks) { blocks = small; gSmall = gSmall + 1; }
+  }
+  return blocks;
+}
 static void report() {
-  static uint64_t lHits, lFills, lHitBlocks, lExtra, lBypass, lHist[6], lSeq, lReqs;
+  static uint64_t lHits, lFills, lHitBlocks, lExtra, lBypass, lHist[6], lSeq, lReqs, lUnused, lSmall;
   if (gHistOn && gReqs != lReqs) {   // nothing printed for a period without reads
     uint64_t reqs = gReqs - lReqs, h[6];
     for (unsigned i = 0; i < 6; i = i + 1) { h[i] = gHist[i] - lHist[i]; lHist[i] = gHist[i]; }
@@ -245,9 +277,11 @@ static void report() {
     lSeq = gSeq; lReqs = gReqs;
   }
   if (gBlocks) {
-    IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead), bypass %llu\n", gHits - lHits,
-          (gHitBlocks - lHitBlocks) * kBlock / 1024, gFills - lFills, (gExtraBlocks - lExtra) * kBlock / 1024, gBypass - lBypass);
-    lHits = gHits; lFills = gFills; lHitBlocks = gHitBlocks; lExtra = gExtraBlocks; lBypass = gBypass;
+    IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead, %llu small), bypass %llu, unused %llu KiB\n",
+          gHits - lHits, (gHitBlocks - lHitBlocks) * kBlock / 1024, gFills - lFills, (gExtraBlocks - lExtra) * kBlock / 1024,
+          gSmall - lSmall, gBypass - lBypass, (gUnused - lUnused) * kBlock / 1024);
+    lHits = gHits; lFills = gFills; lHitBlocks = gHitBlocks; lExtra = gExtraBlocks; lBypass = gBypass; lUnused = gUnused;
+    lSmall = gSmall;
   }
 }
 }  // namespace emmcra
@@ -744,15 +778,18 @@ static int readAhead(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescrip
     gHits = gHits + 1;
     gHitBlocks += count;
     slot->age = ++gClock;
+    const uint32_t reach = static_cast<uint32_t>(lba - slot->lba) + count;
+    if (reach > slot->used) slot->used = reach;
     return buffer->writeBytes(offset, slot->data + (lba - slot->lba) * kBlock, count * kBlock) == count * kBlock ? 1 : -1;
   }
-  uint64_t blocks = end - lba < gBlocks ? end - lba : gBlocks;
+  uint64_t blocks = fillBlocks(lba, count, end - lba);
   if (blocks <= count) { gBypass = gBypass + 1; return 0; }
   slot = victim();
-  slot->count = 0;
+  if (slot->count) retire(*slot);
   if (!gCard.readBlocks(lba, static_cast<uint32_t>(blocks), slot->data)) { gBypass = gBypass + 1; return 0; }
   slot->lba = lba;
   slot->count = static_cast<uint32_t>(blocks);
+  slot->used = count;
   slot->age = ++gClock;
   gFills = gFills + 1;
   gExtraBlocks += blocks - count;
@@ -1028,8 +1065,23 @@ public:
   uint64_t blockCount() const { return blocks; }
   // Base methods of IOBlockStorageDevice (IOStorageFamily IOBlockStorageDevice.cpp, iOS build)
   using IOBlockStorageDevice::init;
+  // guamp-emmc-ssd=1 (default, 03/11; =0 the old behaviour): "Device Characteristics" / "Medium Type" = "Solid State", the
+  // property IOMediaBSDClient reads for DKIOCISSOLIDSTATE (it searches the media's providers). Without it XNU took the eMMC
+  // for a rotating disk (log: "spec_open : ... isssd is (0)"): low-priority I/O waited the disk periods (40/85/200 ms per
+  // throttled I/O for tiers 1/2/3 instead of 5/15/25 ms, bsd/miscfs/specfs/spec_vnops.c) and the mounts had no MNTK_SSD.
   bool init(OSDictionary *properties) override {
-    return IOService::init(properties) && setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
+    if (!IOService::init(properties) || !setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric)) return false;
+    unsigned ssd = 1;
+    PE_parse_boot_argn("guamp-emmc-ssd", &ssd, sizeof(ssd));
+    if (ssd) {
+      OSDictionary *characteristics = OSDictionary::withCapacity(1);
+      OSString *medium = OSString::withCString("Solid State");
+      if (characteristics && medium && characteristics->setObject("Medium Type", medium))
+        setProperty("Device Characteristics", characteristics);
+      OSSafeReleaseNULL(medium);
+      OSSafeReleaseNULL(characteristics);
+    }
+    return true;
   }
   using IOBlockStorageDevice::getProperty;
   OSObject *getProperty(const OSSymbol *key) const override {

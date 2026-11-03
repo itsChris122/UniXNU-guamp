@@ -8,10 +8,12 @@
 #include <cstdarg>
 #include <vector>
 
-static uint32_t gArgRa = 0, gArgHist = 1;
+static uint32_t gArgRa = 0, gArgHist = 1, gArgSlots = 0, gArgAdapt = 0;   // 0 = argument absent (slots, adapt)
 static bool PE_parse_boot_argn(const char *name, void *out, int) {
   if (!strcmp(name, "guamp-emmc-ra")) { memcpy(out, &gArgRa, 4); return true; }
   if (!strcmp(name, "guamp-emmc-hist")) { memcpy(out, &gArgHist, 4); return true; }
+  if (!strcmp(name, "guamp-emmc-ra-slots") && gArgSlots) { memcpy(out, &gArgSlots, 4); return true; }
+  if (!strcmp(name, "guamp-emmc-ra-adapt") && gArgAdapt) { memcpy(out, &gArgAdapt, 4); return true; }
   return false;
 }
 static void IOLog(const char *fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); }
@@ -111,6 +113,42 @@ int main() {
   CHECK(emmcra::gReqs == 5 && emmcra::gSeq == 3);
   CHECK(emmcra::gHist[0] == 1 && emmcra::gHist[1] == 2 && emmcra::gHist[2] == 1 && emmcra::gHist[5] == 1);
   gArgHist = 0; emmcra::configure(); emmcra::note(1, 1); CHECK(emmcra::gReqs == 5);
+  emmcra::report();
+  // 11. Unused blocks: a fill of 128 blocks for an 8-block read, served once more up to block 24, then evicted -> 104 unused.
+  gArgHist = 1; gArgSlots = 8; emmcra::configure();
+  CHECK(emmcra::kSlots == 8);
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  uint64_t unused = emmcra::gUnused;
+  CHECK(readRun(500000, 8, 1000000, &how) && how == 1);
+  CHECK(readRun(500016, 8, 1000000, &how) && how == 1);   // hit, reach 24
+  for (unsigned k = 0; k < 8; k++) CHECK(readRun(600000 + k * 1000, 8, 1000000, &how) && how == 1);   // evicts it
+  CHECK(emmcra::find(500000, 8) == nullptr);
+  CHECK(emmcra::gUnused - unused >= 104);
+  // 12. Slots: clamped to 8..256.
+  gArgSlots = 4; emmcra::configure(); CHECK(emmcra::kSlots == 8);
+  gArgSlots = 999; emmcra::configure(); CHECK(emmcra::kSlots == 256);
+  // 13. guamp-emmc-ra-adapt=1: a read outside the streams fills only to the end of its 16 KiB block (32 blocks);
+  // the next read that continues it gets the full 64 KiB.
+  gArgSlots = 32; gArgAdapt = 1; emmcra::configure();
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  uint64_t blocks = gCard.blocksRead;
+  emmcra::note(700008, 8);
+  CHECK(readRun(700008, 8, 1000000, &how) && how == 1);
+  CHECK(gCard.blocksRead - blocks == 24);   // 700008..700032
+  CHECK(emmcra::find(700008, 24) != nullptr && emmcra::find(700008, 25) == nullptr);
+  emmcra::note(700016, 8);   // continues the stream: hit inside the small slot
+  CHECK(readRun(700016, 8, 1000000, &how) && how == 1 && gCard.blocksRead - blocks == 24);
+  emmcra::note(700024, 16);  // crosses the slot end: new fill, full size because it is a stream
+  CHECK(readRun(700024, 16, 1000000, &how) && how == 1);
+  CHECK(gCard.blocksRead - blocks == 24 + 128);
+  emmcra::note(800000, 32);  // a whole aligned 16 KiB read outside the streams: nothing to add, bypass
+  CHECK(readRun(800000, 32, 1000000, &how) && how == 0);
+  // Without the argument the same non-stream read takes the full 64 KiB.
+  gArgAdapt = 0; emmcra::configure();
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  blocks = gCard.blocksRead;
+  emmcra::note(900008, 8);
+  CHECK(readRun(900008, 8, 1000000, &how) && how == 1 && gCard.blocksRead - blocks == 128);
   emmcra::report();
   printf("emmc read-ahead host test: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? 1 : 0;
