@@ -121,6 +121,7 @@ struct Sm6115Runtime {
     unsigned sim=0;PE_parse_boot_argn("guamp-sim",&sim,sizeof(sim));
     ops.sim=sim==1;ops.simSnapshot=simSnapshot;
     if(ops.sim)IOLog("GuampSim: read-only SIM reader on: QMI UIM/DMS/NAS clients on QRTR (no operating mode, PIN or write request)\n");
+    ops.baseband=basebandRequested();
     e=control.prepare(&owner.arena,owner.allocator,ops,true);
     if(e)return fail(e,"APPS SMP2P/GLINK prepare");
     transition(Prepared);return Ok;
@@ -549,6 +550,35 @@ struct Sm6115Runtime {
   // guamp 04/11: likewise for WLFW ("WLFW N error 0" 18 times a boot)
   static void wlfwEvent(void *,Wlfw::State state,int e) {
     if(e) IOLog("GuampWiFi: WLFW state %u error %d\n",unsigned(state),e); else IOLog("GuampWiFi: WLFW state %u\n",unsigned(state)); }
+  // guamp-baseband=1 (04/11): the UniXNU cellular bridge (drivers/QcomBaseband) on this QRTR link. The bridge itself reads
+  // /chosen/coachz-baseband (the ADT of scripts/make-guamp-baseband-adt.py has it); the boot argument sets it here too, before the
+  // bridge's first look, so one switch is enough. Without a --baseband build the argument is reported and ignored.
+  static bool basebandRequested() {
+    unsigned on=0;PE_parse_boot_argn("guamp-baseband",&on,sizeof(on));
+    if(on!=1)return false;
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+    bool adt=false,set=false;
+    if(IORegistryEntry *chosen=IORegistryEntry::fromPath("IODeviceTree:/chosen")) {
+      OSData *have=OSDynamicCast(OSData,chosen->getProperty("coachz-baseband"));
+      uint32_t value=0;
+      if(have&&have->getLength()==4)memcpy(&value,have->getBytesNoCopy(),4);
+      adt=value!=0;
+      if(!adt) {
+        const uint32_t one=1;
+        if(OSData *data=OSData::withBytes(&one,sizeof(one))){set=chosen->setProperty("coachz-baseband",data);data->release();}
+      }
+      chosen->release();
+    }
+    IOLog("GuampBaseband: guamp-baseband=1: cellular bridge on (/chosen/coachz-baseband %s), enabled %d; QMUX clients on QRTR "
+          "ports 0x4100..0x413f, no cellular data (no SM6115 IPA)\n",adt?"from the ADT":set?"set by the kernel":"NOT SET",
+          coachz_baseband_enabled());
+    return coachz_baseband_enabled()!=0;
+#else
+    IOLog("GuampBaseband: guamp-baseband=1 ignored: kernel built without the bridge (build-arm-driver.py --baseband)\n");
+    return false;
+#endif
+  }
+  static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
   static int boardPower(void *p,int on) {
     auto &r=*static_cast<Sm6115Runtime *>(p);
@@ -581,3 +611,20 @@ extern "C" void guamp_sm6115_wifi_shutdown_result(int stopped) { guampwifi::Sm61
 extern "C" void guamp_sm6115_wifi_abort() { guampwifi::Sm6115Runtime::instance().abort(); }
 extern "C" int guamp_sm6115_wifi_start_station(unsigned mode) { return guampwifi::Sm6115Runtime::instance().startStation(mode); }
 extern "C" void guamp_sm6115_wifi_network_ready() { __atomic_store_n(&guampwifi::Sm6115Runtime::instance().networkReady,1u,__ATOMIC_RELEASE); }
+
+#if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
+// guamp 04/11: the bridge's packet hooks (QcomBaseband.h). The SC7180 reference moves pdp_ip packets through its IPA v4.2 adapter
+// (--coachz); SM6115 has no IPA port here, so there is no cellular data path: every packet is refused (counted once in the log)
+// and the receive callback is kept but never called. Registration, signal, SIM and operator need only the QMUX control path.
+#include <sys/errno.h>
+static void (*gGuampBasebandReceiver)(uint32_t,const uint8_t *,uint32_t,uint32_t);
+static uint32_t gGuampBasebandRefused;
+extern "C" int coachz_modem_data_send(uint32_t mux,const uint8_t *,uint32_t length) {
+  if(!gGuampBasebandRefused++)
+    IOLog("GuampBaseband: cellular data packet refused (mux %u, %u bytes): no IPA data path on SM6115 in this build\n",mux,length);
+  return ENETDOWN;   // as the PDP layer reports an interface without a path (coachz_bb_pdp.cpp)
+}
+extern "C" void coachz_modem_data_receiver(void (*receiver)(uint32_t,const uint8_t *,uint32_t,uint32_t)) {
+  gGuampBasebandReceiver=receiver;
+}
+#endif
