@@ -824,7 +824,22 @@ void thread(void *param, wait_result_t) {
   } else {
     IOLog("GuampTouch: keepfw: no download, the firmware already in the chip is used\n");
   }
+  // Sense on timing (guamp-touch-sense-high=<ms>, default 10 as Linux zero-flash) and attempts until "reload OK"
+  // (guamp-touch-reload-tries, default 3). guamp-touch-redl=0: no second download when the reload is never seen.
+  {
+    unsigned v = 0;
+    if (PE_parse_boot_argn("guamp-touch-sense-high", &v, sizeof(v)) && v <= 300) gChip.sense_high_ms = v ? v : 10;
+    v = 0;
+    if (PE_parse_boot_argn("guamp-touch-reload-tries", &v, sizeof(v)) && v && v <= 10) gChip.reload_tries = v;
+  }
   r = hx_start(&gChip);
+  unsigned redl = 1;
+  PE_parse_boot_argn("guamp-touch-redl", &redl, sizeof(redl));
+  if (!r && !keepFw && redl && gChip.reload_polls >= 200) {
+    IOLog("GuampTouch: reload NOT seen after %u sense on: firmware download again\n", gChip.reload_attempts);
+    r = hx_download(&gChip, &fw, gCfg);
+    if (!r) r = hx_start(&gChip);
+  }
   {
     uint32_t central = 0, isr = 0, reload = 0;
     hx_reg_read32(&gChip, HX_ADDR_CENTRAL_STATE, &central);
@@ -832,8 +847,8 @@ void thread(void *param, wait_result_t) {
     hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
     IOLog("GuampTouch: after start: central state %08x (05 = running), fw isr %08x, reload %08x\n", central, isr, reload);
     // Linux (TWRP): reload OK with data 9A A9 / 72 C0, PANEL_VER 18, FW_VER 1305, TOUCH_VER 6, DISPLAY_VER 0, CID 1206.
-    IOLog("GuampTouch: reload %s after %u polls (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
-          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_polls, gChip.reload1, gChip.reload2, gChip.panel_ver,
+    IOLog("GuampTouch: reload %s after %u polls, %u sense on (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
+          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_polls, gChip.reload_attempts, gChip.reload1, gChip.reload2, gChip.panel_ver,
           gChip.fw_ver, gChip.touch_cfg_ver, gChip.display_cfg_ver, gChip.cid_ver);
   }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);
@@ -854,7 +869,19 @@ void thread(void *param, wait_result_t) {
   // guamp-touch-diag=<n> (default 16): the whole event stack of the first n interrupts, zeros included, and the firmware
   // status words with every "polls" line. guamp-touch-irqonly=1: read the stack only after an interrupt (as Linux does)
   // instead of every 20 ms as well.
-  unsigned diagLeft = 16, irqOnly = 0;
+  // guamp 03/11 (fin37): irqonly is the default now. A read without an interrupt finds the stack already consumed (all
+  // zero), which was taken as "all fingers up" between two reports. guamp-touch-irqonly=0 polls every 20 ms as well.
+  // guamp-touch-dump=<n>: the whole stack of every n-th interrupt (0 = off), for long captures.
+  // Filters (phantom reports of fin37, electrode-grid coordinates): a report whose >= 4 points share one x or one y is
+  // dropped (guamp-touch-line=0 keeps it); >= 3 points identical for more than guamp-touch-repeat (default 32) reports
+  // in a row are dropped until they change (0 = off).
+  unsigned diagLeft = 16, irqOnly = 1, dumpEvery = 0, lineFilter = 1, repeatMax = 32;
+  PE_parse_boot_argn("guamp-touch-dump", &dumpEvery, sizeof(dumpEvery));
+  PE_parse_boot_argn("guamp-touch-line", &lineFilter, sizeof(lineFilter));
+  PE_parse_boot_argn("guamp-touch-repeat", &repeatMax, sizeof(repeatMax));
+  uint32_t phantoms = 0, repeats = 0, empties = 0;
+  unsigned sameRun = 0;
+  struct hx_report lastRep = {};
   PE_parse_boot_argn("guamp-touch-diag", &diagLeft, sizeof(diagLeft));
   PE_parse_boot_argn("guamp-touch-irqonly", &irqOnly, sizeof(irqOnly));
   const bool diag = diagLeft != 0;
@@ -926,13 +953,28 @@ void thread(void *param, wait_result_t) {
       continue;
     }
     if (polls == 50 || (polls & 2047) == 0) {
-      IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad, gReleases,
-            gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback);
+      IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d | empty %u phantom %u "
+            "repeat %u\n", polls, gIrqs, gEvents, gBad, gReleases, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback,
+            empties, phantoms, repeats);
       if (diag) logStatus(polls);
     }
-    if (irqOnly && useIrq && !fromIrq) continue;
+    if (irqOnly && useIrq && !fromIrq) {
+      // No interrupt for 20 ms: only the lost "finger up" guard.
+      if (down && mach_absolute_time() - lastGood > releaseTicks) {
+        struct hx_report up = {};
+        down = false;
+        gReleases = gReleases + 1;
+        publish(up);
+      }
+      continue;
+    }
     struct hx_report rep;
     const int readError = hx_read_event(&gChip, ev);
+    if (dumpEvery && fromIrq && gIrqs % dumpEvery == 0) {
+      char hex[3 * HX_EVENT_LEN + 1] = "";
+      for (unsigned i = 0; i < sizeof(ev); i++) snprintf(hex + 3 * i, 4, "%02x ", ev[i]);
+      IOLog("GuampTouch: dump irq %u rc %d: %s\n", gIrqs, readError, hex);
+    }
     if (diagLeft && fromIrq) {
       diagLeft--;
       char hex[3 * HX_EVENT_LEN + 1] = "";
@@ -947,8 +989,39 @@ void thread(void *param, wait_result_t) {
       for (unsigned i = 0; i < sizeof(ev) && i < 24; i++) snprintf(hex + 3 * i, 4, "%02x ", ev[i]);
       IOLog("GuampTouch: raw poll %u irqs %u: %s\n", polls, gIrqs, hex);
     }
-    if (readError || hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep)) {
-      gBad = gBad + 1;
+    const int parsed = readError ? HX_ERR_BUS
+                                 : hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep);
+    bool drop = parsed != HX_OK;
+    if (!drop && lineFilter && rep.count >= 4) {
+      bool sameX = true, sameY = true;
+      for (unsigned i = 1; i < rep.count; ++i) {
+        sameX = sameX && rep.point[i].x == rep.point[0].x;
+        sameY = sameY && rep.point[i].y == rep.point[0].y;
+      }
+      if (sameX || sameY) {
+        drop = true;
+        phantoms = phantoms + 1;
+        if (phantoms <= 8 || (phantoms & 1023) == 0)
+          IOLog("GuampTouch: phantom report %u dropped: %u points on one %s (%d,%d)\n", phantoms, rep.count, sameY ? "row" : "column",
+                rep.point[0].x, rep.point[0].y);
+      }
+    }
+    if (!drop && repeatMax && rep.count >= 3) {
+      bool same = rep.count == lastRep.count;
+      for (unsigned i = 0; same && i < rep.count; ++i)
+        same = rep.slot[i] == lastRep.slot[i] && rep.point[i].x == lastRep.point[i].x && rep.point[i].y == lastRep.point[i].y;
+      sameRun = same ? sameRun + 1 : 0;
+      lastRep = rep;
+      if (sameRun > repeatMax) {
+        drop = true;
+        repeats = repeats + 1;
+        if (repeats == 1 || (repeats & 1023) == 0)
+          IOLog("GuampTouch: repeated report dropped (%u, %u points identical %u times)\n", repeats, rep.count, sameRun);
+      }
+    }
+    if (parsed == HX_ERR_EMPTY) empties = empties + 1;
+    if (drop) {
+      if (parsed != HX_ERR_EMPTY) gBad = gBad + 1;
       // A lost "finger up" report left iOS with a stuck contact: release after 100 ms without a valid report.
       if (down && mach_absolute_time() - lastGood > releaseTicks) {
         struct hx_report up = {};
