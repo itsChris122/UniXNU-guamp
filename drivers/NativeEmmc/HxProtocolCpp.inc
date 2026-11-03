@@ -336,7 +336,15 @@ int hx_sense_on(struct hx_chip *c)
     if (hx_interface_on(c)) return HX_ERR_CHIP;
     hx_reg_write32(c, HX_ADDR_CTRL_FW_ISR, 0);
     sleep_ms(c, 10);
+    // guamp 03/11 (fin37): with the vendor 50 ms after the release the firmware ran but never did its reload (0x10007F00
+    // and 0x100072C0 stayed 0 for 2 s): electrode-grid coordinates (x up to 1325, y 20), no real finger. Linux zero-flash
+    // waits 10 ms (himax_mcu_pin_reset), TWRP: 37 ms from ic_reset to reload_to_active, "reload OK" 1 ms later.
+    const unsigned low = c->reset_low_ms, high = c->reset_high_ms;
+    c->reset_low_ms = c->sense_low_ms ? c->sense_low_ms : 20;
+    c->reset_high_ms = c->sense_high_ms ? c->sense_high_ms : 10;
     hx_pin_reset(c);
+    c->reset_low_ms = low;
+    c->reset_high_ms = high;
     return reload_to_active(c);
 }
 
@@ -349,14 +357,26 @@ int hx_start(struct hx_chip *c)
     // himax_mcu_read_FW_ver: sense on, wait until the firmware reports the reload (A3 3A at 0x10007F00 or C0 72 at
     // 0x100072C0, 10 ms polls, 200 at most), sense off, versions.
     c->stage = 21;
-    int r = hx_sense_on(c);
-    if (r) return r;
-    for (c->reload_polls = 0; c->reload_polls < 200; ++c->reload_polls) {
-        if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
-            return HX_ERR_BUS;
-        if ((c->reload1 & 0xFFFF) == 0x3AA3 || (c->reload2 & 0xFFFF) == 0x72C0) break;
-        sleep_ms(c, 10);
+    int r = HX_OK;
+    const unsigned tries = c->reload_tries ? c->reload_tries : 3;
+    unsigned total = 0;
+    int ok = 0;
+    for (c->reload_attempts = 1; c->reload_attempts <= tries && !ok; ++c->reload_attempts) {
+        if ((r = hx_sense_on(c)) != HX_OK) return r;
+        for (unsigned i = 0; i < 100; ++i, ++total) {
+            if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
+                return HX_ERR_BUS;
+            if ((c->reload1 & 0xFFFF) == 0x3AA3 || (c->reload2 & 0xFFFF) == 0x72C0) {ok = 1; break;}
+            sleep_ms(c, 10);
+        }
+        if (!ok && c->reload_attempts < tries) {
+            // Not reloaded: back to safe mode and the reload enable word, then sense on again.
+            if ((r = hx_sense_off(c)) != HX_OK) return r;
+            hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0);
+        }
     }
+    c->reload_attempts--;
+    c->reload_polls = ok ? total : 200;
     c->stage = 22;
     if ((r = hx_sense_off(c)) != HX_OK) return r;
     if (!hx_reg_read(c, HX_ADDR_FW_VER, d, 4)) {c->panel_ver = d[0]; c->fw_ver = (uint16_t)(d[1] << 8 | d[2]);}
@@ -450,13 +470,17 @@ int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *o
     for (unsigned i = 0; i < HX_EVENT_LEN; ++i) {sum += buf[i]; zero += buf[i] == 0;}
     out->count = 0;
     out->point_cnt = buf[HX_EVENT_POINT_CNT];
-    if (zero == HX_EVENT_LEN) return HX_OK;                                          // empty stack: no fingers (release)
+    if (zero == HX_EVENT_LEN) return HX_ERR_EMPTY;                                   // no data (not a release)
     if (sum & 0xFF) return HX_ERR_CHECKSUM;
+    {
+        const unsigned sel = (out->point_cnt >> 4) & 0x0F;                            // raw_data_sel
+        if (sel != 0x0F && sel != 0) return HX_ERR_CHECKSUM;                         // raw data frame, not coordinates
+    }
     if (out->point_cnt == 0xFF || !(out->point_cnt & 0x0F)) return HX_OK;           // all fingers up
     for (unsigned i = 0; i < HX_MAX_PT; ++i) {
         const uint8_t *p = buf + 4 * i;
         int x = p[0] << 8 | p[1], y = p[2] << 8 | p[3];
-        if (x > x_max || y > y_max) continue;                                         // 0xFFFF: slot not in use
+        if (x >= x_max || y > y_max) continue;                                        // 0xFFFF: slot not in use
         if (!x && !y) continue;                                                       // HX83102D leaves unused slots at 0,0
         out->slot[out->count] = (int)i;
         out->point[out->count].x = x;

@@ -92,6 +92,7 @@ extern "C" {
 #define HX_ERR_CRC (-74)
 #define HX_ERR_TIMEOUT (-110)
 #define HX_ERR_CHECKSUM (-84)
+#define HX_ERR_EMPTY (-61)          // all-zero event stack: no data (Linux "All Zero event", nothing reported)
 
 struct hx_bus {
     void *ctx;
@@ -117,6 +118,11 @@ struct hx_chip {
     int info_fallback;                  // 1: touch information was implausible, Linux values used
     uint8_t dbg_dummy[4], dbg_conti, dbg_incr4;   // last interface_on replies, for the boot log
     unsigned reset_low_ms, reset_high_ms;          // 0: vendor timing (20 ms low, 50 ms high)
+    // Sense on uses himax_mcu_pin_reset of the zero-flash build: 20 ms low, 10 ms high (HX_ZERO_FLASH), then reload to
+    // active at once. 0: those values.
+    unsigned sense_low_ms, sense_high_ms;
+    unsigned reload_tries;          // sense on attempts until "reload OK" (0: 3), each polled for 1 s
+    unsigned reload_attempts;       // attempts used (result)
     int reset_invert, reset_skip;                  // reset line active high / do not touch it
     // Download options (set by the owner before hx_download; 0 = the Linux sequence).
     int usb_in;                     // 1: tell the firmware a USB cable is in (himax_mcu_usb_detect_set, IN)
@@ -204,7 +210,9 @@ uint32_t hx_set_smwp(struct hx_chip *c, int on);
 int hx_parse_gesture(const uint8_t *buf);
 // One event stack read (HX_EVENT_LEN bytes) into buf.
 int hx_read_event(struct hx_chip *c, uint8_t *buf);
-// Parses an event stack. HX_OK, HX_ERR_CHECKSUM for a torn or empty stack. x_max/y_max bound valid coordinates.
+// Parses an event stack (himax_checksum_cal + himax_parse_report_points): HX_ERR_EMPTY for an all-zero stack,
+// HX_ERR_CHECKSUM for a torn one or a raw-data frame (high nibble of the point count byte neither F nor 0), HX_OK
+// otherwise. Valid points: x < x_max, y <= y_max (the chin row y = max is kept and clamped by the owner).
 int hx_parse_event(const uint8_t *buf, int x_max, int y_max, struct hx_report *out);
 
 #ifdef __cplusplus
