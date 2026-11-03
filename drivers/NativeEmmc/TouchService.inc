@@ -842,8 +842,8 @@ void thread(void *param, wait_result_t) {
   PE_parse_boot_argn("guamp-touch-flashfirst", &flashFirst, sizeof(flashFirst));
   if (!keepFw && flashFirst) {
     const int p = hx_reload_probe(&gChip, 100);
-    IOLog("GuampTouch: flash-first: reload %s (7f00 %08x 72c0 %08x, rc %d)%s\n", p == 1 ? "seen" : "not seen", gChip.reload1,
-          gChip.reload2, p, p == 1 ? ": no download, the chip's own firmware and config are used" : ", download");
+    IOLog("GuampTouch: flash-first: reload %s (7f00 %08x 72c0 %08x, rc %d, tight %u)%s\n", p == 1 ? "seen" : "not seen",
+          gChip.reload1, gChip.reload2, p, gChip.reload_tight, p == 1 ? ": no download, the chip's own firmware and config are used" : ", download");
     regDump("flashfirst");
     if (p == 1) keepFw = 2;
     else hx_sense_off(&gChip);
@@ -916,8 +916,8 @@ void thread(void *param, wait_result_t) {
     hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
     IOLog("GuampTouch: after start: central state %08x (05 = running), fw isr %08x, reload %08x\n", central, isr, reload);
     // Linux (TWRP): reload OK with data 9A A9 / 72 C0, PANEL_VER 18, FW_VER 1305, TOUCH_VER 6, DISPLAY_VER 0, CID 1206.
-    IOLog("GuampTouch: reload %s after %u polls, %u sense on (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
-          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_polls, gChip.reload_attempts, gChip.reload1, gChip.reload2, gChip.panel_ver,
+    IOLog("GuampTouch: reload %s after %u tight reads + %u polls, %u sense on (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
+          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_tight, gChip.reload_polls, gChip.reload_attempts, gChip.reload1, gChip.reload2, gChip.panel_ver,
           gChip.fw_ver, gChip.touch_cfg_ver, gChip.display_cfg_ver, gChip.cid_ver);
   }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);

@@ -354,11 +354,24 @@ static int reload_seen(const struct hx_chip *c)
     return a == 0x3AA3 || a == 0x9AA9 || (c->reload2 & 0xFFFF) == 0x72C0;
 }
 
+// The markers are transient (TWRP 03/11: zero again a few seconds later; Linux reads them within ~1 ms of
+// reload_to_active): read back to back, no sleep, right after the sense on.
+static int reload_tight(struct hx_chip *c)
+{
+    for (c->reload_tight = 0; c->reload_tight < 300; ++c->reload_tight) {
+        if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
+            return 0;
+        if (reload_seen(c)) return 1;
+    }
+    return 0;
+}
+
 int hx_reload_probe(struct hx_chip *c, unsigned polls)
 {
     int r;
     if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;
     if ((r = hx_sense_on(c)) != HX_OK) return r;
+    if (reload_tight(c)) return 1;
     for (unsigned i = 0; i < polls; ++i) {
         if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
             return HX_ERR_BUS;
@@ -383,7 +396,8 @@ int hx_start(struct hx_chip *c)
     int ok = 0;
     for (c->reload_attempts = 1; c->reload_attempts <= tries && !ok; ++c->reload_attempts) {
         if ((r = hx_sense_on(c)) != HX_OK) return r;
-        for (unsigned i = 0; i < 100; ++i, ++total) {
+        ok = reload_tight(c);
+        for (unsigned i = 0; !ok && i < 100; ++i, ++total) {
             if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
                 return HX_ERR_BUS;
             if (reload_seen(c)) {ok = 1; break;}

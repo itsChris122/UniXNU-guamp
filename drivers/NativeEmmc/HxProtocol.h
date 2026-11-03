@@ -136,6 +136,7 @@ struct hx_chip {
     uint32_t recode_crc;            // hardware CRC of the second firmware write (0 = ok)
     uint32_t reload1, reload2;      // HX_ADDR_FLASH_RELOAD / HX_ADDR_2ND_FLASH_RELOAD at "reload OK"
     unsigned reload_polls;          // 10 ms polls until reload OK (200 = never)
+    unsigned reload_tight;          // back-to-back reads right after reload to active before the markers (300 = none)
     uint32_t ovl_seen;              // handshake word when the overlay swap stopped waiting
     unsigned ovl_wait_ms;           // how long it waited for the firmware's request
     uint8_t panel_ver, touch_cfg_ver, display_cfg_ver;
