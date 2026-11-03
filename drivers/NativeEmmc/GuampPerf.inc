@@ -175,6 +175,14 @@ extern "C" struct arm_saved_state *get_user_regs(thread_t);
 extern "C" struct proc *proc_find(int);
 extern "C" int proc_rele(struct proc *);
 extern "C" processor_t thread_bind(processor_t);   // kern/sched_prim.h (MACH_KERNEL_PRIVATE part)
+// guamp-prof-kernel=1 (default while guamp-prof is on, 03/11; =0 off): the same ticks also sample kernel_task threads: the
+// interrupted kernel PC and its caller (kern/backtrace.h, BTF_KERN_INTERRUPTED as kperf does), idle threads excluded, one
+// "GuampKprof" line per round with unslid addresses (resolve them with the kernel.macho symbols). For kernel_task at
+// 25-40 % of a core at rest (GuampCpu) and the GuampKthr thread list of zzzz...-guamp-sched-big.patch.
+#include <kern/backtrace.h>
+// zzzz...-guamp-sched-big.patch (osfmk/kern/sched_prim.c); this weak copy answers "not idle" in a kernel without it.
+extern "C" int guamp_sys_current_is_idle(void);
+extern "C" __attribute__((weak)) int guamp_sys_current_is_idle(void) { return 0; }
 namespace guampprof {
 constexpr unsigned kCpus = 8, kTargets = 3, kSlots = 128, kTids = 8;
 struct Hist { uint64_t pc[kSlots]; uint32_t n[kSlots]; uint64_t tid[kTids]; uint32_t tidN[kTids]; uint32_t total, lost; };
@@ -188,6 +196,8 @@ static uint64_t gPeriod;
 static uint32_t gPauseMs = 19000;   // guamp-prof=2: 1000
 static timer_call_data_t gCall[kCpus];
 static bool gStarted;
+static Hist gKHist[kCpus], gKCaller[kCpus];   // kernel_task: interrupted PC, its caller
+static uint32_t gKernel = 1;                  // guamp-prof-kernel
 
 static void record(Hist &h, uint64_t pc, uint64_t tid) {
   h.total = h.total + 1;
@@ -219,6 +229,13 @@ static void tick(timer_call_param_t p0, timer_call_param_t) {
       if (rs && rs->ash.flavor == ARM_SAVED_STATE64) record(gHist[cpu][k], rs->ss_64.pc, thread_tid(th));
       break;
     }
+  } else if (task && gKernel && !guamp_sys_current_is_idle()) {
+    uintptr_t bt[2] = {};
+    struct backtrace_control ctl = BTCTL_INIT;
+    ctl.btc_flags = BTF_KERN_INTERRUPTED;
+    const unsigned n = backtrace(bt, 2, &ctl, nullptr);
+    if (n >= 1) record(gKHist[cpu], VM_KERNEL_UNSLIDE(bt[0]), thread_tid(th));
+    if (n >= 2) record(gKCaller[cpu], VM_KERNEL_UNSLIDE(bt[1]), thread_tid(th));
   }
   timer_call_enter(&gCall[cpu], mach_absolute_time() + gPeriod, TIMER_CALL_LOCAL | TIMER_CALL_SYS_CRITICAL);
 }
@@ -283,6 +300,36 @@ static void report(unsigned k) {
   IOLog("%s\n", line);
 }
 
+// One line for the kernel_task samples of the round: the six most frequent PCs (h = gKHist) or callers (h = gKCaller).
+static void reportKernel(Hist (&h)[kCpus], const char *what) {
+  unsigned used = 0;
+  uint32_t total = 0, lost = 0;
+  for (unsigned c = 0; c < kCpus; c = c + 1) {
+    total += h[c].total;
+    lost += h[c].lost;
+    for (unsigned s = 0; s < kSlots; s = s + 1) {
+      if (!h[c].n[s]) continue;
+      unsigned j = 0;
+      while (j < used && gPcs[j] != h[c].pc[s]) j = j + 1;
+      if (j == used) { gPcs[j] = h[c].pc[s]; gNs[j] = 0; used = used + 1; }
+      gNs[j] += h[c].n[s];
+    }
+  }
+  if (!total) return;
+  char line[480];
+  int len = snprintf(line, sizeof(line), "GuampKprof: kernel_task %s, samples %u (lost %u, 8 CPUs x 100 per s):", what, total, lost);
+  for (unsigned r = 0; r < 6 && len > 0 && static_cast<size_t>(len) < sizeof(line); r = r + 1) {
+    unsigned best = used;
+    for (unsigned j = 0; j < used; j = j + 1)
+      if (gNs[j] && (best == used || gNs[j] > gNs[best])) best = j;
+    if (best == used) break;
+    len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " 0x%llx %u%%",
+                    static_cast<unsigned long long>(gPcs[best]), gNs[best] * 100 / total);
+    gNs[best] = 0;
+  }
+  IOLog("%s\n", line);
+}
+
 static void loop(void *, wait_result_t) {
   for (;;) {
     IOSleep(gPauseMs < 19000 ? 500 : 10000);
@@ -294,6 +341,8 @@ static void loop(void *, wait_result_t) {
     }
     if (!any) continue;
     bzero(gHist, sizeof(gHist));
+    bzero(gKHist, sizeof(gKHist));
+    bzero(gKCaller, sizeof(gKCaller));
     gActive = 1;
     for (unsigned c = 0; c < kCpus; c = c + 1) {
       processor_t pr = cpu_to_processor(static_cast<int>(c));
@@ -309,6 +358,10 @@ static void loop(void *, wait_result_t) {
     IOSleep(40);
     for (unsigned k = 0; k < kTargets; k = k + 1)
       if (gPid[k] > 0) report(k);
+    if (gKernel) {
+      reportKernel(gKHist, "PC");
+      reportKernel(gKCaller, "caller");
+    }
     IOSleep(gPauseMs);
   }
 }
@@ -320,6 +373,7 @@ static void setTargets(const int *pids, const char (*names)[20], unsigned n) {
     unsigned v = 0;
     enabled = PE_parse_boot_argn("guamp-prof", &v, sizeof(v)) && (v == 1 || v == 2);
     if (enabled && v == 2) gPauseMs = 500;
+    PE_parse_boot_argn("guamp-prof-kernel", &gKernel, sizeof(gKernel));
   }
   if (!enabled) return;
   unsigned k = 0;
@@ -368,6 +422,7 @@ static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
   guampprof::setTargets(top.cpuPid, top.cpuName, 6);
 }
 extern char guamp_cpufreq_summary[2][160];   // GuampCpufreq.inc
+void guamp_cpufreq_live();                      // GuampCpufreq.inc
 // zzy-native-gpu-addon-mount.patch (kern_exec.c, always in the series): GPU addon install below /private/var/ngpu and the union
 // mounts over /System/Library/Extensions (plugin), /System/Library/LaunchDaemons (adrenoprobed job) and the wallpaper.
 extern "C" volatile int native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed,
@@ -412,6 +467,7 @@ static void guampPerfSample() {
     if (cpufreqRound % 6 == 1)
       for (unsigned d = 0; d < 2; ++d)
         if (guamp_cpufreq_summary[d][0]) IOLog("GuampCpufreq: %s\n", guamp_cpufreq_summary[d]);
+    if (cpufreqRound % 6 == 1) guamp_cpufreq_live();
     if (cpufreqRound % 6 == 1 && cpufreqRound < 20)
       IOLog("GuampGpuAddon: files %d written %d same %d failed %d error %d; extensions stage %d status %d, launchdaemons stage %d "
             "status %d, wallpaper stage %d status %d\n", native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same,

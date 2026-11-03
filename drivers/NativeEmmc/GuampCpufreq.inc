@@ -14,6 +14,7 @@
 
 // One line per domain kept for GuampPerf, which prints it every minute (the boot-time lines precede the USB log mirror).
 char guamp_cpufreq_summary[2][160];
+void guamp_cpufreq_live();   // GuampPerf, every minute after the summary
 
 namespace cpufreq {
 constexpr uint64_t kDomainPhys[2] = {0x0f521000ULL, 0x0f523000ULL};
@@ -21,6 +22,14 @@ constexpr uint32_t kEnable = 0x0, kFreqLut = 0x110, kVoltLut = 0x114, kPerfState
 constexpr uint32_t kXoKhz = 19200;
 static const char *const kNames[2] = {"silver cpu0-3", "gold cpu4-7"};
 
+// Live check (03/11, guamp-cpufreq-live=1 default, =0 off): every minute one line per domain with the PERF_STATE request
+// read back, the LMh limit register (DT qcom,limits-dcvs: msm_lmh_dcvs.c reads domain + 0x704, frequency = bits 9:0 x XO) and
+// the domain cycle counter (REG_CYCLE_CNTR 0x9c0; bengal has qcom,no-accumulative-counter = one counter per domain) as average
+// MHz since the previous line. Only reads: whether the cores really run at the state we asked for, or the hardware limits them.
+constexpr uint32_t kLmhReq = 0x704, kCycles = 0x9c0;
+static volatile uint8_t *gBase[2];
+static uint32_t gKhz[2][kMaxRows], gRows[2], gLastCycles[2];
+static uint64_t gLastNs[2];
 static uint32_t rd(volatile uint8_t *b, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(b + off); }
 static void wr(volatile uint8_t *b, uint32_t off, uint32_t v) {
   *reinterpret_cast<volatile uint32_t *>(b + off) = v;
@@ -38,6 +47,7 @@ void start() {
       IOLog("GuampCpufreq: %s mapping failed\n", kNames[d]);
       continue;
     }
+    gBase[d] = b;
     uint32_t khz[kMaxRows] = {}, cores[kMaxRows] = {}, mv[kMaxRows] = {};
     unsigned rows = 0;
     for (unsigned i = 0; i < kMaxRows; ++i) {
@@ -52,6 +62,8 @@ void start() {
         break;
       }
     }
+    gRows[d] = rows;
+    for (unsigned i = 0; i < rows; ++i) gKhz[d][i] = khz[i];
     const uint32_t maxCores = rows ? cores[0] : 0;
     int highest = -1;
     for (unsigned i = 0; i < rows; ++i)
@@ -88,3 +100,28 @@ void start() {
   }
 }
 }  // namespace cpufreq
+
+void guamp_cpufreq_live() {
+  using namespace cpufreq;
+  static int enabled = -1;
+  if (enabled < 0) {
+    unsigned v = 1;
+    PE_parse_boot_argn("guamp-cpufreq-live", &v, sizeof(v));
+    enabled = v ? 1 : 0;
+  }
+  if (!enabled) return;
+  for (unsigned d = 0; d < 2; ++d) {
+    volatile uint8_t *b = gBase[d];
+    if (!b) continue;
+    const uint32_t state = rd(b, kPerfState), lmh = rd(b, kLmhReq), cycles = rd(b, kCycles);
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    const uint64_t span = gLastNs[d] && now > gLastNs[d] ? now - gLastNs[d] : 0;
+    const uint32_t delta = cycles - gLastCycles[d];   // 32-bit counter, wraps
+    gLastNs[d] = now;
+    gLastCycles[d] = cycles;
+    IOLog("GuampCpufreq: %s live: state %u (%u MHz), LMh limit reg %08x (%u MHz), cycle counter %08x avg %llu MHz over %llu ms\n",
+          kNames[d], state, state < gRows[d] ? gKhz[d][state] / 1000 : 0, lmh, (lmh & 0x3ffu) * kXoKhz / 1000, cycles,
+          span ? static_cast<unsigned long long>(delta) * 1000ULL / span : 0ULL, static_cast<unsigned long long>(span / 1000000ULL));
+  }
+}
