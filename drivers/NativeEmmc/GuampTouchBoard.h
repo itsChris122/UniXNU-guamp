@@ -92,6 +92,22 @@
 #define GT_INTF_TIMING_ENGINE_EN 0x000        // sde_hw_intf.c
 #define GT_INTF_FRAME_COUNT 0x0ac
 
+// guamp-touch-hwcfg=1 (TouchService.inc, namespace hwcfg): configurazione hardware come la usa Linux.
+// Fonti: dtbo_a/b fragment@29/30/31 (pmx_ts_*, qupv3_se2_spi_sleep, himax_0flash_ts@0), boot dtb pmx_sde/pmx_sde_te,
+// pinctrl-msm.c msm_gpio_irq_set_type (intr_detection_width 2: EDGE_FALLING = detection 2 + polarity bit),
+// pinctrl-sm6115.c PINGROUP(81, WEST, mdp_vsync_out_0, mdp_vsync_out_1, mdp_vsync, ...) = funzione 3,
+// spi-geni-qcom.c SE_SPI_PRE_POST_CMD_DLY 0x274, SE_SPI_DELAY_COUNTERS 0x278, SE_SPI_SLAVE_EN 0x2bc.
+#define GT_DRIVE_2MA 0                        // drive-strength = <2>
+#define GT_FUNC_MDP_VSYNC 3                   // sde_te_active: gpio81 function "mdp_vsync"
+#define GT_INTR_ENABLE (1u<<0)                // intr_cfg +8
+#define GT_INTR_POLARITY (1u<<1)
+#define GT_INTR_DET_SHIFT 2                   // 2 bit: 0 livello, 1 salita, 2 discesa, 3 entrambi
+#define GT_INTR_RAW_STATUS (1u<<4)
+#define GT_INTR_TARGET_SHIFT 5                // 3 bit, 3 = processore applicativo (intr_target_kpss_val)
+#define GT_SE_SPI_PRE_POST_CMD_DLY 0x274
+#define GT_SE_SPI_DELAY_COUNTERS 0x278
+#define GT_SE_SPI_SLAVE_EN 0x2bc
+
 static inline uint32_t gt_pin(unsigned gpio) {return (uint32_t)gpio * GT_GPIO_STRIDE;}
 static inline uint32_t gt_pin_cfg(unsigned func, unsigned drive_code, unsigned pull) {
     return (pull & 3u) | (func & 15u) << 2 | (drive_code & 7u) << 6;       // pull 0 none, 1 down, 3 up
