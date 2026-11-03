@@ -46,6 +46,28 @@ extern "C" {
 #define HX_ADDR_XY_RES_ENABLE 0x100070F8u
 #define HX_ADDR_XY_RES 0x100070FCu
 #define HX_ADDR_INT_IS_EDGE 0x10007088u
+// Firmware handshake words in DSRAM (himax_ic_core.h fw_addr_* / ovl_*, HX83102D support file): the download leaves them
+// in a known state before the first sense on, as himax_zf_part_info and himax_mcu_power_on_init do.
+#define HX_ADDR_SORTING_MODE 0x10007F04u     // fw_addr_sorting_mode_en: 0 = normal coordinate reporting
+#define HX_ADDR_SMWP_ENABLE 0x10007F10u      // fw_addr_smwp_enable: 0 = no smart wake-up (gesture) mode
+#define HX_ADDR_USB_DETECT 0x10007F38u       // fw_usb_detect_addr: A55AA55A = cable in, 0 = out
+#define HX_ADDR_FW_DBG_MSG 0x10007F40u       // fw_addr_fw_dbg_msg_addr (diagnostics only)
+#define HX_ADDR_OVL_HANDSHAKE 0x10007FFCu    // ovl_handshaking_addr: driver reply after loading a code overlay
+#define HX_ADDR_2ND_FLASH_RELOAD 0x100072C0u // driver_addr_fw_define_2nd_flash_reload: reads C0 72 once reloaded
+#define HX_ADDR_FW_VER 0x10007004u           // fw_addr_fw_ver_addr: panel ver, fw ver hi, lo
+#define HX_ADDR_FW_CFG 0x10007084u           // fw_addr_fw_cfg_addr: touch cfg ver [2], display cfg ver [3]
+#define HX_ADDR_FW_VENDOR 0x10007000u        // fw_addr_fw_vendor_addr: CID major [2], minor [3]
+#define HX_ADDR_FW_STATE 0x900000F8u         // fw_addr_fw_state_addr (diagnostics only)
+#define HX_ADDR_RAW_OUT_SEL 0x800204F4u      // hx83102d_fw_addr_raw_out_sel: 0 = no raw data output
+#define HX_HANDSHAKE_PWD 0xA55AA55Au         // fw_func_handshaking_pwd
+// Overlay handshake values (himax_ic_core.h, HX83102D): the firmware requests, the driver replies.
+#define HX_OVL_GESTURE_REQUEST 0x11
+#define HX_OVL_GESTURE_REPLY 0x22
+#define HX_OVL_BORDER_REQUEST 0x55
+#define HX_OVL_BORDER_REPLY 0x66
+#define HX_OVL_SORTING_REQUEST 0x99
+#define HX_OVL_SORTING_REPLY 0xAA
+#define HX_OVL_FAULT 0xFF
 // Zero-flash image (himax_zf_part_info): a 64 KiB firmware followed by a partition table of 16-byte entries
 // {SRAM address LE32, size LE32, offset in the file LE32, reserved}; byte 12 of the first entry is the partition count.
 // Some images carry an extra 1 KiB header first (bytes 0..7 zero and byte 0x0E = 0x87).
@@ -96,6 +118,20 @@ struct hx_chip {
     uint8_t dbg_dummy[4], dbg_conti, dbg_incr4;   // last interface_on replies, for the boot log
     unsigned reset_low_ms, reset_high_ms;          // 0: vendor timing (20 ms low, 50 ms high)
     int reset_invert, reset_skip;                  // reset line active high / do not touch it
+    // Download options (set by the owner before hx_download; 0 = the Linux sequence).
+    int usb_in;                     // 1: tell the firmware a USB cable is in (himax_mcu_usb_detect_set, IN)
+    int ovl_force;                  // >0: load this partition index as the code overlay instead of the border one
+    int no_recode;                  // 1: skip the second write of the firmware entity (Linux does it, see hx_download)
+    // Results for the boot log.
+    int ovl_loaded;                 // partition index of the code overlay written, -1 none
+    uint8_t ovl_reply;              // reply written to HX_ADDR_OVL_HANDSHAKE
+    uint32_t ovl_handshake;         // read back
+    uint32_t usb_word, smwp_word, sort_word;     // read back after writing
+    uint32_t recode_crc;            // hardware CRC of the second firmware write (0 = ok)
+    uint32_t reload1, reload2;      // HX_ADDR_FLASH_RELOAD / HX_ADDR_2ND_FLASH_RELOAD at "reload OK"
+    unsigned reload_polls;          // 10 ms polls until reload OK (200 = never)
+    uint8_t panel_ver, touch_cfg_ver, display_cfg_ver;
+    uint16_t fw_ver, cid_ver;
 };
 
 struct hx_zf_part {uint32_t sram, size, offset;};
@@ -106,7 +142,11 @@ struct hx_fw {
     unsigned count;                 // partitions, entry 0 = the firmware itself
     struct hx_zf_part part[HX_ZF_MAX_PARTS];
     uint32_t cfg_base, cfg_size;    // the packed config window (entries 1..count-1)
-    int overlay;                    // first non-empty code overlay entry (SRAM 0x2xxxxxxx after the firmware), -1 if none
+    // Code overlays (HX_CODE_OVERLAY, hx_parse_bin_cfg_data): table entries whose bytes 14..15 are 66 55 carry their
+    // type in byte 13 (0 sorting, 1 gesture, 2 border); older images mark them by the SRAM address 0x20008CE0 instead
+    // and get their type from the order. -1: no such entry.
+    int ovl[3];
+    int overlay;                    // the overlay the boot loads: ovl[2] (border, normal touch), as himax_zf_part_info
 };
 
 struct hx_point {int x, y, w;};
@@ -137,11 +177,15 @@ int hx_interface_on(struct hx_chip *c);
 int hx_sense_off(struct hx_chip *c);
 // Reset, safe mode, chip id. HX_OK when the id is 83 10 2D.
 int hx_identify(struct hx_chip *c);
-// The zero-flash download: system reset, safe mode, firmware and config to SRAM with hardware CRC checks, frame setting,
-// flash reload enable. Then hx_start.
+// The zero-flash download (himax_mcu_firmware_update_0f + himax_zf_part_info, HX83102D): system reset, safe mode,
+// firmware and config to SRAM with hardware CRC checks, firmware again, SMWP off / cable state, the border code overlay
+// and its handshake reply, raw out / sorting mode cleared, frame setting. Then hx_start.
 int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg_scratch);
-// Touch information, then sense on (pin reset, reload to active). HX_OK once the firmware reports active.
+// After the download (himax_mcu_0f_operation): reload enable, sense on, wait for "reload OK", sense off, versions and
+// touch information, sense on again. HX_OK once the firmware reports active.
 int hx_start(struct hx_chip *c);
+// Sense on as himax_hx83102d_sense_on(0): interface on, clear the ISR, pin reset, reload to active.
+int hx_sense_on(struct hx_chip *c);
 // One event stack read (HX_EVENT_LEN bytes) into buf.
 int hx_read_event(struct hx_chip *c, uint8_t *buf);
 // Parses an event stack. HX_OK, HX_ERR_CHECKSUM for a torn or empty stack. x_max/y_max bound valid coordinates.

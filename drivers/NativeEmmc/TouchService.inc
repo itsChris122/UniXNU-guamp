@@ -6,6 +6,9 @@
 // Boot argument guamp-touch=<n>: 1 read only, 2 clocks and pins, 3 SPI and chip id, 4 firmware, start and events.
 // guamp-touch-panel=0 skips the read-only panel power probe (SPMI L9A/LCDB, MDSS INTF1); guamp-touch-verbose=1 logs
 // every identify variant; guamp-touch-scan=1 / guamp-touch-linuxseq=1 run bit-banged diagnostics when identify fails.
+// Stage 4: guamp-touch-usb=0|1 (cable state told to the firmware, default 1), guamp-touch-ovl=<partition> (boot code
+// overlay, default the border one), guamp-touch-recode=0, guamp-touch-diag=<n> (raw stack of the first n interrupts and
+// firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
@@ -688,6 +691,28 @@ void publish(const struct hx_report &r) {
   }
 }
 
+// Firmware status words (diagnostics, guamp-touch-diag): central state 900000A8 (05 running), fw state 900000F8, ISR
+// 9000005C, reload 90000048 (01EC), overlay handshake 10007FFC (11/55/99 = the firmware requests an overlay, 22/66/AA
+// = reply), sorting 10007F04, SMWP 10007F10, USB 10007F38, debug message 10007F40 (4 words), raw out 800204F4.
+void logStatus(uint32_t polls) {
+  uint32_t cs = 0, st = 0, isr = 0, rl = 0, hs = 0, so = 0, sm = 0, usb = 0, raw = 0;
+  uint8_t dbg[16] = {};
+  hx_reg_read32(&gChip, HX_ADDR_CENTRAL_STATE, &cs);
+  hx_reg_read32(&gChip, HX_ADDR_FW_STATE, &st);
+  hx_reg_read32(&gChip, HX_ADDR_CTRL_FW_ISR, &isr);
+  hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &rl);
+  hx_reg_read32(&gChip, HX_ADDR_OVL_HANDSHAKE, &hs);
+  hx_reg_read32(&gChip, HX_ADDR_SORTING_MODE, &so);
+  hx_reg_read32(&gChip, HX_ADDR_SMWP_ENABLE, &sm);
+  hx_reg_read32(&gChip, HX_ADDR_USB_DETECT, &usb);
+  hx_reg_read32(&gChip, HX_ADDR_RAW_OUT_SEL, &raw);
+  hx_reg_read(&gChip, HX_ADDR_FW_DBG_MSG, dbg, sizeof(dbg));
+  IOLog("GuampTouch: status poll %u irqs %u: central %08x fwstate %08x isr %08x reload %08x ovl-hs %08x sort %08x smwp %08x "
+        "usb %08x rawout %08x dbg %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n", polls, gIrqs, cs, st,
+        isr, rl, hs, so, sm, usb, raw, dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], dbg[6], dbg[7], dbg[8], dbg[9], dbg[10],
+        dbg[11], dbg[12], dbg[13], dbg[14], dbg[15]);
+}
+
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
@@ -722,10 +747,27 @@ void thread(void *param, wait_result_t) {
   if (!keepFw) {
     struct hx_fw fw;
     r = hx_fw_parse(&fw, fwData, fwSize);
-    IOLog("GuampTouch: firmware %u bytes, %u partitions, overlay %d (rc %d)\n", fwSize, fw.count, fw.overlay, r);
+    IOLog("GuampTouch: firmware %u bytes, %u partitions, overlay %d (sorting %d gesture %d border %d) (rc %d)\n", fwSize,
+          fw.count, fw.overlay, fw.ovl[0], fw.ovl[1], fw.ovl[2], r);
     if (r) { fail(4, r); return; }
+    // guamp 03/11 (fin36): the firmware ran (central 05) with interrupts at ~0.9 Hz and an always empty event stack.
+    // Differences with himax_zf_part_info (HX83102D): overlay 11 (gesture, smart wake-up) loaded instead of 12 (border),
+    // no overlay reply 0x66 at 0x10007FFC, SMWP / USB / sorting words left as found, no second firmware write.
+    // guamp-touch-usb=0|1 (default 1, as TWRP with the cable in), guamp-touch-ovl=<partition> (11 = the old choice),
+    // guamp-touch-recode=0 (skip the second firmware write).
+    unsigned v = 1;
+    PE_parse_boot_argn("guamp-touch-usb", &v, sizeof(v));
+    gChip.usb_in = v != 0;
+    v = 0;
+    if (PE_parse_boot_argn("guamp-touch-ovl", &v, sizeof(v))) gChip.ovl_force = static_cast<int>(v);
+    v = 1;
+    PE_parse_boot_argn("guamp-touch-recode", &v, sizeof(v));
+    gChip.no_recode = v == 0;
     r = hx_download(&gChip, &fw, gCfg);
     IOLog("GuampTouch: download rc %d stage %d cfg crc hw %08x sw %08x\n", r, gChip.stage, gChip.cfg_crc_hw, gChip.cfg_crc_sw);
+    IOLog("GuampTouch: overlay loaded %d reply %02x handshake %08x | recode %s crc %08x | smwp %08x usb %08x (%s) sort %08x\n",
+          gChip.ovl_loaded, gChip.ovl_reply, gChip.ovl_handshake, gChip.no_recode ? "off" : "on", gChip.recode_crc,
+          gChip.smwp_word, gChip.usb_word, gChip.usb_in ? "in" : "out", gChip.sort_word);
     if (r) { fail(41, r); return; }
   } else {
     IOLog("GuampTouch: keepfw: no download, the firmware already in the chip is used\n");
@@ -737,6 +779,10 @@ void thread(void *param, wait_result_t) {
     hx_reg_read32(&gChip, HX_ADDR_CTRL_FW_ISR, &isr);
     hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
     IOLog("GuampTouch: after start: central state %08x (05 = running), fw isr %08x, reload %08x\n", central, isr, reload);
+    // Linux (TWRP): reload OK with data 9A A9 / 72 C0, PANEL_VER 18, FW_VER 1305, TOUCH_VER 6, DISPLAY_VER 0, CID 1206.
+    IOLog("GuampTouch: reload %s after %u polls (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
+          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_polls, gChip.reload1, gChip.reload2, gChip.panel_ver,
+          gChip.fw_ver, gChip.touch_cfg_ver, gChip.display_cfg_ver, gChip.cid_ver);
   }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);
   if (r) { fail(42, r); return; }
@@ -753,6 +799,13 @@ void thread(void *param, wait_result_t) {
   uint8_t lastRaw[HX_EVENT_LEN] = {};
   unsigned rawLeft = 64;
   PE_parse_boot_argn("guamp-touch-raw", &rawLeft, sizeof(rawLeft));
+  // guamp-touch-diag=<n> (default 16): the whole event stack of the first n interrupts, zeros included, and the firmware
+  // status words with every "polls" line. guamp-touch-irqonly=1: read the stack only after an interrupt (as Linux does)
+  // instead of every 20 ms as well.
+  unsigned diagLeft = 16, irqOnly = 0;
+  PE_parse_boot_argn("guamp-touch-diag", &diagLeft, sizeof(diagLeft));
+  PE_parse_boot_argn("guamp-touch-irqonly", &irqOnly, sizeof(irqOnly));
+  const bool diag = diagLeft != 0;
   uint32_t seen = gIrqEvents;
   bool down = false;
   uint32_t polls = 0;
@@ -764,16 +817,27 @@ void thread(void *param, wait_result_t) {
       assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, 20, 1000 * 1000);
       if (gIrqEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
       else thread_block(THREAD_CONTINUE_NULL);
-      seen = gIrqEvents;
     } else {
       IOSleep(10);
     }
+    const bool fromIrq = useIrq && gIrqEvents != seen;
+    seen = gIrqEvents;
     polls = polls + 1;
-    if (polls == 50 || (polls & 2047) == 0)
+    if (polls == 50 || (polls & 2047) == 0) {
       IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad, gReleases,
             gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback);
+      if (diag) logStatus(polls);
+    }
+    if (irqOnly && useIrq && !fromIrq) continue;
     struct hx_report rep;
     const int readError = hx_read_event(&gChip, ev);
+    if (diagLeft && fromIrq) {
+      diagLeft--;
+      char hex[3 * HX_EVENT_LEN + 1] = "";
+      for (unsigned i = 0; i < sizeof(ev); i++) snprintf(hex + 3 * i, 4, "%02x ", ev[i]);
+      IOLog("GuampTouch: diag irq %u poll %u rc %d: %s\n", gIrqs, polls, readError, hex);
+      if (diagLeft < 4 || (diagLeft & 3) == 0) logStatus(polls);
+    }
     if (rawLeft && !readError && memcmp(ev, lastRaw, sizeof(ev))) {
       rawLeft--;
       memcpy(lastRaw, ev, sizeof(ev));
