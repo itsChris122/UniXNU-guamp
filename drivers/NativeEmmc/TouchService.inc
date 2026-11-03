@@ -10,6 +10,8 @@
 // overlay, default the border one), guamp-touch-recode=0, guamp-touch-diag=<n> (raw stack of the first n interrupts and
 // firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
 // guamp-touch-wake=1 (default 0): tap-to-wake with the screen off, see the "wake" block before thread().
+// guamp-touch-events=1|2 (default 0): la catena display -> touch di Linux (resume con download completo a ogni
+// accensione del display di iOS, suspend allo spegnimento), vedi il blocco "events" dopo displayState().
 // guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
@@ -624,6 +626,39 @@ void displayState(bool on) {
   __atomic_fetch_add(&gDisplayGen, 1, __ATOMIC_RELEASE);
   thread_wakeup((event_t)&gIrqEvents);
 }
+// guamp-touch-events (default 0): la catena display -> touch del kernel Motorola (TWRP: himax_v3_mmi_hx83102d, guamp-
+// default.config: HX_ZERO_FLASH, HX_RESUME_SET_FW, HX_RESUME_HW_RESET, HX_SMART_WAKEUP con SMWP_enable 0, niente
+// panel notifier MMI) riprodotta sugli stati del display di iOS.
+// Linux: himax_fb_register (2,5 s dopo il probe) registra drm_notifier_callback sul drm_panel del dtbo ("panel" del nodo
+// himax_0flash_ts). sde_kms.c _sde_kms_drm_check_dpms manda DRM_PANEL_EARLY_EVENT_BLANK in sde_kms_prepare_commit
+// (PRIMA di dsi_panel_power_on / reset / on-command 11-29 e del video) e DRM_PANEL_EVENT_BLANK dopo il kickoff; per
+// l HX83102D conta solo l EARLY (l altro e escluso da #if):
+//   POWERDOWN  himax_common_suspend -> _himax_chip_common_suspend (SMWP 0): int disable, report_all_leave, niente reset
+//              ne alimentazione; poi il pannello fa off-command 28/10 e post_unprepare.
+//   UNBLANK    himax_common_resume -> himax_resume_thread_func: lavoro ritardato di 60 ms (HX83102D), in parallelo col
+//              power on / reset / on-command del pannello -> _himax_chip_common_resume: se suspended == false "It had
+//              entered resume, skip" (nessun resume implicito alla prima accensione dopo il probe: in TWRP il pannello
+//              si accende a 2,72 s, il probe e a 4,4 s, il notifier a 7,9 s), altrimenti fp_0f_operation_dirly
+//              (int disable, himax_mcu_firmware_update_0f = system reset, sense off, SRAM + CRC, config, overlay di
+//              bordo, smwp/usb), fp_reload_disable = hx_dis_rload_0f (0x10007F00 <- 0x00009AA9 qualunque argomento),
+//              fp_sense_on(0) (ic_reset a pin + reload_to_active), controllo 0x900000A8 == 05 (altrimenti
+//              resume_update_fail e nuovo tentativo al resume dopo), fp_resend_cmd_func (SMWP off, cavo USB),
+//              report_all_leave, resume_ic_action (vuota con HX_RESUME_HW_RESET), int enable.
+// Qui GuampBacklight chiama displayEvent() dal suo work loop PRIMA dell on-command / del primo livello > 0 (EARLY
+// UNBLANK) e prima del livello 0 (EARLY POWERDOWN); il thread del touch esegue la sequenza. 1: resume anche alla prima
+// accensione di iOS (il primo livello > 0 di backboardd: il pannello di UEFI non ha mai visto la catena); 2: fedele a
+// Linux (prima accensione ignorata, resume solo dopo uno spegnimento). guamp-touch-events-delay=<ms> (default 60),
+// guamp-touch-events-rl=0 scrive 0 in 0x10007F00 (come hx_start) invece di 9AA9, guamp-touch-events-dsi=0 non manda
+// off/on-command al pannello (default 1: 28/10 dopo il livello 0, 11/29 prima del primo livello, come guamp-touch-wake).
+// Escluso con guamp-touch-wake armato (ha il suo suspend/resume con SMWP). Non tocca il ciclo del pannello.
+volatile uint32_t gEventsMode, gEventsDsi = 1, gEvGen, gEvOn = 1;
+void displayEvent(bool on) {
+  if (!gEventsMode) return;
+  gEvOn = on ? 1u : 0u;
+  const uint32_t gen = __atomic_add_fetch(&gEvGen, 1, __ATOMIC_RELEASE);
+  IOLog("GuampTouch: events: display %s (early, gen %u)\n", on ? "on" : "off", gen);
+  thread_wakeup((event_t)&gIrqEvents);
+}
 unsigned gWakeWait = 500, gWakeForce = 1;
 void logSwap(const char *what, int r) {
   uint32_t cs = 0;
@@ -967,6 +1002,62 @@ void dump(const uint8_t *ev) {
 }
 }  // namespace rawdump
 
+// guamp-touch-events: suspend / resume del driver Linux (vedi displayEvent). L interrupt si maschera nel TLMM come
+// himax_int_enable(0) e si riattiva a fine resume con lo stato azzerato.
+unsigned gEvDelay = 60, gEvReloadWord = 0x00009AA9u;
+volatile uint32_t gEvResumes, gEvSuspends;
+void evIrq(bool on) {
+  if (!gIrqPin) return;
+  const uint32_t cfg = gIrqPin[0x8 / 4];
+  if (!on) { gIrqPin[0x8 / 4] = cfg & ~1u; __asm__ volatile("dsb sy" ::: "memory"); return; }
+  gIrqPin[0xc / 4] = 0;
+  __asm__ volatile("dsb sy" ::: "memory");
+  gIrqPin[0x8 / 4] = cfg | 1u;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+void evSuspend(bool useIrq) {
+  if (useIrq) evIrq(false);
+  struct hx_report up = {};
+  publish(up);                                          // himax_report_all_leave_event
+  gEvSuspends = gEvSuspends + 1;
+  IOLog("GuampTouch: events: suspend %u (display off): irq %s, contacts released, chip left running (SMWP 0)\n",
+        gEvSuspends, useIrq ? "masked" : "polling paused");
+}
+// Restituisce lo stato centrale (05 = in esecuzione).
+uint32_t evResume(bool useIrq, const char *why) {
+  if (useIrq) evIrq(false);
+  if (gEvDelay) IOSleep(gEvDelay);                      // himax_resume_thread_func: queue_delayed_work 60 ms
+  uint64_t t0 = 0, t1 = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &t0);
+  int r = gFwOk ? hx_download(&gChip, &gFw, gCfg) : HX_ERR_FW;   // fp_0f_operation_dirly -> firmware_update_0f
+  const int dl = r, dlStage = gChip.stage;
+  int rl = -1, so = -1;
+  if (!r) {
+    rl = hx_reg_write32(&gChip, HX_ADDR_FLASH_RELOAD, gEvReloadWord);   // fp_reload_disable = hx_dis_rload_0f
+    so = hx_sense_on(&gChip);                                           // fp_sense_on(0x00)
+  }
+  uint32_t central = 0, reload = 0, fl = 0, fl2 = 0;
+  hx_reg_read32(&gChip, HX_ADDR_CENTRAL_STATE, &central);              // addr_sts_chk
+  hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
+  hx_reg_read32(&gChip, HX_ADDR_FLASH_RELOAD, &fl);
+  hx_reg_read32(&gChip, HX_ADDR_2ND_FLASH_RELOAD, &fl2);
+  hx_set_smwp(&gChip, 0);                                               // fp_resend_cmd_func: SMWP off, cavo
+  gChip.usb_word = write32_verify(&gChip, HX_ADDR_USB_DETECT, gChip.usb_in ? HX_HANDSHAKE_PWD : 0);
+  struct hx_report up = {};
+  publish(up);                                                          // himax_report_all_leave_event
+  if (useIrq) evIrq(true);                                              // himax_int_enable(1)
+  absolutetime_to_nanoseconds(mach_absolute_time(), &t1);
+  gEvResumes = gEvResumes + 1;
+  IOLog("GuampTouch: events: resume %u (%s) after %u ms: download rc %d stage %d cfg crc hw %08x sw %08x ovl %d reply %02x | "
+        "0x10007F00 <- %08x (rc %d), sense on rc %d | central %08x (%s) reload %08x 7f00 %08x 72c0 %08x | smwp %08x usb %08x "
+        "| %llu ms\n", gEvResumes, why, gEvDelay, dl, dlStage, gChip.cfg_crc_hw, gChip.cfg_crc_sw, gChip.ovl_loaded,
+        gChip.ovl_reply, gEvReloadWord, rl, so, central,
+        (central & 0xFF) == 0x05 ? "running" : "NOT running: retry at the next display on", reload, fl, fl2, gChip.smwp_word,
+        gChip.usb_word, (unsigned long long)((t1 - t0) / 1000000ull));
+  regDump("events-resume");
+  return central;
+}
+
 void thread(void *param, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-touch");
   const unsigned stage = static_cast<unsigned>(reinterpret_cast<uintptr_t>(param));
@@ -1220,6 +1311,24 @@ void thread(void *param, wait_result_t) {
   uint64_t lastWake = 0, wakeGapTicks = 0;
   nanoseconds_to_absolutetime(1500 * 1000 * 1000ULL, &wakeGapTicks);
   if (wakeOk) gWakeArmed = 1;
+  {
+    unsigned v = 0;
+    if (PE_parse_boot_argn("guamp-touch-events-delay", &v, sizeof(v)) && v <= 1000) gEvDelay = v;
+    v = 1;
+    PE_parse_boot_argn("guamp-touch-events-rl", &v, sizeof(v));
+    gEvReloadWord = v ? 0x00009AA9u : 0u;
+    if (gEventsMode && (gWakeArmed || !gFwOk)) {
+      IOLog("GuampTouch: events mode %u NOT armed (%s)\n", gEventsMode, gWakeArmed ? "guamp-touch-wake armed" : "firmware not parsed");
+      gEventsMode = 0;
+    } else if (gEventsMode) {
+      IOLog("GuampTouch: events mode %u armed (%s, delay %u ms, 0x10007F00 <- %08x, panel commands %s, %u display events "
+            "already seen)\n", gEventsMode,
+            gEventsMode == 1 ? "resume at every display on, the first included" : "Linux: resume after an off only", gEvDelay,
+            gEvReloadWord, gEventsDsi ? "on" : "off", gEvGen);
+    }
+  }
+  uint32_t evGen = 0;
+  bool evSuspended = false, evFirstDone = false, evFailed = false;
   uint32_t seen = gIrqEvents;
   bool down = false;
   uint32_t polls = 0;
@@ -1237,6 +1346,25 @@ void thread(void *param, wait_result_t) {
     const bool fromIrq = useIrq && gIrqEvents != seen;
     seen = gIrqEvents;
     polls = polls + 1;
+    if (gEventsMode && gEvGen != evGen) {
+      evGen = gEvGen;
+      const bool on = gEvOn != 0;
+      if (!on && !evSuspended) {
+        down = false;
+        evSuspend(useIrq);
+        evSuspended = true;
+      } else if (on && (evSuspended || evFailed || (gEventsMode == 1 && !evFirstDone))) {
+        const char *why = evSuspended ? "display on again" : evFailed ? "last resume failed" : "first display on of iOS";
+        evSuspended = false;
+        evFailed = (evResume(useIrq, why) & 0xFF) != 0x05;
+      } else if (on && !evFirstDone) {
+        IOLog("GuampTouch: events: first display on: no resume (Linux: not suspended, \"It had entered resume, skip\")\n");
+      }
+      if (on) evFirstDone = true;
+      seen = gIrqEvents;
+      continue;
+    }
+    if (evSuspended) continue;                         // Linux: interrupt disabilitato fino al resume
     if (gWakeArmed && gDisplayGen != displayGen) {
       displayGen = gDisplayGen;
       const bool off = !gDisplayOn;
@@ -1384,6 +1512,13 @@ void start() {
   PE_parse_boot_argn("guamp-touch", &stage, sizeof(stage));
   if (!stage) return;
   if (stage > 4) stage = 4;
+  {
+    unsigned ev = 0, evDsi = 1;
+    PE_parse_boot_argn("guamp-touch-events", &ev, sizeof(ev));
+    PE_parse_boot_argn("guamp-touch-events-dsi", &evDsi, sizeof(evDsi));
+    gEventsDsi = evDsi != 0;
+    if (stage == 4 && (ev == 1 || ev == 2)) gEventsMode = ev;   // GuampBacklight notifica da qui in poi
+  }
   thread_t t = nullptr;
   if (kernel_thread_start(thread, reinterpret_cast<void *>(static_cast<uintptr_t>(stage)), &t) == KERN_SUCCESS) thread_deallocate(t);
 }
