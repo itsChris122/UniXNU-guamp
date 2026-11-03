@@ -4,7 +4,7 @@ diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl
 index 46006f9..c16ed9f 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -52,6 +52,49 @@ static struct {
+@@ -52,6 +52,52 @@ static struct {
     NativeAdrenoAbiParams params;
  } dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
  
@@ -28,6 +28,9 @@ index 46006f9..c16ed9f 100644
 +      on = debug_get_bool_option("TU_DARWIN_CLIENT_CLEANS", true) ? 1 : 0;
 +   return on;
 +}
++extern "C" __attribute__((visibility("default"))) int tu_darwin_client_cleans_begin(const void *address, uint64_t bytes);
++extern "C" __attribute__((visibility("default"))) void tu_darwin_client_cleans_end(void);
++extern "C" __attribute__((visibility("default"))) void tu_darwin_client_cleans_counts(uint32_t *flagged, uint32_t *plain);
 +/* Returns 1 when the kernel takes the flag (and it is not switched off), so the caller knows its cleaning is now the only one. */
 +extern "C" __attribute__((visibility("default"))) int
 +tu_darwin_client_cleans_begin(const void *address, uint64_t bytes)
