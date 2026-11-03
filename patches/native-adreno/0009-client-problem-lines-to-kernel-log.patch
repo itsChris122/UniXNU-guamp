@@ -1,0 +1,23 @@
+guamp: lines a process streams as "problem ..." (Metal bridge problems, adreno-metal 0011 texref) printed as "GuampMetal: client <process>: ..."
+
+diff -ru a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp	2026-11-03 21:15:03.712111931 +0100
++++ b/NativeAdrenoPublish.cpp	2026-11-03 21:15:03.748111931 +0100
+@@ -815,11 +815,17 @@
+             static char *line=native_adreno_metal_diag.report2;
+             static_assert(sizeof(native_adreno_metal_diag.report)==sizeof(native_adreno_metal_diag.report2),"stream lines");
+             if(value==0x7fff || value==0x7ffe) {
++                /* guamp (UniXNU-guamp patches/native-adreno/0009): a finished line that a process streamed as "problem ..." (the Metal
++                 * bridge's first problem, its refused texture descriptors "problem texref ...", adreno-metal 0011) goes to the kernel log
++                 * when the next line starts, with the process that sent it; the rows and report lines kept no copy of another process's. */
++                static char lastWho[20];
++                if(line && !strncmp(line,"problem ",8))IOLog("GuampMetal: client %.20s: %.64s\n",lastWho[0]?lastWho:"?",line);
+                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
+                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
+                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */
+                 char who[20]={};
+                 proc_selfname(who,sizeof who);
++                strlcpy(lastWho,who,sizeof lastWho);
+                 if(value==0x7fff && strncmp(who,"backboardd",sizeof who)) {
+                     for(auto &entry:native_adreno_client_text) {
+                         if(!entry.name[0]) strlcpy(entry.name,who,sizeof entry.name);
