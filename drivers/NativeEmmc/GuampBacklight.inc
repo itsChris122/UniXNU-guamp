@@ -17,6 +17,10 @@
 // patches/xnu/zzwb-native-sandbox-grant-set-properties.patch (on top of zzw-native-adreno-sandbox-grant.patch) lets the
 // processes named in NativeSandboxGrantProcess set its properties. guamp-backlight-control=0 publishes neither.
 // guamp-backlight-test=1: at start, dim to 1/8 for 3 s and back (checks the DSI path without iOS).
+// guamp-touch-wake=1 (TouchService.inc, armed only once the touch firmware runs): display off also sends the panel's
+// off-command (28, 20 ms, 10, 80 ms: dtbo qcom,mdss-dsi-off-command) after level 0, so the HX83102D (TDDI) firmware
+// enters its sleep / gesture mode as under Linux; the first level above 0 sends the on-command first (11, 160 ms, 29,
+// 50 ms: qcom,mdss-dsi-on-command). guamp-touch-wake-dsi=0 keeps only the level. The touch service follows the state.
 // Logs: one line at start, one per brightness request (rate-limited, says display off/on), failed sends (rate-limited).
 #include "GuampBacklightCore.h"
 
@@ -66,16 +70,46 @@ class GuampBacklight : public IOService {
   bool mayLog() { return gate.allow(backlight::nowUs() / 1000u); }
   // Work loop only. Sends one level; a send that the hardware refused (busy, no DMA_DONE) counts against the controller,
   // and kMaxFailures in a row stop all DSI access until reboot. "Not ready" (clocks, controller, timing) touches nothing.
+  bool panelAsleep = false;                            // off-command sent (guamp-touch-wake)
+  // Panel off / on command (two DCS short writes with the dtbo waits); the outcome goes to the log and to the touch
+  // service, which swaps its code overlay only when the panel really changed state.
+  bool panelCommand(bool on) {
+    guamp_backlight::Diag d;
+    backlight::Io io;
+    const uint32_t first = on ? guamp_backlight::kDcsSleepOut : guamp_backlight::kDcsDisplayOff;
+    const uint32_t second = on ? guamp_backlight::kDcsDisplayOn : guamp_backlight::kDcsSleepIn;
+    int r = guamp_backlight::sendDcsShort(io, first, d);
+    if (r == guamp_backlight::kSent) {
+      IOSleep(on ? 160 : 20);
+      r = guamp_backlight::sendDcsShort(io, second, d);
+      if (r == guamp_backlight::kSent) IOSleep(on ? 50 : 80);
+    }
+    IOLog("GuampBacklight: panel %s (DCS %02x %02x): %s\n", on ? "on-command" : "off-command", first, second,
+          guamp_backlight::resultName(r));
+    return r == guamp_backlight::kSent;
+  }
   void apply(uint32_t next) {
     if (broken || (known && next == level)) return;
     guamp_backlight::Diag d;
     backlight::Io io;
+    if (next && panelAsleep) {                         // wake the panel before its first visible level
+      panelAsleep = false;
+      panelCommand(true);
+      touch::displayState(true);
+    }
     const int r = guamp_backlight::sendBrightness(io, next, d);
     if (r == guamp_backlight::kSent) {
+      const bool wasOn = !known || level != 0;
       level = next;
       known = true;
       failuresInRow = 0;
       backlight::gSends = backlight::gSends + 1;
+      if (!next && wasOn && touch::gWakeArmed) {
+        if (touch::gWakeDsi) panelAsleep = panelCommand(false);
+        touch::displayState(false);
+      } else if (next && !wasOn) {
+        touch::displayState(true);
+      }
       return;
     }
     backlight::gFailures = backlight::gFailures + 1;

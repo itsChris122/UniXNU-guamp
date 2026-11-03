@@ -386,6 +386,54 @@ int hx_start(struct hx_chip *c)
     return HX_OK;
 }
 
+int hx_overlay_swap(struct hx_chip *c, const struct hx_fw *fw, int idx, uint8_t request, uint8_t reply, int reset_after,
+                    unsigned wait_ms, int force)
+{
+    uint32_t v = 0, crc = 1;
+    int requested = 0, r;
+    if (idx <= 0 || (unsigned)idx >= fw->count || !fw->part[idx].size) return HX_ERR_FW;
+    c->ovl_wait_ms = 0;
+    for (;;) {
+        if (hx_reg_read32(c, HX_ADDR_OVL_HANDSHAKE, &v)) return HX_ERR_BUS;
+        if ((v & 0xFF) == request) {requested = 1; break;}
+        if (c->ovl_wait_ms >= wait_ms) break;
+        sleep_ms(c, 10);
+        c->ovl_wait_ms += 10;
+    }
+    c->ovl_seen = v;
+    if (!requested && !force) return 0;
+    if (!requested && (r = hx_sense_off(c)) != HX_OK) return r;
+    c->ovl_reply = sram_write_crc(c, fw, &fw->part[idx], &crc) == HX_OK ? reply : HX_OVL_FAULT;
+    c->ovl_loaded = c->ovl_reply == reply ? idx : -1;
+    // Reply: write, 1 ms, read back, at most 10 times (hx83102d_0f_overlay).
+    for (unsigned i = 0; i < 10; ++i) {
+        hx_reg_write32(c, HX_ADDR_OVL_HANDSHAKE, c->ovl_reply);
+        sleep_ms(c, 1);
+        if (!hx_reg_read32(c, HX_ADDR_OVL_HANDSHAKE, &c->ovl_handshake) && (c->ovl_handshake & 0xFF) == c->ovl_reply) break;
+    }
+    if (!requested || reset_after) {
+        if ((r = hx_sense_on(c)) != HX_OK) return r;
+    }
+    return requested ? 1 : 2;
+}
+
+uint32_t hx_set_smwp(struct hx_chip *c, int on)
+{
+    c->smwp_word = write32_verify(c, HX_ADDR_SMWP_ENABLE, on ? HX_HANDSHAKE_PWD : 0);
+    return c->smwp_word;
+}
+
+int hx_parse_gesture(const uint8_t *buf)
+{
+    static const uint8_t ids[] = {0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+                                  0x0D, 0x0E, 0x0F, 0x81, 0x1D, 0x2D, 0x3D, 0x1F, 0x2F, 0x51, 0x52, 0x53, 0x54};
+    int known = 0;
+    for (unsigned j = 0; j < sizeof ids; ++j) known |= buf[0] == ids[j];
+    if (!known || buf[1] != buf[0] || buf[2] != buf[0] || buf[3] != buf[0]) return 0;
+    if (buf[4] != 0xCC || buf[5] != 0x44) return 0;
+    return buf[0];
+}
+
 int hx_read_event(struct hx_chip *c, uint8_t *buf)
 {
     uint8_t v = 0x00;

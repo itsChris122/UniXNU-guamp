@@ -67,5 +67,7 @@ public:
 #define OSDefineMetaClassAndStructors(name, super) name::name() {} name *name::alloc() { return new name; }
 #define OSTypeAlloc(type) type::alloc()
 volatile uint8_t *mapPhysical(uint64_t physical, uint64_t length);
+// TouchService.inc (included before GuampBacklight.inc in NativeEmmc.cpp): display state for the touch wake.
+namespace touch { extern volatile uint32_t gWakeArmed, gWakeDsi; void displayState(bool on); }
 #include "../GuampBacklight.inc"
 void use() { backlight::start(); }

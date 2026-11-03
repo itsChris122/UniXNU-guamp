@@ -81,6 +81,16 @@ inline void encodeBrightness(uint32_t level, uint32_t out[2]) {
   out[1] = kDcsSetBrightness | ((level >> 8) & 0xffu) << 8 | (level & 0xffu) << 16 | 0xffu << 24;
 }
 
+// DCS short write without parameter (MIPI_DSI_DCS_SHORT_WRITE 0x05: display off 0x28, sleep in 0x10, sleep out 0x11,
+// display on 0x29), header {cmd, 0, VC 0 | type, last} with bit 6 of byte 3 clear (short packet). 4 bytes: one dword,
+// odd, so the zero dword dsi_ctrl appends makes it 8 bytes.
+constexpr uint32_t kDcsShortWrite = 0x05;
+constexpr uint32_t kDcsDisplayOff = 0x28, kDcsSleepIn = 0x10, kDcsSleepOut = 0x11, kDcsDisplayOn = 0x29;
+inline void encodeDcsShort(uint32_t cmd, uint32_t out[2]) {
+  out[0] = (cmd & 0xffu) | (kDcsShortWrite & 0x3fu) << 16 | 1u << 31;
+  out[1] = 0;
+}
+
 // Register value helpers
 constexpr uint32_t dmaCtrlFor(uint32_t old) { return (old & ~(kDmaBroadcast | kDmaMaster | kDmaLpm)) | kDmaEmbedded; }
 constexpr uint32_t scheduleFor(uint32_t old, uint32_t line) { return (old & ~(kScheduleEnable | 0xffffu)) | kScheduleEnable | (line & 0xffffu); }
@@ -123,7 +133,7 @@ struct Diag { uint32_t hw, ctrl, line, intCtrl, status, fifo, ack, timeouts, wai
 // Io: uint32_t rd(uint32_t), void wr(uint32_t, uint32_t), bool clocksOn(), void delayUs(uint32_t), void sleepMs(uint32_t),
 // uint64_t nowUs(). Never touches a register unless clocksOn() and the controller is enabled in video mode; every wait
 // is bounded; whatever it changed is restored on every path after the trigger.
-template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
+template <class Io> int sendPacket(Io &io, const uint32_t words[2], Diag &d) {
   d = Diag{};
   if (!io.clocksOn()) return kClocksOff;
   d.hw = io.rd(rHwVersion);
@@ -146,8 +156,6 @@ template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
   io.wr(rTpgFifoReset, 1);
   io.delayUs(1);
   io.wr(rTpgFifoReset, 0);
-  uint32_t words[2];
-  encodeBrightness(level, words);
   io.wr(rTpgCtrl, kTpgCmdFifo);
   io.wr(rTpgFifo, words[0]);
   io.wr(rTpgFifo, words[1]);
@@ -181,6 +189,16 @@ template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
   if ((trig & kTrigMask) != kTrigSw) io.wr(rTrigCtrl, trig);
   if (!(d.ctrl & kCtrlCmd)) io.wr(rCtrl, io.rd(rCtrl) & ~kCtrlCmd);
   return done ? kSent : kTimeout;
+}
+template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
+  uint32_t words[2];
+  encodeBrightness(level, words);
+  return sendPacket(io, words, d);
+}
+template <class Io> int sendDcsShort(Io &io, uint32_t cmd, Diag &d) {
+  uint32_t words[2];
+  encodeDcsShort(cmd, words);
+  return sendPacket(io, words, d);
 }
 
 // Log rate limit: a burst of kBurst lines, then one per kRefillMs; what was dropped is counted for the next line.

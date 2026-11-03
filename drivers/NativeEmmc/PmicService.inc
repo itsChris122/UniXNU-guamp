@@ -381,7 +381,18 @@ void thread(void *, wait_result_t) {
   guamp_pon::ComboWatch combo, powerHold;
   powerHold.mask = guamp_pon::kKpdpwr;
   uint32_t sinkSeen = gSinkGeneration;
+  // Touch wake (TouchService.inc, guamp-touch-wake=1): a gesture with the display off asks for one short Power press,
+  // 6 polls (150 ms) held, sent only while the display is still off (a press with the display on would lock it).
+  uint32_t wakeSeen = touch::gWakeRequests;
+  unsigned wakeTicks = 0;
   for (unsigned tick = 0;; ++tick) {
+    if (touch::gWakeRequests != wakeSeen) {
+      wakeSeen = touch::gWakeRequests;
+      const bool off = !touch::gDisplayOn;
+      if (off && !wakeTicks) wakeTicks = 6;
+      IOLog("GuampPmic: touch wake request %u: %s (HID sink %s)\n", wakeSeen, off ? "Power press" : "display already on, skipped",
+            gSink ? "attached" : "absent");
+    }
     if (ringer) {
       // Momentary key, debounced like the PON keys (the same level on two polls 25 ms apart; Linux uses 15 ms); each
       // press toggles the latched switch position, the release does nothing.
@@ -399,6 +410,7 @@ void thread(void *, wait_result_t) {
       }
     }
     uint32_t now = readButtons() | (ringer && gRingerState ? kRingerBit : 0u);
+    if (wakeTicks) { now |= 1u << 1; wakeTicks--; }   // Power (report 2 bit 1)
     stable = now == last ? stable + 1 : 0;
     last = now;
     if (stable == 1 && now != sent) {             // the same set on two polls in a row

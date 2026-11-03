@@ -130,6 +130,8 @@ struct hx_chip {
     uint32_t recode_crc;            // hardware CRC of the second firmware write (0 = ok)
     uint32_t reload1, reload2;      // HX_ADDR_FLASH_RELOAD / HX_ADDR_2ND_FLASH_RELOAD at "reload OK"
     unsigned reload_polls;          // 10 ms polls until reload OK (200 = never)
+    uint32_t ovl_seen;              // handshake word when the overlay swap stopped waiting
+    unsigned ovl_wait_ms;           // how long it waited for the firmware's request
     uint8_t panel_ver, touch_cfg_ver, display_cfg_ver;
     uint16_t fw_ver, cid_ver;
 };
@@ -186,6 +188,20 @@ int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg_scratch)
 int hx_start(struct hx_chip *c);
 // Sense on as himax_hx83102d_sense_on(0): interface on, clear the ISR, pin reset, reload to active.
 int hx_sense_on(struct hx_chip *c);
+// Overlay swap while the firmware runs (hx83102d_0f_overlay): wait up to wait_ms for the firmware's request in the
+// handshake word, write partition idx with its hardware CRC, write the reply (HX_OVL_FAULT on a CRC failure), then
+// (reset_after) sense on again, as the border swap of resume does. Without a request: force = 1 does the same from
+// safe mode (sense off, overlay, reply, sense on), force = 0 leaves everything. Returns 1 after a request, 2 forced,
+// 0 nothing done, < 0 error.
+int hx_overlay_swap(struct hx_chip *c, const struct hx_fw *fw, int idx, uint8_t request, uint8_t reply, int reset_after,
+                    unsigned wait_ms, int force);
+// Smart wake-up mode word (himax_mcu_set_SMWP_enable): A55AA55A on, 0 off, written and read back. Returns the read value.
+uint32_t hx_set_smwp(struct hx_chip *c, int on);
+// Gesture report in the first 8 bytes of the event stack (himax_wake_event_parse: HX_REPORT_SMWP_EVENT reads
+// GEST_PTLG_ID_LEN + GEST_PTLG_HDR_LEN): 4 equal id bytes from gest_event[] (0x80 double tap, 0x81 finger gesture,
+// 0x01..0x0F letters / swipes, 0x1D..0x54 others), then CC 44. Returns the id, 0 when it is no gesture.
+#define HX_GEST_DOUBLE_TAP 0x80
+int hx_parse_gesture(const uint8_t *buf);
 // One event stack read (HX_EVENT_LEN bytes) into buf.
 int hx_read_event(struct hx_chip *c, uint8_t *buf);
 // Parses an event stack. HX_OK, HX_ERR_CHECKSUM for a torn or empty stack. x_max/y_max bound valid coordinates.

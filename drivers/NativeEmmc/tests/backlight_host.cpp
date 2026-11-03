@@ -185,6 +185,22 @@ int main() {
     for (unsigned i = 0; i < f.writes && i < 256; i++)
       check(f.wrOff[i] != rCtrl && f.wrOff[i] != rTrigCtrl, "no needless ctrl/trigger write", f.wrOff[i]);
   }
+  // DCS short writes (panel off / on commands for the touch wake): header {cmd, 0, 0x05, last}, short packet, then the
+  // zero dword; sent through the same sequence (length 8).
+  {
+    encodeDcsShort(kDcsDisplayOff, w);
+    check(w[0] == 0x80050028u && w[1] == 0, "display off words", w[0], w[1]);
+    encodeDcsShort(kDcsSleepOut, w);
+    check(w[0] == 0x80050011u && !(w[0] & (1u << 30)), "sleep out: short packet", w[0]);
+    FakeDsi f;
+    f.bootLoaderState();
+    Diag d;
+    check(sendDcsShort(f, kDcsSleepIn, d) == kSent, "sleep in sent");
+    unsigned n = 0; uint32_t seen[4] = {};
+    for (unsigned i = 0; i < f.writes && i < 256; i++) if (f.wrOff[i] == rTpgFifo && n < 4) seen[n++] = f.wrVal[i];
+    check(n == 2 && seen[0] == 0x80050010u && seen[1] == 0, "sleep in dwords in the FIFO", seen[0], seen[1]);
+    check(f.atTrigger[rDmaLength / 4] == 8, "short packet length 8");
+  }
   // Refusals: nothing is touched (clocks off: not even read)
   {
     FakeDsi f;
