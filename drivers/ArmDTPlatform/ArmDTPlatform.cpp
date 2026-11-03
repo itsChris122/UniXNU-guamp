@@ -77,9 +77,15 @@ const char *ArmDTPlatform::deleteList (void)
   return "()";
 }
 
+// guamp (04/11): stessa lista di AppleARMPE (stringa nel kernelcache 21H461). Con "()" processTopLevel() creava un
+// IOPlatformDevice anche per /options, che con IORegistryEntry::init(old, gIODTPlane) PRENDEVA IL POSTO dell'IODTNVRAM
+// nel piano IODeviceTree: IODeviceTree:/options (findmydeviced, MobileSoftwareUpdate, nvram) era un IOPlatformDevice
+// senza NVRAM, e la sandbox negava iokit-set-properties iokit-class:IOPlatformDevice (fm-* con GUID 40A0DDD2-...,
+// IONVRAM-SYNCNOW-PROPERTY). Come su iPhone, chosen/memory/options/aliases restano nel piano DT senza nub: /options
+// torna l'IODTNVRAM di publishNVRAM(), /chosen il nodo originale (letture per percorso invariate).
 const char *ArmDTPlatform::excludeList (void)
 {
-  return "()";
+  return "('chosen', 'memory', 'options', 'aliases')";
 }
 
 bool ArmDTPlatform::hasNVRAMProxy (IOService *provider)
