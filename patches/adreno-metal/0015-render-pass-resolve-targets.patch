@@ -1,0 +1,125 @@
+guamp: render pass attachments pass their resolve target to the runtime (multisampled passes resolved: Maps' empty map)
+
+2ff4be9's renderCommandEncoderWithDescriptor: never read an attachment's resolveTexture: NmbPassAttachment had no field for it, so a
+MultisampleResolve / StoreAndMultisampleResolve store resolved into nothing and the single-sample target the app shows stayed as it
+was. VectorKit renders the map multisampled (ggl's texture creation sets sampleCount and private storage for it) and showed an empty
+map (fin43); any other multisampled pass did the same. The metal2vulkan runtime resolves (RenderPassAttachment resolve_texture,
+resolve_level/slice/depth_plane): NmbPassAttachment gains those four fields (C and Rust, same build) and the frontend fills them, the
+resolve texture kept alive with the command buffer and, over an IOSurface, flushed and invalidated as a written surface (0010).
+This keeps multisampling, unlike UniXNU/AdrenoMetal 5a50581 (every client single-sample). Rust bridge checked with cargo check on
+metal2vulkan 720ef1c; the Objective-C++ is not compiled outside the CI. Applies after 0001-0003, 0009-0014.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index a0fdd2b..30bca89 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1021,6 +1021,8 @@ static NmbTexture *textureFallback(NmbTextureDescriptor &d,uint32_t *substituted
+        (unsigned long long)((t.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift),(unsigned long long)d.width,(unsigned long long)d.height);
+  return handle;
+ }
++// guamp 0015: render pass attachments given a resolve target.
++static std::atomic<uint64_t> gResolvedAttachments;
+ @implementation NBTexture
+ - (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+@@ -1971,7 +1973,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+  return [self encoder:[NBBlitEncoder new] handle:self.committed?nullptr:nmb_blit_encoder_new(_handle) what:@"blitCommandEncoder"];
+ }
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+- NmbRenderPassDescriptor pass={};
++ NmbRenderPassDescriptor pass={};   // guamp 0015: zero-filled, so no resolve unless an attachment names one
+  {
+   id<MTLTexture> first=d.colorAttachments[0].texture;
+   if(first) {
+@@ -1991,6 +1993,16 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];if(a.storeAction!=MTLStoreActionDontCare)[_writtenSurfaces addObject:texture];}
+   [_resourceOwners addObject:texture];
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
++  // guamp 0015: the resolve target of a multisampled attachment (VectorKit, Core Animation's antialiased passes); 2ff4be9 passed none, so a
++  // MultisampleResolve store wrote nothing the app could see (Maps' map stayed empty).
++  if(a.resolveTexture) {
++   if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
++   NBTexture *resolve=(NBTexture *)a.resolveTexture;
++   [_resourceOwners addObject:resolve];
++   if(resolve.surface){[_surfaces addObject:resolve];[_writtenSurfaces addObject:resolve];}
++   out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
++   gResolvedAttachments++;
++  }
+   return true;
+  };
+  for(unsigned i=0;i<8;i++) {
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index d1438a5..b38da69 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -232,6 +232,10 @@ struct NmbPassAttachment {
+     NmbTexture *texture;
+     uint64_t level, slice, depth_plane, load, store;
+     double clear[4]; /* color, or clear[0] depth / stencil */
++    /* guamp (UniXNU-guamp patches/adreno-metal/0015): the attachment's resolveTexture (null: none) and its level, slice and depth plane,
++     * which a MultisampleResolve or StoreAndMultisampleResolve store writes; 2ff4be9 dropped them, so the resolve target was never written. */
++    NmbTexture *resolve_texture;
++    uint64_t resolve_level, resolve_slice, resolve_depth_plane;
+ };
+ struct NmbRenderPassDescriptor {
+     struct NmbPassAttachment colors[8], depth, stencil;
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 0d21e54..dd75502 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -1962,6 +1962,11 @@ pub struct NmbPassAttachment {
+     pub load: u64,
+     pub store: u64,
+     pub clear: [f64; 4],
++    // guamp (UniXNU-guamp patches/adreno-metal/0015): the attachment's resolve texture (null: none), level, slice and depth plane.
++    pub resolve_texture: *mut NmbTexture,
++    pub resolve_level: u64,
++    pub resolve_slice: u64,
++    pub resolve_depth_plane: u64,
+ }
+ 
+ #[repr(C)]
+@@ -1980,6 +1985,10 @@ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
+     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+ }
+ 
++fn resolve_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
++    if a.resolve_texture.is_null() { Ok(None) } else { Ok(Some(get(a.resolve_texture)?.0.clone())) }
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor)
+                                          -> *mut NmbEncoder {
+@@ -1991,6 +2000,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+             slot.level = a.level;
+             slot.slice = a.slice;
+             slot.depth_plane = a.depth_plane;
++            slot.resolve_texture = resolve_of(a)?;
++            slot.resolve_level = a.resolve_level;
++            slot.resolve_slice = a.resolve_slice;
++            slot.resolve_depth_plane = a.resolve_depth_plane;
+             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
+             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
+             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
+@@ -2000,6 +2013,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         depth.level = d.depth.level;
+         depth.slice = d.depth.slice;
+         depth.depth_plane = d.depth.depth_plane;
++        depth.resolve_texture = resolve_of(&d.depth)?;
++        depth.resolve_level = d.depth.resolve_level;
++        depth.resolve_slice = d.depth.resolve_slice;
++        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
+         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
+         depth.clear_depth = d.depth.clear[0];
+@@ -2008,6 +2025,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         stencil.level = d.stencil.level;
+         stencil.slice = d.stencil.slice;
+         stencil.depth_plane = d.stencil.depth_plane;
++        stencil.resolve_texture = resolve_of(&d.stencil)?;
++        stencil.resolve_level = d.stencil.resolve_level;
++        stencil.resolve_slice = d.stencil.resolve_slice;
++        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
+         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
+         stencil.clear_stencil = d.stencil.clear[0] as u32;
