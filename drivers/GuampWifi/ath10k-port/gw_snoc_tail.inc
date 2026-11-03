@@ -117,13 +117,30 @@ static int gw_map_service_to_pipe(struct ath10k *ar,u16 service,u8 *ul,u8 *dl) {
   lx_log(e?3:6,"ath10k: phase HTC service connect 0x%04x -> UL pipe %u DL pipe %u (%d)",service,e?0:*ul,e?0:*dl,e);
   return e;
 }
+/*
+ * guamp 04/11 (fin43 panic, kpan-20261104-000423): after "wmi command 20487 timeout, restarting hardware" the hif was powered
+ * down (gw_hif_power_down: CE servicing off, RRI memory freed), but the station went on transmitting (handshake message 2):
+ * ath10k_htc_send -> hif send_complete_check -> ath10k_ce_completed_send_next read CE4's read index from the freed RRI page
+ * (far = RRI + 4 * 4): data abort. Transmit and completion checks touch the copy engines only while CE servicing is live,
+ * like everything else (gw_snoc_poll_ce, gw_napi_poll); otherwise the frame is refused (-ESHUTDOWN, its caller frees it).
+ */
+static int gw_hif_tx_sg(struct ath10k *ar,u8 pipe,struct ath10k_hif_sg_item *items,int n) {
+  if(!gw_ce_live) { static unsigned said; if(said++<4) lx_log(4,"ath10k: transmit on pipe %u refused: copy engines down",pipe); return -ESHUTDOWN; }
+  return ath10k_snoc_hif_tx_sg(ar,pipe,items,n);
+}
+static void gw_hif_send_complete_check(struct ath10k *ar,u8 pipe,int force) {
+  if(gw_ce_live) ath10k_snoc_hif_send_complete_check(ar,pipe,force);
+}
+static u16 gw_hif_get_free_queue_number(struct ath10k *ar,u8 pipe) {
+  return gw_ce_live?ath10k_snoc_hif_get_free_queue_number(ar,pipe):0;
+}
 static const struct ath10k_hif_ops gw_hif={
   .read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32,
   .start=gw_poll_hif_start,.stop=gw_poll_hif_stop,
   .map_service_to_pipe=gw_map_service_to_pipe,.get_default_pipe=ath10k_snoc_hif_get_default_pipe,
   .power_up=gw_hif_power_up,.power_down=gw_hif_power_down,
-  .tx_sg=ath10k_snoc_hif_tx_sg,.send_complete_check=ath10k_snoc_hif_send_complete_check,
-  .get_free_queue_number=ath10k_snoc_hif_get_free_queue_number,.get_target_info=ath10k_snoc_hif_get_target_info,
+  .tx_sg=gw_hif_tx_sg,.send_complete_check=gw_hif_send_complete_check,
+  .get_free_queue_number=gw_hif_get_free_queue_number,.get_target_info=ath10k_snoc_hif_get_target_info,
 };
 static const struct ath10k_bus_ops gw_bus={.read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32};
 static int gw_napi_poll(struct napi_struct *n,int budget) {
@@ -219,11 +236,22 @@ void gw_snoc_poll_ce(void) {
   napi_schedule(&gw_ar->napi);
   gw_servicing_ce=false;
 }
+/* guamp 04/11: a cheap fingerprint of every copy engine's indices: it moves when anything was sent or received */
+static unsigned gw_ce_fingerprint(void) {
+  if(!gw_ar||!gw_ce_live) return 0;
+  struct ath10k_snoc *s=ath10k_snoc_priv(gw_ar); unsigned f=0;
+  for(unsigned i=0;i<12;i++) {
+    struct ath10k_ce_ring *d=s->ce.ce_states[i].dest_ring,*r=s->ce.ce_states[i].src_ring;
+    if(d) f=f*31+d->sw_index; if(r) f=f*31+r->sw_index*7+r->write_index;
+  }
+  return f;
+}
 int gw_snoc_step(void) {
   if(!gw_ar) return -ENODEV;
   if(gw_boot_error) return gw_boot_error;
   const bool trace=nw_wifi_trace_budget&&nw_wifi_trace_take(&gw_trace_steps);
   if(trace) nw_wifi_trace("step %u: poll_ce (stage %u, error %d)",gw_trace_steps,nw_wifi_stats.stage,nw_wifi_stats.last_err);
+  const unsigned before=gw_ce_fingerprint();
   gw_snoc_poll_ce();
   if(gw_polling) { if(trace) nw_wifi_trace("step %u: nested, dispatcher skipped",gw_trace_steps); return 0; }
   if(trace) nw_wifi_trace("step %u: lx_pump",gw_trace_steps);
@@ -231,7 +259,10 @@ int gw_snoc_step(void) {
   if(trace) nw_wifi_trace("step %u: nw_sta_run",gw_trace_steps);
   nw_sta_run(); gw_polling=false;
   if(trace) nw_wifi_trace("step %u: done",gw_trace_steps);
-  return nw_sta_tx_pending();
+  /* guamp 04/11: work = frames waiting to go out, or copy engine activity in this step. It was the first only, so
+   * guamp-wifi-poll-max (142dffd) saw an idle link during reception and the handshake, and slowed the polling then too. */
+  const unsigned after=gw_ce_fingerprint();
+  return nw_sta_tx_pending() || after!=before;
 }
 int gw_snoc_stop(void) {
   if(!gw_ar) return 0;
