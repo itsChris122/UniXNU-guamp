@@ -211,7 +211,69 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
 
 /* Apple80211's events (APPLE80211_M_...) */
 enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10, EVENT_COUNTRY_CODE_CHANGED = 11, EVENT_LINK_QUALITY = 17, EVENT_RSSI_CHANGED = 39 };
+       EVENT_SCAN_DONE = 10, EVENT_COUNTRY_CODE_CHANGED = 11, EVENT_LINK_QUALITY = 17, EVENT_RSSI_CHANGED = 39,
+       EVENT_WEIGHT_AVG_LQM_UPDATE = 145 };
+
+/*
+ * guamp 03/11: the link quality iOS 17.7.11 reads, from IO80211.framework of the iPad dyld cache (subcache .29):
+ * _eventRead's jump tables send event 39 to __dispatchlqmChangedEvent (0x1dfd82fb0) and 145 to
+ * __dispatchWeightedAvgLQMUpdateEvent (0x1dfd97f58); APPLE80211_IOC 386 is read by __getLQMSummary (0x1dfd86b90). Offsets
+ * and CFNumber types are those the three functions read (keys in their CFDictionaries in the comments). Event 39 was
+ * posted with no data: __dispatchlqmChangedEvent drops anything shorter than 0xb8 bytes, so wifid never had a link
+ * quality (the grey bars).
+ */
+struct apple80211_lqm_event {
+	uint8_t rssi_valid, unused_0[3];
+	int32_t rssi;                           /* 0x04 RSSI (SInt32) */
+	uint8_t core_rssi_valid;                /* 0x08 */
+	int8_t core_rssi[2];                    /* 0x09 PER_CORE_RSSI (0x80: no such chain) */
+	uint8_t snr_valid;                      /* 0x0b */
+	int16_t snr;                            /* 0x0c SNR */
+	uint8_t noise_valid, unused_1;          /* 0x0e */
+	int16_t noise;                          /* 0x10 NOISE */
+	uint8_t tx_valid;                       /* 0x12 */
+	uint8_t cca;                            /* 0x13 CCA (%) */
+	int32_t tx_fail, tx_retrans, tx_frames; /* 0x14 TXFAIL, 0x18 TXRETRANS, 0x1c TXFRAMES */
+	int32_t rx_retry_frames, rx_frames;     /* 0x20 RXRETRYFRMS, 0x24 RXFRAMES */
+	int32_t rx_beacon_frames, rx_beacon_sched;      /* 0x28 RXBEACONFRMS, 0x2c RXBEACONSCHED */
+	uint8_t beacon_valid;                   /* 0x30 */
+	uint8_t fw_valid, unused_2[2];          /* 0x31 */
+	int32_t tx_fw_fail, tx_fw_retrans, tx_fw_frames;        /* 0x34 */
+	int32_t tx_rate, tx_fallback_rate, rx_rate;     /* 0x40 TXRATE, 0x44 TXFBRATE, 0x48 RXRATE */
+	uint8_t unused_3[4];
+	uint8_t qbss_valid, unused_4;           /* 0x50 */
+	uint8_t qbss[10];                       /* 0x52 QBSS_STA_COUNT.. (not filled) */
+	uint32_t network_flags;                 /* 0x5c DIRECTED_NETWORK (bits 0/1), INTERNET_ACCESS (bits 2/3) */
+	uint8_t roam[3];                        /* 0x60, valid at 0x62 */
+	uint8_t unused_5[0xa0 - 0x63];
+	uint8_t cca_stats_valid;                /* 0xa0 */
+	uint8_t unused_6[0xb4 - 0xa1];
+	uint8_t core_noise_valid, unused_7;     /* 0xb4 */
+	int8_t core_noise[2];                   /* 0xb6 PER_CORE_NOISE */
+};
+_Static_assert(sizeof(struct apple80211_lqm_event) == 0xb8 && offsetof(struct apple80211_lqm_event, tx_rate) == 0x40 &&
+    offsetof(struct apple80211_lqm_event, network_flags) == 0x5c && offsetof(struct apple80211_lqm_event, core_noise) == 0xb6,
+    "the LQM event as __dispatchlqmChangedEvent of iPadOS 17.7.11 reads it");
+
+/* event 145: exactly 16 bytes, WEIGHT_AVG_RSSI, _SNR, _TX_RATE, _RX_RATE (SInt32 each) */
+struct apple80211_weight_avg_lqm {
+	int32_t rssi, snr, tx_rate, rx_rate;
+};
+
+/* APPLE80211_IOC 386 (LQM_SUMMARY), 5536 bytes: the first 0x98 as __getLQMSummary reads them */
+struct apple80211_lqm_summary {
+	uint8_t cca;                            /* LQM_SUMMARY_CCA (SInt8) */
+	int8_t rssi;                            /* LQM_SUMMARY_RSSI (SInt8) */
+	int16_t snr;                            /* LQM_SUMMARY_SNR (SInt16) */
+	int32_t data_stall_score, net_score;    /* 0x04, 0x08 (int) */
+	uint8_t unused_0[4];
+	uint64_t tx_retries, tx_fails, tx_frames, rx_fcs, rx_plcp, rx_crs, rx_dup, rx_ampdu_dup, rx_ucast_replay,
+	    rx_ucast_decrypt, rx_mcast_replay, rx_mcast_decrypt, rx_retries, rx_good_plcps, rx_ucast_frames, rx_mcast_frames,
+	    rx_total_frames;                   /* 0x10 .. 0x90 (SInt64) */
+};
+_Static_assert(offsetof(struct apple80211_lqm_summary, tx_fails) == 0x18 &&
+    offsetof(struct apple80211_lqm_summary, rx_total_frames) == 0x90, "the LQM summary as __getLQMSummary reads it");
+
 /* (17 and 39: positions in IO80211.framework's APPLE80211_M_ name table of iPadOS 17.7.11, read from the dyld cache 31/10) */
 
 static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes one interface, and that is its name) */
@@ -236,7 +298,30 @@ static void post(uint32_t code, const void *data, uint32_t length);
 static thread_call_t signal_call;
 
 static struct apple80211_link_changed link_up_event(int rssi);
+
+/* guamp 03/11: the LQM event (39) for an RSSI: signal, SNR, noise, CCA, rates; every beacon of the second heard */
+static void
+post_lqm(int rssi, unsigned seconds)
+{
+	struct apple80211_lqm_event *lqm = IOMallocZeroData(sizeof(*lqm));
+	struct apple80211_weight_avg_lqm avg = { .rssi = rssi, .snr = rssi - GUAMP_NOISE_DBM, .tx_rate = GUAMP_LINK_RATE_MBPS,
+		                                 .rx_rate = GUAMP_LINK_RATE_MBPS };
+
+	if (lqm != NULL) {
+		lqm->rssi_valid = 1; lqm->rssi = rssi;
+		lqm->core_rssi_valid = 1; lqm->core_rssi[0] = (int8_t)rssi; lqm->core_rssi[1] = (int8_t)0x80;
+		lqm->snr_valid = 1; lqm->snr = (int16_t)(rssi - GUAMP_NOISE_DBM);
+		lqm->noise_valid = 1; lqm->noise = GUAMP_NOISE_DBM;
+		lqm->tx_valid = 1; lqm->cca = 10;
+		lqm->tx_rate = lqm->tx_fallback_rate = lqm->rx_rate = GUAMP_LINK_RATE_MBPS;
+		lqm->beacon_valid = 1; lqm->rx_beacon_frames = lqm->rx_beacon_sched = (int32_t)(10 * (seconds ? seconds : 1));
+		post(EVENT_RSSI_CHANGED, lqm, sizeof(*lqm));
+		IOFreeData(lqm, sizeof(*lqm));
+	}
+	post(EVENT_WEIGHT_AVG_LQM_UPDATE, &avg, sizeof(avg));
+}
 static uint32_t link_rssi_events = 1;          /* guamp-wifi-link-rssi */
+static uint32_t lqm_events = 1;                /* guamp-wifi-lqm */
 
 static void
 signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -265,7 +350,11 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 			} quality = { .rssi = state->bss.rssi, .rate = GUAMP_LINK_RATE_MBPS };
 
 			post(EVENT_LINK_QUALITY, &quality, sizeof(quality));
-			post(EVENT_RSSI_CHANGED, NULL, 0);
+			if (lqm_events) {
+				post_lqm(state->bss.rssi, interval);   /* (guamp 03/11: with its data; guamp-wifi-lqm=0: as before) */
+			} else {
+				post(EVENT_RSSI_CHANGED, NULL, 0);
+			}
 			/*
 			 * guamp 03/11: fin34: after these events wifid read the RSSI only once (at the join) and the bars stayed grey.
 			 * The signal also goes in a link event (up, with RSSI, noise and SNR) when it moves by 3 dB or more and at the
@@ -298,6 +387,7 @@ guamp_apple80211_init(void)
 	lck_mtx_init(&apple80211_lock, lck_grp_alloc_init("guamp-apple80211", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
 	PE_parse_boot_argn("guamp-wifi-rssi-events", &on, sizeof(on));
 	PE_parse_boot_argn("guamp-wifi-link-rssi", &link_rssi_events, sizeof(link_rssi_events));
+	PE_parse_boot_argn("guamp-wifi-lqm", &lqm_events, sizeof(lqm_events));
 	if (on) {
 		signal_call = thread_call_allocate_with_options(signal_tick, NULL, THREAD_CALL_PRIORITY_LOW, 0);
 		if (signal_call != NULL) {
@@ -703,6 +793,13 @@ get(struct apple80211req *request)
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : request->req_len == 0 ? give_value(request, GUAMP_LINK_MCS) :
 		    give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 386: {                             /* guamp 03/11: LQM_SUMMARY (see struct apple80211_lqm_summary) */
+		struct apple80211_lqm_summary summary = { .cca = 10, .rssi = (int8_t)state->bss.rssi,
+			                                  .snr = (int16_t)(state->bss.rssi - GUAMP_NOISE_DBM) };
+
+		error = state->phase != HAKIOS_STA_JOINED || !lqm_events ? ENXIO : give(request, &summary, sizeof(summary));
 		break;
 	}
 	case 103:                               /* all of it, as a scan's result */
