@@ -727,6 +727,11 @@ void thread(void *param, wait_result_t) {
         "log %u contacts\n", gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, gEdgeTop, gEdgeSide,
         gEdgeBottom, kEdgeFade, gFlip, gMapLog);
   uint8_t ev[HX_EVENT_LEN];
+  // guamp 03/11: new screen, the chip answers and runs but every report is an empty one even under a finger.
+  // guamp-touch-raw=<n> (default 64): the event bytes are logged whenever they change, at most n times.
+  uint8_t lastRaw[HX_EVENT_LEN] = {};
+  unsigned rawLeft = 64;
+  PE_parse_boot_argn("guamp-touch-raw", &rawLeft, sizeof(rawLeft));
   uint32_t seen = gIrqEvents;
   bool down = false;
   uint32_t polls = 0;
@@ -747,7 +752,15 @@ void thread(void *param, wait_result_t) {
       IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d\n", polls, gIrqs, gEvents, gBad, gReleases,
             gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback);
     struct hx_report rep;
-    if (hx_read_event(&gChip, ev) || hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep)) {
+    const int readError = hx_read_event(&gChip, ev);
+    if (rawLeft && !readError && memcmp(ev, lastRaw, sizeof(ev))) {
+      rawLeft--;
+      memcpy(lastRaw, ev, sizeof(ev));
+      char hex[3 * 24 + 1] = "";
+      for (unsigned i = 0; i < sizeof(ev) && i < 24; i++) snprintf(hex + 3 * i, 4, "%02x ", ev[i]);
+      IOLog("GuampTouch: raw poll %u irqs %u: %s\n", polls, gIrqs, hex);
+    }
+    if (readError || hx_parse_event(ev, gChip.x_res ? gChip.x_res : GT_PANEL_X, gChip.y_res ? gChip.y_res : GT_PANEL_Y, &rep)) {
       gBad = gBad + 1;
       // A lost "finger up" report left iOS with a stuck contact: release after 100 ms without a valid report.
       if (down && mach_absolute_time() - lastGood > releaseTicks) {
