@@ -57,6 +57,7 @@ uint8_t *gFrame, *gRx, *gCfg;
 uint64_t gLevelHz[GT_DFS_LEVELS];
 bool gDfs;
 volatile uint32_t gStep, gEvents, gBad, gIrqs, gReleases;
+volatile uint32_t gGridDrops;   // contacts that began on the electrode grid point (guamp-touch-grid), not sent
 volatile int gError;
 
 void fail(unsigned step, int code) { if (!gError) { gStep = step; gError = code ? code : -1; } IOLog("GuampTouch: step %u failed (%d)\n", step, code); }
@@ -1007,6 +1008,19 @@ void thread(void *param, wait_result_t) {
   PE_parse_boot_argn("guamp-touch-dump", &dumpEvery, sizeof(dumpEvery));
   PE_parse_boot_argn("guamp-touch-line", &lineFilter, sizeof(lineFilter));
   PE_parse_boot_argn("guamp-touch-repeat", &repeatMax, sizeof(repeatMax));
+  // guamp-touch-grid (03/11 idle, default 1, =0 off): live-20261103-195840 has ~2600 contacts that begin on the electrode grid
+  // of the top row, raw y = 20 and x = 25 + 50 k (75, 125 ... 675), almost all one report long: a phantom tap every ~0.4 s that
+  // NativeHidInput sends as a digitizer event, i.e. user activity for backboardd (AttentionAwareness) and the auto-lock never
+  // runs out. A contact whose first point lies on that grid point is not published; it is sent from its first point off the
+  // grid (a finger that started elsewhere is never cut). guamp-touch-grid-y (default 20), guamp-touch-grid-pitch (50) and
+  // guamp-touch-grid-offset (25) in raw panel pixels.
+  unsigned gridFilter = 1, gridY = 20, gridPitch = 50, gridOffset = 25;
+  PE_parse_boot_argn("guamp-touch-grid", &gridFilter, sizeof(gridFilter));
+  PE_parse_boot_argn("guamp-touch-grid-y", &gridY, sizeof(gridY));
+  PE_parse_boot_argn("guamp-touch-grid-pitch", &gridPitch, sizeof(gridPitch));
+  PE_parse_boot_argn("guamp-touch-grid-offset", &gridOffset, sizeof(gridOffset));
+  if (!gridPitch) gridFilter = 0;
+  IOLog("GuampTouch: grid filter %s (row %u, x = %u + %u k)\n", gridFilter ? "on" : "off", gridY, gridOffset, gridPitch);
   uint32_t phantoms = 0, repeats = 0, empties = 0;
   unsigned sameRun = 0;
   struct hx_report lastRep = {};
@@ -1146,6 +1160,23 @@ void thread(void *param, wait_result_t) {
         if (repeats == 1 || (repeats & 1023) == 0)
           IOLog("GuampTouch: repeated report dropped (%u, %u points identical %u times)\n", repeats, rep.count, sameRun);
       }
+    }
+    if (!drop && gridFilter && rep.count) {
+      unsigned kept = 0;
+      for (unsigned i = 0; i < rep.count; ++i) {
+        const int s = rep.slot[i], x = rep.point[i].x, y = rep.point[i].y;
+        const bool live = s >= 0 && s < HX_MAX_PT && gContact[s].down;
+        if (!live && y == static_cast<int>(gridY) && x >= 0 && static_cast<unsigned>(x) % gridPitch == gridOffset) {
+          gGridDrops = gGridDrops + 1;
+          if (gGridDrops <= 8 || (gGridDrops & 1023) == 0)
+            IOLog("GuampTouch: grid contact %u not sent: slot %d at %d,%d (%u points in the report)\n", gGridDrops, s, x, y,
+                  rep.count);
+          continue;
+        }
+        if (kept != i) { rep.slot[kept] = rep.slot[i]; rep.point[kept] = rep.point[i]; }
+        kept++;
+      }
+      rep.count = kept;
     }
     if (parsed == HX_ERR_EMPTY) empties = empties + 1;
     if (drop) {

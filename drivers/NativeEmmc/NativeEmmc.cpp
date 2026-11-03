@@ -1305,6 +1305,7 @@ static void usbProbe()
 #include "UsbMirror.inc"
 #include "TouchService.inc"
 #include "PmicService.inc"
+#include "GuampHidStats.inc"  // one line per minute with the events of each HID source (guamp-hid-stats, 0 off)
 #include "GuampRtc.inc"       // wall clock: PM6125 RTC + offset in kpan (guamp-rtc=0 off), after PmicService.inc
 #include "GuampBtSerial.inc"   // Bluetooth M2 device nodes (guamp-bt-shim=1), the transport of BtService.inc
 #include "BtService.inc"
@@ -1473,6 +1474,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   sensors::start();   // guamp-sensors=1: HID sensor devices fed by the USB mirror ("GSNS"); mode logged always
   pmic::start();
   touch::start();
+  hidstats::start();  // guamp-hid-stats=<s> (default 60): touch/mirror/buttons/sensors events per period, auto-lock checks
   btnub::start();     // guamp-bt-nub=1: IOService on /arm-io/uart1/bluetooth (bluetoothd FindLocalMacAddress)
   bt::start();        // guamp-bt=1: Bluetooth M0 probe (rails, SE3 UART, HCI version); =2 adds M1 (rampatch/NVM, 3 Mbit/s)
   gpum1::start();     // guamp-gpu-m1=1: Adreno 610 M1 (GDSCs, clocks, first GPU register reads), own thread

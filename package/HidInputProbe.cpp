@@ -115,9 +115,19 @@ __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
         // opened, not from the HID device below it; publish them on the service itself (idempotent, once per second).
         // Set once only: every setProperty on a service with attached user clients is a registry property-change
         // notification, and repeating it each second keeps backboardd/hidd busy re-evaluating the service.
-        static IORegistryEntry *publishedFor;
-        if(device->getProperty("Built-In") && publishedFor!=driver) {
-            publishedFor=driver;
+        // guamp 03/11 (idle): one entry per event driver. Since 29/10 the five sensor devices (guamp-sensors>=1) are Built-In
+        // too and tick here every second: the single static pointer alternated between six drivers, so every tick rewrote these
+        // properties (registry property-change notifications to backboardd/hidd each second) and gave the accelerometer, gyro,
+        // orientation, proximity and light services PrimaryUsagePage 0x0D / PrimaryUsage 4 (Digitizer/Touch Screen). Only the
+        // device that carries the touch collection (DigitizerCollectionDispatch, set in start with the touch) gets them, once.
+        static IORegistryEntry *volatile publishedFor[8];
+        bool published=false;
+        for(unsigned i=0;i<8 && !published;++i)published=publishedFor[i]==driver;
+        if(device->getProperty("DigitizerCollectionDispatch") && !published) {
+            for(unsigned i=0;i<8;++i){
+                IORegistryEntry *expected=nullptr;
+                if(__atomic_compare_exchange_n(&publishedFor[i],&expected,driver,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
+            }
             driver->setProperty("Built-In",kOSBooleanTrue);driver->setProperty("DisplayIntegrated",kOSBooleanTrue);
             // backboardd (-[BKHIDDirectTouchEventProcessor processEvent:sender:dispatcher:], decoded from the target) drops a
             // digitizer event unless the sending service has PrimaryUsagePage 0x0D and PrimaryUsage 1, 4 or 0x20

@@ -256,6 +256,7 @@ void chargerGatingLog(bool force) {
 constexpr uint32_t kRingerBit = 1u << 4;     // report 2 bit 4: Telephony 0x0B / 0x2E (guamp-hid-variant.py)
 volatile uint8_t *gAssist;                   // GPIO 33's own 0x1000 block, nothing else of the EAST tile
 volatile uint32_t gRingerState, gRingerPresses, gSinkGeneration;
+volatile uint32_t gSinkChanges, gSinkRefreshes;   // reports handed to the HID sink: on change / same state again (GuampHidStats)
 
 // Maps the pin and checks its configuration; only GPIO 33's cfg is ever written, and only when the boot chain left it
 // in another function, as an output or without the pull-up (the key would then read pressed or float).
@@ -416,7 +417,7 @@ void thread(void *, wait_result_t) {
     if (stable == 1 && now != sent) {             // the same set on two polls in a row
       sent = now;
       gButtons = now;
-      if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, now);
+      if (void (*sink)(void *, uint32_t) = gSink) { sink(gSinkContext, now); gSinkChanges = gSinkChanges + 1; }
       IOLog("GuampPmic: buttons %x, HID sink %s (pon %02x vol-up %02x)\n", now, gSink ? "attached" : "absent",
             gPonRaw, gVolUpRaw);
     } else if (tick % 40 == 0 || gSinkGeneration != sinkSeen) {
@@ -424,7 +425,7 @@ void thread(void *, wait_result_t) {
       // change (NativeHidInput drops reports until its IOHIDEventDriver exists). The same report again is no event:
       // IOHIDEventDriver only dispatches keyboard elements whose value changed.
       sinkSeen = gSinkGeneration;
-      if (void (*sink)(void *, uint32_t) = gSink) sink(gSinkContext, sent);
+      if (void (*sink)(void *, uint32_t) = gSink) { sink(gSinkContext, sent); gSinkRefreshes = gSinkRefreshes + 1; }
     }
     if (tick % 40 == 0) {                         // every second: the charger controller
       uint64_t ns = 0;
