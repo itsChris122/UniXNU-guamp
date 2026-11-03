@@ -391,7 +391,7 @@ int hx_start(struct hx_chip *c)
     // 0x100072C0, 10 ms polls, 200 at most), sense off, versions.
     c->stage = 21;
     int r = HX_OK;
-    const unsigned tries = c->reload_tries ? c->reload_tries : 3;
+    const unsigned tries = c->reload_tries ? c->reload_tries : 1;   // markers are transient: log only
     unsigned total = 0;
     int ok = 0;
     for (c->reload_attempts = 1; c->reload_attempts <= tries && !ok; ++c->reload_attempts) {

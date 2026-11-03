@@ -243,13 +243,14 @@ OSDefineMetaClassAndStructors(GuampBacklight, IOService)
 
 namespace backlight {
 // Touch service experiment (guamp-touch-panelcycle): off-command then on-command, from the touch thread at boot.
-int panelCycle() {
+int panelCycle(int which) {
   static const uint32_t cmds[] = {guamp_backlight::kDcsDisplayOff, guamp_backlight::kDcsSleepIn, guamp_backlight::kDcsSleepOut,
                                   guamp_backlight::kDcsDisplayOn};
   static const uint32_t waits[] = {20, 120, 160, 50};
   guamp_backlight::Diag d;
   Io io;
-  for (unsigned i = 0; i < 4; ++i) {
+  const unsigned first = which == 1 ? 2u : 0u, last = which == 0 ? 2u : 4u;
+  for (unsigned i = first; i < last; ++i) {
     const int r = guamp_backlight::sendDcsShort(io, cmds[i], d);
     if (r != guamp_backlight::kSent) return r;
     IOSleep(waits[i]);
