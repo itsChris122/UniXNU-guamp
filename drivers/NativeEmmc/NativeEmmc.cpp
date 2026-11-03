@@ -1318,6 +1318,7 @@ static void usbProbe()
 #include "GpuService.inc"
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
+#include "GuampDsiState.inc"    // guamp-dsi-dump=1: MDSS/DSI/PHY register dump + DCS reads at boot and 60 s (TWRP: strumenti/twrp-dsi-stato.sh)
 #include "GuampScanout.inc"     // differential copy / double-buffered scanout of the legacy display (guamp-copy-diff, guamp-scanout-flip)
 #include "GuampPanelCycle.inc"  // guamp-touch-panelcycle=5: Linux panel power cycle (LCDB, DSI LP), after GuampScanout.inc
 #include "GuampCpufreq.inc"
@@ -1470,6 +1471,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   dispext::start();
   cpufreq::start();   // guamp-cpufreq=1|2: cpufreq-hw performance state (tables logged always)
   backlight::start(); // guamp-backlight=1: panel DCS 0x51 brightness as AppleARMBacklight for CoreBrightness
+  dsistate::start();  // guamp-dsi-dump=1: display link / panel state dump (after backlight::start: its DSI window)
   rpm::start();       // RPM client lock (used by guamp-bt-ldo=3, guamp-gpu-rpm=1); guamp-rpm-test=1|2 self-test thread
   sensors::start();   // guamp-sensors=1: HID sensor devices fed by the USB mirror ("GSNS"); mode logged always
   pmic::start();

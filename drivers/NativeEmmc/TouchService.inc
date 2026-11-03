@@ -19,6 +19,7 @@
 #include "GeniSpi.h"
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
+#include "GuampDsiStateCore.h"   // guamp-dsi-dump=1: DD register addresses (ddDump)
 #include "GeniSpiCpp.inc"
 #include "HxProtocolCpp.inc"
 
@@ -792,6 +793,76 @@ int panelCycle(const char *when, int which = 2) {
   IOLog("GuampTouch: panel cycle %s: %s (%d)\n", when, !fn ? "no DSI (GuampBacklight absent)" : r == 0 ? "sent" : "refused", r);
   return r;
 }
+// guamp-dsi-dump=1 (GuampDsiState.inc, GuampDsiStateCore.h): the Himax DD (display driver) registers seen through SPI,
+// after the start and once more at 60 s of uptime, to compare with strumenti/twrp-dsi-stato.sh in TWRP (same requests).
+// (a) firmware handshake as /proc/android_touch/debug "dd_debug,r:x<reg>,x00,x20" (himax_mcu_read_DD_status): read only
+// for the display; (b) guamp-dsi-dump-ddahb=1: the direct AHB window 0x30000000 | reg << 12 | param, after the DD clock /
+// password writes of hx83102d_ic_id_read (clock put back afterwards), per byte as himax_mcu_dd_reg_read plus a 32-byte
+// burst as the TWRP "register,r:x300RR000" read gives it.
+unsigned gDsiDump, gDsiDumpAhb;
+void ddHex(char *out, size_t cap, const uint8_t *b, unsigned n) {
+  unsigned len = 0;
+  out[0] = 0;
+  for (unsigned i = 0; i < n && len + 4 < cap; ++i)
+    len += static_cast<unsigned>(snprintf(out + len, cap - len, "%02x%s", b[i], (i & 3) == 3 ? " " : ""));
+}
+void ddDump(const char *when) {
+  if (!gDsiDump) return;
+  using namespace guamp_dsistate;
+  uint32_t before = 0;
+  hx_reg_read32(&gChip, kDdHandshake, &before);
+  unsigned ok = 0, timeouts = 0;
+  for (unsigned reg = kDdFirst; reg <= kDdLast; ++reg) {
+    uint8_t req[4];
+    const uint32_t w = ddRequestWord(static_cast<uint8_t>(reg), 0, kDdLen);
+    for (unsigned i = 0; i < 4; ++i) req[i] = static_cast<uint8_t>(w >> (8 * i));
+    if (hx_reg_write(&gChip, kDdHandshake, req, 4)) { IOLog("GuampTouch: dd %s %02x: bus error\n", when, reg); break; }
+    uint8_t hs[4] = {};
+    unsigned polls = 0;
+    for (; polls < 100; ++polls) {
+      hx_reg_read(&gChip, kDdHandshake, hs, 4);
+      if (hs[3] == kDdAck) break;
+      IOSleep(10);
+    }
+    if (polls == 100) {
+      timeouts++;
+      IOLog("GuampTouch: dd %s %02x: no ack (fc %02x%02x%02x%02x)\n", when, reg, hs[0], hs[1], hs[2], hs[3]);
+      if (!ok && timeouts >= 3) { IOLog("GuampTouch: dd %s: the firmware does not answer DD requests, stopped\n", when); break; }
+      continue;
+    }
+    uint8_t b[kDdLen] = {};
+    hx_reg_read(&gChip, kDdData, b, sizeof(b));
+    char hex[kDdLen * 3 + 1];
+    ddHex(hex, sizeof(hex), b, sizeof(b));
+    IOLog("GuampTouch: dd %s %02x (ack after %u): %s\n", when, reg, polls, hex);
+    ok++;
+  }
+  IOLog("GuampTouch: dd %s: %u registers, %u without ack, handshake word before %08x\n", when, ok, timeouts, before);
+  if (!gDsiDumpAhb) return;
+  uint32_t oscEn = 0, oscPw = 0;
+  hx_reg_read32(&gChip, kOscEn, &oscEn);
+  hx_reg_read32(&gChip, kOscPw, &oscPw);
+  hx_reg_write32(&gChip, kOscEn, 0xDDu);                 // hx83102d_dd_clk_set(true)
+  hx_reg_write32(&gChip, kOscPw, 0xA5u);                 // hx83102d_dd_reg_en
+  const uint8_t b9[4] = {0xA5, 0x83, 0x10, 0x2D};
+  hx_reg_write(&gChip, ddAhbAddr(0xB9, 0, 0), b9, 4);
+  for (unsigned reg = kDdFirst; reg <= kDdLast; ++reg) {
+    uint8_t one[kDdAhbLen] = {}, burst[32] = {};
+    for (unsigned p = 0; p < kDdAhbLen; ++p) {
+      uint8_t v[4] = {};
+      hx_reg_read(&gChip, ddAhbAddr(static_cast<uint8_t>(reg), 0, static_cast<uint8_t>(p)), v, 4);
+      one[p] = v[0];
+    }
+    hx_reg_read(&gChip, ddAhbAddr(static_cast<uint8_t>(reg), 0, 0), burst, sizeof(burst));
+    char h1[kDdAhbLen * 3 + 1], h2[32 * 3 + 1];
+    ddHex(h1, sizeof(h1), one, sizeof(one));
+    ddHex(h2, sizeof(h2), burst, sizeof(burst));
+    IOLog("GuampTouch: ddahb %s %02x: %s | burst %s\n", when, reg, h1, h2);
+  }
+  hx_reg_write32(&gChip, kOscEn, oscEn);                 // hx83102d_dd_clk_set(false): as it was found
+  IOLog("GuampTouch: ddahb %s: osc_en was %08x, osc_pw %08x (osc_en restored)\n", when, oscEn, oscPw);
+}
+
 void regDump(const char *when) {
   if (!gRegDump) return;
   static const uint32_t regions[] = {0x10007000u, 0x10007080u, 0x100072C0u, 0x10007F00u, 0x10007FC0u, 0x10005800u,
@@ -1102,6 +1173,15 @@ void thread(void *param, wait_result_t) {
           gChip.fw_ver, gChip.touch_cfg_ver, gChip.display_cfg_ver, gChip.cid_ver);
   }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);
+  PE_parse_boot_argn("guamp-dsi-dump", &gDsiDump, sizeof(gDsiDump));
+  PE_parse_boot_argn("guamp-dsi-dump-ddahb", &gDsiDumpAhb, sizeof(gDsiDumpAhb));
+  if (!r) ddDump("start");
+  uint64_t ddLate = 0;                                 // second DD dump: at 60 s of uptime, at least 20 s after the first
+  if (gDsiDump && !r) {
+    uint64_t now = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    nanoseconds_to_absolutetime(now < 40000000000ULL ? 60000000000ULL : now + 20000000000ULL, &ddLate);
+  }
   if (r) { fail(42, r); return; }
   gStep = 5;
   const bool useIrq = armIrq();
@@ -1223,6 +1303,7 @@ void thread(void *param, wait_result_t) {
       if (diag) logStatus(polls);
     }
     rawdump::dump(ev);
+    if (ddLate && mach_absolute_time() >= ddLate) { ddLate = 0; ddDump("60s"); }
     if (irqOnly && useIrq && !fromIrq) {
       // No interrupt for 20 ms: only the lost "finger up" guard.
       if (down && mach_absolute_time() - lastGood > releaseTicks) {
