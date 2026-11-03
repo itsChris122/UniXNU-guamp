@@ -18,7 +18,7 @@ are code defaults since 28/10; an explicit key still wins.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '56ffaee74bbb5276a5fbd2b01c181a01229611c33816525b6fe2c0a68affc918'
+PATCHED_SHA256 = 'c259349e4560bcfeb88bd781fd1f17033b107820554633ad64598309790f91b8'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -679,6 +679,28 @@ EDITS.append(('''        unsigned phase=0;PE_parse_boot_argn("offline-legacy-pha
 EDITS.append(('''        unsigned retire=0,cpuPresent=0;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));''', '''        unsigned retire=0,cpuPresent=1;   // offline-legacy-cpu-present default 1 (guamp 28/10)
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));'''))
+# 12. Scanout hook (drivers/NativeEmmc/GuampScanout.inc; boot-args guamp-copy-diff, guamp-scanout-flip, guamp-copy-neon, all off by
+#     default). The copy thread hands every frame to guamp_scanout_present() first: 1 drawn there (only the changed bands, or into
+#     the second buffer of the double-buffered scanout), 0 not asked (weak default here, kernels without it), -1 refused (copied here
+#     as before). A blank frame tells it first (guamp_scanout_external) so the GOP frame is the one shown and is redrawn whole.
+EDITS.append(('volatile uint64_t guamp_copy_latest[10];}',
+              'volatile uint64_t guamp_copy_latest[10];\n'
+              '__attribute__((weak)) int guamp_scanout_present(volatile void *,uint64_t,uint64_t,uint64_t,const void *,uint64_t,uint64_t,\n'
+              '    uint32_t,uint32_t,uint32_t,uint32_t,const uint32_t *,const uint32_t *){return 0;}\n'
+              '__attribute__((weak)) void guamp_scanout_external(void){}}'))
+EDITS.append((r'''            ok=(frame.scaled
+                ?guampScalePixels(''', r'''            const bool tapsOk=!frame.scaled || (scaler.line && scaler.width==frame.width && scaler.height==frame.height &&
+                                                scaler.sourceWidth==frame.offerWidth && scaler.sourceHeight==frame.offerHeight);
+            const int hooked=!tapsOk?-1:guamp_scanout_present(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),frame.rowBytes,bootMapping->getPhysicalAddress(),reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),frame.stride,frame.offerWidth,frame.offerHeight,frame.width,frame.height,
+                frame.scaled?scaler.columns:nullptr,frame.scaled?scaler.rows:nullptr);
+            ok=hooked>0 || (frame.scaled
+                ?guampScalePixels('''))
+EDITS.append(('''        if(frame.blank) {
+            if(bootMapping && native_legacy_fill_pixels(''', '''        if(frame.blank) {
+            guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled
+            if(bootMapping && native_legacy_fill_pixels('''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data

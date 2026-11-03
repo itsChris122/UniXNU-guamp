@@ -1265,6 +1265,7 @@ static void usbProbe()
 #include "GpuService.inc"
 #include "GuampCaMetal.inc"
 #include "GuampBacklight.inc"
+#include "GuampScanout.inc"     // differential copy / double-buffered scanout of the legacy display (guamp-copy-diff, guamp-scanout-flip)
 #include "GuampCpufreq.inc"
 #include "GuampAudioHw.inc"    // audio output HW (guamp-audio-hw=1|2): aw882xx speaker amp, LPI i2s1, RX macro; before GuampAdsp.inc
 #define GUAMP_AUDIO_SHM_PROVIDED 1  // guamp_audio_shm_get/put: GuampAudioPlay.inc (stream 0x1c1 buffer for the capture)
@@ -1616,6 +1617,7 @@ extern "C" int native_verified_block_manifest_sha384(dev_t device, const char *u
 extern "C" void guamp_emmc_flush(unsigned type)
 {
   pmic::torch::shutdown(type >= kPEPanicRestartCPU && type != kPEPagingOff);   // flash LED off first, gate or not
+  gscan::restore();   // guamp-scanout-flip=1: the GOP frame (panic screen, boot loader) is the scanout again
   if (type < kPEPanicRestartCPU || type == kPEPagingOff) rtc::flush();       // pending settimeofday offset, own gate use
   Card &card = gCard;
   if (!card.online || !card.gate) return;
