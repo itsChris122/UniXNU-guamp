@@ -1,0 +1,68 @@
+guamp: render server diagnostics off by default (profiler, frame trace writer, telemetry every 30 s)
+
+Measured on fin35 (live-20261103-192306): backboardd 53% + kernel_task 58% of a core at rest; profile.txt 3.8 MiB rewritten
+every 5 s; 10685 sandbox denies of frames.trace from WidgetRenderer_Default. NMB_PROFILE=1, NMB_FRAME_TRACE=1 or the boot argument
+guamp-m2v-diag=1 bring the diagnostics back; NMB_TELEMETRY_FAST=1 the 6 s telemetry. Applies after 0001 and 0002 (2ff4be9).
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 9a4f183..ebd8319 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -434,7 +434,10 @@ static id deviceForPort(unsigned port) {
+                     if (!end) break;
+                     line = end + 1;
+                 }
+-                sleep(6);
++                // guamp 0009: a dump is about 2000 user-client calls; every 30 s instead of 6 (the kernel prints the rows every 10 minutes
++                // anyway, guamp-metal-rows), every 6 s again with NMB_TELEMETRY_FAST=1.
++                static const bool fast = [] { const char *v = getenv("NMB_TELEMETRY_FAST"); return v && strtoul(v, nullptr, 0) != 0; }();
++                sleep(fast ? 6 : 30);
+             }
+             return nullptr;
+         }, gpu);
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index a094204..81ae060 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -29,6 +29,19 @@
+ #include <thread>
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <sys/sysctl.h>
++// guamp (UniXNU-guamp patches/adreno-metal/0009): the render server's diagnostics that cost frame time are off unless asked for.
++// nbGuampDiag(env): the environment variable set to a nonzero number, or the boot argument guamp-m2v-diag=1 (kern.bootargs; a
++// process whose sandbox refuses the read keeps them off). Read once per process.
++static bool nbGuampDiag(const char *env) {
++ if(const char *v=getenv(env))return strtoul(v,nullptr,0)!=0;
++ static const int fromBootArgs=[]{
++  char args[1024]={};size_t size=sizeof args-1;
++  if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0)return 0;
++  return strstr(args,"guamp-m2v-diag=1")!=nullptr?1:0;
++ }();
++ return fromBootArgs!=0;
++}
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+ 
+@@ -302,6 +315,10 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
+ static void traceStartWriter() {
+  bool expected=false;
+  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
++ // guamp 0009: frames.trace / cpu.profile (backboardd's cache directory) written every 400 ms, and opened every 400 ms by every other
++ // Metal client, whose sandbox denies it (10685 duplicate denies of WidgetRenderer_Default in 10 minutes of fin35). The records stay
++ // in the in-memory ring; the writer starts only with NMB_FRAME_TRACE=1 or guamp-m2v-diag=1.
++ if(!nbGuampDiag("NMB_FRAME_TRACE"))return;
+  std::thread([]{
+   pthread_setname_np("frame-trace");
+   int fd=-1;
+@@ -722,6 +739,10 @@ static void *profileLoop(void *) {
+ }
+ static void startProfile() {
+  if(gProfilePath.empty())return;
++ // guamp 0009: the profiler suspended the compositor's render thread 1000 times a second while it ran (thread_suspend, a stack walk
++ // and a std::map insert per sample, then profile.txt of several MiB symbolized and rewritten every 5 s of activity). Off by default;
++ // NMB_PROFILE=1 or guamp-m2v-diag=1 brings it back.
++ if(!nbGuampDiag("NMB_PROFILE"))return;
+  gProfiled=mach_thread_self();   // the send right stays with the sampler
+  pthread_t thread;
+  if(pthread_create(&thread,nullptr,profileLoop,nullptr)==0)pthread_detach(thread);
