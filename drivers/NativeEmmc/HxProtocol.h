@@ -192,6 +192,9 @@ int hx_download(struct hx_chip *c, const struct hx_fw *fw, uint8_t *cfg_scratch)
 // After the download (himax_mcu_0f_operation): reload enable, sense on, wait for "reload OK", sense off, versions and
 // touch information, sense on again. HX_OK once the firmware reports active.
 int hx_start(struct hx_chip *c);
+// Reload probe without any download: reload enable (0x10007F00 = 0), sense on, then up to polls x 10 ms for the
+// firmware's reload markers (A9 9A / A3 3A at 0x10007F00, C0 72 at 0x100072C0). 1 seen, 0 not, < 0 error.
+int hx_reload_probe(struct hx_chip *c, unsigned polls);
 // Sense on as himax_hx83102d_sense_on(0): interface on, clear the ISR, pin reset, reload to active.
 int hx_sense_on(struct hx_chip *c);
 // Overlay swap while the firmware runs (hx83102d_0f_overlay): wait up to wait_ms for the firmware's request in the

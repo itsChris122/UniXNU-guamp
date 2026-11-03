@@ -348,6 +348,26 @@ int hx_sense_on(struct hx_chip *c)
     return reload_to_active(c);
 }
 
+static int reload_seen(const struct hx_chip *c)
+{
+    const uint32_t a = c->reload1 & 0xFFFF;
+    return a == 0x3AA3 || a == 0x9AA9 || (c->reload2 & 0xFFFF) == 0x72C0;
+}
+
+int hx_reload_probe(struct hx_chip *c, unsigned polls)
+{
+    int r;
+    if (hx_reg_write32(c, HX_ADDR_FLASH_RELOAD, 0)) return HX_ERR_BUS;
+    if ((r = hx_sense_on(c)) != HX_OK) return r;
+    for (unsigned i = 0; i < polls; ++i) {
+        if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
+            return HX_ERR_BUS;
+        if (reload_seen(c)) return 1;
+        sleep_ms(c, 10);
+    }
+    return 0;
+}
+
 int hx_start(struct hx_chip *c)
 {
     uint8_t d[8];
@@ -366,7 +386,7 @@ int hx_start(struct hx_chip *c)
         for (unsigned i = 0; i < 100; ++i, ++total) {
             if (hx_reg_read32(c, HX_ADDR_FLASH_RELOAD, &c->reload1) || hx_reg_read32(c, HX_ADDR_2ND_FLASH_RELOAD, &c->reload2))
                 return HX_ERR_BUS;
-            if ((c->reload1 & 0xFFFF) == 0x3AA3 || (c->reload2 & 0xFFFF) == 0x72C0) {ok = 1; break;}
+            if (reload_seen(c)) {ok = 1; break;}
             sleep_ms(c, 10);
         }
         if (!ok && c->reload_attempts < tries) {
