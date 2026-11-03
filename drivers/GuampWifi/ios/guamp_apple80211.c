@@ -601,6 +601,11 @@ get(struct apple80211req *request)
 		return give_value(request, 0);
 	case 18:                                /* guamp 03/11: interrupt mitigation: APPLE80211_INT_MIT_AUTO (the firmware's own) */
 		return give_value(request, 1);
+	case 29: {                              /* guamp 04/11: DEAUTH (apple80211_deauth_data): no deauthentication reason */
+		const uint32_t answer[4] = { 1, 0, 0, 0 };
+
+		return give(request, answer, sizeof(answer));
+	}
 	case 353:                               /* guamp 03/11: NSS? (no buffer): one spatial stream (WCN3950: 1x1) */
 		return give_value(request, 1);
 	case 423: {
@@ -1004,6 +1009,7 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	case 28:
 	case 365:
 	case 383:
+	case 422:                               /* (guamp 04/11: 6G_MODE?, value 0 = off, before every join) */
 	case 470:
 	case 471:
 	case 473: {

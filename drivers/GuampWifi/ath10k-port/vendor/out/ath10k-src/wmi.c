@@ -1956,14 +1956,22 @@ int ath10k_wmi_cmd_send(struct ath10k *ar, struct sk_buff *skb, u32 cmd_id)
 				ret = -ESHUTDOWN;
 		}
 		(ret != -EAGAIN);
-	}), 3 * HZ);
+	}), 10 * HZ);
+	/* guamp 04/11: 10 s instead of 3. The wait did not time out at all before 7d4796d (the timeout was only looked at in
+	 * an idle round); fin43 then hit it 5.5 s after an association (VDEV_DOWN 0x5007 without a WMI credit) and the
+	 * "restart" left the radio dead: this port has no ieee80211_restart_hw, only a log line. The credits and the WMI
+	 * endpoint are said when it happens. */
 
 	if (ret)
 		dev_kfree_skb_any(skb);
 
 	if (ret == -EAGAIN) {
+		struct ath10k_htc_ep *ep = &ar->htc.endpoint[ar->wmi.eid];
+
 		ath10k_warn(ar, "wmi command %d timeout, restarting hardware\n",
 			    cmd_id);
+		ath10k_warn(ar, "wmi endpoint %d: tx credits %d (credit size %d, flow %d), ul pipe %d\n",
+			    ar->wmi.eid, ep->tx_credits, ep->tx_credit_size, ep->tx_credit_flow_enabled, ep->ul_pipe_id);
 		ath10k_core_start_recovery(ar);
 	}
 
@@ -2740,6 +2748,8 @@ static void ath10k_wmi_event_chan_info_unpaired(struct ath10k *ar,
 
 	idx = freq_to_idx(ar, params->freq);
 	if (idx >= ARRAY_SIZE(ar->survey)) {
+		if (params->freq == 0)	/* guamp 04/11: the WCN3990 firmware's closing chan info of a scan has frequency 0 */
+			return;
 		ath10k_warn(ar, "chan info: invalid frequency %d (idx %d out of bounds)\n",
 			    params->freq, idx);
 		return;
@@ -2771,6 +2781,8 @@ static void ath10k_wmi_event_chan_info_paired(struct ath10k *ar,
 
 	idx = freq_to_idx(ar, params->freq);
 	if (idx >= ARRAY_SIZE(ar->survey)) {
+		if (params->freq == 0)	/* guamp 04/11: the WCN3990 firmware's closing chan info of a scan has frequency 0 */
+			return;
 		ath10k_warn(ar, "chan info: invalid frequency %d (idx %d out of bounds)\n",
 			    params->freq, idx);
 		return;

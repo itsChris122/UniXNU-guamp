@@ -472,7 +472,9 @@ struct Sm6115Runtime {
   static int wlanPower(void *p,bool on) { return on?static_cast<Sm6115Runtime *>(p)->startWlanResources():Busy; }
   static int fileSize(void *,const char *name,uint32_t *bytes) { return guamp_wifi_firmware_file_size(name,bytes); }
   static int fileRead(void *,const char *name,uint32_t at,uint8_t *out,uint32_t bytes) { return guamp_wifi_firmware_file_read(name,at,out,bytes); }
-  static void controlEvent(void *,WifiControl::Stage state,int e) { IOLog("GuampWiFi: control %u error %d\n",unsigned(state),e); }
+  // guamp 04/11: a stage reached is not an error ("control N error 0" 4 times a boot): "error" only with one
+  static void controlEvent(void *,WifiControl::Stage state,int e) {
+    if(e) IOLog("GuampWiFi: control stage %u error %d\n",unsigned(state),e); else IOLog("GuampWiFi: control stage %u\n",unsigned(state)); }
   static void controlTrace(void *,const char *what,int e,uint32_t a,uint32_t b,uint32_t c) {
     IOLog("GuampWiFi: transport %s: %u/%u/%u (0x%x/0x%x/0x%x) result %d %s at %llu ms\n",
       what,a,b,c,a,b,c,e,errorName(e),nowMs());
@@ -544,7 +546,9 @@ struct Sm6115Runtime {
           info.msisdn[0]?"read":"none",info.spn,info.revision);
     guamp_sim_publish(&info);
   }
-  static void wlfwEvent(void *,Wlfw::State state,int e) { IOLog("GuampWiFi: WLFW %u error %d\n",unsigned(state),e); }
+  // guamp 04/11: likewise for WLFW ("WLFW N error 0" 18 times a boot)
+  static void wlfwEvent(void *,Wlfw::State state,int e) {
+    if(e) IOLog("GuampWiFi: WLFW state %u error %d\n",unsigned(state),e); else IOLog("GuampWiFi: WLFW state %u\n",unsigned(state)); }
   static int boardReady(void *p) { return static_cast<Sm6115Runtime *>(p)->physicalReady(); }
   static int boardPower(void *p,int on) {
     auto &r=*static_cast<Sm6115Runtime *>(p);
