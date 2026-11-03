@@ -142,7 +142,7 @@ template <class Io> struct Cycle {
   uint32_t sendList(const char *what, const Cmd *c, unsigned count) {
     uint32_t fails = 0;
     for (unsigned i = 0; i < count; ++i) {
-      guamp_backlight::Diag d;
+      guamp_backlight::Diag d{};
       const int e = guamp_backlight::sendDcsCmd(io, c[i].b, c[i].n, true, d);
       if (e != guamp_backlight::kSent) fails = fails + 1;
       io.log("GuampPanel: %s %02x (%u bytes, LP): %s, %u us, status %08x ack %08x timeout %08x fifo %08x\n", what, c[i].b[0],
