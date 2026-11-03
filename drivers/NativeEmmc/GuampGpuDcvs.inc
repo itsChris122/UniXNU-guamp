@@ -35,6 +35,13 @@ __attribute__((weak)) volatile uint64_t native_adreno_submit_cost[8];
 __attribute__((weak)) volatile uint64_t native_adreno_publish_skipped[2];
 // patches/native-adreno/0011: the maintained bytes by kind (imported, write-combined while distrusted, other owned; [3] distrusted).
 __attribute__((weak)) volatile uint64_t native_adreno_publish_kinds[4];
+// patches/native-adreno/0012: imports left to their client ({mappings, bytes}), the BoMap flags honoured / not, the re-assertion's
+// counters (NativeAdrenoSubmit.cpp: [0] submissions that re-asserted, [1] with none to do, [2] whole checks, [3] pages a check found the
+// event count missed, [4] BOs re-asserted, [5] fallen back to every submission) and the event count itself.
+__attribute__((weak)) volatile uint64_t native_adreno_publish_client[2];
+__attribute__((weak)) volatile uint32_t native_adreno_client_cleans_maps[2];
+__attribute__((weak)) volatile uint64_t native_adreno_reassert_stats[6];
+__attribute__((weak)) volatile uint32_t native_adreno_wc_epoch;
 }
 
 namespace gpudcvs {
@@ -91,6 +98,17 @@ void logSubmits() {
           (imp - last[4]) / dn >> 10, (wc - last[5]) / dn >> 10, native_adreno_publish_kinds[3], (own - last[6]) / dn >> 10,
           (re - last[7]) / dn);
   last[4] = imp; last[5] = wc; last[6] = own; last[7] = re;
+  // patch 0012: per submission, the imports left to their client (their KiB), and how often the re-assertion had work.
+  static uint64_t prev[6];
+  const uint64_t cm = native_adreno_publish_client[0], cb = native_adreno_publish_client[1], rw = native_adreno_reassert_stats[0],
+                 rn = native_adreno_reassert_stats[1], rc = native_adreno_reassert_stats[2], rb = native_adreno_reassert_stats[4];
+  if (dn)
+    IOLog("GuampGpu: submit coherence: client-cleaned imports %llu mappings %llu KiB each (maps flagged %u, refused %u); re-assert "
+          "ran %llu skipped %llu checks %llu BOs %llu, missed %llu pages, fallback %llu, events %u\n",
+          (cm - prev[0]) / dn, (cb - prev[1]) / dn >> 10, native_adreno_client_cleans_maps[0], native_adreno_client_cleans_maps[1],
+          rw - prev[2], rn - prev[3], rc - prev[4], rb - prev[5], native_adreno_reassert_stats[3], native_adreno_reassert_stats[5],
+          native_adreno_wc_epoch);
+  prev[0] = cm; prev[1] = cb; prev[2] = rw; prev[3] = rn; prev[4] = rc; prev[5] = rb;
 }
 
 void thread(void *, wait_result_t) {

@@ -1,0 +1,73 @@
+turnip darwin: host imports the Metal bridge cleans itself (IOSurface textures, tu_darwin_client_cleans_begin/_end) are mapped with BoMap flag 1, when the kernel advertises Query flag 2 (needs native-adreno 0012; older kernels: never set)
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 46006f9..c16ed9f 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -52,6 +52,49 @@ static struct {
+    NativeAdrenoAbiParams params;
+ } dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
+ 
++/* guamp (UniXNU-guamp patches/mesa-turnip/0002, kernel: patches/native-adreno/0012): a kernel that advertises this Query flag accepts
++ * bit 0 of BoMap's reserved word on an imported BO, meaning that the client cleans the CPU caches over the import itself before the GPU
++ * reads it; the kernel then leaves the import out of the cache maintenance it does at every submission. The ABI header of the build
++ * may predate them, so the values are spelled here. */
++#define DW_PARAMS_CLIENT_CLEANS 2u
++#define DW_MAP_CLIENT_CLEANS 1u
++/* The host imports the caller says it cleans itself: the Metal bridge brackets the import of an IOSurface texture's pages (whose CPU
++ * lines it cleans by surface seed before each command buffer, flushSurfaces) with tu_darwin_client_cleans_begin/_end on its thread.
++ * Only an import wholly inside the bracketed range, made on that thread inside the bracket, is flagged; any other import (a no-copy
++ * buffer, a call on another thread) is maintained by the kernel as before. TU_DARWIN_CLIENT_CLEANS=0 never flags. */
++static thread_local struct {uint64_t start, end;} dw_client_cleans;
++static uint32_t dw_client_cleans_flagged, dw_client_cleans_plain;
++static bool
++dw_client_cleans_on(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = debug_get_bool_option("TU_DARWIN_CLIENT_CLEANS", true) ? 1 : 0;
++   return on;
++}
++/* Returns 1 when the kernel takes the flag (and it is not switched off), so the caller knows its cleaning is now the only one. */
++extern "C" __attribute__((visibility("default"))) int
++tu_darwin_client_cleans_begin(const void *address, uint64_t bytes)
++{
++   dw_client_cleans.start = (uint64_t)(uintptr_t)address;
++   dw_client_cleans.end = dw_client_cleans.start + bytes < dw_client_cleans.start ? 0 : dw_client_cleans.start + bytes;
++   return dw.open && (dw.params.flags & DW_PARAMS_CLIENT_CLEANS) && dw_client_cleans_on() ? 1 : 0;
++}
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_client_cleans_end(void)
++{
++   dw_client_cleans.start = dw_client_cleans.end = 0;
++}
++/* Imports flagged and imports made while a bracket was open but not flagged (another range), for the plugin's rows. */
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_client_cleans_counts(uint32_t *flagged, uint32_t *plain)
++{
++   if (flagged)
++      *flagged = __atomic_load_n(&dw_client_cleans_flagged, __ATOMIC_RELAXED);
++   if (plain)
++      *plain = __atomic_load_n(&dw_client_cleans_plain, __ATOMIC_RELAXED);
++}
++
+ /* Preserve the native handle, CPU view and IOVA until the captured ring fence
+  * actually completed. An unrelated later submission never extends this lease.
+  * The queue is bounded; pressure may wait, but ordinary destruction does not. */
+@@ -437,6 +480,16 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+    }
+    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
++   /* guamp 0002: an import the caller cleans itself (tu_darwin_client_cleans_begin) is flagged, when the kernel takes the flag. */
++   const uint64_t first = (uint64_t)(uintptr_t)pointer;
++   if (dw_client_cleans.end && (dw.params.flags & DW_PARAMS_CLIENT_CLEANS) && dw_client_cleans_on()) {
++      if (first >= dw_client_cleans.start && size <= dw_client_cleans.end - first && first < dw_client_cleans.end) {
++         map.reserved = DW_MAP_CLIENT_CLEANS;
++         __atomic_fetch_add(&dw_client_cleans_flagged, 1, __ATOMIC_RELAXED);
++      } else {
++         __atomic_fetch_add(&dw_client_cleans_plain, 1, __ATOMIC_RELAXED);
++      }
++   }
+    NativeAdrenoAbiBoMapReply mapped = {};
+    kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+    if (kr != KERN_SUCCESS) {

@@ -1,0 +1,386 @@
+guamp: submissions maintain only what the CPU may have written: imports their client cleans itself (BoMap flag NativeAdrenoMapClientCleans, advertised as NativeAdrenoParamsClientCleans) are left out, and the write-combine re-assertion runs only for BOs a cache-mode event may have touched (with a whole check every 64th submission)
+
+diff --git a/NativeAdrenoABI.h b/NativeAdrenoABI.h
+index 4e38f10..f0c1491 100644
+--- a/NativeAdrenoABI.h
++++ b/NativeAdrenoABI.h
+@@ -41,7 +41,17 @@ struct NativeAdrenoAbiParams {
+     uint64_t max_bo_bytes;
+ };
+ enum {
+-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
++    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
++    /* guamp (UniXNU-guamp patches/native-adreno/0012): BoMap of an import accepts NativeAdrenoMapClientCleans. A client that does not
++     * know the flag ignores it and never sets it: the kernel then maintains the import as before. */
++    NativeAdrenoParamsClientCleans = 2
++};
++/* NativeAdrenoAbiBoMap.reserved: bit 0 on the map of an IMPORTED BO tells the kernel that the client cleans the CPU caches over it to the
++ * point of coherency before every submission that reads it after a CPU write (the Metal bridge does it for IOSurface textures, by
++ * surface seed: flushSurfaces). The kernel then leaves it out of the per-submission maintenance; the clean when it is mapped stays.
++ * Accepted only while the kernel advertises NativeAdrenoParamsClientCleans; ignored on a BO the kernel allocated; other bits refused. */
++enum {
++    NativeAdrenoMapClientCleans = 1
+ };
+ struct NativeAdrenoAbiBoAlloc {
+     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
+diff --git a/NativeAdrenoClient.cpp b/NativeAdrenoClient.cpp
+index 3bf4449..f6bbcce 100644
+--- a/NativeAdrenoClient.cpp
++++ b/NativeAdrenoClient.cpp
+@@ -13,7 +13,7 @@ IOReturn NativeAdrenoClient::open(const NativeAdrenoTransport *transport)
+     if(status) {transport_={};return status;}
+     if(reply.abi_version!=NativeAdrenoAbiVersion || reply.input_bits<32 ||
+         reply.input_bits>48 || reply.output_bits<32 || reply.output_bits>48 ||
+-        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport))) {transport_={};return kIOReturnUnsupported;}
++        !reply.max_bo_bytes || (reply.flags&~uint32_t(NativeAdrenoParamsHostImport|NativeAdrenoParamsClientCleans))) {transport_={};return kIOReturnUnsupported;}
+     params_=reply;open_=true;
+     return kIOReturnSuccess;
+ }
+diff --git a/NativeAdrenoCpu.cpp b/NativeAdrenoCpu.cpp
+index 862de46..1737198 100644
+--- a/NativeAdrenoCpu.cpp
++++ b/NativeAdrenoCpu.cpp
+@@ -14,6 +14,18 @@ extern "C" unsigned int pmap_cache_attributes(ppnum_t pn);
+ extern "C" {volatile uint64_t native_adreno_cache_stats[5];}
+ /* Time spent checking and re-asserting write-combined page attributes (NativeAdrenoReassertWriteCombined), for the board page. */
+ extern "C" {volatile uint64_t native_adreno_reassert_ticks;}
++/* guamp (UniXNU-guamp patches/native-adreno/0012): XNU puts a page back at its default attribute only from a VM operation on the object
++ * that holds it (a memory entry or a mapping with another cache mode, vm_object_change_wimg_mode, or the page leaving its object), and such
++ * operations reach a BO through this driver (a BO made, made write-combined or freed, a client view of it, an import) or through IOKit while
++ * it serves one of those calls. Each of them counts here; a submission re-asserts a write-combined BO only when the count moved since that
++ * BO was last re-asserted, or while the last event is younger than the quiet time (IOKit may still be building a view after the call
++ * returned). native_adreno_wc_event_ticks: mach_absolute_time() of the last event. */
++extern "C" {volatile uint32_t native_adreno_wc_epoch=1;volatile uint64_t native_adreno_wc_event_ticks;}
++void NativeAdrenoNoteCacheModeEvent(void)
++{
++    __atomic_fetch_add(&native_adreno_wc_epoch,1,__ATOMIC_RELAXED);
++    __atomic_store_n(&native_adreno_wc_event_ticks,mach_absolute_time(),__ATOMIC_RELAXED);
++}
+ static void noteMaintenance(uint64_t began,size_t bytes)
+ {
+     const uint64_t ticks=mach_absolute_time()-began;
+diff --git a/NativeAdrenoMemory.cpp b/NativeAdrenoMemory.cpp
+index b8c717e..be313b1 100644
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -301,6 +301,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
+     native_adreno_import_stage=19;
+     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)span_count_;
+     counted_=3;accountBytes(counted_,bytes_,true);
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012: the import's memory entry and wiring are VM operations on the owner's objects */
+     return kIOReturnSuccess;
+ failed:
+     (void)release();return status;
+@@ -313,6 +314,7 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
+     IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,bytes_,NativeAdrenoCleanInvalidate);
+     if(status)return status;
+     status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012 */
+     if(status)return status;
+     write_combined_=true;return kIOReturnSuccess;
+ }
+@@ -320,6 +322,7 @@ IOReturn NativeAdrenoMemory::release()
+ {
+     native_adreno_trace_stage=30;
+     if(device_references_ || quarantined_)return kIOReturnBusy;
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012: freeing the descriptor or the import tears down VM objects and entries */
+     if(write_combined_ && pooled_ && pool.write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
+     if(write_combined_) {
+         /* The pages go back to the VM cacheable, as they came. */
+diff --git a/NativeAdrenoMemory.h b/NativeAdrenoMemory.h
+index b71598d..22b6dcd 100644
+--- a/NativeAdrenoMemory.h
++++ b/NativeAdrenoMemory.h
+@@ -23,6 +23,9 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t c
+  * attribute when it populates or tears down a device-pager view. Every page of the spans no longer write-combined is made so again (the pmap
+  * then rewrites every mapping it tracks and writes the page's cache lines back); *reset counts them. */
+ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size_t count,uint32_t *reset);
++/* guamp 0012: a VM operation that may have put a BO page back at the default attribute (NativeAdrenoCpu.cpp: native_adreno_wc_epoch). */
++void NativeAdrenoNoteCacheModeEvent(void);
++extern "C" {extern volatile uint32_t native_adreno_wc_epoch;extern volatile uint64_t native_adreno_wc_event_ticks;}
+ 
+ /* Native XNU backing store, not a Metal device or user ABI. No IOMMU mapper,
+  * Linux fd/ioctl, hardware address, guessed PA or implicit destructor cleanup.
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 855dc1f..7430216 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -505,6 +505,7 @@ void AGXDeviceUserClient::free()
+ }
+ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
+ {
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012: IOKit maps (or unmaps) the view it returns after this call */
+     if(memory)*memory=nullptr;
+     if(!memory || !options)return kIOReturnBadArgument;
+     IOReturn status=kIOReturnNotFound;
+diff --git a/NativeAdrenoReassertPlan.h b/NativeAdrenoReassertPlan.h
+new file mode 100644
+index 0000000..c63e688
+--- /dev/null
++++ b/NativeAdrenoReassertPlan.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_REASSERT_PLAN_H
++#define NATIVE_ADRENO_REASSERT_PLAN_H
++#include <stdint.h>
++/* guamp (UniXNU-guamp patches/native-adreno/0012): when a submission re-asserts the write-combined attribute of its window's BOs.
++ * mode 0: every BO at every submission (0011). mode 1: only the BOs a cache-mode event (NativeAdrenoNoteCacheModeEvent) may have touched
++ * since their last re-assertion; while the last event is younger than the quiet time they are re-asserted at every submission and keep
++ * their old epoch (IOKit may still be building a view), afterwards once more and they take the current epoch. Every `check`-th
++ * submission (0: never) walks every BO of the window whatever its epoch: pages found reset in a BO whose epoch was current mean an event
++ * the count missed, and the caller then falls back to mode 0 for good. */
++struct NativeAdrenoReassertPlan {
++    bool all;      /* every write-combined BO of the window, epochs aside */
++    bool settle;   /* the BOs re-asserted take the current epoch */
++};
++static inline NativeAdrenoReassertPlan nativeAdrenoReassertPlan(uint32_t mode,uint32_t check,uint32_t tick,uint64_t now,
++    uint64_t last_event,uint64_t quiet)
++{
++    NativeAdrenoReassertPlan plan{true,false};
++    if(!mode)return plan;
++    plan.all=check && !(tick%check);
++    plan.settle=now-last_event>=quiet;
++    return plan;
++}
++/* Whether a BO last re-asserted at mapping_epoch is walked by a pass at epoch. */
++static inline bool nativeAdrenoReassertWalks(uint32_t mapping_epoch,uint32_t epoch,bool all)
++{
++    return all || mapping_epoch!=epoch;
++}
++#endif
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index ed16a53..b1eb1b0 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
++#include "NativeAdrenoReassertPlan.h"
+ #include <IOKit/IOLib.h>
+ #include <kern/clock.h>
+ 
+@@ -115,6 +116,36 @@ size_t NativeAdrenoSubmit::outstanding() const
+  * maintenance to its client's window; 0 walks every client's mappings on every submission, as before. */
+ extern "C" {volatile uint64_t native_adreno_submit_cost[8];volatile uint32_t native_adreno_publish_window=1;}
+ static uint64_t submitNowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
++/* guamp (UniXNU-guamp patches/native-adreno/0012): the write-combine re-assertion only for BOs a cache-mode event may have touched
++ * (NativeAdrenoReassertPlan.h). native_adreno_reassert_mode (board: guamp-adreno-reassert, default 1; 0 = every BO of the window at
++ * every submission, as 0011), native_adreno_reassert_check (guamp-adreno-reassert-check, default 64: every 64th submission walks the
++ * whole window to prove the count saw every event), native_adreno_wc_quiet_us (guamp-adreno-reassert-quiet-us, default 100000).
++ * native_adreno_reassert_stats: [0] submissions that re-asserted at least one BO, [1] submissions with none to re-assert, [2] whole
++ * passes, [3] pages a whole pass found reset in a BO the count called current (any: back to mode 0, [5] = 1), [4] BOs re-asserted,
++ * [5] fallen back. */
++extern "C" {volatile uint32_t native_adreno_reassert_mode=1,native_adreno_reassert_check=64,native_adreno_wc_quiet_us=100000;
++    volatile uint64_t native_adreno_reassert_stats[6];}
++static IOReturn reassertWindow(NativeAdrenoVm *vm,uint64_t window_start,uint64_t window_bytes,uint32_t *reset)
++{
++    static uint32_t tick;
++    const uint32_t mode=native_adreno_reassert_mode;
++    if(!mode)return vm->reassertWriteCombinedIn(window_start,window_bytes,reset);
++    const uint32_t epoch=__atomic_load_n(&native_adreno_wc_epoch,__ATOMIC_RELAXED);
++    const uint64_t event=__atomic_load_n(&native_adreno_wc_event_ticks,__ATOMIC_RELAXED);
++    uint64_t quiet=0;nanoseconds_to_absolutetime((uint64_t)native_adreno_wc_quiet_us*1000ull,&quiet);
++    const NativeAdrenoReassertPlan plan=nativeAdrenoReassertPlan(mode,native_adreno_reassert_check,++tick,mach_absolute_time(),event,quiet);
++    uint32_t missed=0,walked=0;
++    const IOReturn status=vm->reassertWriteCombinedChanged(window_start,window_bytes,epoch,plan.all,plan.settle,reset,&missed,&walked);
++    if(walked)native_adreno_reassert_stats[0]=native_adreno_reassert_stats[0]+1;
++    else native_adreno_reassert_stats[1]=native_adreno_reassert_stats[1]+1;
++    if(plan.all)native_adreno_reassert_stats[2]=native_adreno_reassert_stats[2]+1;
++    native_adreno_reassert_stats[4]=native_adreno_reassert_stats[4]+walked;
++    if(missed) {
++        native_adreno_reassert_stats[3]=native_adreno_reassert_stats[3]+missed;
++        native_adreno_reassert_stats[5]=1;native_adreno_reassert_mode=0;
++    }
++    return status;
++}
+ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+     uint32_t queue,uint32_t *fence,uint64_t window_start,uint64_t window_bytes)
+ {
+@@ -186,7 +217,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+         uint32_t reset=0;
+         /* guamp 0011: only the submitter's window (its jobs reach no other mapping), timed in native_adreno_submit_cost[6]. */
+         const uint64_t reassert_began=submitNowUs();
+-        IOReturn audited=vm_->reassertWriteCombinedIn(window_start,window_bytes,&reset);
++        IOReturn audited=reassertWindow(vm_,window_start,window_bytes,&reset);   /* guamp 0012: only what an event may have touched */
+         native_adreno_submit_cost[6]=native_adreno_submit_cost[6]+(submitNowUs()-reassert_began);
+         native_adreno_wc_audit[5]=native_adreno_wc_audit[5]+reset;
+         uint32_t lines=0,dirty=0,stale=0;size_t budget=SubmitAuditBytes;
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index 0a03140..56977f4 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -59,7 +59,11 @@ static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t ad
+ }
+ #include <IOKit/IOLib.h>
+ #include <string.h>
+-extern "C" {volatile uint32_t native_adreno_window_overflow[4][3];}   /* {count, last size KiB, last end MiB} per client window */
++extern "C" {volatile uint32_t native_adreno_window_overflow[4][3];}
++/* guamp (UniXNU-guamp patches/native-adreno/0012): native_adreno_client_cleans (board: guamp-adreno-client-cleans, default 1) advertises
++ * NativeAdrenoParamsClientCleans and honours the BoMap flag; 0 neither (old behaviour). Maps that asked for it: [0] honoured, [1] not
++ * (an allocated BO, or the switch off). */
++extern "C" {volatile uint32_t native_adreno_client_cleans=1;volatile uint32_t native_adreno_client_cleans_maps[2];}   /* {count, last size KiB, last end MiB} per client window */
+ NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::find(uint64_t handle)
+ {
+     const uint32_t index=entries_?index_.find(handle):UINT32_MAX;
+@@ -182,7 +186,8 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
+     if(!open_)return kIOReturnNotReady;
+     params->abi_version=NativeAdrenoAbiVersion;
+     params->input_bits=input_bits_;params->output_bits=output_bits_;
+-    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
++    params->flags=NativeAdrenoParamsHostImport|(native_adreno_client_cleans?NativeAdrenoParamsClientCleans:0u);
++    params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+     return kIOReturnSuccess;
+ }
+ /* Per client slot (4, the kernel's own client last): [0] live objects now, [1] their peak, [2] refused BoAllocs, [3] last refusal status,
+@@ -291,7 +296,7 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
+     if(!request || !reply)return kIOReturnBadArgument;reply->iova=0;
+     if(!open_)return kIOReturnNotReady;
+     if(!(request->permissions&1) || (request->permissions&~3u) || request->writeback>1 ||
+-        (request->shareability!=2 && request->shareability!=3) || request->reserved ||
++        (request->shareability!=2 && request->shareability!=3) || (request->reserved&~uint32_t(NativeAdrenoMapClientCleans)) ||
+         (request->iova&4095))return kIOReturnBadArgument;
+     Entry *entry=find(request->handle);
+     if(!entry || entry->unreleasable)return kIOReturnBadArgument;
+@@ -316,8 +321,12 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
+     /* Only memory the GPU never writes is mapped coherent: sysmem passes written through write-back inner-shareable mappings stopped
+      * the GPU inside its end-of-pass cache clean (BR and BV idle at the clean events), while non-coherent mappings never did. */
+     const bool coherent=entry->memory.imported() && native_adreno_io_coherent && !(permissions&2u);
++    /* guamp 0012: the client keeps this import's CPU caches clean itself (NativeAdrenoMapClientCleans). */
++    const bool client_cleans=(request->reserved&NativeAdrenoMapClientCleans) && native_adreno_client_cleans && entry->memory.imported();
++    if(request->reserved&NativeAdrenoMapClientCleans)
++        native_adreno_client_cleans_maps[client_cleans?0:1]=native_adreno_client_cleans_maps[client_cleans?0:1]+1;
+     const IOReturn status=vm_->map(&entry->memory,0,request->iova,permissions,
+-        coherent?1u:request->writeback,coherent?3u:request->shareability,&handle);
++        coherent?1u:request->writeback,coherent?3u:request->shareability,&handle,client_cleans);
+     if(status)return status;
+     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
+     if(end>window_peak_)window_peak_=end;
+@@ -633,6 +642,7 @@ IOReturn NativeAdrenoUserClient::cpuMap(const NativeAdrenoAbiBoCpuMap *request,
+     if(entry->memory.imported())return kIOReturnUnsupported;
+     if(entry->mapping_leases==UINT32_MAX)return kIOReturnNoResources;
+     ++entry->mapping_leases;
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012: a client view of the BO follows */
+     reply->token=entry->token;reply->bytes=entry->memory.bytes();
+     return kIOReturnSuccess;
+ }
+@@ -646,6 +656,7 @@ IOReturn NativeAdrenoUserClient::cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *reque
+     if(request->token!=entry->token)return kIOReturnBadArgument;
+     if(!entry->mapping_leases)return kIOReturnBusy;
+     --entry->mapping_leases;
++    NativeAdrenoNoteCacheModeEvent();   /* guamp 0012: the view goes */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoUserClient::createQueue(NativeAdrenoAbiQueueReply *reply)
+diff --git a/NativeAdrenoVm.cpp b/NativeAdrenoVm.cpp
+index 73b6681..a3aa113 100644
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoVm.h"
+ #include "NativeAdrenoVmAlias.h"
++#include "NativeAdrenoReassertPlan.h"
+ extern "C" volatile uint32_t native_adreno_trace_stage;
+ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
+     int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
+@@ -296,7 +297,7 @@ void NativeAdrenoVm::erase(size_t at,size_t n,unsigned upper)
+     if(upper)upper_count_-=n;else lower_count_-=n;
+ }
+ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t iova,
+-    unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle)
++    unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle,bool client_cleans)
+ {
+     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -314,7 +315,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t
+         record=&mappings_[i];free_hint_=i+1;if(high_<i+1)high_=i+1;break;
+     }
+     if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
+-    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0};++objects_;
++    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,client_cleans && memory->imported(),0};++objects_;
+     if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+     else {
+         checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
+@@ -431,6 +432,8 @@ extern "C" {volatile uint64_t native_adreno_publish_skipped[2];}
+  * (default 1): a mapping the GPU only reads is cleaned (DC CVAC) instead of cleaned and invalidated: nothing the GPU writes can be under
+  * it, and the owner's CPU keeps its lines (Core Animation's backing stores were invalidated on every submission). */
+ extern "C" {volatile uint64_t native_adreno_publish_kinds[4];volatile uint32_t native_adreno_publish_ro_clean=1;}
++/* guamp 0012: imports publishMapped left to their client (NativeAdrenoMapClientCleans): [0] mappings, [1] bytes. */
++extern "C" {volatile uint64_t native_adreno_publish_client[2];}
+ IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_bytes,uint64_t *maintained_bytes)
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -443,6 +446,11 @@ IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_byt
+             native_adreno_publish_skipped[1]=native_adreno_publish_skipped[1]+m.memory->bytes();
+             continue;
+         }
++        if(m.client_cleans) {   /* guamp 0012: its client cleaned what the CPU wrote (cleaned once when it was mapped) */
++            native_adreno_publish_client[0]=native_adreno_publish_client[0]+1;
++            native_adreno_publish_client[1]=native_adreno_publish_client[1]+m.memory->bytes();
++            continue;
++        }
+         const bool writes=!native_adreno_publish_ro_clean || (m.permissions&ArmSmmu4KWrite);
+         if(m.memory->publishForDevice(0,m.memory->bytes(),writes,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+         if(maintained_bytes)*maintained_bytes+=m.memory->bytes();
+@@ -513,6 +521,25 @@ IOReturn NativeAdrenoVm::reassertWriteCombinedIn(uint64_t window_start,uint64_t
+     }
+     return kIOReturnSuccess;
+ }
++IOReturn NativeAdrenoVm::reassertWriteCombinedChanged(uint64_t window_start,uint64_t window_bytes,uint32_t epoch,bool all,bool settle,
++    uint32_t *reset,uint32_t *missed,uint32_t *walked)
++{
++    if(!reset || !missed || !walked)return kIOReturnBadArgument;
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    for(size_t i=0;i<high_;++i) {
++        Mapping &m=mappings_[i];
++        if(!m.memory || !m.memory->writeCombined() || m.memory->pooled())continue;   /* reassertWriteCombined has nothing to do for these */
++        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
++        const bool current=m.wc_epoch==epoch;
++        if(!nativeAdrenoReassertWalks(m.wc_epoch,epoch,all))continue;
++        uint32_t found=0;
++        const IOReturn status=m.memory->reassertWriteCombined(&found);
++        if(status)return status;
++        *reset+=found;if(current)*missed+=found;++*walked;
++        if(settle)m.wc_epoch=epoch;
++    }
++    return kIOReturnSuccess;
++}
+ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const
+ {
+     if(!lines || !dirty || !stale)return kIOReturnBadArgument;
+diff --git a/NativeAdrenoVm.h b/NativeAdrenoVm.h
+index 5e4c27a..19bcccf 100644
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -45,6 +45,8 @@ class NativeAdrenoVm final {
+         uint64_t handle=0,iova=0;
+         size_t spans=0,mapped_spans=0;
+         unsigned permissions=0,writeback=0,shareability=0,jobs=0;
++        bool client_cleans=false;   /* guamp 0012: an import whose client cleans its CPU caches itself (NativeAdrenoMapClientCleans) */
++        uint32_t wc_epoch=0;        /* guamp 0012: native_adreno_wc_epoch when its write-combined pages were last re-asserted (0 never) */
+     };
+     Mapping *mappings_=nullptr;
+     NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+@@ -91,7 +93,7 @@ public:
+     IOReturn detach();
+     IOReturn findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *iova) const;
+     IOReturn map(NativeAdrenoMemory *,unsigned upper,uint64_t iova,
+-        unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
++        unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle,bool client_cleans=false);
+     IOReturn unmap(uint64_t handle);
+     IOReturn holdJob(uint64_t handle);
+     /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
+@@ -106,6 +108,12 @@ public:
+     IOReturn publishMapped(uint64_t window_start=0,uint64_t window_bytes=0,uint64_t *maintained_bytes=nullptr);
+     /* guamp 0011: the write-combine re-assertion kept to the submitter's window, as publishMapped (window_bytes 0: every mapping). */
+     IOReturn reassertWriteCombinedIn(uint64_t window_start,uint64_t window_bytes,uint32_t *reset) const;
++    /* guamp 0012: the same for the window's write-combined BOs that a cache-mode event (NativeAdrenoNoteCacheModeEvent) may have touched
++     * since their last re-assertion: a mapping whose wc_epoch is `epoch` is skipped unless `all`; with `settle` the re-asserted ones take
++     * `epoch`. *reset counts pages found back at the default attribute, *missed those of them in mappings whose wc_epoch was already
++     * `epoch` (only an `all` pass sees them: an event the count did not see), *walked the mappings re-asserted. */
++    IOReturn reassertWriteCombinedChanged(uint64_t window_start,uint64_t window_bytes,uint32_t epoch,bool all,bool settle,
++        uint32_t *reset,uint32_t *missed,uint32_t *walked);
+     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
+      * like any other (sticky; the safe behaviour of int-070..097). */
+     void distrustWriteCombined() {distrust_write_combined_=true;}

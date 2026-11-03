@@ -51,6 +51,13 @@ if [ -e "$WORK/na/NativeAdrenoGpuAll.h" ]; then
 else
   echo "NativeAdrenoGpuAll.h missing (patch 0005 not applied)"; rc=1
 fi
+echo "== write-combine re-assertion plan and the ABI flags (patch 0012, NativeAdrenoReassertPlan.h): clang (ASan/UBSan) and gcc"
+if [ -e "$WORK/na/NativeAdrenoReassertPlan.h" ]; then
+  clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/coherence_host.cpp" -o "$WORK/coherence" && "$WORK/coherence" || rc=1
+  g++ $FLAGS -Wvolatile -I "$WORK/na" "$HERE/coherence_host.cpp" -o "$WORK/coherence_gcc" && "$WORK/coherence_gcc" >/dev/null || rc=1
+else
+  echo "NativeAdrenoReassertPlan.h missing (patch 0012 not applied)"; rc=1
+fi
 extract() {   # source output: the statements of dropViews between "if(!view)return;" and "view->release();"
   python3 -I - "$1" "$2" <<'PY' || return 1
 import sys

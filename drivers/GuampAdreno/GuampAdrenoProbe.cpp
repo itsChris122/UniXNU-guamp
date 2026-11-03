@@ -54,6 +54,12 @@ __attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_boost;
 extern volatile uint32_t native_adreno_a6xx_prologue_wfi, native_adreno_publish_window;
 // patches/native-adreno/0011: GPU-read-only mappings only cleaned before a submission (guamp-adreno-ro-clean, default 1).
 extern volatile uint32_t native_adreno_publish_ro_clean;
+// patches/native-adreno/0012: imports whose client (the Metal bridge, through Turnip's BoMap flag) cleans them itself left out of the
+// submissions' maintenance (guamp-adreno-client-cleans, default 1), and the write-combine re-assertion only for BOs a cache-mode event
+// may have touched (guamp-adreno-reassert, default 1; 0 = every BO of the window at every submission), with a whole check every N-th
+// submission (guamp-adreno-reassert-check, default 64; 0 = never) after a quiet time (guamp-adreno-reassert-quiet-us, default 100000).
+extern volatile uint32_t native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check,
+    native_adreno_wc_quiet_us;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -786,6 +792,12 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   native_adreno_a6xx_prologue_wfi = bootArg("guamp-adreno-wfi", 1) ? 1 : 0;
   native_adreno_publish_window = bootArg("guamp-adreno-publish-window", 1) ? 1 : 0;
   native_adreno_publish_ro_clean = bootArg("guamp-adreno-ro-clean", 1) ? 1 : 0;
+  native_adreno_client_cleans = bootArg("guamp-adreno-client-cleans", 1) ? 1 : 0;
+  native_adreno_reassert_mode = bootArg("guamp-adreno-reassert", 1) ? 1 : 0;
+  native_adreno_reassert_check = bootArg("guamp-adreno-reassert-check", 64);
+  native_adreno_wc_quiet_us = bootArg("guamp-adreno-reassert-quiet-us", 100000);
+  IOLog("GuampAdreno: submission coherence: client-cleaned imports %u, re-assert on events %u (check every %u, quiet %u us)\n",
+        native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check, native_adreno_wc_quiet_us);
   IOLog("GuampAdreno: job prologue wait for idle %u, submission maintenance own window %u\n", native_adreno_a6xx_prologue_wfi,
         native_adreno_publish_window);   // default on (verified 28/10); before the ring: its write index is followed from attach on
   do {
