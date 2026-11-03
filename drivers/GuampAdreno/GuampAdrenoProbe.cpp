@@ -46,6 +46,9 @@ volatile uint32_t guamp_gpu_recover[8];
 // GuampGpuDcvs.inc (NativeEmmc): nonzero pauses the frequency governor; held during a reset and re-init, and for good once parked.
 // Weak stand-in for a kernel built without the governor (static link: no weak_import).
 __attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_hold;
+// GuampGpuDcvs.inc guamp-gpu-boost=1: set when a CPU thread blocks on a GPU fence (naIdle, guamp_adreno_wait_submitted); the governor
+// clears it. Only a flag write: the governor reads it at its next 1 ms sample, nothing here touches clocks.
+__attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_boost;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -205,6 +208,7 @@ void gpuIrq(void *c) {
   thread_wakeup(event_t(&gIrqCount));
 }
 int naIdle(void *) {
+  guamp_gpu_dcvs_boost = 1;
   if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
     assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 100, NSEC_PER_USEC);
     thread_block(THREAD_CONTINUE_NULL);
@@ -734,6 +738,7 @@ extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited
     if (waited_us) *waited_us = spent > 0xffffffffull ? 0xffffffffu : uint32_t(spent);
     if (int32_t(done - target) >= 0) return 0;
     if (spent >= timeout_us || ring->poisoned() || gGpuParked) return 1;
+    guamp_gpu_dcvs_boost = 1;
     if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
       assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 200, NSEC_PER_USEC);
       thread_block(THREAD_CONTINUE_NULL);

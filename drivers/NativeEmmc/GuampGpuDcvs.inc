@@ -18,9 +18,18 @@
 //   log     "GuampGpu: dcvs ..." start line, every switch failure, every 10 s the level, switches, failures, the busy
 //           share of the last window and the ms spent at each level.
 // guamp_gpu_dcvs_hold != 0 (a GPU recovery in progress, for instance) pauses sampling and switching until it is 0.
+// Interactive tuning (03/11; fin34/fin35: the display waited 7-54 ms a frame for the GPU while the busy share stayed under 30 %, so
+// the 70 % rule kept the GPU at 320 MHz for most frames; 950 MHz verified with 0 failed switches in 106):
+//   guamp-gpu-boost=1  wait boost: a CPU thread blocked on a GPU fence (NativeAdreno's fence waits, the display's guamp-copy-gpu-wait:
+//                      GuampAdrenoProbe.cpp sets guamp_gpu_dcvs_boost) ends the window at once and sends the GPU to the top; the steps
+//                      down are the usual ones (500 ms of near idle per level). Default 0 (off).
+//   guamp-gpu-up=<%>   busy share of a window that sends the GPU to the top (default 70).
+//   guamp-gpu-min=<MHz> the slowest level the governor goes down to (default 0: 320 MHz).
+//   One line "GuampGpu: dcvs tuning ..." at start; the 10 s line gains "boosts N".
 
 extern "C" {
 volatile uint32_t guamp_gpu_dcvs_hold;
+volatile uint32_t guamp_gpu_dcvs_boost;   // set by a blocked GPU fence wait, cleared here
 }
 
 namespace gpudcvs {
@@ -28,6 +37,7 @@ volatile uint8_t *gCc, *gGpu;
 gp_state gS;
 gp_gov gG;
 uint32_t gCxMin = GP_RPM_LOW_SVS, gMxMin = GP_RPM_MIN_SVS;
+unsigned gBoostOn = 0, gBoosts = 0;
 
 uint32_t rd(void *, unsigned block, uint32_t off) {
   return *reinterpret_cast<volatile uint32_t *>((block == GG2_GPUCC ? gCc : gGpu) + off);
@@ -52,8 +62,8 @@ const gp_ops kOps = {nullptr, corner, bus, gdsc, none, none};
 
 void logState(unsigned busy, unsigned switches, unsigned fails, const uint32_t *ms) {
   IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u "
-        "465:%u 320:%u xo:%u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails, busy * 100u / GP_GOV_WINDOW,
-        ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8]);
+        "465:%u 320:%u xo:%u | boosts %u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails,
+        busy * 100u / GP_GOV_WINDOW, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], gBoosts);
 }
 
 void thread(void *, wait_result_t) {
@@ -62,20 +72,31 @@ void thread(void *, wait_result_t) {
   unsigned switches = 0, fails = 0, run = 0, busy = 0;
   for (unsigned window = 1;; ++window) {
     busy = 0;
-    bool held = false;
+    bool held = false, boosted = false;
+    unsigned sampled = 0;
     for (unsigned i = 0; i < GP_GOV_WINDOW; ++i) {
       if (guamp_gpu_dcvs_hold) {
         held = true;
         break;
       }
+      if (gBoostOn && guamp_gpu_dcvs_boost) {
+        guamp_gpu_dcvs_boost = 0;
+        if (gS.level != gS.top) {
+          boosted = true;
+          break;
+        }
+        gG.quiet = 0;   // already at the top: waits on the GPU keep it there (no step down while they go on)
+      }
       if (gp_gov_busy(gg2_gr(&kIo, GP_RBBM_STATUS))) ++busy;
+      ++sampled;
       IOSleep(1);
     }
     if (held) {
       IOSleep(GP_GOV_WINDOW);
       continue;
     }
-    const unsigned prev = gS.level, target = gp_gov_window(&gG, &gS, busy);
+    if (boosted) ++gBoosts;
+    const unsigned prev = gS.level, target = boosted ? gp_gov_boost(&gG, &gS) : gp_gov_window(&gG, &gS, busy);
     if (target != prev) {
       const int e = gp_set_level(&kIo, &kOps, &gS, target);
       if (!e) {
@@ -98,7 +119,7 @@ void thread(void *, wait_result_t) {
         }
       }
     }
-    ms[gS.level] += GP_GOV_WINDOW;
+    ms[gS.level] += boosted ? sampled : GP_GOV_WINDOW;
     if (window % 200 == 0) logState(busy, switches, fails, ms);
   }
 }
@@ -139,7 +160,14 @@ void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
   gS.level = level;
   gS.pllOn = GP_PLL1;
   gS.top = gp_gov_top(bin, cap);
-  gS.bottom = GP_LEVEL_320;
+  unsigned up = 0, minMhz = 0;
+  PE_parse_boot_argn("guamp-gpu-boost", &gBoostOn, sizeof(gBoostOn));
+  PE_parse_boot_argn("guamp-gpu-up", &up, sizeof(up));
+  PE_parse_boot_argn("guamp-gpu-min", &minMhz, sizeof(minMhz));
+  gBoostOn = gBoostOn == 1;
+  gG = gp_gov();
+  gG.up = gp_gov_up_samples(up);
+  gS.bottom = gp_gov_bottom(gS.top, minMhz);
   gS.busKhz = gp_bus_bimc_khz(kGpLevels[level].bus);
   if (gS.top == GP_LEVEL_320 && level == GP_LEVEL_320) {
     IOLog("GuampGpu: dcvs off: nothing above 320 MHz (bin %u from %s, guamp-gpu-max %u)\n", bin, binFrom, cap);
@@ -158,6 +186,8 @@ void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
   gS.mx = kGpLevels[level].mx;
   IOLog("GuampGpu: dcvs on: %u MHz, levels %u..%u MHz (bin %u from %s, guamp-gpu-max %u), cx floor %u mx floor %u\n",
         kGpLevels[level].mhz, kGpLevels[gS.bottom].mhz, kGpLevels[gS.top].mhz, bin, binFrom, cap, gCxMin, gMxMin);
+  IOLog("GuampGpu: dcvs tuning: boost %u, up %u/%u samples, min %u MHz (bottom %u MHz)\n", gBoostOn, gG.up, GP_GOV_WINDOW, minMhz,
+        kGpLevels[gS.bottom].mhz);
   thread_t t = nullptr;
   if (kernel_thread_start(thread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }

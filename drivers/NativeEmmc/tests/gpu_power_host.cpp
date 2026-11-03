@@ -296,6 +296,26 @@ static void testGovernor() {
   for (unsigned i = 0; i < 3 * GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&g, &s, 0) == GP_LEVEL_320);   // the bottom holds
   s.level = GP_LEVEL_XO;
   CHECK(gp_gov_window(&g, &s, 0) == GP_LEVEL_320 && gp_gov_window(&g, &s, GP_GOV_WINDOW) == 0);
+  // guamp-gpu-up / guamp-gpu-min / guamp-gpu-boost (03/11)
+  CHECK(gp_gov_up_samples(0) == GP_GOV_UP && gp_gov_up_samples(101) == GP_GOV_UP && gp_gov_up_samples(70) == 35);
+  CHECK(gp_gov_up_samples(1) == 1 && gp_gov_up_samples(25) == 13 && gp_gov_up_samples(100) == GP_GOV_WINDOW);
+  CHECK(gp_gov_bottom(0, 0) == GP_LEVEL_320 && gp_gov_bottom(0, 320) == GP_LEVEL_320 && gp_gov_bottom(0, 321) == 6);
+  CHECK(gp_gov_bottom(0, 600) == 5 && gp_gov_bottom(0, 601) == 4 && gp_gov_bottom(1, 2000) == 1 && gp_gov_bottom(6, 900) == 6);
+  {
+    gp_state u;
+    u.level = GP_LEVEL_320;
+    u.top = 1;
+    u.bottom = GP_LEVEL_320;
+    gp_gov h;
+    h.up = gp_gov_up_samples(25);
+    CHECK(gp_gov_window(&h, &u, 12) == GP_LEVEL_320 && gp_gov_window(&h, &u, 13) == 1);   // 25 %: to the top
+    h.quiet = 5;
+    CHECK(gp_gov_boost(&h, &u) == 1 && h.quiet == 0);
+    u.bottom = gp_gov_bottom(u.top, 600);                     // a floor: the first window goes up to it
+    CHECK(gp_gov_window(&h, &u, 0) == 5);
+    u.level = 5;
+    for (unsigned i = 0; i < 3 * GP_GOV_QUIET; ++i) CHECK(gp_gov_window(&h, &u, 0) == 5);   // and never under it
+  }
   // a cap: busy goes to the capped top only
   s.level = GP_LEVEL_320;
   s.top = gp_gov_top(0, 465);
