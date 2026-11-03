@@ -49,6 +49,9 @@ __attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_hold;
 // GuampGpuDcvs.inc guamp-gpu-boost=1: set when a CPU thread blocks on a GPU fence (naIdle, guamp_adreno_wait_submitted); the governor
 // clears it. Only a flag write: the governor reads it at its next 1 ms sample, nothing here touches clocks.
 __attribute__((weak)) volatile uint32_t guamp_gpu_dcvs_boost;
+// patches/native-adreno/0010: the A6XX job prologue's CP_WAIT_FOR_IDLE (guamp-adreno-wfi, default 1) and a submission's cache
+// maintenance kept to its client's GPU window (guamp-adreno-publish-window, default 1).
+extern volatile uint32_t native_adreno_a6xx_prologue_wfi, native_adreno_publish_window;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -769,7 +772,11 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   IOLog("GuampAdreno: start level %u: rbbm status %08x, sqe %u bytes\n", in->level, gr(s, 0x210), in->sqeBytes);
   int result = GuampAdrenoOk;
   bool tested = false;
-  gRecEnabled = bootArg("guamp-gpu-recover", 1) == 1;   // default on (verified 28/10); before the ring: its write index is followed from attach on
+  gRecEnabled = bootArg("guamp-gpu-recover", 1) == 1;
+  native_adreno_a6xx_prologue_wfi = bootArg("guamp-adreno-wfi", 1) ? 1 : 0;
+  native_adreno_publish_window = bootArg("guamp-adreno-publish-window", 1) ? 1 : 0;
+  IOLog("GuampAdreno: job prologue wait for idle %u, submission maintenance own window %u\n", native_adreno_a6xx_prologue_wfi,
+        native_adreno_publish_window);   // default on (verified 28/10); before the ring: its write index is followed from attach on
   do {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}

@@ -30,6 +30,9 @@
 extern "C" {
 volatile uint32_t guamp_gpu_dcvs_hold;
 volatile uint32_t guamp_gpu_dcvs_boost;   // set by a blocked GPU fence wait, cleared here
+// patches/native-adreno/0010 (weak stand-ins for a kernel without it): the submissions' cost and the mappings their maintenance skipped.
+__attribute__((weak)) volatile uint64_t native_adreno_submit_cost[6];
+__attribute__((weak)) volatile uint64_t native_adreno_publish_skipped[2];
 }
 
 namespace gpudcvs {
@@ -64,6 +67,20 @@ void logState(unsigned busy, unsigned switches, unsigned fails, const uint32_t *
   IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u "
         "465:%u 320:%u xo:%u | boosts %u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails,
         busy * 100u / GP_GOV_WINDOW, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], gBoosts);
+}
+
+// Every 10 s with the level line: the GPU submissions since the previous line, their mean time in the kernel and in its cache
+// maintenance, the MiB maintained a submission, the longest of each so far, and the mappings outside the submitter's window left alone.
+void logSubmits() {
+  static uint64_t last[4];
+  const uint64_t n = native_adreno_submit_cost[0], us = native_adreno_submit_cost[1], pub = native_adreno_submit_cost[2],
+                 kib = native_adreno_submit_cost[3];
+  const uint64_t dn = n - last[0];
+  if (dn)
+    IOLog("GuampGpu: submits +%llu, kernel %llu us each (maintenance %llu us, %llu KiB each), longest %llu / %llu us; skipped other "
+          "windows %llu mappings %llu MiB in all\n", dn, (us - last[1]) / dn, (pub - last[2]) / dn, (kib - last[3]) / dn,
+          native_adreno_submit_cost[4], native_adreno_submit_cost[5], native_adreno_publish_skipped[0], native_adreno_publish_skipped[1] >> 20);
+  last[0] = n; last[1] = us; last[2] = pub; last[3] = kib;
 }
 
 void thread(void *, wait_result_t) {
@@ -120,7 +137,10 @@ void thread(void *, wait_result_t) {
       }
     }
     ms[gS.level] += boosted ? sampled : GP_GOV_WINDOW;
-    if (window % 200 == 0) logState(busy, switches, fails, ms);
+    if (window % 200 == 0) {
+      logState(busy, switches, fails, ms);
+      logSubmits();
+    }
   }
 }
 
