@@ -71,6 +71,15 @@ extern "C" volatile uint64_t guamp_copy_gpu_wait[8];
 // Section 10 of the variant, latest-frame-wins: [0] frames started, [1] coalesced, [2] stale-skipped, [3] GPU frames, [4] CPU frames,
 // [5] in-thread refreshes, [6] trailing re-shows, [7] GPU failures, [8] CPU copy failures, [9] on.
 extern "C" volatile uint64_t guamp_copy_latest[10];
+// Section 12, software composition of multi-layer swaps: [0] composed swaps accepted, [1] frames handed over, [2] frames composed,
+// [3] failures, [4] BGRA layers drawn, [5] 4:2:0 layers drawn, [6]-[8] layers skipped (format, transform, geometry), [9] last skipped
+// format, [10] compose ticks, [11] map failures, [12] swaps refused by the composition too, [13] background fills, [14] most layers,
+// [15] 4:2:0 planes with two different offsets. Per layer: format, planes, surface w h, src x y w h, dst x y w h, transform, result.
+extern "C" volatile uint64_t guamp_compose[16];
+extern "C" volatile uint32_t guamp_compose_layer[4][14];
+// package/LegacyDisplayProbe.cpp: the surface of the last swap refused for its surface (reason 4): width, height, format, planes,
+// row bytes, allocation, descriptor bytes.
+extern "C" volatile uint64_t native_legacy_rej_surface[7] __attribute__((weak_import));
 // drivers/NativeAdreno/NativeAdrenoPublish.cpp: the Metal plugin's connections and tunnel calls (only the leading counters of its
 // NativeAdrenoMetalDiag, declared first there) and its telemetry rows, which otherwise reach only the boot page (hidden under Metal).
 struct GuampMetalDiagHead {
@@ -172,6 +181,43 @@ static void metalLog()
   lastCalls = d.calls; lastTunnel = d.tunnel_calls; lastSeq = seq;
 }
 
+static char fourcc(uint32_t format, unsigned shift)
+{
+  const char c = (char)((format >> shift) & 0xff);
+  return c >= 0x20 && c < 0x7f ? c : '.';
+}
+
+// Section 12 of the variant: composed swaps and frames since the previous report, the mean compose time (layers into the cached buffer,
+// before the scanout copy), layers drawn and skipped; then every layer that changed since the previous report.
+static void composeLog(uint64_t f)
+{
+  static uint64_t last[16] = {};
+  static uint32_t lastLayer[4][14] = {};
+  uint64_t now[16];
+  for (unsigned i = 0; i < 16; i++) now[i] = guamp_compose[i];
+  if (now[0] != last[0] || now[1] != last[1] || now[12] != last[12] || now[3] != last[3]) {
+    const uint64_t frames = now[2] - last[2];
+    const uint32_t skipped = (uint32_t)now[9];
+    IOLog("GuampDisplay: composed swaps +%llu frames +%llu (done +%llu failed +%llu) compose %llu us/frame; layers bgra +%llu 420 +%llu, "
+          "skipped format +%llu (last %c%c%c%c) transform +%llu geometry +%llu; refused +%llu, map failures +%llu, fills +%llu, "
+          "most layers %llu, plane offsets differ %llu\n", now[0] - last[0], now[1] - last[1], frames, now[3] - last[3],
+          frames ? (now[10] - last[10]) / frames * 1000000 / f : 0, now[4] - last[4], now[5] - last[5], now[6] - last[6],
+          fourcc(skipped, 24), fourcc(skipped, 16), fourcc(skipped, 8), fourcc(skipped, 0), now[7] - last[7], now[8] - last[8],
+          now[12] - last[12], now[11] - last[11], now[13] - last[13], now[14], now[15]);
+  }
+  for (unsigned i = 0; i < 4; i++) {
+    uint32_t l[14];
+    bool changed = false;
+    for (unsigned j = 0; j < 14; j++) { l[j] = guamp_compose_layer[i][j]; changed = changed || l[j] != lastLayer[i][j]; }
+    if (!changed) continue;
+    IOLog("GuampDisplay: compose layer %u: format %c%c%c%c planes %u surface %ux%u src %u,%u,%u,%u dst %d,%d,%u,%u transform %u "
+          "result %u (0 drawn 1 format 2 transform 3 geometry 4 no surface 5 disabled)\n", i, fourcc(l[0], 24), fourcc(l[0], 16),
+          fourcc(l[0], 8), fourcc(l[0], 0), l[1], l[2], l[3], l[4], l[5], l[6], l[7], (int)l[8], (int)l[9], l[10], l[11], l[12], l[13]);
+    for (unsigned j = 0; j < 14; j++) lastLayer[i][j] = l[j];
+  }
+  for (unsigned i = 0; i < 16; i++) last[i] = now[i];
+}
+
 static void copyLog()
 {
   static uint64_t lastN = 0, lastSum = 0, lastBytes = 0, lastMax = 0;
@@ -230,7 +276,16 @@ static void copyLog()
           native_legacy_rej_options[1], native_legacy_rej_options[2], native_legacy_rej_size[0], native_legacy_rej_size[1],
           native_legacy_rej_rects[0][0], native_legacy_rej_rects[0][1], native_legacy_rej_rects[0][2], native_legacy_rej_rects[0][3],
           native_legacy_rej_rects[1][0], native_legacy_rej_rects[1][1], native_legacy_rej_rects[1][2], native_legacy_rej_rects[1][3]);
+    // guamp 03/11: the boot swaps refused for their surface (reason 4) never said which surface.
+    if (native_legacy_rej_reason == 4 && &native_legacy_rej_surface) {
+      const uint32_t format = (uint32_t)native_legacy_rej_surface[2];
+      IOLog("GuampDisplay: last rejected surface: %llux%llu format %c%c%c%c (%08x) planes %llu row bytes %llu allocation %llu "
+            "descriptor %llu\n", native_legacy_rej_surface[0], native_legacy_rej_surface[1], fourcc(format, 24), fourcc(format, 16),
+            fourcc(format, 8), fourcc(format, 0), format, native_legacy_rej_surface[3], native_legacy_rej_surface[4],
+            native_legacy_rej_surface[5], native_legacy_rej_surface[6]);
+    }
   }
+  composeLog(f);
   lastWaits = waits; lastTimeouts = timeouts; lastNoRing = noRing; lastWaitUs = waitUs; lastReady = ready;
   {
     // Mapping (and, with guamp-fast-copy=1, cache maintenance) per frame and the read-only probe of guamp-copy-probe=N.

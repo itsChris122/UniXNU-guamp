@@ -14,11 +14,13 @@ scales it to the panel, as the display pipe of an iPhone in Display Zoom (or an 
 Swaps whose larger rectangle is the canvas are scaled into the GOP frame buffer (which the USB mirror keeps reading at 720 x 1600).
 Without the two arguments the canvas is off. Section 11: the guamp display arguments (offline-legacy-*) and guamp-copy-gpu-wait=500
 are code defaults since 28/10; an explicit key still wins.
+Section 12 (guamp-compose, default 1): swaps with several layers (a video in a page) or a partial rectangle, which froze the screen
+when refused, are composed in software.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'c259349e4560bcfeb88bd781fd1f17033b107820554633ad64598309790f91b8'
+PATCHED_SHA256 = '983cf08cc7a348a39f5ed7acff99f83b0db2ae14fe9654477a5acd50aa3f269d'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -701,6 +703,391 @@ EDITS.append(('''        if(frame.blank) {
             if(bootMapping && native_legacy_fill_pixels(''', '''        if(frame.blank) {
             guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled
             if(bootMapping && native_legacy_fill_pixels('''))
+# 13. Software composition of multi-layer swaps (guamp-compose, default 1; 0 = the previous single-layer behaviour). A video in a page
+#     (not full screen) makes backboardd present it as its own hardware layer: the swaps carry the page and the video in layers 1 and 2
+#     with layer 0 disabled (state 7/1/0), which the single-layer validation refused (reason 2) for every frame, so the screen froze
+#     (fin29/fin30/fin34). Request fields, read from the original swap_submit (kernelcache 0xfffffff00678f224: the user's 0x508-byte
+#     IOMFBSwapRec at +0x38 into the request) and IOMobileFramebufferSwapSetLayer (dyld cache 0x1b63d2824), per layer i of 4:
+#       src rect (x, y, w, h; surface pixels)  17 + 16 i      <- user +0xac     dst rect (display pixels)  81 + 16 i  <- user +0x10c
+#       transform & 7                         580 + 4 i      <- user +0x15c    surface (IOSurface *)   2624 + 8 i  (updated layers)
+#       updated / disabled / background       792 / 796 / 800                  options 804..812 (must be 0), display size 816/820.
+#     A swap carries only the layers whose updated bit is set: the others keep what the previous swap set, as on the display hardware,
+#     so the layers persist here (released when a later swap disables them or a single-layer/blank swap replaces the screen).
+#     Layer 0 is the bottom. Each frame is composed by the copy thread (after its GPU wait) into a cached buffer of the panel size and
+#     then copied to the scanout: premultiplied BGRA (bilinear, guamp-canvas-filter) with source-over, and biplanar 4:2:0 video ('420v'
+#     video range, '420f' full range; BT.709 from 720 lines, else BT.601; nearest sample). IOSurface plane table (getters at
+#     0xfffffff005b9eae0..0xfffffff005b9f3ac): array at +0x180, count +0x188, 56-byte entries: width +0, height +8, offset +0x10 (+0x18
+#     the same for plain planes), row bytes +0x20, size +0x28. Other formats and transformed layers are skipped (counted, the format
+#     logged) instead of refusing the swap. Composed swaps need latest-frame-wins (section 10, the default).
+#     guamp_compose: [0] composed swaps accepted, [1] composed frames handed over, [2] frames composed, [3] compose failures, [4] BGRA
+#     layers drawn, [5] 4:2:0 layers drawn, [6] layers skipped: format, [7] skipped: transform, [8] skipped: geometry, [9] last skipped
+#     format, [10] compose ticks, [11] map failures, [12] swaps the composition refused too, [13] background fills, [14] most layers in a
+#     frame, [15] 4:2:0 planes whose +0x10 and +0x18 offsets differ. guamp_compose_layer[i]: format, planes, surface width, height, src
+#     x, y, w, h, dst x, y, w, h, transform, result of the last swap that updated layer i (0 drawable, 1 format, 2 transform, 3 geometry,
+#     4 no IOSurface, 5 disabled).
+EDITS.append(('''struct GuampFrame {
+    IOMemoryDescriptor *memory;uint64_t stride,allocation,length,rowBytes;
+    uint32_t width,height,offerWidth,offerHeight;bool scaled,blank;
+};
+''', r'''// guamp composition (scripts/guamp-canvas-variant.py section 12). The text between the two markers is the host-tested core
+// (drivers/NativeEmmc/tests/compose_host.cpp extracts it): pure integer code, no kernel calls.
+// guamp-compose-core-begin
+struct GuampComposeLayer {
+    const unsigned char *base;uint64_t bytes;   // the mapped surface (its whole allocation)
+    uint32_t kind;                              // 0 premultiplied BGRA, 1 biplanar 4:2:0 video range, 2 the same in full range
+    uint32_t matrix;                            // 4:2:0: 0 BT.601, 1 BT.709
+    uint32_t width,height;                      // surface (luma plane) size
+    uint64_t offset,stride;                     // first plane: byte offset and row bytes
+    uint64_t chromaOffset,chromaStride;         // 4:2:0: the interleaved Cb Cr plane
+    uint32_t sx,sy,sw,sh;                       // source rectangle, surface pixels
+    int64_t dx,dy;uint32_t dw,dh;               // destination rectangle, output pixels (may reach past the output)
+    unsigned filter;                            // BGRA: 1 bilinear, 0 nearest (4:2:0 always samples the nearest)
+    bool blend;                                 // BGRA: premultiplied source-over instead of replacing
+};
+// One output sample: source index << 9 | weight of the next source sample (0..256), centres aligned.
+static inline uint32_t guampComposeTap(uint32_t i,uint32_t outCount,uint32_t inCount,unsigned filter) {
+    uint64_t position=(((uint64_t)(2*i+1)*inCount)<<16)/(2ull*outCount);
+    position=position>=32768?position-32768:0;
+    uint32_t index=(uint32_t)(position>>16),weight=(uint32_t)(((position&0xffff)+128)>>8);
+    if(!filter){if(weight>=128)index=index+1;weight=0;}
+    if(index>=inCount-1){index=inCount-1;weight=0;}
+    return index<<9|weight;
+}
+static inline uint32_t guampComposeLerp(uint32_t a,uint32_t b,uint32_t w) {
+    const uint32_t v=256-w;
+    const uint32_t rb=((((a&0x00ff00ffU)*v+(b&0x00ff00ffU)*w)+0x00800080U)>>8)&0x00ff00ffU;
+    const uint32_t ga=((((a>>8)&0x00ff00ffU)*v+((b>>8)&0x00ff00ffU)*w)+0x00800080U)&0xff00ff00U;
+    return rb|ga;
+}
+// Premultiplied source over destination, per channel d * (255 - a) / 255 rounded, plus the source, saturated.
+static inline uint32_t guampComposeOver(uint32_t s,uint32_t d) {
+    const uint32_t a=s>>24;
+    if(a==255)return s;
+    if(!s)return d;
+    const uint32_t k=255-a;
+    uint32_t rb=(d&0x00ff00ffU)*k+0x00800080U;rb=((rb+((rb>>8)&0x00ff00ffU))>>8)&0x00ff00ffU;
+    uint32_t ga=((d>>8)&0x00ff00ffU)*k+0x00800080U;ga=((ga+((ga>>8)&0x00ff00ffU))>>8)&0x00ff00ffU;
+    rb+=s&0x00ff00ffU;ga+=(s>>8)&0x00ff00ffU;
+    rb|=(rb&0x01000100U)-((rb&0x01000100U)>>8);ga|=(ga&0x01000100U)-((ga&0x01000100U)>>8);
+    return (rb&0x00ff00ffU)|((ga&0x00ff00ffU)<<8);
+}
+static inline uint32_t guampComposeClamp(int32_t v) {return v<0?0:v>255?255:(uint32_t)v;}
+// Y'CbCr to BGRA (8.8 fixed point): luma gain, Cr to R, Cb to G, Cr to G, Cb to B, luma offset. 601/709 video range, 601/709 full.
+static const int32_t kGuampComposeYuv[4][6]={{298,409,100,208,516,16},{298,459,55,136,541,16},{256,359,88,183,454,0},{256,403,48,120,475,0}};
+static inline uint32_t guampComposeYuv(uint32_t y,uint32_t cb,uint32_t cr,const int32_t *k) {
+    const int32_t c=((int32_t)y-k[5])*k[0],d=(int32_t)cb-128,e=(int32_t)cr-128;
+    const int32_t r=(c+k[1]*e+128)>>8,g=(c-k[2]*d-k[3]*e+128)>>8,b=(c+k[4]*d+128)>>8;
+    return 0xff000000U|guampComposeClamp(r)<<16|guampComposeClamp(g)<<8|guampComposeClamp(b);
+}
+// Every byte the layer reads lies in its surface.
+static inline bool guampComposeValid(const GuampComposeLayer &l) {
+    if(!l.base || l.kind>2 || l.matrix>1 || !l.sw || !l.sh || !l.dw || !l.dh || l.sw>16384 || l.sh>16384 || l.dw>16384 || l.dh>16384 ||
+       l.width>16384 || l.height>16384 || (uint64_t)l.sx+l.sw>l.width || (uint64_t)l.sy+l.sh>l.height || !l.stride || l.stride>(1u<<20) ||
+       l.offset>l.bytes)return false;
+    const uint64_t pixel=l.kind?1:4,rows=(uint64_t)l.sy+l.sh,right=((uint64_t)l.sx+l.sw)*pixel;
+    if(l.stride<right || (l.bytes-l.offset)<l.stride*(rows-1)+right)return false;
+    if(!l.kind)return !(l.offset&3) && !(l.stride&3);
+    const uint64_t chromaRows=(rows+1)/2,chromaRight=(((uint64_t)l.sx+l.sw+1)/2)*2;
+    return l.chromaStride && l.chromaStride<=(1u<<20) && l.chromaStride>=chromaRight && l.chromaOffset<=l.bytes &&
+           (l.bytes-l.chromaOffset)>=l.chromaStride*(chromaRows-1)+chromaRight;
+}
+// Draws one layer into the width x height output. taps: at least visible columns + rows words; line: (sw + 1) * 4 bytes for BGRA.
+// Returns the output pixels written (0 when the layer is off the output), -1 when nothing was drawn because the layer is invalid.
+static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t height,const GuampComposeLayer &l,
+    uint32_t *taps,uint64_t tapWords,unsigned char *line,uint64_t lineBytes) {
+    if(!out || !width || !height || !taps || !guampComposeValid(l))return -1;
+    const int64_t x0=l.dx<0?0:l.dx,y0=l.dy<0?0:l.dy;
+    const int64_t x1=l.dx+(int64_t)l.dw>(int64_t)width?(int64_t)width:l.dx+(int64_t)l.dw;
+    const int64_t y1=l.dy+(int64_t)l.dh>(int64_t)height?(int64_t)height:l.dy+(int64_t)l.dh;
+    if(x0>=x1 || y0>=y1)return 0;
+    const uint32_t cols=(uint32_t)(x1-x0),rows=(uint32_t)(y1-y0);
+    const bool bgra=!l.kind;
+    if(tapWords<(uint64_t)cols+rows || (bgra && (!line || lineBytes<((uint64_t)l.sw+1)*4)))return -1;
+    const unsigned filter=bgra?l.filter:0;
+    uint32_t *columnTaps=taps,*rowTaps=taps+cols;
+    for(uint32_t c=0;c<cols;++c)columnTaps[c]=guampComposeTap((uint32_t)(x0-l.dx)+c,l.dw,l.sw,filter);
+    for(uint32_t r=0;r<rows;++r)rowTaps[r]=guampComposeTap((uint32_t)(y0-l.dy)+r,l.dh,l.sh,filter);
+    const int32_t *k=kGuampComposeYuv[(l.kind==2?2:0)+l.matrix];
+    const bool direct=l.sw==l.dw;   // one source column per output column: no column weights
+    for(uint32_t r=0;r<rows;++r) {
+        uint32_t *o=out+(uint64_t)(y0+r)*width+(uint64_t)x0;
+        const uint32_t row=l.sy+(rowTaps[r]>>9),weight=rowTaps[r]&511;
+        if(bgra) {
+            const unsigned char *first=l.base+l.offset+(uint64_t)row*l.stride+(uint64_t)l.sx*4;
+            const unsigned char *src=first;
+            if(weight) {   // the tap guarantees row + 1 inside the rectangle
+                const unsigned char *second=first+l.stride;
+                for(uint32_t x=0;x<l.sw;++x) {
+                    uint32_t a,b;__builtin_memcpy(&a,first+(uint64_t)x*4,4);__builtin_memcpy(&b,second+(uint64_t)x*4,4);
+                    const uint32_t v=guampComposeLerp(a,b,weight);__builtin_memcpy(line+(uint64_t)x*4,&v,4);
+                }
+                src=line;
+            }
+            for(uint32_t c=0;c<cols;++c) {
+                const uint32_t tap=columnTaps[c],at=(tap>>9)*4,w=direct?0:(tap&511);
+                uint32_t s;__builtin_memcpy(&s,src+at,4);
+                if(w){uint32_t t;__builtin_memcpy(&t,src+at+4,4);s=guampComposeLerp(s,t,w);}
+                o[c]=l.blend?guampComposeOver(s,o[c]):s;
+            }
+        } else {
+            const unsigned char *luma=l.base+l.offset+(uint64_t)row*l.stride;
+            const unsigned char *chroma=l.base+l.chromaOffset+(uint64_t)(row/2)*l.chromaStride;
+            for(uint32_t c=0;c<cols;++c) {
+                const uint32_t column=l.sx+(columnTaps[c]>>9),pair=column&~1u;
+                o[c]=guampComposeYuv(luma[column],chroma[pair],chroma[pair+1],k);
+            }
+        }
+    }
+    return (int64_t)cols*rows;
+}
+static inline void guampComposeFill(uint32_t *out,uint64_t pixels,uint32_t value) {
+    const uint64_t pair=(uint64_t)value<<32|value;uint64_t i=0;
+    if(!((uintptr_t)out&7))for(;i+2<=pixels;i+=2)*reinterpret_cast<uint64_t *>(out+i)=pair;
+    for(;i<pixels;++i)out[i]=value;
+}
+// guamp-compose-core-end
+extern "C" {volatile uint64_t guamp_compose[16];volatile uint32_t guamp_compose_layer[4][14];}
+// The layers of one composed frame, shared by the frames that show them (latest-frame-wins keeps the one on screen): each surface's
+// memory stays retained until the last frame holding the set lets it go.
+struct GuampLayerSource {IOMemoryDescriptor *memory;uint64_t allocation;GuampComposeLayer layer;};
+struct GuampLayers {
+    uint32_t refs,count,background;bool fill;
+    GuampLayerSource source[4];
+    void retain() {__atomic_add_fetch(&refs,1,__ATOMIC_RELAXED);}
+    void release() {
+        if(__atomic_sub_fetch(&refs,1,__ATOMIC_ACQ_REL))return;
+        for(uint32_t i=0;i<count;++i)OSSafeReleaseNULL(source[i].memory);
+        IOFree(this,sizeof(*this));
+    }
+};
+struct GuampFrame {
+    IOMemoryDescriptor *memory;uint64_t stride,allocation,length,rowBytes;
+    uint32_t width,height,offerWidth,offerHeight;bool scaled,blank;
+    GuampLayers *layers;   // section 12: a composed frame (memory is null)
+};
+'''))
+EDITS.append(('''                                    scaled?sourceWidth:width,scaled?sourceHeight:height,scaled,false};''',
+              '''                                    scaled?sourceWidth:width,scaled?sourceHeight:height,scaled,false,nullptr};'''))
+EDITS.append(('const GuampFrame frame={nullptr,0,0,blankLength,blank.v_rowBytes,bw,bh,bw,bh,false,true};',
+              'const GuampFrame frame={nullptr,0,0,blankLength,blank.v_rowBytes,bw,bh,bw,bh,false,true,nullptr};'))
+EDITS.append(('''    void latestRetain(const GuampFrame &frame) {if(frame.memory)frame.memory->retain();}
+    void latestRelease(const GuampFrame &frame) {if(frame.memory)frame.memory->release();}''',
+              '''    void latestRetain(const GuampFrame &frame) {if(frame.memory)frame.memory->retain();if(frame.layers)frame.layers->retain();}
+    void latestRelease(const GuampFrame &frame) {if(frame.memory)frame.memory->release();if(frame.layers)frame.layers->release();}'''))
+EDITS.append(('''    bool latestCopyOnce(const GuampFrame &frame) {
+        IOMemoryMap *source=guampSourceMap(frame.memory,frame.allocation);''',
+              '''    bool latestCopyOnce(const GuampFrame &frame) {
+        if(frame.layers)return composeOnce(frame);   // section 12
+        IOMemoryMap *source=guampSourceMap(frame.memory,frame.allocation);'''))
+EDITS.append(('        } else if(frame.memory) {\n', '        } else if(frame.memory || frame.layers) {\n'))
+EDITS.append(('        latest.clear(*this);\n', '        latest.clear(*this);\n        freeCompose();\n'))
+# Two layers per frame plus the single-layer frames: keep the mappings of 8 surfaces.
+EDITS.append(('GuampMapSlot mapSlots[4]={};', 'GuampMapSlot mapSlots[8]={};'))
+EDITS.append(('    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;}',
+              '    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;\n'
+              '        for(auto &entry: composedValidated)if(entry==request)entry=nullptr;}'))
+EDITS.append(('transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;',
+              'transferred=false;for(auto &entry: validated)entry=nullptr;for(auto &entry: composedValidated)entry=nullptr;gpuRequest=nullptr;'))
+EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: software composition of multi-layer swaps.
+    const OriginalLegacySwapRequest *composedValidated[8]={};
+    bool isComposed(const OriginalLegacySwapRequest *request) const {
+        if(!request)return false;
+        for(auto entry: composedValidated)if(entry==request)return true;
+        return false;
+    }
+    void addComposed(const OriginalLegacySwapRequest *request) {
+        if(isComposed(request))return;
+        for(auto &entry: composedValidated)if(!entry){entry=request;return;}
+        composedValidated[0]=request;
+    }
+    int composeWanted=-1;
+    GuampLayerSource composeCurrent[4]={};uint32_t composeBackground=0xff000000U;
+    void *composeBuffer=nullptr;vm_size_t composeBufferSize=0;
+    void *composeScratch=nullptr;vm_size_t composeScratchSize=0;
+    bool composeOn() {
+        if(composeWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose",&v,sizeof v);composeWanted=v!=0;}
+        return composeWanted==1;
+    }
+    // The persistent layers go (a single-layer or blank swap replaced the screen, or teardown).
+    void composeReset() {
+        for(auto &s: composeCurrent){OSSafeReleaseNULL(s.memory);s={};}
+        composeBackground=0xff000000U;
+    }
+    void freeCompose() {
+        composeReset();
+        if(composeBuffer){IOFreeAligned(composeBuffer,composeBufferSize);composeBuffer=nullptr;composeBufferSize=0;}
+        if(composeScratch){IOFree(composeScratch,composeScratchSize);composeScratch=nullptr;composeScratchSize=0;}
+    }
+    // Layer i of the request, read from the request and its IOSurface. 0 drawable (out filled, memory retained when out is set),
+    // 1 unsupported format, 2 transformed, 3 bad geometry, 4 no IOSurface.
+    unsigned composeLayer(const unsigned char *bytes,unsigned i,uint32_t displayWidth,uint32_t displayHeight,GuampLayerSource *out) {
+        volatile uint32_t *note=guamp_compose_layer[i];
+        OSObject *surface=nullptr;memcpy(&surface,bytes+2624+8*i,sizeof(surface));
+        if(!surface || !surface->metaCast("IOSurface"))return 4;
+        IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
+        if(!memory || !memory->metaCast("IOMemoryDescriptor"))return 4;
+        const uint32_t format=native_legacy_surface_format(surface),planes=native_legacy_surface_planes(surface);
+        const uint64_t width=native_legacy_surface_width(surface),height=native_legacy_surface_height(surface);
+        const uint64_t allocation=native_legacy_surface_allocation(surface);
+        uint32_t source[4]={},target[4]={},transform=0;
+        memcpy(source,bytes+17+16*i,sizeof(source));memcpy(target,bytes+81+16*i,sizeof(target));memcpy(&transform,bytes+580+4*i,4);
+        note[0]=format;note[1]=planes;note[2]=(uint32_t)width;note[3]=(uint32_t)height;
+        for(unsigned j=0;j<4;++j){note[4+j]=source[j];note[8+j]=target[j];}
+        note[12]=transform;
+        GuampComposeLayer l={};
+        if(width>16384 || height>16384 || !allocation || allocation>memory->getLength())return 3;
+        if(nativeBgra(format,planes)) {
+            l.kind=0;l.offset=0;l.stride=native_legacy_surface_stride(surface);
+        } else if((format==0x34323076 || format==0x34323066) && planes==2) {   // '420v', '420f'
+            const unsigned char *object=reinterpret_cast<const unsigned char *>(surface);
+            uint64_t table=0;uint32_t entries=0;memcpy(&table,object+0x180,8);memcpy(&entries,object+0x188,4);
+            if(!table || (table>>48)!=0xffff || entries<2)return 1;
+            uint64_t luma[6]={},chroma[6]={};   // width, height, offset, second offset, row bytes, size
+            memcpy(luma,reinterpret_cast<const void *>(table),sizeof(luma));memcpy(chroma,reinterpret_cast<const void *>(table+56),sizeof(chroma));
+            if(luma[2]!=luma[3] || chroma[2]!=chroma[3])guamp_compose[15]=guamp_compose[15]+1;
+            if(luma[0]<width || luma[1]<height || 2*chroma[0]<width || 2*chroma[1]<height ||
+               luma[2]>allocation || luma[5]>allocation-luma[2] || chroma[2]>allocation || chroma[5]>allocation-chroma[2])return 3;
+            l.kind=format==0x34323066?2:1;l.matrix=height>=720?1:0;
+            l.offset=luma[2];l.stride=luma[4];l.chromaOffset=chroma[2];l.chromaStride=chroma[4];
+        } else {guamp_compose[9]=format;return 1;}
+        if(transform&7)return 2;
+        l.width=(uint32_t)width;l.height=(uint32_t)height;
+        l.sx=source[0];l.sy=source[1];l.sw=source[2];l.sh=source[3];
+        // Destination in display coordinates (signed: the client clips, this does too), mapped to the scanout when they differ.
+        int64_t dx=(int32_t)target[0],dy=(int32_t)target[1];uint64_t dw=target[2],dh=target[3];
+        if(displayWidth!=gopWidth || displayHeight!=gopHeight) {
+            dx=dx*(int64_t)gopWidth/(int64_t)displayWidth;dy=dy*(int64_t)gopHeight/(int64_t)displayHeight;
+            dw=dw*gopWidth/displayWidth;dh=dh*gopHeight/displayHeight;
+        }
+        if(dw>16384 || dh>16384 || dx>=(int64_t)gopWidth || dy>=(int64_t)gopHeight || dx+(int64_t)dw<=0 || dy+(int64_t)dh<=0)return 3;
+        l.dx=dx;l.dy=dy;l.dw=(uint32_t)dw;l.dh=(uint32_t)dh;l.filter=canvasFilter;
+        l.base=reinterpret_cast<const unsigned char *>(1);l.bytes=allocation;   // the geometry against the allocation; mapped later
+        const bool valid=guampComposeValid(l);l.base=nullptr;l.bytes=0;
+        if(!valid)return 3;
+        if(out){memory->retain();out->memory=memory;out->allocation=allocation;out->layer=l;}
+        return 0;
+    }
+    // A swap the single-layer path refused (reason 2 or 3): known layer bits, no options, every updated enabled layer an IOSurface.
+    bool composeAccepts(const unsigned char *bytes) {
+        if(!composeOn() || !logicalPM || !primary || !bootMapping || !gopWidth || !gopHeight || !latestOn())return false;
+        auto word=[&](unsigned offset){uint32_t value=0;memcpy(&value,bytes+offset,4);return value;};
+        const uint32_t updated=word(792),disabled=word(796);
+        if(((updated|disabled)&~0x8000000fU) || (disabled&~updated) || !(updated&0xfU))return false;
+        for(unsigned offset=804;offset<=812;offset+=4)if(word(offset))return false;
+        for(unsigned i=0;i<4;++i) {
+            if(!(updated&~disabled&(1u<<i)))continue;
+            OSObject *surface=nullptr;memcpy(&surface,bytes+2624+8*i,sizeof(surface));
+            if(!surface || !surface->metaCast("IOSurface"))return false;
+        }
+        return true;
+    }
+    // The validated head of a composed swap: its layers update the persistent ones, a snapshot of them becomes the frame.
+    void kickComposed(const OriginalLegacySwapRequest *request) {
+        const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
+        PE_Video video={};
+        const uint64_t length=(uint64_t)gopWidth*gopHeight*4;
+        if(PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() || video.v_width!=gopWidth ||
+           video.v_height!=gopHeight || video.v_depth!=32 || video.v_rotate ||
+           !native_legacy_surface_bounds(gopWidth,gopHeight,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
+            native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+        }
+        if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+        uint32_t displayWidth=0,displayHeight=0;getDisplayDimensions(&displayWidth,&displayHeight);
+        if(!displayWidth || !displayHeight){native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+        uint32_t updated=0,disabled=0,background=0;memcpy(&updated,bytes+792,4);memcpy(&disabled,bytes+796,4);memcpy(&background,bytes+800,4);
+        for(unsigned i=0;i<4;++i) {
+            const uint32_t bit=1u<<i;
+            if(!(updated&bit))continue;
+            OSSafeReleaseNULL(composeCurrent[i].memory);composeCurrent[i]={};
+            if(disabled&bit){guamp_compose_layer[i][13]=5;continue;}
+            const unsigned result=composeLayer(bytes,i,displayWidth,displayHeight,&composeCurrent[i]);
+            guamp_compose_layer[i][13]=result;
+            if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
+        }
+        if(updated&0x80000000U)composeBackground=0xff000000U|(background&0x00ffffffU);
+        GuampLayers *set=static_cast<GuampLayers *>(IOMalloc(sizeof(GuampLayers)));
+        if(!set){native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;}
+        bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;
+        for(unsigned i=0;i<4;++i) {
+            if(!composeCurrent[i].memory)continue;
+            GuampLayerSource &s=set->source[set->count];s=composeCurrent[i];s.memory->retain();s.layer.blend=true;
+            if(!set->count && !(composeBackground&0x00ffffffU) && s.layer.dx<=0 && s.layer.dy<=0 &&
+               s.layer.dx+(int64_t)s.layer.dw>=(int64_t)gopWidth && s.layer.dy+(int64_t)s.layer.dh>=(int64_t)gopHeight) {
+                set->fill=false;s.layer.blend=false;   // the bottom layer covers the black background: replace, no fill
+            }
+            set->count=set->count+1;
+        }
+        if(set->count>guamp_compose[14])guamp_compose[14]=set->count;
+        guamp_compose[1]=guamp_compose[1]+1;
+        const GuampFrame frame={nullptr,0,0,length,video.v_rowBytes,gopWidth,gopHeight,gopWidth,gopHeight,false,false,set};
+        latestRetire(request,frame);
+    }
+    // Copy thread: the layers into the cached buffer, then the buffer into the scanout.
+    bool composeOnce(const GuampFrame &frame) {
+        GuampLayers *set=frame.layers;
+        const uint64_t pixels=(uint64_t)frame.width*frame.height,need=pixels*4;
+        if(!set || !bootMapping || !pixels)return false;
+        if(!composeBuffer || composeBufferSize<need) {
+            if(composeBuffer)IOFreeAligned(composeBuffer,composeBufferSize);
+            composeBufferSize=(vm_size_t)((need+16383)&~16383ull);composeBuffer=IOMallocAligned(composeBufferSize,16384);
+            if(!composeBuffer){composeBufferSize=0;guamp_compose[3]=guamp_compose[3]+1;return false;}
+        }
+        uint64_t widest=0;
+        for(uint32_t i=0;i<set->count;++i)if(set->source[i].layer.sw>widest)widest=set->source[i].layer.sw;
+        const uint64_t tapWords=(uint64_t)frame.width+frame.height,scratchNeed=tapWords*4+(widest+1)*4;
+        if(!composeScratch || composeScratchSize<scratchNeed) {
+            if(composeScratch)IOFree(composeScratch,composeScratchSize);
+            composeScratchSize=(vm_size_t)scratchNeed;composeScratch=IOMalloc(composeScratchSize);
+            if(!composeScratch){composeScratchSize=0;guamp_compose[3]=guamp_compose[3]+1;return false;}
+        }
+        uint32_t *taps=static_cast<uint32_t *>(composeScratch);
+        unsigned char *line=static_cast<unsigned char *>(composeScratch)+tapWords*4;
+        uint32_t *out=static_cast<uint32_t *>(composeBuffer);
+        uint64_t composeStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(composeStart));
+        if(set->fill){guampComposeFill(out,pixels,set->background);guamp_compose[13]=guamp_compose[13]+1;}
+        for(uint32_t i=0;i<set->count;++i) {
+            const GuampLayerSource &s=set->source[i];
+            IOMemoryMap *map=guampSourceMap(s.memory,s.allocation);
+            if(!map || !map->getVirtualAddress() || map->getLength()<s.allocation) {
+                OSSafeReleaseNULL(map);guamp_compose[11]=guamp_compose[11]+1;continue;
+            }
+            GuampComposeLayer l=s.layer;
+            l.base=reinterpret_cast<const unsigned char *>(map->getVirtualAddress());l.bytes=s.allocation;
+            const int64_t drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4);
+            OSSafeReleaseNULL(map);
+            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;continue;}
+            if(l.kind)guamp_compose[5]=guamp_compose[5]+1;else guamp_compose[4]=guamp_compose[4]+1;
+        }
+        uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+        guamp_compose[10]=guamp_compose[10]+(copyStart-composeStart);
+        const bool ok=native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
+            frame.rowBytes,out,need,(uint64_t)frame.width*4,frame.width,frame.height)!=0;
+        __asm__ volatile("dsb sy" ::: "memory");
+        uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+        if(ok){native_legacy_copy_timing_observed(copyEnd-copyStart,frame.length);guamp_compose[2]=guamp_compose[2]+1;}
+        else guamp_compose[3]=guamp_compose[3]+1;
+        return ok;
+    }
+    // Section 10: latest-frame-wins.
+'''))
+# The composed path in the validator (after the single-layer and blank checks) and in the queue kick.
+EDITS.append(('''        if(accepted)addValidated(request);else removeValidated(request);
+        native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;''',
+              '''        // guamp composition (canvas variant section 12): what the single-layer path refused for its layers or geometry.
+        bool composed=false;
+        if(!accepted && enabled==1 && request && (reason==2 || reason==3)) {
+            if(composeAccepts(bytes)){reason=6;accepted=composed=true;guamp_compose[0]=guamp_compose[0]+1;}
+            else guamp_compose[12]=guamp_compose[12]+1;
+        }
+        if(accepted)addValidated(request);else removeValidated(request);
+        if(composed)addComposed(request);
+        native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;'''))
+EDITS.append(('''        if(!request || !isValidated(request))return;
+''', '''        if(!request || !isValidated(request))return;
+        // guamp composition (canvas variant section 12): a composed swap; any other frame replaces the persistent layers.
+        if(isComposed(request)){kickComposed(request);return;}
+        composeReset();
+'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
