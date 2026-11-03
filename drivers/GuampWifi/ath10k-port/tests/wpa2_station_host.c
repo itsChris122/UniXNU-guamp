@@ -152,6 +152,11 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
   if (txi->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) {
     CHECK(skb->len >= 14, "hardware encapsulation receives a full Ethernet header");
     CHECK(txi->control.hw_key == g_pk, "Ethernet data selects the installed pairwise key");
+    /* guamp 03/11: group key message 2 goes this way, encrypted by the firmware with the pairwise key */
+    if (skb->len > 14 + 7 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) {
+      const u8 *k = skb->data + 14; unsigned n = skb->len - 14;
+      if ((k[5] << 8 | k[6]) == 0x0302) { g_group_m4_count++; CHECK(check_mic(k, n), "group-key message 2 MIC verifies"); }
+      kfree_skb(skb); return; }
     if (g_last_data) kfree_skb(g_last_data); g_last_data = skb; return;
   }
   struct ieee80211_hdr *h = (void *)skb->data; u16 fc = le16_to_cpu(h->frame_control);
@@ -257,7 +262,8 @@ int main(void) {
     send_group_update(1); CHECK(n_setkey==2 && g_group_m4_count==0,"invalid group-key MIC is ignored");
     g_fail_group=1; resend_group_update(); CHECK(n_setkey==3 && g_group_m4_count==0,"failed GTK installation is not acknowledged");
     resend_group_update(); spin(3); CHECK(n_setkey==4 && g_group_m4_count==1,"retransmitted GTK update succeeds after install failure");
-    resend_group_update(); CHECK(n_setkey==4 && g_group_m4_count==2,"duplicate GTK update is acknowledged without reinstalling"); }
+    resend_group_update(); CHECK(n_setkey==4 && g_group_m4_count==2,"duplicate GTK update is acknowledged without reinstalling");
+    send_group_update(0); spin(3); CHECK(n_setkey==4 && g_group_m4_count==3,"the same GTK repeated with a new replay counter is acknowledged without reinstalling"); }
   /* AP-initiated pairwise rekey keeps the old link up until M4 is ACKed. */
   send_rekey_msg1(); spin(3);
   CHECK(g_conn_done==NW_RES_OK && n_setkey==4 && g_pending_m4_skb,"pairwise rekey leaves the active link and keys intact before M4 completion");

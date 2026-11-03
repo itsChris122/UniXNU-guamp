@@ -91,6 +91,7 @@ static struct {
   u8 group_cipher;   /* the access point's RSN group cipher suite: 4 CCMP, 2 TKIP (WPA/WPA2 mixed networks) */
   /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */
   u8 gtk[32]; int gtk_len, gtk_idx; u64 m4_replay; u32 m4_cookie; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames; unsigned join_frames;
+  u8 gtk_last[32]; unsigned gtk_last_len; int gtk_last_idx;   /* the group key last installed (to answer a repeat without installing) */
 } C;
 static u32 g_next_m4_cookie;
 static volatile u64 g_m4_wait_replay;
@@ -529,6 +530,20 @@ static void send_eapol(const struct eapol_key *k, unsigned total, u32 tx_cookie)
   static const u8 snap[8] = { 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e }; skb_put_data(skb, snap, 8); skb_put_data(skb, k, total);
   skb->protocol = cpu_to_be16(ETH_P_PAE); skb->mark=tx_cookie; /* TX completion identifies this handshake message */
   tx_frame(skb); }
+/* guamp 03/11: an EAPOL frame once the pairwise key is in use (group key message 2): through the data path, which the firmware
+ * encrypts with that key, as wpa_supplicant's control port frames go. send_eapol() sends 802.11 frames without the Protected bit,
+ * so ath10k sent them in the clear (ATH10K_SKB_F_NO_HWCRYPT); an access point that drops unencrypted data from a station with
+ * a key never saw our message 2 and repeated the group key message (fin37d: a second update 1 s later, then the stall). The
+ * first handshake (message 2 and 4) stays in the clear, as it must. */
+/* guamp 03/11: a log line holds 256 characters (lx_log): longer reports go in pieces of 200 (fin37d: the last WMI commands were cut) */
+static void log_long(int level, const char *what, const char *text) {
+  unsigned n = (unsigned)strlen(text);
+  for (unsigned at = 0;; at += 200) { lx_log(level, "wifi: %s%s %.200s", what, at ? " (more)" : "", text + at); if (at + 200 >= n) break; } }
+static void send_eapol_protected(const struct eapol_key *k, unsigned total) {
+  u8 e[14 + 512];
+  if (!C.ptk_key || C.state != NW_STA_UP || total > sizeof e - 14) { send_eapol(k, total, 0); return; }
+  memcpy(e, C.ap.bssid, 6); memcpy(e + 6, g_vif->addr, 6); e[12] = 0x88; e[13] = 0x8e; memcpy(e + 14, k, total);
+  tx_eth(e, 14 + total); }
 void nw_wifi_htt_stats(int type); void nw_wifi_rx_state(char *b, int n); void nw_wifi_ring_state(char *b, int n);
 void nw_wifi_quiet_report(char *b, int n, int commands);
 static void sign(struct eapol_key *k, unsigned total) {
@@ -620,7 +635,8 @@ static void heartbeat(u64 now) {
   /* guamp 03/11: in the last second, what the firmware still sent and why management frames went nowhere; in the first quiet
    * second also the last WMI commands (two went out right before every stall) */
   nw_wifi_quiet_report(rx, sizeof rx, C.hb_quiet == 1);
-  lx_log(6, "wifi: %s %s; station dropped %u flagged frames", C.hb_quiet ? "quiet:" : "rx sources:", rx, g_rx_flagged);
+  { size_t used = strlen(rx); snprintf(rx + used, sizeof rx - used, "; station dropped %u flagged frames", g_rx_flagged); }
+  log_long(6, C.hb_quiet ? "quiet:" : "rx sources:", rx);
   nw_wifi_rx_state(rx, sizeof rx); const char *semi = strchr(rx, ';');
   lx_log(6, "wifi: last second %u frames %u beacons, quiet %u; rx %.*s", f, bc, C.hb_quiet, semi ? (int)(semi - rx) : (int)strlen(rx), rx);
   if (semi) lx_log(6, "wifi: rx rings%s", semi + 1);
@@ -704,16 +720,23 @@ static void handle_eapol(const u8 *p, unsigned len) {
   if (!pairwise && ack) {   /* group key update */
     if(C.group_replay_valid && rc==C.group_replay) {
       struct eapol_key *o=(void *)buf; memset(o,0,sizeof *o); o->ver=2; o->type=3; o->desc=2; unsigned body=sizeof *o-4;
-      o->len[0]=body>>8; o->len[1]=body; o->info[0]=0x03; o->info[1]=0x02; memcpy(o->replay,k->replay,8); sign(o,sizeof *o); send_eapol(o,sizeof *o,0); return;
+      o->len[0]=body>>8; o->len[1]=body; o->info[0]=0x03; o->info[1]=0x02; memcpy(o->replay,k->replay,8); sign(o,sizeof *o); send_eapol_protected(o,sizeof *o); return;
     }
     if (!gtk || gtklen!=(C.group_cipher == 2 ? 32u : 16u)) { C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    /* guamp 03/11: the access point repeats a group key message it got no answer to with a new replay counter and the same
+     * key. Installed again, the firmware never completed the second key command (fin37d 317.3 s: the receive work waited in it
+     * 9.8 s). The same key at the same index is answered, not installed again. */
+    int same_key = gtkid >= 0 && gtkid < 4 && C.gtk_keys[gtkid] && C.gtk_last_len == gtklen && C.gtk_last_idx == gtkid &&
+                   equal_constant_time(C.gtk_last, gtk, gtklen);
     /* guamp 03/11: said every time (the access point renews the group key on its own timer, often every 600 s: the period of
      * the reception stalls) -- the index and length only, never the key */
-    if (install_key(0, gtkid, gtk, gtklen)) { lx_log(4, "wifi: group key update (index %d): install failed", gtkid); C.retry_replay=rc; C.retry_replay_valid=1; return; }
-    lx_log(6, "wifi: group key update: index %d, %u bytes, installed", gtkid, gtklen);
+    if (same_key) lx_log(6, "wifi: group key update: index %d, the key already installed: answered only", gtkid);
+    else if (install_key(0, gtkid, gtk, gtklen)) { lx_log(4, "wifi: group key update (index %d): install failed", gtkid); C.retry_replay=rc; C.retry_replay_valid=1; return; }
+    else { lx_log(6, "wifi: group key update: index %d, %u bytes, installed", gtkid, gtklen);
+      memcpy(C.gtk_last, gtk, gtklen); C.gtk_last_len = gtklen; C.gtk_last_idx = gtkid; }
     C.group_replay=rc; C.group_replay_valid=1; C.retry_replay_valid=0;
     struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;
-    o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o,0); } }
+    o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol_protected(o, sizeof *o); } }
 
 /* ---- association results ---- */
 static void on_mgmt(struct sk_buff *skb) {
@@ -863,7 +886,8 @@ static void timer_fn(struct work_struct *w) {
         /* guamp 03/11: what came from the access point meanwhile (0: the radio is not where the access point is) and what the
          * firmware did (WMI commands: vdev start, peer create, management frames; events) */
         char why[480]; nw_wifi_quiet_report(why, sizeof why, 1);
-        lx_log(4, "wifi: authentication unanswered: %u frames from the access point during the join; %s", g_current_link_frames - C.join_frames, why);
+        lx_log(4, "wifi: authentication unanswered: %u frames from the access point during the join", g_current_link_frames - C.join_frames);
+        log_long(4, "authentication unanswered:", why);
         connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
   case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } send_assoc(); } break;
   case NW_STA_KEYS: break;

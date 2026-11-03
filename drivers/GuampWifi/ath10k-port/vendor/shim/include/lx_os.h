@@ -121,8 +121,13 @@ void lx_idle(unsigned int ms);   /* nothing ready: let the clock advance and dev
     unsigned long _end = jiffies + (tmo_j); long _r; (void)(w); \
     for (;;) { \
       if (cond) { unsigned long _now = jiffies; _r = time_before(_now, _end) ? (long)(_end - _now) : 1; break; } \
-      if (!lx_pump()) { if (time_after(jiffies, _end) || jiffies == _end) { _r = (cond) ? 1 : 0; break; } lx_idle(1); } } \
+      if (time_after(jiffies, _end) || jiffies == _end) { _r = 0; break; } \
+      if (!lx_pump()) lx_idle(1); } \
     _r; })
+/* guamp 03/11: the timeout is looked at in every round. It was looked at only in a round where nothing ran, and with the
+ * handlers offered a look every millisecond (lx_pump) something always runs: a wait never timed out. fin37d: after a group key
+ * update the receive work stayed in such a wait for 9.8 s (317.3 -> 327.1 s), every received frame queued behind it, until the
+ * link-lost teardown's own key command completed the same completion. */
 /* guamp 29/10: wait_event_timeout is that single-evaluation wait as well. It used to evaluate cond once more after its loop, so
  * ath10k_wmi_cmd_send(), whose cond calls ath10k_wmi_cmd_send_nowait(), sent every WMI command twice: WMI INIT took the
  * endpoint's credit, the extra send got -EAGAIN, the caller freed the skb still queued on CE3, warned "wmi command timeout,
