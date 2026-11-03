@@ -21,6 +21,9 @@
 // off-command (28, 20 ms, 10, 80 ms: dtbo qcom,mdss-dsi-off-command) after level 0, so the HX83102D (TDDI) firmware
 // enters its sleep / gesture mode as under Linux; the first level above 0 sends the on-command first (11, 160 ms, 29,
 // 50 ms: qcom,mdss-dsi-on-command). guamp-touch-wake-dsi=0 keeps only the level. The touch service follows the state.
+// guamp-touch-events=1|2 (TouchService.inc): ogni cambio acceso/spento (il primo livello > 0 di iOS compreso) va al touch
+// prima dei comandi del pannello e del livello (EARLY_EVENT_BLANK di Linux); con guamp-touch-events-dsi=1 (default) anche
+// off-command dopo il livello 0 e on-command prima del primo livello, come guamp-touch-wake.
 // Logs: one line at start, one per brightness request (rate-limited, says display off/on), failed sends (rate-limited).
 #include "GuampBacklightCore.h"
 
@@ -96,11 +99,22 @@ class GuampBacklight : public IOService {
           guamp_backlight::resultName(r));
     return r == guamp_backlight::kSent;
   }
+  // guamp-touch-events (TouchService.inc, displayEvent): lo stato del display detto al touch come il
+  // DRM_PANEL_EARLY_EVENT_BLANK di sde_kms, prima dei comandi del pannello e del livello; una volta per cambio.
+  bool evKnown = false, evOn = false;
+  void touchEvent(bool on) {
+    if (!touch::gEventsMode || (evKnown && evOn == on)) return;
+    evKnown = true;
+    evOn = on;
+    touch::displayEvent(on);
+  }
   void apply(uint32_t next) {
     if (broken || (known && next == level)) return;
     backlight::DsiGuard guard;
     guamp_backlight::Diag d;
     backlight::Io io;
+    if (next && (!known || level == 0)) touchEvent(true);   // EARLY UNBLANK (il primo livello di iOS compreso)
+    if (!next && (!known || level != 0)) touchEvent(false); // EARLY POWERDOWN
     if (next && panelAsleep) {                         // wake the panel before its first visible level
       panelAsleep = false;
       panelCommand(true);
@@ -117,6 +131,8 @@ class GuampBacklight : public IOService {
       if (!next && wasOn && touch::gWakeArmed) {
         if (touch::gWakeDsi) panelAsleep = panelCommand(false);
         touch::displayState(false);
+      } else if (!next && wasOn && touch::gEventsMode && touch::gEventsDsi && !panelAsleep) {
+        panelAsleep = panelCommand(false);               // dsi_panel_disable dopo il suspend del touch
       } else if (next && !wasOn) {
         touch::displayState(true);
       }
