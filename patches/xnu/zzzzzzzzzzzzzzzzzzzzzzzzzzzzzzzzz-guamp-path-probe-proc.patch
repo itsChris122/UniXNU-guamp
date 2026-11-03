@@ -1,0 +1,58 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index a6f8192..ceca92f 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -2286,6 +2286,39 @@ guamp_path_probe_active(void)
+ 	}
+ 	return guamp_path_probe_used < limit;
+ }
++static char guamp_path_probe_procs[96];
++static volatile SInt32 guamp_path_probe_procs_state = -1;
++static int
++guamp_path_probe_proc_match(void)
++{
++	if (guamp_path_probe_procs_state < 0) {
++		if (!PE_parse_boot_argn("guamp-path-probe-proc", guamp_path_probe_procs, sizeof(guamp_path_probe_procs) - 1)) {
++			guamp_path_probe_procs[0] = '\0';
++		}
++		guamp_path_probe_procs_state = guamp_path_probe_procs[0] && guamp_path_probe_procs[0] != '0' ? 1 : 0;
++	}
++	if (guamp_path_probe_procs_state == 0) {
++		return 0;
++	}
++	proc_t p = current_proc();
++	const char *name = p ? proc_best_name(p) : NULL;
++	if (name == NULL) {
++		return 0;
++	}
++	const char *at = guamp_path_probe_procs;
++	while (*at) {
++		const char *end = at;
++		while (*end && *end != ',') {
++			end++;
++		}
++		size_t len = (size_t)(end - at);
++		if (len && strncmp(name, at, len) == 0) {
++			return 1;
++		}
++		at = *end ? end + 1 : end;
++	}
++	return 0;
++}
+ int
+ guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size)
+ {
+@@ -2302,6 +2335,13 @@ guamp_path_probe_copy(user_addr_t path, enum uio_seg seg, char *buf, size_t size
+ 	} else {
+ 		strlcpy(buf, CAST_DOWN(const char *, path), size);
+ 	}
++	/* 03/11 (ag-sys): guamp-path-probe-proc=<prefix>[,<prefix>...] (with guamp-path-probe=N for the budget): every FAILED
++	 * lookup/open/getattrlist of a process whose name starts with one of the prefixes, whatever the path, e.g.
++	 * guamp-path-probe-proc=StocksWidget,MusicWidgets,CalendarWidget for the widgets that run at ~97 % of a core in CoreText
++	 * after every boot (a font or resource that is missing and looked up again and again?). */
++	if (guamp_path_probe_proc_match()) {
++		return 2;
++	}
+ 	/* 30/10 (app-rotte): boot-time noise that used up the budget before Safari ran (MSUEarlyBootTask/usermanagerd logging
+ 	 * plists, lsd's empty App cryptex) is skipped; app group containers and the ExtensionKit directory are logged on failure
+ 	 * only (2), with the persona of the caller (sandbox keys group containers as PERSONA_ID_<persona>:<group>); the Info.plist

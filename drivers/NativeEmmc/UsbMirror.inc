@@ -24,7 +24,7 @@ extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[1
 void native_touch_published(void);
 }
 uint64_t native_usb_touches = 0;
-uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_bytes = 0, native_usb_errors = 0, native_usb_ended = 0;
+uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_frames_skipped = 0, native_usb_bytes = 0, native_usb_errors = 0, native_usb_ended = 0;
 }
 
 namespace usbm {
@@ -328,9 +328,9 @@ struct Mirror {
     nanoseconds_to_absolutetime(30ULL * 1000 * 1000 * 1000, &interval);
     if (now - lastStatus < interval) return;
     lastStatus = now;
-    IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu errors %llu ended %llu touches %llu"
+    IOLog("NativeEmmc USB mirror: stage %u configured %u speed %u in-busy %d bytes %llu frames %llu (skipped %llu) errors %llu ended %llu touches %llu"
           " events %llu, ep1 trb %08x cmd %08x\n", native_usb_stage, native_usb_configured, native_usb_speed, inBusy ? 1 : 0,
-          native_usb_bytes, native_usb_frames, native_usb_errors, native_usb_ended, native_usb_touches, native_usb_events,
+          native_usb_bytes, native_usb_frames, native_usb_frames_skipped, native_usb_errors, native_usb_ended, native_usb_touches, native_usb_events,
           trb(kEp1Trb)->ctrl, r(DEPCMD + 0x10 * kEp1In));
   }
 
@@ -469,17 +469,38 @@ void thread(void *, wait_result_t)
 {
   Mirror &m = gMirror;
   uint64_t lastFrame = 0;
+  // 03/11 (GuampKthr: an unnamed kernel_task thread at 8-12 % of a core, at rest too): the mirror reads the uncached frame
+  // buffer (a quarter of every row to compare, everything every 6th frame). guamp-usb-frame-skip=1 (default; 0 = as before):
+  // once the legacy display has copied frames, a period in which it copied none (native_legacy_copy_n unchanged) leaves the
+  // frame buffer as it was, so the scan is skipped; a whole frame still goes out every 20 skipped periods (~10 s) for a viewer
+  // opened later. Before the first display copy (boot logo, progress bar) nothing changes. guamp-usb-fps=<1..10> (default 2).
+  thread_set_thread_name(current_thread(), "guamp-usb-mirror");
+  uint32_t skip = 1, fps = 2;
+  PE_parse_boot_argn("guamp-usb-frame-skip", &skip, sizeof(skip));
+  PE_parse_boot_argn("guamp-usb-fps", &fps, sizeof(fps));
+  if (fps < 1) fps = 1;
+  if (fps > 10) fps = 10;
+  uint64_t lastCopies = 0, interval = 0;
+  uint32_t idlePeriods = 0;
+  nanoseconds_to_absolutetime(1000 * 1000 * 1000ULL / fps, &interval);   // the frame buffer is uncached
   for (;;) {
     m.pollEvents();
     m.status();
     if (native_usb_configured) {
       m.sendLog();
-      uint64_t now = mach_absolute_time(), interval = 0;
-      nanoseconds_to_absolutetime(500 * 1000 * 1000ULL, &interval);   // 2 frames per second: the frame buffer is uncached
+      uint64_t now = mach_absolute_time();
       if (now - lastFrame > interval) {
-        // A whole frame every 30 frames (~3 s): a viewer opened later, or after a lost transfer, catches up
-        if (m.frame % 6 == 0 && m.shadow) memset(m.shadow, 0xA5, kFbBytes);                  // whole frame every ~3 s
-        m.sendFrame(gCard.fb);
+        const uint64_t copies = &native_legacy_copy_n ? native_legacy_copy_n : 0;
+        if (skip && copies && copies == lastCopies && ++idlePeriods < 20) {
+          native_usb_frames_skipped++;
+        } else {
+          // A whole frame every 6 frames (~3 s), and after 20 skipped periods: a viewer opened later, or after a lost transfer,
+          // catches up
+          if ((m.frame % 6 == 0 || idlePeriods >= 20) && m.shadow) memset(m.shadow, 0xA5, kFbBytes);
+          idlePeriods = 0;
+          lastCopies = copies;
+          m.sendFrame(gCard.fb);
+        }
         lastFrame = now;
       }
     }
