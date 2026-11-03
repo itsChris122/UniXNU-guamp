@@ -89,7 +89,12 @@ struct Scratch {
 };
 static int64_t draw(std::vector<uint32_t> &out, uint32_t w, uint32_t h, const GuampComposeLayer &l) {
   Scratch s(w, h, l.sw);
-  return guampComposeDraw(out.data(), w, h, l, s.taps.data(), s.taps.size(), s.line.data(), s.line.size());
+  return guampComposeDraw(out.data(), w, h, l, s.taps.data(), s.taps.size(), s.line.data(), s.line.size(), 0, 0, w, h);
+}
+static int64_t drawClip(std::vector<uint32_t> &out, uint32_t w, uint32_t h, const GuampComposeLayer &l, int64_t x0, int64_t y0,
+                        int64_t x1, int64_t y1) {
+  Scratch s(w, h, l.sw);
+  return guampComposeDraw(out.data(), w, h, l, s.taps.data(), s.taps.size(), s.line.data(), s.line.size(), x0, y0, x1, y1);
 }
 
 static void testOver() {
@@ -192,9 +197,9 @@ static void testInvalid() {
   l = bgraLayer(s, 0, 0, 10, 10, 0, 0, 10, 10, 1, false);
   std::vector<uint32_t> taps(5);
   std::vector<unsigned char> line(44);
-  CHECK(guampComposeDraw(out.data(), W, H, l, taps.data(), taps.size(), line.data(), line.size()) == -1);   // too few taps
+  CHECK(guampComposeDraw(out.data(), W, H, l, taps.data(), taps.size(), line.data(), line.size(), 0, 0, W, H) == -1);   // too few taps
   taps.resize(20); line.resize(40);
-  CHECK(guampComposeDraw(out.data(), W, H, l, taps.data(), taps.size(), line.data(), line.size()) == -1);   // line too short
+  CHECK(guampComposeDraw(out.data(), W, H, l, taps.data(), taps.size(), line.data(), line.size(), 0, 0, W, H) == -1);   // line too short
   for (uint32_t v : out) CHECK(v == 7);
 }
 
@@ -251,6 +256,37 @@ static void testYuv() {
   CHECK(draw(out, W, H, l) == -1);
 }
 
+// A redraw clipped to a rectangle equals the whole draw inside it and leaves the rest alone; the union of rectangles.
+static void testClip() {
+  const uint32_t W = 96, H = 80;
+  std::vector<unsigned char> mem;
+  Surface s = makeBgra(100, 83, 100 * 4, mem, true);
+  GuampComposeLayer l = bgraLayer(s, 0, 0, 100, 83, -3, 2, W + 5, H - 4, 1, true);
+  std::vector<uint32_t> base(W * H), whole(W * H), part(W * H);
+  for (auto &v : base) v = pix(rnd() & 255, rnd() & 255, rnd() & 255, 255);
+  whole = base; part = base;
+  CHECK(draw(whole, W, H, l) > 0);
+  CHECK(drawClip(part, W, H, l, 17, 9, 61, 50) == 44 * 41);
+  bool ok = true;
+  for (uint32_t y = 0; y < H; y++)
+    for (uint32_t x = 0; x < W; x++) {
+      bool in = x >= 17 && x < 61 && y >= 9 && y < 50;
+      ok = ok && part[y * W + x] == (in ? whole[y * W + x] : base[y * W + x]);
+    }
+  CHECK(ok);
+  part = base;
+  CHECK(drawClip(part, W, H, l, -20, -20, 200, 200) > 0);   // the clip is bounded by the output
+  CHECK(part == whole);
+  CHECK(drawClip(part, W, H, l, 50, 50, 50, 60) == 0);      // empty clip
+  int64_t r[4] = {0, 0, 0, 0};
+  guampComposeUnion(r, 10, 10, 5, 5, W, H);
+  CHECK(r[0] == 10 && r[1] == 10 && r[2] == 15 && r[3] == 15);
+  guampComposeUnion(r, -4, 30, 8, 100, W, H);
+  CHECK(r[0] == 0 && r[1] == 10 && r[2] == 15 && r[3] == (int64_t)H);
+  guampComposeUnion(r, 200, 0, 5, 5, W, H);   // off the output: unchanged
+  CHECK(r[0] == 0 && r[1] == 10 && r[2] == 15 && r[3] == (int64_t)H);
+}
+
 static void testFill() {
   std::vector<uint32_t> a(13, 0), b(14, 0);
   guampComposeFill(a.data() + 1, 12, 0xff102030u);   // misaligned start
@@ -271,6 +307,7 @@ int main() {
   testClipAndBlend();
   testInvalid();
   testYuv();
+  testClip();
   testFill();
   std::printf("compose core: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;

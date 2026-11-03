@@ -76,7 +76,8 @@ extern "C" volatile uint64_t guamp_copy_latest[10];
 // format, [10] compose ticks, [11] map failures, [12] swaps refused by the composition too, [13] background fills, [14] most layers,
 // [15] 4:2:0 planes with two different offsets. Per layer: format, planes, surface w h, src x y w h, dst x y w h, transform, result.
 // [16] composed swaps with nothing to draw (retired, previous frame kept), [17] requests dumped (guamp-compose-dump).
-extern "C" volatile uint64_t guamp_compose[20];
+// [18] BGRA layer ticks, [19] 4:2:0 layer ticks, [20] scanout copy ticks, [21] whole redraws, [22] partial, [23] unchanged.
+extern "C" volatile uint64_t guamp_compose[24];
 extern "C" volatile uint32_t guamp_compose_layer[4][14];
 // package/LegacyDisplayProbe.cpp: the surface of the last swap refused for its surface (reason 4): width, height, format, planes,
 // row bytes, allocation, descriptor bytes.
@@ -192,10 +193,10 @@ static char fourcc(uint32_t format, unsigned shift)
 // before the scanout copy), layers drawn and skipped; then every layer that changed since the previous report.
 static void composeLog(uint64_t f)
 {
-  static uint64_t last[20] = {};
+  static uint64_t last[24] = {};
   static uint32_t lastLayer[4][14] = {};
-  uint64_t now[20];
-  for (unsigned i = 0; i < 20; i++) now[i] = guamp_compose[i];
+  uint64_t now[24];
+  for (unsigned i = 0; i < 24; i++) now[i] = guamp_compose[i];
   if (now[0] != last[0] || now[1] != last[1] || now[12] != last[12] || now[3] != last[3]) {
     const uint64_t frames = now[2] - last[2];
     const uint32_t skipped = (uint32_t)now[9];
@@ -205,6 +206,11 @@ static void composeLog(uint64_t f)
           frames ? (now[10] - last[10]) / frames * 1000000 / f : 0, now[4] - last[4], now[5] - last[5], now[6] - last[6],
           fourcc(skipped, 24), fourcc(skipped, 16), fourcc(skipped, 8), fourcc(skipped, 0), now[7] - last[7], now[8] - last[8],
           now[12] - last[12], now[11] - last[11], now[13] - last[13], now[14], now[15], now[16] - last[16], now[17]);
+    const uint64_t drawn = (now[21] - last[21]) + (now[22] - last[22]);
+    IOLog("GuampDisplay: compose phases per drawn frame: page (bgra) %llu us, video (420) %llu us, scanout %llu us; frames whole +%llu "
+          "partial +%llu unchanged +%llu\n", drawn ? (now[18] - last[18]) / drawn * 1000000 / f : 0,
+          drawn ? (now[19] - last[19]) / drawn * 1000000 / f : 0, drawn ? (now[20] - last[20]) / drawn * 1000000 / f : 0,
+          now[21] - last[21], now[22] - last[22], now[23] - last[23]);
   }
   for (unsigned i = 0; i < 4; i++) {
     uint32_t l[14];
@@ -216,7 +222,7 @@ static void composeLog(uint64_t f)
           fourcc(l[0], 8), fourcc(l[0], 0), l[1], l[2], l[3], l[4], l[5], l[6], l[7], (int)l[8], (int)l[9], l[10], l[11], l[12], l[13]);
     for (unsigned j = 0; j < 14; j++) lastLayer[i][j] = l[j];
   }
-  for (unsigned i = 0; i < 20; i++) last[i] = now[i];
+  for (unsigned i = 0; i < 24; i++) last[i] = now[i];
 }
 
 static void copyLog()

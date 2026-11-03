@@ -20,7 +20,7 @@ when refused, are composed in software.
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'e0269ee84ef19f707ddc0598e686a16095da4911ce97aa80be5ae522fc3ec83c'
+PATCHED_SHA256 = '4679af6bc5d436e2b55a70a8e8b728ead70d2c5110a21070284466eb24a00797'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -726,7 +726,15 @@ EDITS.append(('''        if(frame.blank) {
 #     keeps the previous frame instead of turning black: fin37d showed only such swaps during a video), [17] requests dumped.
 #     guamp-compose-dump=<n> (default 6, at most 64): the first n composed requests are logged raw ('GuampDisplay: compose dump'):
 #     the key fields, then hex rows of bytes 0x000-0x160 (rects and regions), 0x1c0-0x260 (counts, per-layer words, transforms),
-#     0x300-0x340 (masks, options, size) and 0xa40-0xa60 (surfaces), to check the layout against the real requests. guamp_compose_layer[i]: format, planes, surface width, height, src
+#     0x300-0x340 (masks, options, size) and 0xa40-0xa60 (surfaces), to check the layout against the real requests.
+#     Speed (fin42: 34-113 ms per composed frame, the video stalled): the compose buffer keeps the last composed picture and only the
+#     part that changed is redrawn and copied. Every layer a swap updates gets a new generation; the copy thread compares the frame's
+#     layers (generation, destination) with what the buffer holds, so coalesced frames lose nothing, and redraws only the union of
+#     the old and new rectangles of the changed layers (a video frame: its own rectangle, the page under it is not rescaled). A full
+#     redraw (first frame, another frame took the scanout, background change) scales a full-screen page with the canvas scaler. The
+#     result goes to the scanout hook (section 12, whole buffer) or, without it, only the changed rectangle is copied.
+#     [18] BGRA layer ticks, [19] 4:2:0 layer ticks, [20] scanout copy ticks, [21] full redraws, [22] partial redraws, [23] frames
+#     with nothing changed (no copy). guamp_compose_layer[i]: format, planes, surface width, height, src
 #     x, y, w, h, dst x, y, w, h, transform, result of the last swap that updated layer i (0 drawable, 1 format, 2 transform, 3 geometry,
 #     4 no IOSurface, 5 disabled).
 EDITS.append(('''struct GuampFrame {
@@ -795,14 +803,23 @@ static inline bool guampComposeValid(const GuampComposeLayer &l) {
     return l.chromaStride && l.chromaStride<=(1u<<20) && l.chromaStride>=chromaRight && l.chromaOffset<=l.bytes &&
            (l.bytes-l.chromaOffset)>=l.chromaStride*(chromaRows-1)+chromaRight;
 }
-// Draws one layer into the width x height output. taps: at least visible columns + rows words; line: (sw + 1) * 4 bytes for BGRA.
-// Returns the output pixels written (0 when the layer is off the output), -1 when nothing was drawn because the layer is invalid.
+// Draws one layer into the width x height output, only inside the clip rectangle [cx0,cx1) x [cy0,cy1) (the part of the screen
+// that changed). taps: at least visible columns + rows words; line: (sw + 1) * 4 bytes for BGRA.
+// Returns the output pixels written (0 when the layer is off the output or the clip), -1 when nothing was drawn (invalid layer).
 static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t height,const GuampComposeLayer &l,
-    uint32_t *taps,uint64_t tapWords,unsigned char *line,uint64_t lineBytes) {
+    uint32_t *taps,uint64_t tapWords,unsigned char *line,uint64_t lineBytes,int64_t cx0,int64_t cy0,int64_t cx1,int64_t cy1) {
     if(!out || !width || !height || !taps || !guampComposeValid(l))return -1;
-    const int64_t x0=l.dx<0?0:l.dx,y0=l.dy<0?0:l.dy;
-    const int64_t x1=l.dx+(int64_t)l.dw>(int64_t)width?(int64_t)width:l.dx+(int64_t)l.dw;
-    const int64_t y1=l.dy+(int64_t)l.dh>(int64_t)height?(int64_t)height:l.dy+(int64_t)l.dh;
+    if(cx0<0)cx0=0;
+    if(cy0<0)cy0=0;
+    if(cx1>(int64_t)width)cx1=width;
+    if(cy1>(int64_t)height)cy1=height;
+    int64_t x0=l.dx<0?0:l.dx,y0=l.dy<0?0:l.dy;
+    int64_t x1=l.dx+(int64_t)l.dw>(int64_t)width?(int64_t)width:l.dx+(int64_t)l.dw;
+    int64_t y1=l.dy+(int64_t)l.dh>(int64_t)height?(int64_t)height:l.dy+(int64_t)l.dh;
+    if(x0<cx0)x0=cx0;
+    if(y0<cy0)y0=cy0;
+    if(x1>cx1)x1=cx1;
+    if(y1>cy1)y1=cy1;
     if(x0>=x1 || y0>=y1)return 0;
     const uint32_t cols=(uint32_t)(x1-x0),rows=(uint32_t)(y1-y0);
     const bool bgra=!l.kind;
@@ -844,18 +861,30 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
     }
     return (int64_t)cols*rows;
 }
+// Union of a destination rectangle (clipped to the output) into the box r = {x0, y0, x1, y1} (empty when x0 >= x1).
+static inline void guampComposeUnion(int64_t *r,int64_t dx,int64_t dy,uint64_t dw,uint64_t dh,uint32_t width,uint32_t height) {
+    int64_t x0=dx<0?0:dx,y0=dy<0?0:dy,x1=dx+(int64_t)dw,y1=dy+(int64_t)dh;
+    if(x1>(int64_t)width)x1=width;
+    if(y1>(int64_t)height)y1=height;
+    if(x0>=x1 || y0>=y1)return;
+    if(r[0]>=r[2] || r[1]>=r[3]){r[0]=x0;r[1]=y0;r[2]=x1;r[3]=y1;return;}
+    if(x0<r[0])r[0]=x0;
+    if(y0<r[1])r[1]=y0;
+    if(x1>r[2])r[2]=x1;
+    if(y1>r[3])r[3]=y1;
+}
 static inline void guampComposeFill(uint32_t *out,uint64_t pixels,uint32_t value) {
     const uint64_t pair=(uint64_t)value<<32|value;uint64_t i=0;
     if(!((uintptr_t)out&7))for(;i+2<=pixels;i+=2)*reinterpret_cast<uint64_t *>(out+i)=pair;
     for(;i<pixels;++i)out[i]=value;
 }
 // guamp-compose-core-end
-extern "C" {volatile uint64_t guamp_compose[20];volatile uint32_t guamp_compose_layer[4][14];}
+extern "C" {volatile uint64_t guamp_compose[24];volatile uint32_t guamp_compose_layer[4][14];}
 // The layers of one composed frame, shared by the frames that show them (latest-frame-wins keeps the one on screen): each surface's
 // memory stays retained until the last frame holding the set lets it go.
-struct GuampLayerSource {IOMemoryDescriptor *memory;uint64_t allocation;GuampComposeLayer layer;};
+struct GuampLayerSource {IOMemoryDescriptor *memory;uint64_t allocation;GuampComposeLayer layer;uint32_t slot,gen;};
 struct GuampLayers {
-    uint32_t refs,count,background;bool fill;
+    uint32_t refs,count,background;bool fill;uint64_t serial;
     GuampLayerSource source[4];
     void retain() {__atomic_add_fetch(&refs,1,__ATOMIC_RELAXED);}
     void release() {
@@ -920,6 +949,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
     void composeReset() {
         for(auto &s: composeCurrent){OSSafeReleaseNULL(s.memory);s={};}
         composeBackground=0xff000000U;
+        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // the scanout no longer shows the compose buffer
     }
     void freeCompose() {
         composeReset();
@@ -1036,6 +1066,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             OSSafeReleaseNULL(composeCurrent[i].memory);composeCurrent[i]={};
             if(disabled&bit){guamp_compose_layer[i][13]=5;continue;}
             const unsigned result=composeLayer(bytes,i,displayWidth,displayHeight,&composeCurrent[i]);
+            composeGen[i]=composeGen[i]+1;composeCurrent[i].slot=i;composeCurrent[i].gen=composeGen[i];
             guamp_compose_layer[i][13]=result;
             if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
         }
@@ -1044,6 +1075,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         GuampLayers *set=static_cast<GuampLayers *>(IOMalloc(sizeof(GuampLayers)));
         if(!set){native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;}
         bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;
+        composeSerial=composeSerial+1;set->serial=composeSerial;
         for(unsigned i=0;i<4;++i) {
             if(!composeCurrent[i].memory)continue;
             GuampLayerSource &s=set->source[set->count];s=composeCurrent[i];s.memory->retain();s.layer.blend=true;
@@ -1064,15 +1096,24 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         const GuampFrame frame={nullptr,0,0,length,video.v_rowBytes,gopWidth,gopHeight,gopWidth,gopHeight,false,false,set};
         latestRetire(request,frame);
     }
-    // Copy thread: the layers into the cached buffer, then the buffer into the scanout.
+    // Work loop: layer generations and frame serials. Copy thread: what the compose buffer holds.
+    uint32_t composeGen[4]={};uint64_t composeSerial=0;
+    struct ComposeShown {bool present;uint32_t gen;int64_t dx,dy;uint32_t dw,dh;};
+    ComposeShown composeShown[4]={};uint32_t composeShownBackground=0;bool composeShownFill=false;
+    bool composeStale=true;uint64_t composeLastSerial=0;int64_t composeLastDirty[4]={};
+    static uint64_t composeTicks() {uint64_t t;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(t));return t;}
+    // Copy thread: the part of the screen that changed since the buffer was last composed (the same frame again, a re-copy after
+    // the GPU wait or a trailing re-show, redraws the same part), then the layers inside it, then the scanout.
     bool composeOnce(const GuampFrame &frame) {
         GuampLayers *set=frame.layers;
         const uint64_t pixels=(uint64_t)frame.width*frame.height,need=pixels*4;
         if(!set || !bootMapping || !pixels)return false;
+        bool full=__atomic_exchange_n(&composeStale,false,__ATOMIC_ACQ_REL);
         if(!composeBuffer || composeBufferSize<need) {
             if(composeBuffer)IOFreeAligned(composeBuffer,composeBufferSize);
             composeBufferSize=(vm_size_t)((need+16383)&~16383ull);composeBuffer=IOMallocAligned(composeBufferSize,16384);
-            if(!composeBuffer){composeBufferSize=0;guamp_compose[3]=guamp_compose[3]+1;return false;}
+            if(!composeBuffer){composeBufferSize=0;guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);return false;}
+            full=true;
         }
         uint64_t widest=0;
         for(uint32_t i=0;i<set->count;++i)if(set->source[i].layer.sw>widest)widest=set->source[i].layer.sw;
@@ -1080,34 +1121,88 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         if(!composeScratch || composeScratchSize<scratchNeed) {
             if(composeScratch)IOFree(composeScratch,composeScratchSize);
             composeScratchSize=(vm_size_t)scratchNeed;composeScratch=IOMalloc(composeScratchSize);
-            if(!composeScratch){composeScratchSize=0;guamp_compose[3]=guamp_compose[3]+1;return false;}
+            if(!composeScratch){composeScratchSize=0;guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);return false;}
         }
+        if(set->fill!=composeShownFill || (set->fill && set->background!=composeShownBackground))full=true;
+        int64_t dirty[4]={0,0,0,0};
+        if(full) {dirty[2]=frame.width;dirty[3]=frame.height;}
+        else if(set->serial==composeLastSerial) {for(unsigned k=0;k<4;++k)dirty[k]=composeLastDirty[k];}
+        else for(uint32_t slot=0;slot<4;++slot) {
+            const GuampLayerSource *now=nullptr;
+            for(uint32_t i=0;i<set->count;++i)if(set->source[i].slot==slot)now=&set->source[i];
+            const ComposeShown &was=composeShown[slot];
+            const bool same=now?(was.present && was.gen==now->gen && was.dx==now->layer.dx && was.dy==now->layer.dy &&
+                                 was.dw==now->layer.dw && was.dh==now->layer.dh):!was.present;
+            if(same)continue;
+            if(was.present)guampComposeUnion(dirty,was.dx,was.dy,was.dw,was.dh,frame.width,frame.height);
+            if(now)guampComposeUnion(dirty,now->layer.dx,now->layer.dy,now->layer.dw,now->layer.dh,frame.width,frame.height);
+        }
+        for(uint32_t slot=0;slot<4;++slot)composeShown[slot]={};
+        for(uint32_t i=0;i<set->count;++i) {
+            const GuampLayerSource &src=set->source[i];
+            if(src.slot<4)composeShown[src.slot]={true,src.gen,src.layer.dx,src.layer.dy,src.layer.dw,src.layer.dh};
+        }
+        composeShownFill=set->fill;composeShownBackground=set->background;
+        composeLastSerial=set->serial;for(unsigned k=0;k<4;++k)composeLastDirty[k]=dirty[k];
+        if(dirty[0]>=dirty[2] || dirty[1]>=dirty[3]) {   // nothing changed: the scanout already shows this frame
+            guamp_compose[23]=guamp_compose[23]+1;guamp_compose[2]=guamp_compose[2]+1;return true;
+        }
+        const bool whole=dirty[0]==0 && dirty[1]==0 && dirty[2]==(int64_t)frame.width && dirty[3]==(int64_t)frame.height;
+        if(whole)guamp_compose[21]=guamp_compose[21]+1;else guamp_compose[22]=guamp_compose[22]+1;
         uint32_t *taps=static_cast<uint32_t *>(composeScratch);
         unsigned char *line=static_cast<unsigned char *>(composeScratch)+tapWords*4;
         uint32_t *out=static_cast<uint32_t *>(composeBuffer);
-        uint64_t composeStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(composeStart));
-        if(set->fill){guampComposeFill(out,pixels,set->background);guamp_compose[13]=guamp_compose[13]+1;}
+        const uint64_t composeStart=composeTicks();
+        if(set->fill) {
+            for(int64_t y=dirty[1];y<dirty[3];++y)
+                guampComposeFill(out+(uint64_t)y*frame.width+(uint64_t)dirty[0],(uint64_t)(dirty[2]-dirty[0]),set->background);
+            guamp_compose[13]=guamp_compose[13]+1;
+        }
         for(uint32_t i=0;i<set->count;++i) {
-            const GuampLayerSource &s=set->source[i];
-            IOMemoryMap *map=guampSourceMap(s.memory,s.allocation);
-            if(!map || !map->getVirtualAddress() || map->getLength()<s.allocation) {
+            const GuampLayerSource &src=set->source[i];
+            GuampComposeLayer l=src.layer;
+            // Off the changed part: not even mapped.
+            if(l.dx>=dirty[2] || l.dy>=dirty[3] || l.dx+(int64_t)l.dw<=dirty[0] || l.dy+(int64_t)l.dh<=dirty[1])continue;
+            const uint64_t layerStart=composeTicks();
+            IOMemoryMap *map=guampSourceMap(src.memory,src.allocation);
+            if(!map || !map->getVirtualAddress() || map->getLength()<src.allocation) {
                 OSSafeReleaseNULL(map);guamp_compose[11]=guamp_compose[11]+1;continue;
             }
-            GuampComposeLayer l=s.layer;
-            l.base=reinterpret_cast<const unsigned char *>(map->getVirtualAddress());l.bytes=s.allocation;
-            const int64_t drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4);
+            l.base=reinterpret_cast<const unsigned char *>(map->getVirtualAddress());l.bytes=src.allocation;
+            int64_t drawn=-1;
+            // A whole redraw of a full-screen page: the canvas scaler (two taps per pixel, 64-bit stores), as single-layer frames.
+            if(whole && !l.kind && !l.blend && !l.sx && !l.sy && !l.dx && !l.dy && l.dw==frame.width && l.dh==frame.height &&
+               (l.sw!=l.dw || l.sh!=l.dh) && guampComposeValid(l) &&
+               // the tables the work loop built for single-layer canvas frames, only read here (never rebuilt from this thread)
+               scaler.line && scaler.sourceWidth==l.sw && scaler.sourceHeight==l.sh && scaler.width==frame.width && scaler.height==frame.height &&
+               guampScalePixels(reinterpret_cast<volatile void *>(out),need,(uint64_t)frame.width*4,l.base+l.offset,
+                   l.bytes-l.offset,l.stride,scaler))drawn=(int64_t)pixels;
+            if(drawn<0)drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4,dirty[0],dirty[1],dirty[2],dirty[3]);
             OSSafeReleaseNULL(map);
+            const uint64_t layerTicks=composeTicks()-layerStart;
+            if(l.kind)guamp_compose[19]=guamp_compose[19]+layerTicks;else guamp_compose[18]=guamp_compose[18]+layerTicks;
             if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;continue;}
             if(l.kind)guamp_compose[5]=guamp_compose[5]+1;else guamp_compose[4]=guamp_compose[4]+1;
         }
-        uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+        const uint64_t copyStart=composeTicks();
         guamp_compose[10]=guamp_compose[10]+(copyStart-composeStart);
-        const bool ok=native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
-            frame.rowBytes,out,need,(uint64_t)frame.width*4,frame.width,frame.height)!=0;
+        // Section 12 hook first (whole buffer: it finds the changed bands itself and may flip buffers), else the changed part only.
+        const int hooked=guamp_scanout_present(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),
+            frame.rowBytes,bootMapping->getPhysicalAddress(),out,need,(uint64_t)frame.width*4,frame.width,frame.height,frame.width,
+            frame.height,nullptr,nullptr);
+        bool ok=hooked>0;
+        if(!ok) {
+            const uint64_t at=(uint64_t)dirty[1]*frame.rowBytes+(uint64_t)dirty[0]*4,from=((uint64_t)dirty[1]*frame.width+(uint64_t)dirty[0])*4;
+            ok=at<bootMapping->getLength() && native_legacy_copy_pixels(
+                reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()+at),bootMapping->getLength()-at,frame.rowBytes,
+                reinterpret_cast<const unsigned char *>(out)+from,need-from,(uint64_t)frame.width*4,
+                (uint32_t)(dirty[2]-dirty[0]),(uint32_t)(dirty[3]-dirty[1]))!=0;
+        }
         __asm__ volatile("dsb sy" ::: "memory");
-        uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+        const uint64_t copyEnd=composeTicks();
+        guamp_compose[20]=guamp_compose[20]+(copyEnd-copyStart);
         if(ok){native_legacy_copy_timing_observed(copyEnd-copyStart,frame.length);guamp_compose[2]=guamp_compose[2]+1;}
-        else guamp_compose[3]=guamp_compose[3]+1;
+        else {guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);}
         return ok;
     }
     // Section 10: latest-frame-wins.
@@ -1130,6 +1225,14 @@ EDITS.append(('''        if(!request || !isValidated(request))return;
         if(const ComposedEntry *entry=composedEntry(request)){const ComposedEntry masks=*entry;kickComposed(request,masks);return;}
         composeReset();
 '''))
+# Section 13 speed: every other frame the copy thread puts on the scanout (single-layer copy, blank fill) makes the next composed
+# frame a whole redraw (set in the copy thread itself, so the order is that of the frames shown).
+EDITS.append(('        if(frame.layers)return composeOnce(frame);   // section 12\n',
+              '        if(frame.layers)return composeOnce(frame);   // section 12\n'
+              '        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 13: the compose buffer is no longer on screen\n'))
+EDITS.append(('            guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled\n',
+              '            guamp_scanout_external();   // section 12: the GOP frame is shown again before it is filled\n'
+              '            __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 13\n'))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
