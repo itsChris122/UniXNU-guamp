@@ -91,6 +91,22 @@ inline void encodeDcsShort(uint32_t cmd, uint32_t out[2]) {
   out[1] = 0;
 }
 
+// Any DCS write of 1..4 bytes {cmd, params...} in one 8-byte FIFO image, as dsi_panel sends the on-command:
+// 1 byte = DCS short write 0x05, 2 = short write with parameter 0x15 {cmd, param, type, last}, 3..4 = long write 0x39
+// (header with the word count, payload padded with 0xff). 0 = too long / empty.
+inline bool encodeDcs(const uint8_t *p, unsigned n, uint32_t out[2]) {
+  if (!n || n > 4) return false;
+  if (n <= 2) {
+    out[0] = p[0] | (n == 2 ? (uint32_t)p[1] << 8 : 0u) | ((n == 2 ? 0x15u : kDcsShortWrite) & 0x3fu) << 16 | 1u << 31;
+    out[1] = 0;
+    return true;
+  }
+  out[0] = packetHeader(kDcsLongWrite, n, true);
+  out[1] = 0;
+  for (unsigned i = 0; i < 4; i++) out[1] |= (uint32_t)(i < n ? p[i] : 0xffu) << (8 * i);
+  return true;
+}
+
 // Register value helpers
 constexpr uint32_t dmaCtrlFor(uint32_t old) { return (old & ~(kDmaBroadcast | kDmaMaster | kDmaLpm)) | kDmaEmbedded; }
 constexpr uint32_t scheduleFor(uint32_t old, uint32_t line) { return (old & ~(kScheduleEnable | 0xffffu)) | kScheduleEnable | (line & 0xffffu); }
@@ -193,6 +209,11 @@ template <class Io> int sendPacket(Io &io, const uint32_t words[2], Diag &d) {
 template <class Io> int sendBrightness(Io &io, uint32_t level, Diag &d) {
   uint32_t words[2];
   encodeBrightness(level, words);
+  return sendPacket(io, words, d);
+}
+template <class Io> int sendDcs(Io &io, const uint8_t *p, unsigned n, Diag &d) {
+  uint32_t words[2];
+  if (!encodeDcs(p, n, words)) return kBadTiming;
   return sendPacket(io, words, d);
 }
 template <class Io> int sendDcsShort(Io &io, uint32_t cmd, Diag &d) {

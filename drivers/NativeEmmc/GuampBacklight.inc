@@ -28,6 +28,7 @@ namespace backlight {
 using namespace guamp_backlight;
 volatile uint8_t *gDsi, *gDispcc, *gGccDisp;
 volatile uint32_t gRequests, gSends, gFailures;
+volatile uint32_t gLastLevel = guamp_backlight::kDefaultLevel;   // last level the panel was sent (panel re-init)
 
 uint32_t rd32(volatile uint8_t *base, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(base + off); }
 uint64_t nowUs() {
@@ -102,6 +103,7 @@ class GuampBacklight : public IOService {
       const bool wasOn = !known || level != 0;
       level = next;
       known = true;
+      backlight::gLastLevel = next;
       failuresInRow = 0;
       backlight::gSends = backlight::gSends + 1;
       if (!next && wasOn && touch::gWakeArmed) {
@@ -243,13 +245,37 @@ OSDefineMetaClassAndStructors(GuampBacklight, IOService)
 
 namespace backlight {
 // Touch service experiment (guamp-touch-panelcycle): off-command then on-command, from the touch thread at boot.
-int panelCycle() {
+// which 3: the dtbo on-command in full (qcom,mdss-dsi-on-command of hlt_hx83102d, waits included): 11 / 160 ms,
+// 29 / 50 ms, 51 <level> (the last level sent instead of 00 00, so the screen does not stay dark), 55 01, 53 2C,
+// B9 83 10 2D, CD 01 / 10 ms. Sent in HS during the video stream's vertical front porch, as the level is.
+int panelInit() {
+  const uint32_t lv = gLastLevel ? gLastLevel : guamp_backlight::kDefaultLevel;
+  const uint8_t c11[] = {0x11}, c29[] = {0x29}, c51[] = {0x51, (uint8_t)(lv >> 8), (uint8_t)lv}, c55[] = {0x55, 0x01},
+                c53[] = {0x53, 0x2C}, cB9[] = {0xB9, 0x83, 0x10, 0x2D}, cCD[] = {0xCD, 0x01};
+  struct Step { const uint8_t *p; unsigned n, wait; };
+  const Step steps[] = {{c11, 1, 160}, {c29, 1, 50}, {c51, 3, 0}, {c55, 2, 0}, {c53, 2, 0}, {cB9, 4, 0}, {cCD, 2, 10}};
+  guamp_backlight::Diag d;
+  Io io;
+  for (const Step &s : steps) {
+    const int r = guamp_backlight::sendDcs(io, s.p, s.n, d);
+    if (r != guamp_backlight::kSent) {
+      IOLog("GuampBacklight: panel init %02x: %s (hw %08x ctrl %08x status %08x ack %08x)\n", s.p[0],
+            guamp_backlight::resultName(r), d.hw, d.ctrl, d.status, d.ack);
+      return r;
+    }
+    if (s.wait) IOSleep(s.wait);
+  }
+  return guamp_backlight::kSent;
+}
+int panelCycle(int which) {
+  if (which == 3) return panelInit();
   static const uint32_t cmds[] = {guamp_backlight::kDcsDisplayOff, guamp_backlight::kDcsSleepIn, guamp_backlight::kDcsSleepOut,
                                   guamp_backlight::kDcsDisplayOn};
   static const uint32_t waits[] = {20, 120, 160, 50};
   guamp_backlight::Diag d;
   Io io;
-  for (unsigned i = 0; i < 4; ++i) {
+  const unsigned first = which == 1 ? 2u : 0u, last = which == 0 ? 2u : 4u;
+  for (unsigned i = first; i < last; ++i) {
     const int r = guamp_backlight::sendDcsShort(io, cmds[i], d);
     if (r != guamp_backlight::kSent) return r;
     IOSleep(waits[i]);

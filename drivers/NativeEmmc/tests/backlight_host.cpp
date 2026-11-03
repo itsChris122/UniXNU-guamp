@@ -200,6 +200,13 @@ int main() {
     for (unsigned i = 0; i < f.writes && i < 256; i++) if (f.wrOff[i] == rTpgFifo && n < 4) seen[n++] = f.wrVal[i];
     check(n == 2 && seen[0] == 0x80050010u && seen[1] == 0, "sleep in dwords in the FIFO", seen[0], seen[1]);
     check(f.atTrigger[rDmaLength / 4] == 8, "short packet length 8");
+    const uint8_t b9[] = {0xB9, 0x83, 0x10, 0x2D}, cd[] = {0xCD, 0x01}, br[] = {0x51, 0x06, 0x66};
+    check(encodeDcs(b9, 4, w) && w[0] == 0xc0390004u && w[1] == 0x2d1083b9u, "B9 long write", w[0], w[1]);
+    check(encodeDcs(cd, 2, w) && w[0] == 0x801501cdu && w[1] == 0, "CD 01 short write with parameter", w[0], w[1]);
+    uint32_t w2[2];
+    encodeBrightness(0x666, w2);
+    check(encodeDcs(br, 3, w) && w[0] == w2[0] && w[1] == w2[1], "51 via encodeDcs = encodeBrightness", w[1], w2[1]);
+    check(!encodeDcs(b9, 5, w) && !encodeDcs(b9, 0, w), "length bounds");
   }
   // Refusals: nothing is touched (clocks off: not even read)
   {

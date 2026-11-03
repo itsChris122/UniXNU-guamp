@@ -767,16 +767,20 @@ void logStatus(uint32_t polls) {
 // guamp-touch-regdump=0 turns it off (default on): the regions of the TWRP reference read (log-xnu/twrp-himax-reg-*.txt,
 // /proc/android_touch/debug register reads), 64 bytes each, at the named moment, to compare with Linux byte by byte.
 unsigned gRegDump = 1;
-// GuampBacklight registers it once DSI0 is mapped: the panel's off-command then on-command (28, 10, 11, 29 with the
-// dtbo waits) from this thread. Returns the GuampBacklightCore result (0 = sent).
-int (*volatile gPanelCycle)() = nullptr;
-// guamp-touch-panelcycle=1|2 (TDDI experiment, default 0): under Linux the panel's sleep out / display on comes from
-// the kernel before the touch reset; here UEFI sent it long before. 1: cycle the panel after the download, before the
-// sense on; 2: after the start, then wait 1 s for the reload markers again. Logs the outcome either way.
-int panelCycle(const char *when) {
+// GuampBacklight registers it once DSI0 is mapped: the panel's off-command (which 0: 28, 10), on-command (1: 11, 29)
+// or both (2), with the dtbo waits, from this thread. Returns the GuampBacklightCore result (0 = sent).
+int (*volatile gPanelCycle)(int which) = nullptr;
+// guamp-touch-panelcycle (TDDI experiment, default 0): under Linux the panel's sleep out / display on comes from the
+// kernel before the touch reset; here UEFI sent it long before. 1: cycle the panel after the download, before the
+// sense on; 2: after the start, then wait 1 s for the reload markers again; 3: the TWRP suspend / resume order
+// (_himax_chip_common_suspend / _resume without SMWP, HX_RESUME_SET_FW) before the download: panel off-command, touch
+// reset held low, panel on-command, reset 1 / 2 ms, 0 / 5 ms, 1 / 2 ms, then the full download and start. In TWRP the
+// verified working touch (S1@391,840 at 58.7 s) came after such a screen off / on cycle (second 0f at 21.6 s).
+// 4: the Linux boot order (LCD reset sequence and the full on-command before the touch), see the block in thread().
+int panelCycle(const char *when, int which = 2) {
   for (unsigned i = 0; i < 60 && !gPanelCycle; ++i) IOSleep(50);
-  int (*fn)() = gPanelCycle;
-  const int r = fn ? fn() : -1;
+  int (*fn)(int) = gPanelCycle;
+  const int r = fn ? fn(which) : -1;
   IOLog("GuampTouch: panel cycle %s: %s (%d)\n", when, !fn ? "no DSI (GuampBacklight absent)" : r == 0 ? "sent" : "refused", r);
   return r;
 }
@@ -838,15 +842,50 @@ void thread(void *param, wait_result_t) {
   // dmesg), and the reload markers A9 9A / C0 72: after the upload the firmware reloads the panel's own config. Here the
   // reload never happens and the uploaded config makes electrode-grid phantoms. guamp-touch-flashfirst=1 (default):
   // first a sense on without download; if the firmware reloads by itself within 1 s, its own code and config are kept.
-  unsigned flashFirst = 1;
+  // fin39 + TWRP (03/11): the markers are transient and read 0 in a working TWRP too, so the probe proves nothing:
+  // default off now (it cost 1 s and a sense on).
+  unsigned flashFirst = 0;
   PE_parse_boot_argn("guamp-touch-flashfirst", &flashFirst, sizeof(flashFirst));
   if (!keepFw && flashFirst) {
     const int p = hx_reload_probe(&gChip, 100);
-    IOLog("GuampTouch: flash-first: reload %s (7f00 %08x 72c0 %08x, rc %d)%s\n", p == 1 ? "seen" : "not seen", gChip.reload1,
-          gChip.reload2, p, p == 1 ? ": no download, the chip's own firmware and config are used" : ", download");
+    IOLog("GuampTouch: flash-first: reload %s (7f00 %08x 72c0 %08x, rc %d, tight %u)%s\n", p == 1 ? "seen" : "not seen",
+          gChip.reload1, gChip.reload2, p, gChip.reload_tight, p == 1 ? ": no download, the chip's own firmware and config are used" : ", download");
     regDump("flashfirst");
     if (p == 1) keepFw = 2;
     else hx_sense_off(&gChip);
+  }
+  {
+    unsigned cyc = 0;
+    PE_parse_boot_argn("guamp-touch-panelcycle", &cyc, sizeof(cyc));
+    if (cyc == 4) {
+      // Linux (TWRP 03/11, touch working without any suspend): dsi_panel_disable 2.475, post_unprepare 2.576 (LCD
+      // reset low, rails down), power_on 2.592 (rails up, reset sequence 1/5, 0/2, 1/60 ms of the dtsi), enable 2.724
+      // (on-command), then the touch probe at 4.8 s. Here without the rails (L9A / LCDB stay on: no safe SPMI write
+      // path for them in this service): touch reset low, LCD reset low 20 ms, the reset sequence, the full on-command
+      // over DSI while the MDSS video stream keeps running, touch reset released, identify again, download, start.
+      pinWrite(GT_GPIO_RESET, 4, 0u);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 0u); IOSleep(20);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(5);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 0u); IOSleep(2);
+      pinWrite(GT_GPIO_LCD_RESET, 4, 2u); IOSleep(60);
+      panelCycle("lcd reset + on-command", 3);
+      IOSleep(100);
+      pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(50);
+      const int id = hx_identify(&gChip);
+      IOLog("GuampTouch: after panel re-init: lcd-rst %u, identify rc %d id %02x%02x%02x central %02x\n",
+            pinRead(GT_GPIO_LCD_RESET, 4) & 1u, id, gChip.id[3], gChip.id[2], gChip.id[1], gChip.central_state);
+      regDump("panel-reinit");
+    }
+    if (cyc == 3 && !keepFw) {
+      panelCycle("resume order: off-command", 0);
+      pinWrite(GT_GPIO_RESET, 4, 0u);                    // himax_rst_gpio_set(rst, 0) in suspend
+      IOSleep(20);
+      panelCycle("resume order: on-command", 1);
+      pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(2);        // _himax_chip_common_resume, HX_RESUME_SET_FW
+      pinWrite(GT_GPIO_RESET, 4, 0u); IOSleep(5);
+      pinWrite(GT_GPIO_RESET, 4, 2u); IOSleep(2);
+      regDump("resume-order");
+    }
   }
   if (!keepFw) {
     r = gFwOk ? HX_OK : HX_ERR_FW;
@@ -902,7 +941,7 @@ void thread(void *param, wait_result_t) {
     IOLog("GuampTouch: after panel cycle: reload %s (7f00 %08x 72c0 %08x after %u polls)\n", i < 100 ? "seen" : "NOT seen", a, b, i);
     regDump("cycle");
   }
-  unsigned redl = 1;
+  unsigned redl = 0;                                   // reload markers are transient: no second download by default
   PE_parse_boot_argn("guamp-touch-redl", &redl, sizeof(redl));
   if (!r && !keepFw && redl && gChip.reload_polls >= 200) {
     IOLog("GuampTouch: reload NOT seen after %u sense on: firmware download again\n", gChip.reload_attempts);
@@ -916,8 +955,8 @@ void thread(void *param, wait_result_t) {
     hx_reg_read32(&gChip, HX_ADDR_RELOAD_TO_ACTIVE, &reload);
     IOLog("GuampTouch: after start: central state %08x (05 = running), fw isr %08x, reload %08x\n", central, isr, reload);
     // Linux (TWRP): reload OK with data 9A A9 / 72 C0, PANEL_VER 18, FW_VER 1305, TOUCH_VER 6, DISPLAY_VER 0, CID 1206.
-    IOLog("GuampTouch: reload %s after %u polls, %u sense on (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
-          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_polls, gChip.reload_attempts, gChip.reload1, gChip.reload2, gChip.panel_ver,
+    IOLog("GuampTouch: reload %s after %u tight reads + %u polls, %u sense on (7f00 %08x 72c0 %08x) | panel %02x fw %04x touch %02x display %02x cid %04x\n",
+          gChip.reload_polls < 200 ? "OK" : "NOT seen", gChip.reload_tight, gChip.reload_polls, gChip.reload_attempts, gChip.reload1, gChip.reload2, gChip.panel_ver,
           gChip.fw_ver, gChip.touch_cfg_ver, gChip.display_cfg_ver, gChip.cid_ver);
   }
   IOLog("GuampTouch: start rc %d res %ux%u pt %u edge %d\n", r, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.int_is_edge);
