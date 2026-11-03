@@ -1236,8 +1236,13 @@ void thread(void *param, wait_result_t) {
   // guamp-touch-delay=<s>: start later, so the USB mirror (it connects after the first seconds) sees every line.
   unsigned delay = 0;
   PE_parse_boot_argn("guamp-touch-delay", &delay, sizeof(delay));
+  IOLog("GuampTouch: thread running, stage %u, delay %u s\n", stage, delay);
   if (delay && delay <= 600) IOSleep(delay * 1000);
-  if (!snapshot() || stage < 2 || !enable()) return;
+  // guamp 04/11 (UEFI with the Qualcomm DisplayDxe): every way out before the identify says why, so a boot with no
+  // "GuampTouch: RESULT" line tells snapshot (maps), stage (guamp-touch=1) and enable (clocks/QUP/pins) apart.
+  if (!snapshot()) { IOLog("GuampTouch: stop after snapshot (step %u error %d)\n", gStep, gError); return; }
+  if (stage < 2) { IOLog("GuampTouch: stop after snapshot, stage %u < 2 (guamp-touch=%u)\n", stage, stage); return; }
+  if (!enable()) { IOLog("GuampTouch: stop in enable (step %u error %d)\n", gStep, gError); return; }
   {
     // guamp-touch-panelcycle=5: the Linux panel power cycle (GuampPanelCycle.inc) as early as the touch pins allow,
     // before the SPI bus, the reset, the download and the start (all unchanged after it), and long before the first
@@ -1702,7 +1707,7 @@ void start() {
   // guamp 03/11: screen replaced (no more ghost touches) -> touch ON by default at stage 4; guamp-touch=0 turns it off.
   stage = 4;
   PE_parse_boot_argn("guamp-touch", &stage, sizeof(stage));
-  if (!stage) return;
+  if (!stage) { IOLog("GuampTouch: off (guamp-touch=0)\n"); return; }
   if (stage > 4) stage = 4;
   {
     unsigned ev = 0, evDsi = 1;
@@ -1712,6 +1717,8 @@ void start() {
     if (stage == 4 && (ev == 1 || ev == 2)) gEventsMode = ev;   // GuampBacklight notifica da qui in poi
   }
   thread_t t = nullptr;
-  if (kernel_thread_start(thread, reinterpret_cast<void *>(static_cast<uintptr_t>(stage)), &t) == KERN_SUCCESS) thread_deallocate(t);
+  const kern_return_t kr = kernel_thread_start(thread, reinterpret_cast<void *>(static_cast<uintptr_t>(stage)), &t);
+  IOLog("GuampTouch: start stage %u, thread %d\n", stage, kr);
+  if (kr == KERN_SUCCESS) thread_deallocate(t);
 }
 }  // namespace touch
