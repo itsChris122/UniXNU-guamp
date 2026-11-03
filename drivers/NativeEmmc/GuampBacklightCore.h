@@ -40,6 +40,10 @@ enum : uint32_t {
 constexpr uint32_t kCtrlEnable = 1u << 0, kCtrlVideo = 1u << 1, kCtrlCmd = 1u << 2;        // ctrl_en, video/cmd_engine_en
 constexpr uint32_t kStatusDmaBusy = 1u << 1;                                               // DSI_STATUS0_CMD_MODE_DMA_BUSY
 constexpr uint32_t kIntDmaDone = 1u << 0;                                                  // get_interrupt_status
+constexpr uint32_t kIntBtaDone = 1u << 20;                                                 // DSI_BTA_DONE
+// Read back (dsi_ctrl_reg.h): RDBK_DATA0 0x06c, DATATYPE0 0x07c, RDBK_DATA_CTRL 0x1d4 (count in 31:16, bit 0 clears)
+constexpr uint32_t rRdbkData0 = 0x06c, rRdbkType0 = 0x07c, rRdbkCtrl = 0x1d4;
+constexpr uint32_t kHdrBta = 1u << 29;                                                     // dsi_ctrl_copy_and_pad_cmd buf[3] BIT(5)
 // INT_CTRL: even bits are write-1-to-clear status, odd bits the enables (enable_status_interrupts; 25 = error mask)
 constexpr uint32_t kIntEnables = (1u << 1) | (1u << 9) | (1u << 11) | (1u << 13) | (1u << 15) | (1u << 17) | (1u << 21) |
                                  (1u << 25) | (1u << 29) | (1u << 31);
@@ -121,7 +125,7 @@ constexpr uint32_t scheduleLine(uint32_t activeV, uint32_t total) {
 
 enum Result : int {
   kSent = 0, kClocksOff = 1, kCtrlOff = 2, kNotVideo = 3, kBadVersion = 4, kBadTiming = 5, kBusy = 6, kTimeout = 7,
-  kVideoOn = 8,
+  kVideoOn = 8, kNoBta = 9, kNoData = 10,
 };
 inline const char *resultName(int r) {
   switch (r) {
@@ -134,6 +138,8 @@ inline const char *resultName(int r) {
   case kBusy: return "command DMA busy";
   case kTimeout: return "DMA_DONE timeout";
   case kVideoOn: return "video engine still on";
+  case kNoBta: return "no BTA_DONE (panel did not answer)";
+  case kNoData: return "no DCS short read response";
   default: return "?";
   }
 }
@@ -147,7 +153,7 @@ inline int readiness(uint32_t hwVersion, uint32_t ctrl) {
 }
 
 // What one send saw, for the log
-struct Diag { uint32_t hw, ctrl, line, intCtrl, status, fifo, ack, timeouts, waitedUs; };
+struct Diag { uint32_t hw, ctrl, line, intCtrl, status, fifo, ack, timeouts, waitedUs, btaUs, rdCtrl, rd0, rdType; };
 
 // Io: uint32_t rd(uint32_t), void wr(uint32_t, uint32_t), bool clocksOn(), void delayUs(uint32_t), void sleepMs(uint32_t),
 // uint64_t nowUs(). Never touches a register unless clocksOn() and the controller is enabled in video mode; every wait
@@ -255,11 +261,24 @@ template <class Io> int sendPacketCmd(Io &io, const uint32_t words[2], bool lp, 
     else io.sleepMs(1);
   }
   d.waitedUs = (uint32_t)(io.nowUs() - t1);
+  bool bta = !(words[0] & kHdrBta);
+  if (done && !bta) {                                   // read request: the panel answers after the bus turnaround
+    for (;;) {
+      const uint32_t v = io.rd(rIntCtrl);
+      if (v & kIntBtaDone) { bta = true; io.wr(rIntCtrl, (v & kIntEnables) | kIntBtaDone); break; }
+      if (io.nowUs() - t1 >= kDoneTimeoutUs) break;
+      io.delayUs(25);
+    }
+    d.btaUs = (uint32_t)(io.nowUs() - t1);
+    d.rdCtrl = io.rd(rRdbkCtrl);
+    d.rd0 = io.rd(rRdbkData0);
+    d.rdType = io.rd(rRdbkType0);
+  }
   d.status = io.rd(rStatus);
   d.fifo = io.rd(rFifoStatus);
   d.ack = io.rd(rAckErr);
   d.timeouts = io.rd(rTimeoutStatus);
-  if (done) io.wr(rIntCtrl, ackDmaDone(d.intCtrl));
+  if (done) io.wr(rIntCtrl, ackDmaDone(io.rd(rIntCtrl)));
   io.wr(rTpgCtrl, 0);                                   // reset_cmd_fifo
   io.wr(rTpgFifoReset, 1);
   io.delayUs(1);
@@ -270,7 +289,28 @@ template <class Io> int sendPacketCmd(Io &io, const uint32_t words[2], bool lp, 
   if (schedule & kScheduleEnable) io.wr(rDmaSchedule, schedule);
   if ((trig & kTrigMask) != kTrigSw) io.wr(rTrigCtrl, trig);
   if (!(d.ctrl & kCtrlCmd)) io.wr(rCtrl, io.rd(rCtrl) & ~kCtrlCmd);
-  return done ? kSent : kTimeout;
+  return !done ? kTimeout : !bta ? kNoBta : kSent;
+}
+// DCS short read of one byte in command mode (dsi_message_rx, short_resp): SET_MAXIMUM_RETURN_PACKET_SIZE 0x37 {1, 0},
+// clear the read-back registers (clear_rdbk_reg), DCS_READ 0x06 {cmd, 0} with the embedded BTA, then RDBK_DATA0 as
+// get_cmd_read_data reads it (bits 31:24 = response type, 0x21 DCS short read 1 byte / 0x02 ack-error report).
+// The panel status check of the dtbo is this read of 0x0A in LP (expected 0x9c / 0x9d: booster, sleep out, display on).
+constexpr uint32_t kDcsRead = 0x06, kSetMaxReturn = 0x37, kRespDcsShort1 = 0x21, kRespAckErr = 0x02;
+template <class Io> int readDcsCmd(Io &io, uint8_t cmd, bool lp, uint8_t *value, Diag &d) {
+  *value = 0;
+  uint32_t w[2] = {1u | (kSetMaxReturn & 0x3fu) << 16 | 1u << 31, 0};
+  int e = sendPacketCmd(io, w, lp, d);
+  if (e != kSent) return e;
+  io.wr(rRdbkCtrl, 1);
+  io.wr(rRdbkCtrl, 0);
+  w[0] = cmd | (kDcsRead & 0x3fu) << 16 | kHdrBta | 1u << 31;
+  e = sendPacketCmd(io, w, lp, d);
+  if (e != kSent) return e;
+  // get_cmd_read_data keeps ntohl(RDBK_DATA0) in memory and takes byte 0 as the type: register bits 31:24 = type,
+  // 23:16 = the byte read (dsi_parse_short_read1_resp: rx_buf[0] = buff[1])
+  if ((d.rdCtrl >> 16) == 0 || (d.rd0 >> 24) != kRespDcsShort1) return kNoData;
+  *value = (uint8_t)(d.rd0 >> 16);
+  return kSent;
 }
 template <class Io> int sendDcsCmd(Io &io, const uint8_t *p, unsigned n, bool lp, Diag &d) {
   uint32_t words[2];

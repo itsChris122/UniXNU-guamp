@@ -323,12 +323,42 @@ int main() {
       bool spmiWritable() { return writable; }
       bool lcdResetIsOutput() { return lcdOut; }
       unsigned lcdResetLevel() { return lcd; }
-      void lcdReset(bool h) { lcd = h; mark(h ? 'H' : 'L'); }
+      void lcdReset(bool h) { lcd = h; mark(h ? 'H' : 'L'); lcdResetModel(h); }
       void tpReset(bool h) { tp = h; mark(h ? 'T' : 't'); }
       void sleepMs(uint32_t n) {
         us += n * 1000ull;
         if (intf[0] & 1) intf[guamp_panelcycle::rIntfFrameCount / 4] += (n + 15) / 16;
       }
+      // Panel model: DCS writes change its power mode (0x0A), a read with BTA answers it; video busy follows the engines.
+      uint8_t mode = 0x9c;
+      bool dsiDead = false;                                     // video engine never busy (restart failure)
+      unsigned softResets = 0, reads = 0;
+      uint32_t rd(uint32_t o) {
+        uint32_t v = FakeDsi::rd(o);
+        if (o == rStatus && !dsiDead && (r(rCtrl) & kCtrlVideo) && (intf[0] & 1)) v |= guamp_panelcycle::kStatusVideoBusy;
+        return v;
+      }
+      void wr(uint32_t o, uint32_t v) {
+        if (o == guamp_panelcycle::rSoftReset && v) softResets = softResets + 1;
+        if (o == rSwTrigger && fifoCount) {
+          const uint32_t w0 = fifo[0], type = (w0 >> 16) & 0x3f, cmd = w0 & 0xff;
+          if (type == 0x05 || type == 0x15) {
+            if (cmd == 0x11) mode |= 0x90;
+            if (cmd == 0x10) mode &= (uint8_t)~0x90;
+            if (cmd == 0x29) mode |= 0x04;
+            if (cmd == 0x28) mode &= (uint8_t)~0x04;
+          }
+          if (type == 0x06 && (w0 & guamp_backlight::kHdrBta)) {
+            reads = reads + 1;
+            r(rIntCtrl) |= guamp_backlight::kIntBtaDone;
+            r(guamp_backlight::rRdbkCtrl) = 4u << 16;
+            r(guamp_backlight::rRdbkData0) = 0x21u << 24 | (uint32_t)mode << 16;
+          }
+        }
+        if (o == guamp_backlight::rRdbkCtrl && v == 1) { r(guamp_backlight::rRdbkData0) = 0; r(o) = 0; return; }
+        FakeDsi::wr(o, v);
+      }
+      void lcdResetModel(bool h) { if (!h) mode = 0x08; }
       void log(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {   // PANEL_LOG=1: print the cycle
         if (!getenv("PANEL_LOG")) return;
         va_list ap;
@@ -365,6 +395,27 @@ int main() {
       check(p.lcd == 1 && p.tp == 1, "resets released");
       check(!strcmp(p.ev, "tLDUHLHT"), "order: touch low, lcd low, rails down, up, reset 1/0/1, touch high");
       if (strcmp(p.ev, "tLDUHLHT")) printf("  events %s\n", p.ev);
+      check(rep.modeBeforeRc == 0 && rep.modeBefore == 0x9c && rep.modeAfterRc == 0 && rep.modeAfter == 0x9c && p.reads == 2,
+            "power mode read before and after (0x9c)", rep.modeBefore, rep.modeAfter);
+      check(p.softResets == 1, "one DSI soft reset before the panel reset", p.softResets);
+      check(rep.dsiStatusAfter & kStatusVideoBusy, "DSI video engine busy again");
+      check(p.r(rDmaCtrl) == ((1u << 26) | (1u << 31)) && p.r(guamp_backlight::rRdbkCtrl) == (4u << 16), "DMA ctrl restored");
+    }
+    {   // panel answers "in sleep" after the on-command: warned; DSI video engine never busy: restart path, warned
+      Plat p;
+      p.boot();
+      p.dsiDead = true;
+      Options o;
+      Report rep;
+      const int res = run(p, o, rep);
+      check((res & kWarnVideo) && (res & kWarnDsiIdle) && p.softResets == 2 && p.r(rCtrl) & kCtrlVideo && p.intf[0] == 1,
+            "DSI idle after restart: soft reset retry, warned, engines left on", res);
+      Plat q;
+      q.boot();
+      o.hsOn = true;
+      o.readStatus = false;
+      o.softReset = false;
+      check(run(q, o, rep) == kDone && q.reads == 0 && q.softResets == 0, "HS on-command, no read, no soft reset");
     }
     {   // the boot loader's voltage kept, reset high as Linux
       Plat p;

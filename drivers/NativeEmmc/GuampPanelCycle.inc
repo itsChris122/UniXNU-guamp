@@ -5,7 +5,13 @@
 // from the touch thread (TouchService.inc, after the touch pins are configured and before the SPI bus is opened).
 // Options: guamp-touch-pc-lcdb=0 (no rail cycle: DSI off / on and the reset only), guamp-touch-pc-rstlow=0 (LCD reset
 // kept high while the rails are off, exactly as Linux with this dtbo), guamp-touch-pc-mv=<mV> (LDO / NCP after the ramp,
-// default 5600 as the dtbo supply; 0 = keep the boot loader's value), guamp-touch-pc-off=<ms> (rails off time, default 10).
+// default 5600 as the dtbo supply; 0 = keep the boot loader's value), guamp-touch-pc-off=<ms> (rails off time, default 10),
+// guamp-touch-pc-softreset=0 (no DSI controller soft reset before the panel reset), guamp-touch-pc-hs=1 (on-command in HS),
+// guamp-touch-pc-read=0 (no DCS read of the power mode 0x0A before / after).
+// fin43 (04/11): the cycle ran (rails cycled, every command DMA_DONE) but the screen stayed dark all boot while the INTF
+// counter moved again (1524 -> 1587 one second later); the frame check had been skipped (FRAME_LINE_COUNT_EN reads 0).
+// Now: the counter is always the test, the power mode read says whether the panel took the on-command, the DSI video
+// engine must be busy after the restart (else a soft reset and a second start), and Linux's soft reset before the reset.
 // Logs: every line starts with "GuampPanel:".
 #include <stdarg.h>
 #include "GuampPanelCycleCore.h"
@@ -50,6 +56,15 @@ int run() {
   o.targetMv = v;
   v = 10;
   if (PE_parse_boot_argn("guamp-touch-pc-off", &v, sizeof(v)) && v <= 2000) o.offMs = v;
+  v = 1;
+  PE_parse_boot_argn("guamp-touch-pc-softreset", &v, sizeof(v));
+  o.softReset = v != 0;
+  v = 0;
+  PE_parse_boot_argn("guamp-touch-pc-hs", &v, sizeof(v));
+  o.hsOn = v != 0;
+  v = 1;
+  PE_parse_boot_argn("guamp-touch-pc-read", &v, sizeof(v));
+  o.readStatus = v != 0;
   o.level = backlight::gLastLevel ? backlight::gLastLevel : guamp_backlight::kDefaultLevel;
   if (!backlight::gDsi) { IOLog("GuampPanel: refused: no DSI window (guamp-backlight=0?)\n"); return -1; }
   if (!gIntf) {

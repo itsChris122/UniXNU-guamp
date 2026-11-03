@@ -31,7 +31,11 @@
 //  (7) dsi_display_vid_engine_enable then sde_encoder_phys_vid_enable / kickoff: DSI_CTRL back as the boot loader left it
 //      (video engine on), INTF_TIMING_ENGINE_EN = 1. The MDSS pipe, the framebuffer (0x5C000000, stride 2880, 720x1600),
 //      the DSI PHY and PLL are never touched, so nothing has to be reprogrammed: the boot loader's video setup resumes.
-//      Checked with the INTF frame counter; one stop / start retry if it does not move.
+//      Checked with the INTF frame counter AND DSI_STATUS bit 3 (video engine busy) 50 ms later; if not, timing engine
+//      off, DSI video off, controller soft reset, video on, timing engine on, checked again (fin43: dark screen with the
+//      counter moving). Linux also soft-resets the controller before dsi_panel_prepare (dsi_display_enable without
+//      continuous splash): done here before the reset sequence. The panel power mode (DCS read 0x0A in LP with BTA, the
+//      dtbo status check, expected 9c) is read with the video stopped before the off-command and after the on-command.
 // Every write is logged with the value read back; the cycle refuses before its first write when anything is not as
 // expected (clocks, controller, timing engine, LCDB state, SPMI write permission, reset pin), and after the first write
 // every path ends with the rails up, the reset released, the on-command sent and the video running again.
@@ -81,12 +85,16 @@ struct Options {
   uint32_t targetMv = kLinuxPanelMv;   // LDO / NCP after the ramp (0 = the boot loader's value)
   uint32_t offMs = 10;     // rails off time after the force pull-down is released
   uint32_t level = guamp_backlight::kDefaultLevel;   // 51 parameter in the on-command
+  bool softReset = true;   // DSI controller soft reset before the panel reset (dsi_display_enable, not continuous splash)
+  bool hsOn = false;       // on-command in HS instead of LP (guamp-touch-pc-hs=1)
+  bool readStatus = true;  // DCS read 0x0A (power mode) in LP with BTA, before and after (dtbo status check)
 };
 enum Result : int {
   kDone = 0, kNoClocks = 1, kDsiNotReady = 2, kIntfOff = 3, kLcdbRead = 4, kLcdbOff = 5, kSpmiReadOnly = 6, kResetPin = 7,
   kBadVoltage = 8,
   // after the first write: the cycle ran to the end but something is worth a look
   kWarnOffCmd = 16, kWarnLcdbDown = 32, kWarnLcdbUp = 64, kWarnOnCmd = 128, kWarnVideo = 256, kWarnFrozen = 512,
+  kWarnPanelMode = 1024, kWarnDsiIdle = 2048,
 };
 struct Report {
   int result = 0;
@@ -94,7 +102,14 @@ struct Report {
   uint8_t enBefore = 0, rtBefore = 0, ldoBefore = 0, ncpBefore = 0, bstBefore = 0, pdBefore = 0;
   uint8_t enDown = 0, rtDown = 0, enUp = 0, rtUp = 0, ldoUp = 0, ncpUp = 0, bstUp = 0;
   bool railsDown = false;
+  int modeBeforeRc = -1, modeAfterRc = -1;
+  uint8_t modeBefore = 0, modeAfter = 0;
+  uint32_t dsiStatusAfter = 0, laneAfter = 0;
 };
+// DSI_STATUS bit 3 VIDEO_MODE_ENGINE_BUSY: set while the video engine carries the INTF stream (boot loader: 0x2008)
+constexpr uint32_t kStatusVideoBusy = 1u << 3;
+// dsi_ctrl_reg.h DSI_SOFT_RESET 0x118; dsi_ctrl_hw_cmn.c DSI_CTRL_DYNAMIC_FORCE_ON = 0x23F | BIT(8) | BIT(9) | BIT(11) | BIT(21)
+constexpr uint32_t rSoftReset = 0x118, kClkForceOn = 0x23fu | 1u << 8 | 1u << 9 | 1u << 11 | 1u << 21;
 
 // Io: the backlight Io (rd, wr, clocksOn, delayUs, sleepMs, nowUs on the DSI window) plus
 //   uint32_t intfRd(uint32_t), void intfWr(uint32_t, uint32_t)        INTF_1 window
@@ -139,17 +154,50 @@ template <class Io> struct Cycle {
   }
   // DCS list in LP, command engine, video stopped. Returns the number of refused commands.
   struct Cmd { uint8_t b[4]; uint8_t n; uint16_t waitMs; };
-  uint32_t sendList(const char *what, const Cmd *c, unsigned count) {
+  uint32_t sendList(const char *what, const Cmd *c, unsigned count, bool lp = true) {
     uint32_t fails = 0;
     for (unsigned i = 0; i < count; ++i) {
       guamp_backlight::Diag d{};
-      const int e = guamp_backlight::sendDcsCmd(io, c[i].b, c[i].n, true, d);
+      const int e = guamp_backlight::sendDcsCmd(io, c[i].b, c[i].n, lp, d);
       if (e != guamp_backlight::kSent) fails = fails + 1;
-      io.log("GuampPanel: %s %02x (%u bytes, LP): %s, %u us, status %08x ack %08x timeout %08x fifo %08x\n", what, c[i].b[0],
-             (unsigned)c[i].n, guamp_backlight::resultName(e), d.waitedUs, d.status, d.ack, d.timeouts, d.fifo);
+      io.log("GuampPanel: %s %02x (%u bytes, %s): %s, %u us, status %08x ack %08x timeout %08x fifo %08x\n", what, c[i].b[0],
+             (unsigned)c[i].n, lp ? "LP" : "HS", guamp_backlight::resultName(e), d.waitedUs, d.status, d.ack, d.timeouts, d.fifo);
       if (c[i].waitMs) io.sleepMs(c[i].waitMs);
     }
     return fails;
+  }
+  // 0x0A get_power_mode: bit 7 booster, 4 sleep out, 3 normal mode, 2 display on (0x9c / 0x9d expected when on)
+  int powerMode(const char *when, uint8_t &mode) {
+    guamp_backlight::Diag d{};
+    const int e = guamp_backlight::readDcsCmd(io, 0x0a, true, &mode, d);
+    io.log("GuampPanel: power mode %s: %s %02x (bta %u us, rdbk ctrl %08x data %08x type %08x, ack %08x timeout %08x)%s\n",
+           when, guamp_backlight::resultName(e), mode, d.btaUs, d.rdCtrl, d.rd0, d.rdType, d.ack, d.timeouts,
+           e ? "" : (mode & 0x14) == 0x14 ? ": sleep out, display on" : (mode & 0x10) ? ": sleep out, display off" : ": in sleep");
+    return e;
+  }
+  // dsi_ctrl_hw_cmn_soft_reset: engines off, clocks forced on, SOFT_RESET pulse, clocks and DSI_CTRL back
+  void softReset(const char *when) {
+    using namespace guamp_backlight;
+    const uint32_t ctrl = io.rd(rCtrl), clk = io.rd(rClkCtrl);
+    io.wr(rCtrl, ctrl & ~7u);
+    io.wr(rClkCtrl, clk | kClkForceOn);
+    io.wr(rSoftReset, 1);
+    io.delayUs(1);
+    io.wr(rSoftReset, 0);
+    io.wr(rClkCtrl, clk);
+    io.wr(rCtrl, ctrl);
+    io.log("GuampPanel: DSI soft reset (%s): ctrl %08x clk %08x status %08x\n", when, ctrl, clk, io.rd(guamp_backlight::rStatus));
+  }
+  // video really back: INTF frame counter moving and the DSI video engine busy with it
+  bool videoBack(uint32_t &a, uint32_t &b) {
+    a = frames();
+    io.sleepMs(50);
+    b = frames();
+    r.dsiStatusAfter = io.rd(guamp_backlight::rStatus);
+    r.laneAfter = io.rd(guamp_backlight::rLaneStatus);
+    io.log("GuampPanel: video check: frames %u -> %u, DSI status %08x (video engine %s), lane status %08x\n", a, b, r.dsiStatusAfter,
+           (r.dsiStatusAfter & kStatusVideoBusy) ? "busy" : "IDLE", r.laneAfter);
+    return b != a && (r.dsiStatusAfter & kStatusVideoBusy);
   }
   bool pollVregOk(uint8_t &rt) {
     for (unsigned i = 0; i < 20; ++i) {     // Linux: 10 polls x (soft-start + debounce); here 1 ms x 20
@@ -210,18 +258,18 @@ template <class Io> struct Cycle {
     const uint32_t hw = io.rd(rHwVersion);
     r.dsiCtrl = io.rd(rCtrl);
     r.intfEn = io.intfRd(rIntfTimingEn);
-    const uint32_t countEn = io.intfRd(rIntfFrameLineEn);
     dsiState("before");
     if (readiness(hw, r.dsiCtrl) != kSent) {
       io.log("GuampPanel: refused: DSI hw %08x ctrl %08x: %s\n", hw, r.dsiCtrl, resultName(readiness(hw, r.dsiCtrl)));
       return r.result = kDsiNotReady;
     }
-    const bool counting = (countEn & 1u) != 0;
-    if (!(r.intfEn & 1u) || (counting && !timingRuns(r.frames[0], r.frames[1]))) {
-      io.log("GuampPanel: refused: INTF1 timing engine %x, frame counter %s %u -> %u\n", r.intfEn, counting ? "on" : "off",
-             r.frames[0], r.frames[1]);
+    // fin43: FRAME_LINE_COUNT_EN read 0 while the counter moved (1520 -> 1523): the counter itself is the test.
+    if (!(r.intfEn & 1u) || !timingRuns(r.frames[0], r.frames[1])) {
+      io.log("GuampPanel: refused: INTF1 timing engine %x, frame counter %u -> %u (count enable %08x)\n", r.intfEn, r.frames[0],
+             r.frames[1], io.intfRd(rIntfFrameLineEn));
       return r.result = kIntfOff;
     }
+    const bool counting = true;
     if (!io.lcdResetIsOutput() || !io.lcdResetLevel()) {
       io.log("GuampPanel: refused: gpio82 (LCD reset) not a driven-high output (level %u)\n", io.lcdResetLevel());
       return r.result = kResetPin;
@@ -249,8 +297,8 @@ template <class Io> struct Cycle {
         return r.result = kBadVoltage;
       }
     }
-    io.log("GuampPanel: cycle start (lcdb %s, reset %s while off, target %u mV, off %u ms, level %u)\n", o.lcdb ? "on" : "off",
-           o.resetLow ? "low" : "high", target, o.offMs, o.level);
+    io.log("GuampPanel: cycle start (lcdb %s, reset %s while off, target %u mV, off %u ms, level %u, soft reset %u, on-command %s)\n",
+           o.lcdb ? "on" : "off", o.resetLow ? "low" : "high", target, o.offMs, o.level, o.softReset ? 1u : 0u, o.hsOn ? "HS" : "LP");
     int warn = 0;
 
     // --- (1) video off: timing engine, one vblank, video engine off / command engine on
@@ -263,6 +311,8 @@ template <class Io> struct Cycle {
     io.delayUs(100);
     dsiState("video stopped");
     if (counting && r.frames[2] != r.frames[3]) io.log("GuampPanel: warning: frame counter still moving %u -> %u\n", r.frames[2], r.frames[3]);
+
+    if (o.readStatus) r.modeBeforeRc = powerMode("before (video stopped)", r.modeBefore);
 
     // --- (2) off-command in LP
     static const Cmd off[] = {{{0x28}, 1, 20}, {{0x10}, 1, 80}};
@@ -300,6 +350,7 @@ template <class Io> struct Cycle {
     } else {
       io.sleepMs(o.offMs);
     }
+    if (o.softReset) softReset("before the panel reset");
     // dsi_panel_reset: <1 5>, <0 2>, <1 60>
     io.lcdReset(true); io.sleepMs(5);
     io.lcdReset(false); io.sleepMs(2);
@@ -309,31 +360,42 @@ template <class Io> struct Cycle {
     // --- (6) on-command in LP
     const Cmd on[] = {{{0x11}, 1, 160}, {{0x29}, 1, 50}, {{0x51, (uint8_t)(o.level >> 8), (uint8_t)o.level}, 3, 0},
                       {{0x55, 0x01}, 2, 0}, {{0x53, 0x2c}, 2, 0}, {{0xb9, 0x83, 0x10, 0x2d}, 4, 0}, {{0xcd, 0x01}, 2, 10}};
-    r.onFails = sendList("on-command", on, 7);
+    r.onFails = sendList("on-command", on, 7, !o.hsOn);
     if (r.onFails) warn |= kWarnOnCmd;
+    if (o.readStatus) {
+      r.modeAfterRc = powerMode("after on-command", r.modeAfter);
+      if (r.modeAfterRc || (r.modeAfter & 0x14) != 0x14) warn |= kWarnPanelMode;
+    }
 
     // --- (7) video back: DSI_CTRL as found, timing engine on, frame counter checked
     io.wr(rCtrl, r.dsiCtrl);
     io.delayUs(100);
     io.intfWr(rIntfTimingEn, r.intfEn);
-    bool runs = !counting || timingRuns(r.frames[4], r.frames[5]);
+    bool runs = !counting || videoBack(r.frames[4], r.frames[5]);
     if (!runs) {
-      io.log("GuampPanel: frame counter frozen after restart (%u -> %u): timing engine off and on again\n", r.frames[4], r.frames[5]);
+      // dsi_display_vid_engine_disable / enable around a controller soft reset, then the timing engine again
+      io.log("GuampPanel: video not back: timing engine off, DSI video off, soft reset, video on, timing engine on\n");
       io.intfWr(rIntfTimingEn, 0);
       io.sleepMs(20);
+      io.wr(rCtrl, (r.dsiCtrl & ~kCtrlVideo) | kCtrlCmd);
+      softReset("video restart");
+      io.wr(rCtrl, r.dsiCtrl);
+      io.delayUs(100);
       io.intfWr(rIntfTimingEn, r.intfEn);
-      runs = timingRuns(r.frames[4], r.frames[5]);
-      warn |= runs ? kWarnVideo : kWarnFrozen;
+      runs = videoBack(r.frames[4], r.frames[5]);
+      warn |= kWarnVideo;
+      if (!runs) warn |= (r.frames[4] == r.frames[5]) ? kWarnFrozen : kWarnDsiIdle;
     }
     dsiState("video restored");
-    io.log("GuampPanel: video %s (frames %u -> %u)\n", runs ? "running" : "FROZEN", r.frames[4], r.frames[5]);
+    io.log("GuampPanel: video %s (frames %u -> %u, DSI status %08x)\n", runs ? "running" : "NOT running", r.frames[4], r.frames[5],
+           r.dsiStatusAfter);
 
     // --- (8) touch reset released (the touch service then resets, downloads and starts as usual)
     io.tpReset(true);
     io.sleepMs(50);
     r.result = warn;
-    io.log("GuampPanel: cycle end: result %d (off-command refused %u, on-command refused %u, rails %s)\n", warn, r.offFails,
-           r.onFails, o.lcdb ? (r.railsDown ? "cycled" : "NOT cycled") : "kept");
+    io.log("GuampPanel: cycle end: result %d (off-command refused %u, on-command refused %u, rails %s, power mode %02x -> %02x)\n",
+           warn, r.offFails, r.onFails, o.lcdb ? (r.railsDown ? "cycled" : "NOT cycled") : "kept", r.modeBefore, r.modeAfter);
     return warn;
   }
 };
