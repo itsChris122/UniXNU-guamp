@@ -1,0 +1,82 @@
+diff --git a/bsd/kern/proc_info.c b/bsd/kern/proc_info.c
+index b33d152..04580d6 100644
+--- a/bsd/kern/proc_info.c
++++ b/bsd/kern/proc_info.c
+@@ -72,6 +72,7 @@
+ 
+ #include <sys/mount_internal.h>
+ #include <sys/proc_info.h>
++#include <pexpert/pexpert.h>
+ #include <sys/bsdtask_info.h>
+ #include <sys/kdebug.h>
+ #include <sys/sysproto.h>
+@@ -794,6 +795,60 @@ proc_pidbsdinfo(proc_t p, struct proc_bsdinfo * pbsd, int zombie)
+ }
+ 
+ 
++/*
++ * guamp 04/11 (ag-sys): the widget extensions at ~95 % of a core for minutes after every boot. chronod's log (logarchive of
++ * 04/11 00:05): at each boot it reloads every widget (initial + extensionChanged, getPlaceholders(19) = all kinds x families)
++ * and the extension needs longer than WidgetKit's session watchdog on this CPU: "Watchdog provision violated for
++ * getPlaceholders(19)" / "getTimelines(1)", the session is cancelled and the extension restarted, 3 tries, then "Disallowing
++ * reloads due to extensive failures" and a retry later: the same rendering is started again and again and never finishes, so
++ * nothing gets cached. WidgetKit (WidgetExtensionSession) skips that watchdog when BSPIDIsBeingDebugged(pid) says the
++ * extension is traced ("watchdog not configured, due to debugger"); BaseBoard reads it here (proc_pidinfo
++ * PROC_PIDT_SHORTBSDINFO, PROC_FLAG_TRACED).
++ * guamp-widget-nowd=<prefix>[,<prefix>...] (default "0" = off): to chronod only (the caller's name), the processes whose name
++ * starts with one of the prefixes are reported as traced, so their renders run to the end once instead of being killed and
++ * restarted. Nobody else sees the flag (RunningBoard, ReportCrash, the process itself): no other behaviour changes.
++ * Example: guamp-widget-nowd=StocksWidget,MusicWidgets,CalendarWidgetExtension,WorldClockWidget
++ */
++static char guamp_widget_nowd_list[128];
++static int guamp_widget_nowd_state = -1;
++static int
++guamp_widget_nowd(proc_t p)
++{
++	if (guamp_widget_nowd_state < 0) {
++		if (!PE_parse_boot_argn("guamp-widget-nowd", guamp_widget_nowd_list, sizeof(guamp_widget_nowd_list) - 1)) {
++			guamp_widget_nowd_list[0] = '\0';
++		}
++		guamp_widget_nowd_state = guamp_widget_nowd_list[0] && strcmp(guamp_widget_nowd_list, "0") != 0 ? 1 : 0;
++	}
++	if (guamp_widget_nowd_state == 0 || p == PROC_NULL) {
++		return 0;
++	}
++	proc_t self = current_proc();
++	if (self == PROC_NULL || strcmp(proc_best_name(self), "chronod") != 0) {
++		return 0;
++	}
++	const char *name = proc_best_name(p);
++	const char *at = guamp_widget_nowd_list;
++	while (*at) {
++		const char *end = at;
++		while (*end && *end != ',') {
++			end++;
++		}
++		size_t len = (size_t)(end - at);
++		if (len && strncmp(name, at, len) == 0) {
++			static int logged;
++			if (logged < 16) {
++				logged++;
++				printf("guamp-widget-nowd: %s[%d] reported as traced to chronod (WidgetKit session watchdog off)\n", name,
++				    proc_getpid(p));
++			}
++			return 1;
++		}
++		at = *end ? end + 1 : end;
++	}
++	return 0;
++}
++
+ int
+ proc_pidshortbsdinfo(proc_t p, struct proc_bsdshortinfo * pbsd_shortp, int zombie)
+ {
+@@ -811,6 +866,8 @@ proc_pidshortbsdinfo(proc_t p, struct proc_bsdshortinfo * pbsd_shortp, int zombi
+ 	}
+ 	if ((p->p_lflag & P_LTRACED) == P_LTRACED) {
+ 		pbsd_shortp->pbsi_flags |= PROC_FLAG_TRACED;
++	} else if (guamp_widget_nowd(p)) {
++		pbsd_shortp->pbsi_flags |= PROC_FLAG_TRACED;
+ 	}
+ 	if ((p->p_lflag & P_LEXIT) == P_LEXIT) {
+ 		pbsd_shortp->pbsi_flags |= PROC_FLAG_INEXIT;
