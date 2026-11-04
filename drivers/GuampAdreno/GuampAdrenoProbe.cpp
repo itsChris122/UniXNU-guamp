@@ -537,6 +537,10 @@ int naPublish(Session &s) {
   static const char *const kGpuAllArgs[7] = {"guamp-gpu-all-win", "guamp-gpu-all-minwin", "guamp-gpu-all-bo", "guamp-gpu-all-total",
                                              "guamp-gpu-all-rate", "guamp-gpu-all-max", "guamp-gpu-all-perproc"};
   for (unsigned i = 0; i < 7; i = i + 1) native_adreno_gpu_all_cfg[i] = bootArg(kGpuAllArgs[i], 0);
+  // fin44: Maps ran out of its 192 MiB window ("texture: OutOfMemory(Device)" from metal2vulkan, with the kernel refusing nothing:
+  // others BO 260 -> 388 MiB while it ran, metal2vulkan's 64 MiB pool blocks). Without the argument a client window is now 256 MiB;
+  // the 2 GiB of client windows hold eight such, and the smallest window (64 MiB) still serves a ninth.
+  if (!native_adreno_gpu_all_cfg[0]) native_adreno_gpu_all_cfg[0] = 256;
   {
     char deny[sizeof native_adreno_gpu_all_deny] = {};
     if (!PE_parse_boot_argn("guamp-gpu-all-deny", deny, sizeof deny)) strlcpy(deny, "SpringBoard,mediaserverd", sizeof deny);
