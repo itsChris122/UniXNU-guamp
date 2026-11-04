@@ -12,6 +12,8 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-baseband.patch shows over /usr/standalo
 
 --base merges the entries of an existing addon (for example the delta of the current image) into the output, so one boot payload
 carries both; an entry name present in both is refused. Apple firmware: it only goes into the boot payload, never into a repository.
+A ".guamp-keep" of --base (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-addon-prune.patch) is rebuilt with the firmware names and
+baseband/ added; without one in --base the output has none and the kernel prunes nothing.
 """
 from pathlib import Path
 import argparse
@@ -108,6 +110,10 @@ def main():
     entries = []
     if options.base:
         entries = read_addon(options.base)
+    keep = [line for name, mode, size, packed in entries if name == '.guamp-keep'
+            for line in zlib.decompress(packed).decode().split('\n')[1:] if line]
+    had_keep = any(name == '.guamp-keep' for name, *_ in entries)
+    entries = [entry for entry in entries if entry[0] != '.guamp-keep']
     names = {name for name, *_ in entries}
     added = 0
     with zipfile.ZipFile(io.BytesIO(bbfw)) as archive:
@@ -122,6 +128,11 @@ def main():
             entries.append((name, 0o644, len(data), zlib.compress(data, 9)))
             names.add(name)
             added += 1
+    if had_keep:
+        lines = sorted((set(keep) - {p for p in keep if p.endswith('/')}) | names | {'.guamp-keep'})
+        lines += sorted({p for p in keep if p.endswith('/')} | {'baseband/'})
+        listing = ('NGPUKEEP1\n' + ''.join(line + '\n' for line in lines)).encode()
+        entries.append(('.guamp-keep', 0o644, len(listing), zlib.compress(listing, 9)))
     assert len(entries) <= 4096
     body = b''
     for name, mode, size, packed in entries:

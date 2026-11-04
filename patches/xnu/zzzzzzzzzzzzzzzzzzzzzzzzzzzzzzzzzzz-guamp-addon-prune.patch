@@ -1,0 +1,248 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8689284..d5d8b34 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7560,6 +7560,163 @@ native_gpu_addon_delete(proc_t p, user_addr_t scratch, const char *path, vfs_con
+ 	}
+ 	return error;
+ }
++/* guamp 05/11, addon prune: the persistent addon never removed a file that a later addon no longer carries (fin46 left
++ * NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib in Data; the plug-in of fin45 loads it when present, AMFI rejects it because
++ * fin45's trust cache lacks its CDHash, backboardd loses Metal). An addon that carries the entry ".guamp-keep" declares the complete
++ * set of files it wants in Data: "NGPUKEEP1\n", then one addon name per line (a line ending in '/' keeps every name below that
++ * prefix, for example "baseband/" for the persistent firmware of make-guamp-baseband-addon.py). After the install, every manifest
++ * record that is neither an entry of this addon nor named by the keep list is unlinked (regular files only, only below
++ * /private/var/ngpu or /private/var/Managed Preferences/mobile, the two addon targets, and only when the canonical path of the
++ * vnode is exactly that path: no symlinked directory can lead outside) and its record dropped. Files that a kernel without the
++ * manifest wrote are not recorded and stay. An addon without ".guamp-keep" (a baseband-only addon, a hand-made delta) prunes nothing,
++ * as before. guamp-addon-prune=0 turns it off. Never panics; a malformed keep list prunes nothing.
++ * The functions between the BEGIN/END markers are pure and host-tested (scripts/test-guamp-addon-prune.sh). */
++#define NATIVE_GPU_KEEP_NAME ".guamp-keep"
++#define NATIVE_GPU_KEEP_MAX (1u << 20)
++#define NATIVE_GPU_KEEP_PREFIXES 16
++volatile int native_gpu_addon_pruned = 0, native_gpu_addon_prune_refused = 0;
++/* guamp-addon-prune pure BEGIN */
++/* The Data path of an addon name, exactly as native_gpu_addon_install maps it; EINVAL for a name that cannot be an addon target,
++ * EPERM for the manifest itself. */
++static int
++native_gpu_addon_target(const char *name, char *path, size_t size)
++{
++	size_t length = strnlen(name, 160);
++	if (length < 1 || length >= 160 || name[0] == '/' || name[length - 1] == '/') {
++		return EINVAL;
++	}
++	for (size_t k = 0; k + 1 < length; ++k) {
++		if ((name[k] == '.' && name[k + 1] == '.') || (name[k] == '/' && name[k + 1] == '/')) {
++			return EINVAL;
++		}
++	}
++	if (!strncmp(name, ".guamp-manifest", sizeof(".guamp-manifest") - 1)) {
++		return EPERM;
++	}
++	int n;
++	if (!strncmp(name, "@mp/", 4)) {
++		if (length == 4) {
++			return EINVAL;
++		}
++		n = snprintf(path, size, "/private/var/Managed Preferences/mobile/%s", name + 4);
++	} else {
++		n = snprintf(path, size, "/private/var/ngpu/%s", name);
++	}
++	return n > 0 && (size_t)n < size ? 0 : ENAMETOOLONG;
++}
++/* Marks in seen[] every used record that the keep list names (a line, or a line ending in '/' as prefix). Splits keep into lines in
++ * place. Returns the number of names and prefixes, or -1 when the list is malformed (no magic, a line without its newline, a NUL,
++ * a name of 160 bytes or more, more than NATIVE_GPU_KEEP_PREFIXES prefixes) or empty. */
++static int
++native_gpu_keep_mark(char *keep, size_t size, const struct native_gpu_manifest_record *records, uint32_t count, uint8_t *seen)
++{
++	static const char magic[] = "NGPUKEEP1\n";
++	const size_t magic_size = sizeof(magic) - 1;
++	if (size < magic_size || memcmp(keep, magic, magic_size)) {
++		return -1;
++	}
++	const char *prefix[NATIVE_GPU_KEEP_PREFIXES];
++	size_t prefix_size[NATIVE_GPU_KEEP_PREFIXES];
++	int prefixes = 0, lines = 0;
++	size_t at = magic_size;
++	while (at < size) {
++		char *line = keep + at;
++		size_t length = 0;
++		while (at + length < size && line[length] != '\n') {
++			if (!line[length]) {
++				return -1;
++			}
++			length++;
++		}
++		if (at + length == size || length >= 160) {
++			return -1;
++		}
++		line[length] = 0;
++		at += length + 1;
++		if (!length) {
++			continue;
++		}
++		lines++;
++		if (line[length - 1] == '/') {
++			if (prefixes == NATIVE_GPU_KEEP_PREFIXES) {
++				return -1;
++			}
++			prefix[prefixes] = line;
++			prefix_size[prefixes++] = length;
++			continue;
++		}
++		for (uint32_t i = 0; i < count; i++) {
++			if (records[i].used && !seen[i] && !strcmp(records[i].name, line)) {
++				seen[i] = 1;
++				break;
++			}
++		}
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		for (int k = 0; records[i].used && !seen[i] && k < prefixes; k++) {
++			if (!strncmp(records[i].name, prefix[k], prefix_size[k])) {
++				seen[i] = 1;
++			}
++		}
++	}
++	return lines ? lines : -1;
++}
++/* guamp-addon-prune pure END */
++/* The ".guamp-keep" entry of a validated addon, inflated (NUL-terminated, kfree_data(*keep, *size + 1)); 0 when there is none. */
++static int
++native_gpu_addon_keep(const uint8_t *addon, uint32_t count, char **keep, uint64_t *keep_size)
++{
++	*keep = NULL;
++	*keep_size = 0;
++	uint64_t at = 24;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t name_bytes = 0, mode = 0;
++		uint64_t size = 0, packed = 0;
++		memcpy(&name_bytes, addon + at, 4);
++		memcpy(&mode, addon + at + 4, 4);
++		memcpy(&size, addon + at + 8, 8);
++		memcpy(&packed, addon + at + 16, 8);
++		at += 24;
++		const char *name = (const char *)(addon + at);
++		at += (name_bytes + 7) & ~7ULL;
++		if (!strcmp(name, NATIVE_GPU_KEEP_NAME)) {
++			if (mode == NATIVE_GPU_ADDON_DELETE || !size || size > NATIVE_GPU_KEEP_MAX) {
++				return EINVAL;
++			}
++			char *data = kalloc_data(size + 1, Z_WAITOK | Z_ZERO);
++			int error = data ? native_gpu_addon_inflate(addon + at, packed, (uint8_t *)data, size) : ENOMEM;
++			if (error) {
++				if (data) {
++					kfree_data(data, size + 1);
++				}
++				return error;
++			}
++			*keep = data;
++			*keep_size = size;
++			return 0;
++		}
++		at += (packed + 7) & ~7ULL;
++	}
++	return 0;
++}
++/* 0 when path names a regular file whose canonical path is exactly path (no symlink on the way), EPERM otherwise. */
++static int
++native_gpu_addon_prune_check(const char *path, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	char real[256];
++	int length = sizeof(real);
++	int same = vnode_vtype(vp) == VREG && !vn_getpath(vp, real, &length) && !strcmp(real, path);
++	if (!same) {
++		printf("guamp-addon: prune refuses %s (type %d, canonical %s)\n", path, (int)vnode_vtype(vp), length > 0 ? real : "?");
++	}
++	vnode_put(vp);
++	return same ? 0 : EPERM;
++}
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -7641,6 +7798,13 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 	uint32_t n_records = records ? native_gpu_manifest_read(records, ctx) : 0;
+ 	native_gpu_addon_manifest_records = records ? (int)n_records : -1;
+ 	int manifest_changed = 0;
++	/* Addon prune: seen[i] = record i is an entry of this addon (or kept by its keep list). */
++	uint32_t prune = 1;
++	PE_parse_boot_argn("guamp-addon-prune", &prune, sizeof(prune));
++	uint8_t *seen = records && prune ? kalloc_data(NATIVE_GPU_MANIFEST_MAX, Z_WAITOK | Z_ZERO) : NULL;
++	char *keep = NULL;
++	uint64_t keep_size = 0;
++	int keep_error = seen ? native_gpu_addon_keep(addon, count, &keep, &keep_size) : 0;
+ 	char path[192];
+ 	at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -7661,6 +7825,9 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 			snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
+ 		}
+ 		struct native_gpu_manifest_record *record = records ? native_gpu_manifest_find(records, n_records, name) : NULL;
++		if (record && seen) {
++			seen[record - records] = 1;
++		}
+ 		if (mode == NATIVE_GPU_ADDON_DELETE) {
+ 			int error = native_gpu_addon_delete(p, scratch, path, ctx);
+ 			if (record) {
+@@ -7708,6 +7875,9 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 			if (!record && n_records < NATIVE_GPU_MANIFEST_MAX) {
+ 				record = &records[n_records++];
+ 				strlcpy(record->name, name, sizeof(record->name));
++				if (seen) {
++					seen[record - records] = 1;
++				}
+ 			}
+ 			if (record && (!record->used || record->hash != hash || record->size != size || record->mode != mode)) {
+ 				record->used = 1;
+@@ -7720,6 +7890,45 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		at += (packed + 7) & ~7ULL;
+ 	}
+ 	native_gpu_addon_force = 0;
++	if (seen && keep) {
++		int lines = native_gpu_keep_mark(keep, (size_t)keep_size, records, n_records, seen);
++		int gone = 0, failed = 0;
++		for (uint32_t i = 0; lines > 0 && i < n_records; i++) {
++			if (!records[i].used || seen[i]) {
++				continue;
++			}
++			int error = native_gpu_addon_target(records[i].name, path, sizeof(path));
++			if (!error) {
++				error = native_gpu_addon_prune_check(path, ctx);
++			}
++			if (!error) {
++				error = native_gpu_addon_delete(p, scratch, path, ctx);
++			}
++			if (!error || error == ENOENT) {
++				records[i].used = 0;	/* removed now or already gone: forget it */
++				manifest_changed = 1;
++				native_gpu_addon_pruned += error ? 0 : 1;
++				gone += error ? 1 : 0;
++			} else if (error == EPERM || error == EINVAL || error == EISDIR) {
++				native_gpu_addon_prune_refused++;
++			} else {
++				failed++;
++			}
++			if (native_gpu_addon_pruned + gone + native_gpu_addon_prune_refused + failed <= 64) {
++				printf("guamp-addon: prune %s status %d\n", records[i].name, error);
++			}
++		}
++		printf("guamp-addon: prune keep %d names, %d stale removed, %d already gone, %d refused, %d failed\n", lines,
++		    native_gpu_addon_pruned, gone, native_gpu_addon_prune_refused, failed);
++	} else if (seen) {
++		printf("guamp-addon: prune off (no %s in this addon, status %d)\n", NATIVE_GPU_KEEP_NAME, keep_error);
++	}
++	if (keep) {
++		kfree_data(keep, keep_size + 1);
++	}
++	if (seen) {
++		kfree_data(seen, NATIVE_GPU_MANIFEST_MAX);
++	}
+ 	if (records && manifest_changed) {
+ 		native_gpu_addon_manifest_error = native_gpu_manifest_write(records, n_records, ctx);
+ 	}
