@@ -72,6 +72,12 @@ constexpr unsigned kQ0Words = 64, kQ1Words = 16;   // CCI v1.2 queue sizes
 constexpr unsigned kReadMax = 14;                  // CCI_READ_MAX_V_1_2
 constexpr unsigned kRetries = 3;                   // SET_PARAM retries field (bits 17:16)
 
+constexpr unsigned kPayload = 11;                  // MSM_CCI_WRITE_DATA_PAYLOAD_SIZE_11 (address + data bytes per WRITE)
+constexpr uint16_t kSamsungDataPort = 0x6f12;      // S5K indirect write port (pointer set through 0x6028/0x602A)
+
+// One register write: data MSB first on the bus, delayUs after it (vendor regSetting / GCAM entry).
+struct Reg { uint16_t addr, data; uint8_t addrBytes, dataBytes; uint16_t delayUs; };
+
 struct CciTiming { uint16_t thigh, tlow, tsuSto, tsuSta, thdDat, thdSta, tbuf; uint8_t stretch, trdhld, tsp; };
 // qcom,cci0 timing nodes (cci-clk-src 37.5 MHz); with the 19.2 MHz TCXO source the bus runs at about half speed.
 constexpr CciTiming kCciStandard = {0xc9, 0xae, 0xcc, 0xe7, 0x16, 0xa2, 0xe3, 0, 6, 3};
@@ -237,8 +243,15 @@ struct Cci {
   }
 
   // Whole block reset, interrupt status enabled (the SPI stays unclaimed: everything is polled), both masters timed.
+  // The mask is written before the reset too: Linux waits for RST_DONE through its IRQ, and whether a masked status bit
+  // shows up in IRQ_STATUS_0 is not documented. A missing RST_DONE is logged and tolerated (the reset itself takes
+  // a few cycles); a NACK or bus error later still tells the truth.
+  bool resetSeen = false;
   int init(const CciTiming &t) {
+    wr(kCciIrqMask0, kCciIrqMask0All);
     int r = reset(kCciResetAll);
+    resetSeen = !r;
+    if (r == kErrTimeout) { note(*o, "cci reset: no RST_DONE, continuing (status, mask)", r, lastStatus, rd(kCciIrqMask0)); r = kOk; }
     if (r) { note(*o, "cci reset (status)", r, lastStatus, 0); return r; }
     wr(kCciIrqMask0, kCciIrqMask0All);
     clear(0xffffffffu);
@@ -291,6 +304,64 @@ struct Cci {
       }
     }
     return got == n ? kOk : kErrIo;
+  }
+
+  // Batched register writes on queue 0 (cam_cci_data_queue model): one SET_PARAM, then WRITE commands of at most
+  // kPayload bytes (address + data, MSB first), one REPORT when the queue is nearly full or at the end. Consecutive 16 bit
+  // writes to the Samsung indirect data port 0x6F12 are packed four words per command (the sensor advances its pointer
+  // per word, exactly as for separate writes). A register delay flushes the queue and waits in software.
+  // get(i) returns the i-th Reg; done (optional) counts the registers written before an error.
+  template <typename Get>
+  int writeList(unsigned m, uint8_t slave7, unsigned n, Get get, unsigned *done = nullptr) {
+    if (m > 1) return kErrInval;
+    if (rd(qCur(m, 0))) return kErrIo;
+    unsigned used = 0, ok = 0, pending = 0;
+    int r = kOk;
+    auto flush = [&]() -> int {
+      if (!used) return kOk;
+      load(m, 0, kCmdReport | kReportIrq);
+      used = 0;
+      const int fr = run(m, 0, irqReport(m, 0));
+      if (!fr) { ok += pending; pending = 0; }
+      return fr;
+    };
+    for (unsigned i = 0; i < n && !r;) {
+      Reg g = get(i);
+      if (!g.addrBytes || g.addrBytes > 2 || !g.dataBytes || g.dataBytes > 2) { r = kErrInval; break; }
+      uint8_t b[1 + kPayload + 1] = {};
+      unsigned len = 0, packed = 0;
+      for (unsigned k = g.addrBytes; k-- > 0;) b[1 + len++] = static_cast<uint8_t>(g.addr >> (8 * k));
+      for (;;) {
+        for (unsigned k = g.dataBytes; k-- > 0;) b[1 + len++] = static_cast<uint8_t>(g.data >> (8 * k));
+        ++packed;
+        ++i;
+        if (g.delayUs || g.addr != kSamsungDataPort || g.addrBytes != 2 || g.dataBytes != 2 || i >= n) break;
+        const Reg nx = get(i);
+        if (nx.addr != kSamsungDataPort || nx.addrBytes != 2 || nx.dataBytes != 2 || len + 2 > kPayload) break;
+        g = nx;
+      }
+      b[0] = static_cast<uint8_t>(kCmdWrite | len << 4);
+      const unsigned words = (1 + len + 3) / 4;
+      if (used && used + words + 1 > kQ0Words - 2) { r = flush(); if (r) break; }
+      if (!used) { load(m, 0, setParam(slave7)); used = 1; }
+      for (unsigned w = 0; w < words; ++w)
+        load(m, 0, b[4 * w] | static_cast<uint32_t>(b[4 * w + 1]) << 8 | static_cast<uint32_t>(b[4 * w + 2]) << 16 |
+                       static_cast<uint32_t>(b[4 * w + 3]) << 24);
+      used += words;
+      pending += packed;
+      if (g.delayUs) {
+        r = flush();
+        if (r) break;
+        if (g.delayUs >= 1000) o->sleepMs(o->ctx, (g.delayUs + 999) / 1000); else o->delayUs(o->ctx, g.delayUs);
+      }
+    }
+    if (!r) r = flush();
+    if (done) *done = ok;
+    return r;
+  }
+
+  int writeRegs(unsigned m, uint8_t slave7, const Reg *regs, unsigned n, unsigned *done = nullptr) {
+    return writeList(m, slave7, n, [regs](unsigned i) { return regs[i]; }, done);
   }
 
   // Register write on queue 0: SET_PARAM, WRITE (address + data, <= 11 bytes), REPORT with interrupt.
@@ -394,52 +465,7 @@ inline ProbeResult probe(const Ops &o, LdoState &ldo, Cci &cci, const Sensor &s,
   return res;
 }
 
-// ---- GCAM v1 tables (sensormodule.py --gcam), loaded at run time, never committed --------------------------------
-struct GcamReg { uint16_t addr, data; uint8_t addrBytes, dataBytes; uint16_t delayUs; };
-struct GcamSensor {
-  char name[16];
-  uint8_t slave7, addrBytes, dataBytes, mode;
-  uint16_t idReg, id, width, height, lanes, dt;
-  uint32_t laneMbps;
-  uint16_t nPowerUp, nInit, nMode, nStreamOn, nStreamOff;
-  const uint8_t *powerUp;      // nPowerUp x 8 bytes {u8 type, u8 pad, u16 delayMs, u32 value}
-  const uint8_t *regs[4];      // init, mode, stream on, stream off: n x 8 bytes {u16 addr, u16 data, u8, u8, u16 delayUs}
-};
-
-inline uint16_t le16(const uint8_t *p) { return static_cast<uint16_t>(p[0] | p[1] << 8); }
-inline uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | static_cast<uint32_t>(p[3]) << 24; }
-inline GcamReg gcamReg(const uint8_t *p) { return {le16(p), le16(p + 2), p[4], p[5], le16(p + 6)}; }
-
-// Finds a sensor by name ("mot_s5kgm1st" or "s5kgm1st"); every length is checked against len.
-inline int gcamFind(const uint8_t *blob, size_t len, const char *name, GcamSensor *out) {
-  if (!blob || len < 12 || blob[0] != 'G' || blob[1] != 'C' || blob[2] != 'A' || blob[3] != 'M') return kErrInval;
-  if (le32(blob + 4) != 1) return kErrInval;
-  const uint32_t count = le32(blob + 8);
-  size_t at = 12;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (len - at < 48) return kErrRange;
-    const uint8_t *h = blob + at;
-    GcamSensor s = {};
-    for (unsigned k = 0; k < 15; ++k) s.name[k] = static_cast<char>(h[k]);
-    s.slave7 = h[16]; s.addrBytes = h[17]; s.dataBytes = h[18]; s.mode = h[19];
-    s.idReg = le16(h + 20); s.id = le16(h + 22); s.width = le16(h + 24); s.height = le16(h + 26);
-    s.lanes = le16(h + 28); s.dt = le16(h + 30); s.laneMbps = le32(h + 32);
-    s.nPowerUp = le16(h + 36); s.nInit = le16(h + 38); s.nMode = le16(h + 40);
-    s.nStreamOn = le16(h + 42); s.nStreamOff = le16(h + 44);
-    at += 48;
-    const size_t need = 8ull * (s.nPowerUp + s.nInit + s.nMode + s.nStreamOn + s.nStreamOff);
-    if (len - at < need) return kErrRange;
-    s.powerUp = blob + at;
-    at += 8ull * s.nPowerUp;
-    const uint16_t n[4] = {s.nInit, s.nMode, s.nStreamOn, s.nStreamOff};
-    for (unsigned k = 0; k < 4; ++k) { s.regs[k] = blob + at; at += 8ull * n[k]; }
-    const char *a = s.name, *b = name;
-    if (a[0] == 'm' && a[1] == 'o' && a[2] == 't' && a[3] == '_' && !(b[0] == 'm' && b[1] == 'o' && b[2] == 't' && b[3] == '_')) a += 4;
-    while (*a && *a == *b) { ++a; ++b; }
-    if (!*a && !*b) { *out = s; return kOk; }
-  }
-  return kErrRange;
-}
+// GCAM tables (vendor sequences, loaded at run time): GuampCameraSensor.h.
 
 }  // namespace gcam
 #endif

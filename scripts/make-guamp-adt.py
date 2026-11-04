@@ -40,6 +40,9 @@ TEXT_FIXUP_ENTRY_BYTES = 160
 
 # Himax touch firmware, local only (gitignored local/ of the device repository; the build copies the tree without it)
 TOUCH_FIRMWARE = Path.home() / 'moto/UniXNU-guamp/local/hlt_Himax_firmware.bin'
+# Camera sensor tables (GCAM v2 from the vendor sensormodule blobs, analisi/camera/tools/sensormodule.py --gcam):
+# local only like the touch firmware; the kernel GuampCamera session reads /chosen/guamp-camera-gcam.
+CAMERA_GCAM = Path.home() / 'moto/UniXNU-guamp/local/guamp-camera.gcam'
 
 def node(name, properties=(), children=()):
     properties = [('name', name.encode() + b'\0'), *properties]
@@ -152,6 +155,7 @@ def main():
             # tree, never committed; the kernel touch service reads it here (stage 4).
             *([('guamp-touch-firmware', TOUCH_FIRMWARE.read_bytes())]
               if TOUCH_FIRMWARE.exists() else []),
+            *([('guamp-camera-gcam', CAMERA_GCAM.read_bytes())] if CAMERA_GCAM.exists() else []),
             *([('certificate-production-status', u32(0)), ('effective-production-status-ap', u32(0)),
                ('certificate-security-mode', u32(1)), ('effective-security-mode-sep', u32(1))] if ipad else []),
             *([('ephemeral-storage', u32(1))]

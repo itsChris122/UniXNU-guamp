@@ -1,8 +1,11 @@
-// Host test of GuampCameraCore.h (PM8008 LDOs, CCI queue commands, power sequences, chip id probe, GCAM parser) and
-// of the RDI skeleton plan (GuampCameraRdi.h), against a simulated PM8008 and a simulated CCI with four sensors that
-// answer only when their rails, MCLK and reset line are right. Optional argument: a .gcam file made by
-// analisi/camera/tools/sensormodule.py --gcam (vendor data, kept outside the repo) to check the parser on real tables.
+// Host test of GuampCameraCore.h (PM8008 LDOs, CCI queue commands, batched writes, power sequences, chip id probe),
+// GuampCameraSensor.h (GCAM v2 parser, mode choice, MIPI facts, exposure/gain registers, sensor session) and of the
+// RDI skeleton plan (GuampCameraRdi.h), against a simulated PM8008 and a simulated CCI with four sensors that answer
+// only when their rails, MCLK and reset line are right and keep a register file. Optional argument: a .gcam file made
+// by analisi/camera/tools/sensormodule.py --gcam (vendor data, kept outside the repo) to run every sensor's real
+// tables through the session.
 #include "../GuampCameraCore.h"
+#include "../GuampCameraSensor.h"
 #include "../GuampCameraRdi.h"
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +35,11 @@ struct Sim {
   uint16_t sensorId[4] = {0xf8d1, 0x487b, 0x002b, 0x002b};
   uint32_t regPtr = 0;
   unsigned reads = 0;
+  // sensor register files: SMIA byte map (S5K direct page 0x4000 only), OV02B {page << 8 | reg}
+  std::vector<uint8_t> regs[4] = {std::vector<uint8_t>(0x10000), std::vector<uint8_t>(0x10000), std::vector<uint8_t>(0x10000),
+                                  std::vector<uint8_t>(0x10000)};
+  unsigned indirect[4] = {}, regWrites[4] = {}, writeCmds[4] = {}, s5kPage = 0x4000, maxQueue = 0, queueRuns = 0;
+  uint8_t frame[4] = {};
 };
 static Sim *S;
 
@@ -42,6 +50,41 @@ static bool powered(const Sensor &s) {
   if (!(S->pm[0][kPmChipEnable] & 1)) return false;
   auto ok = [](const Rail &r) { return !r.ldo || (ldoOnSim(r.ldo) && ldoMvSim(r.ldo) == ldoMv(r.uv)); };
   return ok(s.vio) && ok(s.vana) && ok(s.vdig) && S->mclk[s.mclk] && S->gpioHigh[s.resetGpio];
+}
+
+static bool ovSensor(const Sensor &s) { return s.addrBytes == 1; }
+static uint32_t regKey(const Sensor &s, uint32_t a) { return ovSensor(s) ? (S->regs[s.cell][0xfd] << 8 | (a & 0xff)) : a & 0xffff; }
+static bool streaming(const Sensor &s) { return ovSensor(s) ? (S->regs[s.cell][0x3c2] & 1) : (S->regs[s.cell][0x0100] & 1); }
+
+// One WRITE command: address (sensor width) then data bytes; 0x6F12 = S5K indirect port, otherwise auto increment.
+static void sensorWrite(const Sensor &s, const std::vector<uint8_t> &by) {
+  if (by.size() <= s.addrBytes) { printf("sim: write without data\n"); ++fails; return; }
+  uint32_t a = 0;
+  for (unsigned k = 0; k < s.addrBytes; ++k) a = a << 8 | by[k];
+  const size_t nd = by.size() - s.addrBytes;
+  if (s.addrBytes == 2 && a == kSamsungDataPort) {
+    if (nd % 2) { printf("sim: odd 0x6f12 data\n"); ++fails; }
+    S->indirect[s.cell] += static_cast<unsigned>(nd / 2);
+    S->regWrites[s.cell] += static_cast<unsigned>(nd / 2);
+    return;
+  }
+  if (s.addrBytes == 2 && a == 0x6028 && nd == 2) { S->s5kPage = by[2] << 8 | by[3]; ++S->regWrites[s.cell]; return; }
+  for (size_t k = 0; k < nd; ++k) {
+    const uint32_t ra = a + static_cast<uint32_t>(k);
+    if (s.cell == 0 && S->s5kPage != 0x4000 && ra < 0x6000) continue;   // another direct page: not modelled
+    if (ovSensor(s) && (ra & 0xff) == 0xfd) { S->regs[s.cell][0xfd] = by[s.addrBytes + k]; continue; }   // OV page select, any page
+    S->regs[s.cell][regKey(s, ra)] = by[s.addrBytes + k];
+  }
+  // a vendor entry with 2 data bytes counts as one register write
+  S->regWrites[s.cell] += s.addrBytes == 2 && s.cell == 0 && nd == 2 ? 1 : static_cast<unsigned>(nd);
+}
+static uint8_t sensorRead(const Sensor &s, uint32_t a) {
+  const uint16_t id = S->sensorId[s.cell];
+  if (s.idBytes == 2 && a == s.idReg) return id >> 8;
+  if (s.idBytes == 2 && a == s.idReg + 1u) return id & 0xff;
+  if (s.idBytes == 1 && a == s.idReg) return id & 0xff;
+  if (!ovSensor(s) && a == 0x0005) return streaming(s) ? (S->frame[s.cell] = static_cast<uint8_t>(S->frame[s.cell] + 7)) : S->frame[s.cell];
+  return S->regs[s.cell][regKey(s, a)];
 }
 
 static int pmRead(void *, uint8_t dev, uint16_t reg, uint8_t *v) {
@@ -74,6 +117,9 @@ static const Sensor *sensorAt(unsigned m, uint8_t slave) {
 
 static void execQueue(unsigned m, unsigned qq) {
   std::vector<uint32_t> &w = S->q[m][qq];
+  if (w.size() > S->maxQueue) S->maxQueue = static_cast<unsigned>(w.size());
+  if (w.size() > (qq ? kQ1Words : kQ0Words)) { printf("sim: queue %u overflow (%zu words)\n", qq, w.size()); ++fails; }
+  ++S->queueRuns;
   uint8_t slave = 0;
   bool nack = false;
   size_t i = 0;
@@ -97,15 +143,7 @@ static void execQueue(unsigned m, unsigned qq) {
       const unsigned n = (word >> 4) & 0xf;
       if (!ack) { nack = true; ++i; continue; }
       std::vector<uint8_t> bytes = {static_cast<uint8_t>(slave << 1 | 1)};
-      for (unsigned k = 0; k < n; ++k) {
-        const uint32_t a = S->regPtr + k;
-        uint8_t v = 0;
-        const uint16_t id = S->sensorId[s->cell];
-        if (s->idBytes == 2 && a == s->idReg) v = id >> 8;
-        else if (s->idBytes == 2 && a == s->idReg + 1u) v = id & 0xff;
-        else if (s->idBytes == 1 && a == s->idReg) v = id & 0xff;
-        bytes.push_back(v);
-      }
+      for (unsigned k = 0; k < n; ++k) bytes.push_back(sensorRead(*s, S->regPtr + k));
       for (size_t k = 0; k < bytes.size(); k += 4) {
         uint32_t d = 0;
         for (size_t j = 0; j < 4 && k + j < bytes.size(); ++j) d |= static_cast<uint32_t>(bytes[k + j]) << (8 * j);
@@ -119,7 +157,12 @@ static void execQueue(unsigned m, unsigned qq) {
     if (cmd == kCmdWrite) {
       const unsigned len = (word >> 4) & 0xf;
       const size_t words = (1 + len + 3) / 4;
+      if (len > kPayload) { printf("sim: write payload %u > %u\n", len, kPayload); ++fails; }
+      if (i + words > w.size()) { printf("sim: write command past the queue end\n"); ++fails; break; }
       if (!ack) nack = true;
+      std::vector<uint8_t> by;
+      for (size_t k = 1; k < 1 + len; ++k) by.push_back(static_cast<uint8_t>(w[i + k / 4] >> (8 * (k % 4))));
+      if (ack) { sensorWrite(*s, by); ++S->writeCmds[s->cell]; }
       i += words;
       continue;
     }
@@ -166,9 +209,10 @@ static int mclk(void *, unsigned idx, unsigned, int on) {
   S->trace.push_back("mclk" + std::to_string(idx) + (on ? "=on" : "=off"));
   return 0;
 }
+static unsigned sleptMs = 0;
 static void delayUs(void *, unsigned) {}
-static void sleepMs(void *, unsigned) {}
-static void noteFn(void *, const char *, int, uint32_t, uint32_t) {}
+static void sleepMs(void *, unsigned ms) { sleptMs += ms; }
+static void noteFn(void *, const char *s, int rc, uint32_t a, uint32_t b) { if (getenv("CAM_NOTES")) printf("  note %s rc %d 0x%x 0x%x\n", s, rc, a, b); }
 
 static const Ops kOps = {nullptr, pmRead, pmWrite, cciRd, cciWr, gpio, mclk, delayUs, sleepMs, noteFn};
 
@@ -208,7 +252,7 @@ static void testProbe() {
   Sim sim; S = &sim;
   LdoState st = {};
   Cci cci = {&kOps};
-  CHECK(cci.init(kCciFast) == 0 && sim.cciReset);
+  CHECK(cci.init(kCciFast) == 0 && sim.cciReset && cci.resetSeen);
   CHECK(sim.timing[0][0] == (0x26u << 16 | 0x38) && sim.timing[1][4] == (6u << 4 | 3));
   CHECK(pmChip(kOps, true) == 0);
   for (unsigned i = 0; i < kSensors; ++i) {
@@ -251,6 +295,73 @@ static void testProbe() {
   CHECK(pw.down() == 0 && ldoUsers(st) == 0);
 }
 
+// Batched writes: 0x6F12 packing (4 words per command), queue never above 64 words, delays flush, NACK reported.
+static void testWriteList() {
+  Sim sim; S = &sim;
+  LdoState st = {};
+  Cci cci = {&kOps};
+  CHECK(cci.init(kCciFast) == 0 && pmChip(kOps, true) == 0);
+  Power pw = {&kOps, &st, &kBoard[0]};
+  CHECK(pw.up() == 0);
+  std::vector<Reg> v;
+  v.push_back({0x6028, 0x2000, 2, 2, 0});
+  v.push_back({0x602a, 0x3f5c, 2, 2, 0});
+  for (unsigned k = 0; k < 1001; ++k) v.push_back({0x6f12, static_cast<uint16_t>(k), 2, 2, 0});
+  v.push_back({0x6028, 0x4000, 2, 2, 0});
+  v.push_back({0x0340, 0x0c, 2, 1, 0});
+  v.push_back({0x0341, 0x6d, 2, 1, 2000});                              // delay: flush + 2 ms sleep
+  v.push_back({0x0100, 0x0103, 2, 2, 0});
+  unsigned done = 0;
+  sleptMs = 0;
+  CHECK(cci.writeRegs(0, 0x2d, v.data(), static_cast<unsigned>(v.size()), &done) == 0 && done == v.size());
+  CHECK(sim.indirect[0] == 1001 && sim.regWrites[0] == v.size());
+  CHECK(sim.writeCmds[0] == 2 + 251 + 1 + 2 + 1);                       // 1001 words = 250 x 4 + 1
+  CHECK(sim.maxQueue <= kQ0Words && sleptMs == 2);
+  CHECK(sim.regs[0][0x0340] == 0x0c && sim.regs[0][0x0341] == 0x6d && sim.regs[0][0x0100] == 1 && sim.regs[0][0x0101] == 3);
+  // the wrong slave: NACK, nothing counted as done past the failing run
+  CHECK(cci.writeRegs(0, 0x77, v.data(), 4, &done) == kErrNack && done == 0);
+  Reg bad = {0x0100, 1, 3, 1, 0};
+  CHECK(cci.writeRegs(0, 0x2d, &bad, 1) == kErrInval);
+  CHECK(pw.down() == 0);
+}
+
+static void testExposure() {
+  Mode m = {};
+  m.width = 1280; m.height = 720; m.lanes = 4; m.bits = 10; m.opPixClk = 145600000; m.llpck = 5024; m.fll = 816; m.fpsMilli = 120010;
+  CHECK(m.laneMbps() == 364);
+  CHECK(m.linePs() == 1000000000000000ull / (120010ull * 816));            // ~10.2 us
+  const ExpModel &g = kExp[0];
+  Reg r[kExpRegsMax];
+  ExposureApplied a;
+  unsigned n = exposureRegs(g, kBoard[0], m, {100, 512, 0}, r, &a);
+  CHECK(n == 9 && r[0].addr == 0x6028 && r[0].data == 0x4000 && r[1].addr == 0x0104 && r[1].data == 1 && r[8].addr == 0x0104 && r[8].data == 0);
+  CHECK(r[6].addr == 0x0204 && r[6].data == 0x00 && r[7].addr == 0x0205 && r[7].data == 0x40 && a.code == 0x40 && a.gainQ8 == 512);
+  CHECK(r[2].addr == 0x0340 && (r[2].data << 8 | r[3].data) == 816 && (r[4].data << 8 | r[5].data) == 100 && a.lines == 100);
+  // long exposure grows the frame length, clamps at maxLineCount; gain clamps to 16x and 1x
+  n = exposureRegs(g, kBoard[0], m, {2000, 100000, 0}, r, &a);
+  CHECK(a.fll == 2004 && a.lines == 2000 && a.code == 0x200);
+  n = exposureRegs(g, kBoard[0], m, {60000, 10, 0}, r, &a);
+  CHECK(a.fll == 47974 && a.lines == 47970 && a.code == 0x20);
+  n = exposureRegs(g, kBoard[0], m, {0, 256, 0}, r, &a);
+  CHECK(a.lines == 2);
+  // S5K4H7: no group hold, no page
+  n = exposureRegs(kExp[1], kBoard[1], m, {100, 256, 0}, r, &a);
+  CHECK(n == 6 && r[0].addr == 0x0340 && r[5].addr == 0x0205 && r[5].data == 0x20);
+  // OV02B: page, vertical blank, steps
+  Mode ov = {};
+  ov.fll = 1221; ov.fpsMilli = 30070; ov.llpck = 448;
+  n = exposureRegs(kExp[3], kBoard[3], ov, {500, 256 * 3 + 100, 0}, r, &a);
+  CHECK(n == 7 && r[0].addr == 0xfd && r[0].data == 1 && r[1].addr == 0x14 && r[2].data == 1 && r[6].addr == 0xfe && r[6].data == 2);
+  CHECK(r[3].data == 1 && r[4].data == 0xf4 && r[5].addr == 0x22 && a.code == 0x36 && a.gainQ8 == 0x36 * 16);   // 3.39x -> 3.375x
+  CHECK(gainCode(kExp[3], 256 * 10) == 0xa0 && gainCode(kExp[3], 256 * 9 + 50) == 0x90 && gainCode(kExp[3], 256 * 20) == 0xf8);
+  CHECK(gainCode(kExp[3], 256 * 5 + 40) == 0x50 && gainCode(kExp[3], 100) == 0x10);
+  n = exposureRegs(kExp[3], kBoard[3], ov, {3000, 256, 0}, r, &a);
+  CHECK(a.fll == 3008 && (r[1].data << 8 | r[2].data) == 3008 - 1220);
+  n = exposureRegs(kExp[3], kBoard[3], ov, {40000, 256, 0}, r, &a);
+  CHECK(a.fll == 32759 && a.lines == 32751);
+  CHECK(linesForNs(ov, 10000000ull) == 367);                               // 10 ms at 27.2 us per line
+}
+
 static void testRdi() {
   rdi::Write w[64];
   rdi::Cfg c;
@@ -271,23 +382,149 @@ static void testRdi() {
                                             w[i].off, w[i].rmwOr ? "|=" : "= ", w[i].val, w[i].what);
 }
 
+// ---- synthetic GCAM v2 ---------------------------------------------------------------------------------------------
 static void put16(std::vector<uint8_t> &b, uint16_t v) { b.push_back(v & 0xff); b.push_back(v >> 8); }
+static void put32(std::vector<uint8_t> &b, uint32_t v) { put16(b, v & 0xffff); put16(b, v >> 16); }
+static void putReg(std::vector<uint8_t> &b, uint16_t a, uint16_t d, uint8_t ab, uint8_t db, uint16_t dl = 0) {
+  put16(b, a); put16(b, d); b.push_back(ab); b.push_back(db); put16(b, dl);
+}
+struct SynMode { uint16_t w, h; uint32_t pclk, llpck, fll, fps; std::vector<std::vector<uint16_t>> regs; };
+static void synSensor(std::vector<uint8_t> &b, const char *name, const Sensor &s, uint8_t dataBytes, const std::vector<SynMode> &modes,
+                      const std::vector<std::vector<uint16_t>> &init, const std::vector<std::vector<uint16_t>> &on,
+                      const std::vector<std::vector<uint16_t>> &off) {
+  char n[16] = {};
+  strncpy(n, name, 15);
+  b.insert(b.end(), n, n + 16);
+  b.insert(b.end(), {s.slave7, s.addrBytes, dataBytes, static_cast<uint8_t>(modes.size())});
+  put16(b, s.idReg); put16(b, s.id);
+  put16(b, 1); put16(b, static_cast<uint16_t>(init.size())); put16(b, static_cast<uint16_t>(on.size())); put16(b, static_cast<uint16_t>(off.size()));
+  put16(b, 64); put16(b, 4000); put16(b, 3000);
+  b.insert(b.end(), 10, 0);
+  for (const SynMode &m : modes) {
+    const size_t at = b.size();
+    put16(b, m.w); put16(b, m.h); put16(b, 0); put16(b, 0);
+    b.insert(b.end(), {4, 0x2b, 0, 1});
+    put32(b, m.pclk); put32(b, m.llpck); put32(b, m.fll); put32(b, m.fps);
+    b.insert(b.end(), {1, 1, 14, 10});
+    put16(b, 0); put16(b, 0); b.push_back(0); b.push_back(0); put16(b, static_cast<uint16_t>(m.regs.size()));
+    b.insert(b.end(), 48 - (b.size() - at), 0);
+  }
+  b.insert(b.end(), {8, 0, 1, 0, 1, 0, 0, 0});                       // power: RESET 1 + 1 ms (informative)
+  auto list = [&](const std::vector<std::vector<uint16_t>> &L) {
+    for (const auto &r : L) putReg(b, r[0], r[1], s.addrBytes, static_cast<uint8_t>(r[2]), r.size() > 3 ? r[3] : 0);
+  };
+  list(init); list(on); list(off);
+  for (const SynMode &m : modes) list(m.regs);
+}
+
+static std::vector<uint8_t> synGcam() {
+  std::vector<uint8_t> b = {'G', 'C', 'A', 'M', 2, 0, 0, 0, 2, 0, 0, 0};
+  // gm1st: two modes (full 4000x3000, small 1280x720), init with a 0x6F12 burst
+  std::vector<std::vector<uint16_t>> init = {{0x6028, 0x4000, 2}, {0x6010, 0x0001, 2, 6000}, {0x6028, 0x2000, 2}, {0x602a, 0x3f5c, 2}};
+  for (unsigned k = 0; k < 9; ++k) init.push_back({0x6f12, static_cast<uint16_t>(k), 2});
+  SynMode full = {4000, 3000, 460800000, 5024, 3181, 30160, {{0x6028, 0x4000, 2}, {0x034c, 0x0fa0, 2}, {0x034e, 0x0bb8, 2}, {0x6028, 0x2000, 2}}};
+  SynMode small = {1280, 720, 145600000, 5024, 816, 120010, {{0x6028, 0x4000, 2}, {0x034c, 0x0500, 2}, {0x034e, 0x02d0, 2}, {0x6028, 0x2000, 2}}};
+  synSensor(b, "mot_s5kgm1st", kBoard[0], 2, {full, small}, init, {{0x6028, 0x4000, 2}, {0x0100, 0x0103, 2}}, {{0x0100, 0x00, 1}});
+  // 4h7: one full mode
+  SynMode f4 = {3264, 2448, 292800000, 3580, 2530, 30030, {{0x0100, 0, 1}, {0x034c, 0x0c, 1}, {0x034d, 0xc0, 1}, {0x034e, 0x09, 1}, {0x034f, 0x90, 1}}};
+  synSensor(b, "mot_s5k4h7", kBoard[1], 1, {f4}, {{0x0b05, 1, 1}}, {{0x0100, 1, 1}}, {{0x0100, 0, 1}});
+  return b;
+}
+
 static void testGcamSynthetic() {
-  std::vector<uint8_t> b = {'G', 'C', 'A', 'M', 1, 0, 0, 0, 1, 0, 0, 0};
-  const char name[16] = "mot_ov02b10";
-  b.insert(b.end(), name, name + 16);
-  b.insert(b.end(), {0x3c, 1, 1, 0});
-  put16(b, 3); put16(b, 0x2b); put16(b, 1600); put16(b, 1200); put16(b, 1); put16(b, 0x2b);
-  b.insert(b.end(), {0x94, 2, 0, 0});
-  put16(b, 1); put16(b, 2); put16(b, 1); put16(b, 1); put16(b, 1); put16(b, 0);
-  b.insert(b.end(), {8, 0, 10, 0, 1, 0, 0, 0});                       // power: RESET 1 + 10 ms
-  for (unsigned k = 0; k < 5; ++k) { put16(b, 0xfd); put16(b, k); b.push_back(1); b.push_back(1); put16(b, k == 1 ? 5000 : 0); }
-  GcamSensor s;
-  CHECK(gcamFind(b.data(), b.size(), "ov02b10", &s) == 0 && s.slave7 == 0x3c && s.width == 1600 && s.laneMbps == 660);
-  CHECK(gcamFind(b.data(), b.size(), "mot_ov02b10", &s) == 0 && s.nInit == 2);
-  CHECK(gcamReg(s.regs[0] + 8).delayUs == 5000 && gcamReg(s.regs[3]).data == 4);
-  CHECK(gcamFind(b.data(), b.size(), "s5k4h7", &s) == kErrRange);
-  for (size_t cut = 0; cut < b.size(); ++cut) CHECK(gcamFind(b.data(), cut, "ov02b10", &s) != 0);
+  std::vector<uint8_t> b = synGcam();
+  Gcam g;
+  CHECK(gcamFind(b.data(), b.size(), "s5kgm1st", &g) == 0 && g.slave7 == 0x2d && g.nModes == 2 && g.nInit == 13 && g.id == 0xf8d1);
+  CHECK(g.modes[1].width == 1280 && g.modes[1].laneMbps() == 364 && g.modes[0].laneMbps() == 1152 && g.modes[1].nRegs == 4);
+  CHECK(gcamReg(g.init + 8).delayUs == 6000 && gcamReg(g.modes[1].regs + 8).data == 0x0500);
+  CHECK(gcamFind(b.data(), b.size(), "mot_s5k4h7", &g) == 0 && g.nModes == 1 && g.modes[0].fll == 2530);
+  CHECK(gcamFind(b.data(), b.size(), "ov02b10", &g) == kErrRange);
+  for (size_t cut = 0; cut < b.size(); ++cut) CHECK(gcamFind(b.data(), cut, "s5k4h7", &g) != 0);
+  std::vector<uint8_t> v1 = b;
+  v1[4] = 1;
+  CHECK(gcamFind(v1.data(), v1.size(), "s5kgm1st", &g) == kErrInval);
+  // mode choice
+  Mode m;
+  Reg ov[kBinRegs];
+  unsigned nov = 9;
+  CHECK(gcamFind(b.data(), b.size(), "s5kgm1st", &g) == 0);
+  CHECK(pickMode(g, kExp[0], kResLow, -1, &m, ov, &nov) && m.index == 1 && nov == 0);
+  CHECK(pickMode(g, kExp[0], kResFull, -1, &m, ov, &nov) && m.index == 0 && m.width == 4000);
+  CHECK(pickMode(g, kExp[0], kResLow, 0, &m, ov, &nov) && m.index == 0);
+  CHECK(gcamFind(b.data(), b.size(), "s5k4h7", &g) == 0);
+  CHECK(pickMode(g, kExp[1], kResLow, -1, &m, ov, &nov) && m.derived && m.width == 1632 && m.height == 1224 && nov == kBinRegs);
+  CHECK(ov[1].addr == 0x0901 && ov[1].data == 0x22 && ov[4].addr == 0x034c && (ov[4].data << 8 | ov[5].data) == 1632);
+  CHECK(pickMode(g, kExp[1], kResFull, -1, &m, ov, &nov) && !m.derived && m.width == 3264 && nov == 0);
+  const Mipi mi = mipiOf(kBoard[1], m);
+  CHECK(mi.csiphy == 2 && mi.lanes == 4 && mi.laneMbps == 732 && mi.dt == 0x2b && mi.strideBytes == 4080 && mi.laneAssign == 0x3210);
+}
+
+// Session over the simulator: open, configure, exposure, stream on/off with a moving frame counter, close.
+static void sessionRun(const uint8_t *blob, size_t len, unsigned cell, Res res, bool verbose) {
+  Sim *sim = new Sim; S = sim;
+  LdoState st = {};
+  Cci cci = {&kOps};
+  CHECK(cci.init(kCciFast) == 0 && pmChip(kOps, true) == 0);
+  Gcam g;
+  CHECK(gcamFind(blob, len, kBoard[cell].name, &g) == 0);
+  Session ss;
+  CHECK(ss.open(kOps, st, cci, kCciFast, kBoard[cell], &g) == 0 && ss.state == kPowered);
+  CHECK(ss.streamOn() == kErrInval);                                     // not configured yet
+  Mode m;
+  Reg ov[kBinRegs];
+  unsigned nov;
+  pickMode(g, kExp[cell], res, -1, &m, ov, &nov);
+  const int rc = ss.configure(res, -1, {linesForNs(m, 10000000ull), 512, 0});
+  CHECK(rc == 0 && ss.state == kConfigured);
+  const unsigned expectWrites = g.nInit + ss.mode.nRegs + ss.nOverlay + (kExp[cell].longExp ? 4 : 0);
+  CHECK(sim->regWrites[cell] >= expectWrites);
+  CHECK(sim->maxQueue <= kQ0Words);
+  Status a, b;
+  CHECK(ss.status(&a) == 0 && a.ok && a.id == kBoard[cell].id && a.lines == ss.exp.lines && a.fll == ss.exp.fll && a.gainCode == ss.exp.code);
+  if (kExp[cell].kind == kExpSmia) CHECK(a.width == ss.mode.width && a.height == ss.mode.height);
+  CHECK(ss.streamOn() == 0 && ss.state == kStreaming && streaming(kBoard[cell]));
+  CHECK(ss.status(&b) == 0);
+  if (kExp[cell].kind == kExpSmia) CHECK(b.frameCount != a.frameCount && b.modeSelect == 1);
+  ExposureApplied e;
+  CHECK(ss.setExposure({ss.exp.lines * 2, 256 * 4, 0}) == 0);
+  e = ss.exp;
+  CHECK(ss.status(&b) == 0 && b.lines == e.lines && b.gainCode == e.code);
+  CHECK(ss.streamOff() == 0 && !streaming(kBoard[cell]) && ss.state == kConfigured);
+  CHECK(ss.close() == 0 && ss.state == kOff && ldoUsers(st) == 0 && !sim->mclk[kBoard[cell].mclk]);
+  if (verbose) {
+    const Mipi mi = mipiOf(kBoard[cell], ss.mode);
+    printf("  session %-9s %s mode %u%s %ux%u: %u writes in %u commands, %u queue runs (max %u words), %u indirect; exposure %u lines "
+           "(%llu us) fll %u gain 0x%x; mipi csiphy %u %u lane %u Mbit/s dt 0x%x settle %u\n", kBoard[cell].name, res ? "full" : "low ",
+           ss.mode.index, ss.mode.derived ? "b" : "", ss.mode.width, ss.mode.height, sim->regWrites[cell], sim->writeCmds[cell], sim->queueRuns,
+           sim->maxQueue, sim->indirect[cell], e.lines, static_cast<unsigned long long>(e.exposureNs / 1000), e.fll, e.code, mi.csiphy, mi.lanes,
+           mi.laneMbps, mi.dt, mi.settle);
+  }
+  delete sim;
+}
+
+static void testSessionSynthetic() {
+  std::vector<uint8_t> b = synGcam();
+  sessionRun(b.data(), b.size(), 0, kResLow, false);
+  sessionRun(b.data(), b.size(), 0, kResFull, false);
+  sessionRun(b.data(), b.size(), 1, kResLow, false);
+  // a sensor that NACKs during init: the session reports it and powers down on close
+  Sim *sim = new Sim; S = sim;
+  LdoState st = {};
+  Cci cci = {&kOps};
+  CHECK(cci.init(kCciFast) == 0 && pmChip(kOps, true) == 0);
+  Gcam g;
+  CHECK(gcamFind(b.data(), b.size(), "s5k4h7", &g) == 0);
+  Session ss;
+  CHECK(ss.open(kOps, st, cci, kCciFast, kBoard[1], &g) == 0);
+  sim->sensorPresent[1] = false;
+  CHECK(ss.configure(kResLow, -1, {100, 256, 0}) == kErrNack && ss.state == kPowered);
+  CHECK(ss.close() == 0 && ldoUsers(st) == 0);
+  // table of another sensor: refused
+  CHECK(gcamFind(b.data(), b.size(), "s5kgm1st", &g) == 0);
+  sim->sensorPresent[1] = true;
+  CHECK(ss.open(kOps, st, cci, kCciFast, kBoard[1], &g) == 0 && ss.configure(kResLow, -1, {100, 256, 0}) == kErrMismatch);
+  CHECK(ss.close() == 0);
+  delete sim;
 }
 
 static void testGcamFile(const char *path) {
@@ -298,13 +535,22 @@ static void testGcamFile(const char *path) {
   while ((c = fgetc(f)) != EOF) b.push_back(static_cast<uint8_t>(c));
   fclose(f);
   for (unsigned i = 0; i < kSensors; ++i) {
-    GcamSensor s;
-    const int r = gcamFind(b.data(), b.size(), kBoard[i].name, &s);
+    Gcam g;
+    const int r = gcamFind(b.data(), b.size(), kBoard[i].name, &g);
     CHECK(r == 0);
     if (r) continue;
-    CHECK(s.slave7 == kBoard[i].slave7 && s.idReg == kBoard[i].idReg && s.id == kBoard[i].id && s.addrBytes == kBoard[i].addrBytes);
-    printf("  gcam %-9s slave 0x%02x id 0x%04x mode %u %ux%u %u lane %u Mbit/s: power %u, init %u, mode %u, on %u, off %u writes\n",
-           kBoard[i].name, s.slave7, s.id, s.mode, s.width, s.height, s.lanes, s.laneMbps, s.nPowerUp, s.nInit, s.nMode, s.nStreamOn, s.nStreamOff);
+    CHECK(g.slave7 == kBoard[i].slave7 && g.idReg == kBoard[i].idReg && g.id == kBoard[i].id && g.addrBytes == kBoard[i].addrBytes);
+    printf("  gcam %-9s slave 0x%02x id 0x%04x: power %u, init %u, on %u, off %u writes, black %u, %u modes\n", kBoard[i].name, g.slave7, g.id,
+           g.nPowerUp, g.nInit, g.nOn, g.nOff, g.blackLevel, g.nModes);
+    for (unsigned m = 0; m < g.nModes; ++m) {
+      const Mode &d = g.modes[m];
+      CHECK(d.dt == kDtRaw10 && d.bits == 10 && d.vc == 0);
+      printf("    mode %u %ux%u @%u.%03u fps, %u lane %u Mbit/s, llpck %u fll %u, line %llu ns, bin %ux%u, cfa %u, settle %u, %u writes%s\n", m,
+             d.width, d.height, d.fpsMilli / 1000, d.fpsMilli % 1000, d.lanes, d.laneMbps(), d.llpck, d.fll,
+             static_cast<unsigned long long>(d.linePs() / 1000), d.hBin, d.vBin, d.cfa, d.settle, d.nRegs, d.extraW ? " + PDAF stream" : "");
+    }
+    sessionRun(b.data(), b.size(), i, kResLow, true);
+    sessionRun(b.data(), b.size(), i, kResFull, true);
   }
 }
 
@@ -312,8 +558,11 @@ int main(int argc, char **argv) {
   testEncoding();
   testLdo();
   testProbe();
+  testWriteList();
+  testExposure();
   testRdi();
   testGcamSynthetic();
+  testSessionSynthetic();
   if (argc > 1) testGcamFile(argv[1]);
   printf("camera_host: %s\n", fails ? "FAIL" : "PASS");
   return fails != 0;
