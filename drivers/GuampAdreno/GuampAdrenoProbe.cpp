@@ -60,6 +60,9 @@ extern volatile uint32_t native_adreno_publish_ro_clean;
 // submission (guamp-adreno-reassert-check, default 64; 0 = never) after a quiet time (guamp-adreno-reassert-quiet-us, default 100000).
 extern volatile uint32_t native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check,
     native_adreno_wc_quiet_us;
+// patches/native-adreno/0013: imports the GPU only reads cleaned when mapped and every N-th submission (guamp-adreno-ro-imports-owned,
+// default 1; 0 = at every submission) (guamp-adreno-ro-imports-sweep, default 32; 0 = never).
+extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_imports_sweep;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 boolean_t ml_get_interrupts_enabled(void);
@@ -796,6 +799,10 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   native_adreno_reassert_mode = bootArg("guamp-adreno-reassert", 1) ? 1 : 0;
   native_adreno_reassert_check = bootArg("guamp-adreno-reassert-check", 64);
   native_adreno_wc_quiet_us = bootArg("guamp-adreno-reassert-quiet-us", 100000);
+  native_adreno_ro_imports_owned = bootArg("guamp-adreno-ro-imports-owned", 1) ? 1 : 0;
+  native_adreno_ro_imports_sweep = bootArg("guamp-adreno-ro-imports-sweep", 32);
+  IOLog("GuampAdreno: read-only imports cleaned at map only %u, swept every %u submissions\n", native_adreno_ro_imports_owned,
+        native_adreno_ro_imports_sweep);
   IOLog("GuampAdreno: submission coherence: client-cleaned imports %u, re-assert on events %u (check every %u, quiet %u us)\n",
         native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check, native_adreno_wc_quiet_us);
   IOLog("GuampAdreno: job prologue wait for idle %u, submission maintenance own window %u\n", native_adreno_a6xx_prologue_wfi,

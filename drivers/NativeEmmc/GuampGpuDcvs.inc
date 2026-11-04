@@ -42,6 +42,8 @@ __attribute__((weak)) volatile uint64_t native_adreno_publish_client[2];
 __attribute__((weak)) volatile uint32_t native_adreno_client_cleans_maps[2];
 __attribute__((weak)) volatile uint64_t native_adreno_reassert_stats[6];
 __attribute__((weak)) volatile uint32_t native_adreno_wc_epoch;
+// patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
+__attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 }
 
 namespace gpudcvs {
@@ -109,6 +111,13 @@ void logSubmits() {
           rw - prev[2], rn - prev[3], rc - prev[4], rb - prev[5], native_adreno_reassert_stats[3], native_adreno_reassert_stats[5],
           native_adreno_wc_epoch);
   prev[0] = cm; prev[1] = cb; prev[2] = rw; prev[3] = rn; prev[4] = rc; prev[5] = rb;
+  // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
+  static uint64_t ro[3];
+  const uint64_t om = native_adreno_publish_ro_owned[0], ob = native_adreno_publish_ro_owned[1], os = native_adreno_publish_ro_owned[2];
+  if (dn)
+    IOLog("GuampGpu: read-only imports left to their map clean: %llu mappings %llu KiB each, sweeps %llu\n", (om - ro[0]) / dn,
+          (ob - ro[1]) / dn >> 10, os - ro[2]);
+  ro[0] = om; ro[1] = ob; ro[2] = os;
 }
 
 void thread(void *, wait_result_t) {
