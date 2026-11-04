@@ -12,6 +12,16 @@ static struct ath10k *gw_ar;
 struct nw_wifi_stats nw_wifi_stats;
 static bool gw_polling;
 static bool gw_servicing_ce;
+/* guamp 04/11 (fin45 panic, kpan-20261104-021110: wifi_worker -> gw_snoc_step -> gw_snoc_poll_ce -> ath10k_snoc_htt_tx_cb ->
+ * ath10k_ce_completed_send_next read CE4's index from the freed RRI page): the WMI timeout's hardware restart runs as work
+ * inside a copy engine handler of the same poll (nested lx_pump), powers the block down and frees the RRI memory, and the
+ * poll then went on to the next engine. Every engine service now checks gw_ce_live first, and the RRI page is freed only
+ * when no copy engine service is on the stack (gw_ce_users), else when the outermost one ends. */
+static unsigned gw_ce_users;
+static bool gw_rri_free_pending;
+static void gw_rri_release_if_idle(struct ath10k *ar) {
+  if(gw_rri_free_pending&&!gw_ce_users) { gw_rri_free_pending=false; ath10k_ce_free_rri(ar); }
+}
 static int gw_boot_error;
 /* gw_regs_live / gw_ce_live (declared in gw_snoc.c, before the register accessors): a register access outside a confirmed
  * wlan_enable .. wlan_disable hangs the SoC bus; CE servicing runs only from a successful hif power_up to hif_stop. */
@@ -87,6 +97,7 @@ static int gw_hif_power_up(struct ath10k *ar,enum ath10k_firmware_mode mode) {
   int e=gw_board.power(gw_board.ctx,1); if(e) return e;
   e=ath10k_snoc_wlan_enable(ar,mode); if(e) return e;
   gw_regs_live=true;   // WLFW confirmed mission mode: the block answers from here to wlan_disable
+  if(gw_rri_free_pending) { gw_rri_free_pending=false; ath10k_ce_free_rri(ar); }   /* (guamp 04/11: a release still waiting) */
   ath10k_ce_alloc_rri(ar);
   e=ath10k_snoc_init_pipes(ar);
   if(e) { gw_regs_live=false; lx_log(3,"ath10k: CE init failed %d",e); ath10k_ce_free_rri(ar); return e; }
@@ -102,7 +113,7 @@ static void gw_hif_power_down(struct ath10k *ar) {
   timer_delete_sync(&ath10k_snoc_priv(ar)->rx_post_retry);
   int e=gw_board.wlan_disable(gw_board.ctx);
   if(e) { gw_boot_error=e; lx_log(3,"ath10k: WLAN stop unconfirmed; DMA retained"); return; }
-  ath10k_ce_free_rri(ar);
+  gw_rri_free_pending=true; gw_rri_release_if_idle(ar);   /* (guamp 04/11: not under a running copy engine service) */
   e=gw_board.power(gw_board.ctx,0); if(e) gw_boot_error=e;
 }
 static int gw_map_service_to_pipe(struct ath10k *ar,u16 service,u8 *ul,u8 *dl) {
@@ -145,7 +156,9 @@ static const struct ath10k_hif_ops gw_hif={
 static const struct ath10k_bus_ops gw_bus={.read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32};
 static int gw_napi_poll(struct napi_struct *n,int budget) {
   struct ath10k *ar=container_of(n,struct ath10k,napi);
-  if(gw_ce_live) for(unsigned i=0;i<12;i++) ath10k_ce_per_engine_service(ar,i);
+  gw_ce_users++;
+  for(unsigned i=0;i<12&&gw_ce_live;i++) ath10k_ce_per_engine_service(ar,i);   /* (guamp 04/11: checked before each engine) */
+  gw_ce_users--; gw_rri_release_if_idle(ar);
   int done=ath10k_htt_txrx_compl_task(ar,budget);
   if(done<budget) napi_complete_done(n,done); return done;
 }
@@ -225,16 +238,16 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
 static volatile unsigned gw_trace_polls,gw_trace_steps;
 void gw_snoc_poll_ce(void) {
   if(!gw_ar||gw_boot_error||gw_servicing_ce||!gw_ce_live)return;
-  gw_servicing_ce=true;
+  gw_servicing_ce=true; gw_ce_users++;
   const bool trace=nw_wifi_trace_budget&&nw_wifi_trace_take(&gw_trace_polls);
-  for(unsigned i=0;i<12;i++) {
+  for(unsigned i=0;i<12&&gw_ce_live;i++) {   /* (guamp 04/11: a handler may have powered the block down: stop there) */
     if(trace) nw_wifi_trace("poll_ce %u: ath10k_ce_per_engine_service ce%u (ctrl +0x%x)",gw_trace_polls,i,
                             (unsigned)ath10k_snoc_priv(gw_ar)->ce.ce_states[i].ctrl_addr);
     ath10k_ce_per_engine_service(gw_ar,i);
   }
   if(trace) nw_wifi_trace("poll_ce %u: napi_schedule",gw_trace_polls);
-  napi_schedule(&gw_ar->napi);
-  gw_servicing_ce=false;
+  if(gw_ce_live) napi_schedule(&gw_ar->napi);
+  gw_servicing_ce=false; gw_ce_users--; gw_rri_release_if_idle(gw_ar);
 }
 /* guamp 04/11: a cheap fingerprint of every copy engine's indices: it moves when anything was sent or received */
 static unsigned gw_ce_fingerprint(void) {
@@ -289,6 +302,10 @@ void gw_note_wmi_event(unsigned id) {
   gw_wmi_events_other++;
 }
 void gw_note_mgmt_drop(int why) { if(why>=0&&why<6) gw_mgmt_drops[why]++; }
+void gw_wmi_timeout(unsigned cmd_id) {
+  static unsigned timeouts; timeouts++;
+  lx_log(3,"ath10k: WMI command %#x had no credit for 10 s (%u so far): refused, no hardware restart (this port cannot restart the chip)",cmd_id,timeouts);
+}
 void gw_note_htt_t2h(unsigned type) { gw_htt_types[type<23?type:23]++; }
 /* Everything since the last call: WMI events by id, management frames dropped by reason, HTT messages by type; with
  * commands, the last WMI commands (id and how long ago). */
