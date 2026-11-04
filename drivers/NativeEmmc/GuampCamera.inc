@@ -20,6 +20,7 @@
 //                         (sensor PLLs are set for 24 MHz: at 19.2 every lane rate and fps is 0.8x)
 //   guamp-camera-cci=100|400|1000  CCI timing set (default 400; the CCI clock is the 19.2 MHz TCXO, so the bus
 //                         runs at about half the nominal rate)
+//   guamp-camera-af=1|3      after the sensors: lens driver + EEPROM AF probe (GuampCamera3A.inc), 3 = also macro
 //   guamp-camera-pmgpio=1    also program PM8008 GPIO1 as the DT does (func1 output); default: only log it
 //   guamp-camera-sensor=<cell>  session sensor for mode 2 (default 0 = s5kgm1st; 1 s5k4h7, 2 ov02b1b, 3 ov02b10)
 //   guamp-camera-res=0|1     0 low (default: gm1st 1280x720, 4h7 1632x1224 binned, ov02b 1600x1200), 1 full
@@ -197,6 +198,8 @@ void pmGpio1() {
   pmWrite(nullptr, gcam::kPmChip, gcam::kPmGpio1 + 0x44, 2);           // func1
   pmWrite(nullptr, gcam::kPmChip, gcam::kPmGpio1 + 0x46, 0x80);        // enable
 }
+
+namespace af { void probe(gcam::Cci &cci, const gcam::CciTiming &t); void start(); }   // GuampCamera3A.inc
 
 // ---- hardware up/down (shared by the probe, the session test and the API) ------------------------------------------
 bool gHwUp, gChipWasOn, gPmUp, gCamss;
@@ -425,6 +428,7 @@ void probeThread(void *, wait_result_t) {
   unsigned ok = 0, tried = 0;
   int r = hwUp();
   if (!r) ok = probeAll(&tried);
+  if (!r) af::probe(gCciDev, *gTiming);                            // guamp-camera-af (lens drivers, EEPROM AF block)
   if (gHwUp) hwDown();
   IOLog("GuampCamera: RESULT %u/%u sensors answered (step 1)%s\n", ok, tried, r ? ", hardware not up" : "");
   IOLockUnlock(gSessionLock);
@@ -446,6 +450,7 @@ void start() {
   PE_parse_boot_argn("guamp-camera-stream-ms", &gStreamMs, sizeof(gStreamMs));
   PE_parse_boot_argn("guamp-camera-exp-us", &gExpUs, sizeof(gExpUs));
   PE_parse_boot_argn("guamp-camera-gain", &gGainQ8, sizeof(gGainQ8));
+  af::start();
   if (gMode > 2) gMode = 1;
   if (gDelay > 600) gDelay = 600;
   if (gCciKhz != 100 && gCciKhz != 1000) gCciKhz = 400;

@@ -502,7 +502,8 @@ void thread(void *, wait_result_t) {
       IOLog("GuampPmic: torch init retry %u: %s\n", torchRetries, torchRuns ? "ready" : "still off");
     }
     if (torchRuns) torch::poll(tick);
-    IOSleep(25);
+    if (torchRuns) torch::nap(25);   // 25 ms, cut short by a photo flash request
+    else IOSleep(25);
   }
 }
 
@@ -525,3 +526,11 @@ extern "C" void guamp_torch_request(uint32_t permille) { pmic::torch::request(pe
 // Current torch state in mA (0 = off), for property readback.
 extern "C" uint32_t guamp_torch_current_ma() { return pmic::torch::gMa; }
 extern "C" int guamp_torch_available() { return pmic::torch::gReady ? 1 : 0; }
+// Photo flash from any thread (camera service through the GuampTorch FlashKind property, or in-kernel): kind 0 off,
+// 1 pre-flash (torch levels), 2 main flash; mA/ms 0 = defaults. Applied at once by the PMIC thread (see GuampTorch.inc).
+extern "C" void guamp_flash_request(uint32_t kind, uint32_t ma, uint32_t ms) { pmic::torch::flashRequest(kind, ma, ms); }
+// 0 idle, 1 pre-flash on, 2 main flash on, 3 refused; *onAbs = mach_absolute_time of the last switch on.
+extern "C" uint32_t guamp_flash_state(uint64_t *onAbs) {
+  if (onAbs) *onAbs = pmic::torch::gFlashOnAbs;
+  return pmic::torch::gFlashState;
+}
