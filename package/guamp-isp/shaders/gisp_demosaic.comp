@@ -1,0 +1,112 @@
+#version 450
+// SPDX-License-Identifier: BSD-2-Clause
+// guamp-isp, passo GPU 1: RAW10 MIPI -> nero/WB/LSC -> demosaic bilineare (o superpixel 2x2) -> CCM -> gamma
+// -> immagine RGBA8 alla risoluzione del ritaglio (o meta' in BIN2). Stessa aritmetica intera del percorso fast
+// della CPU (lineare a 14 bit, guadagni Q8, CCM Q10, LUT gamma 4096), ma senza la scala separabile: la scala la fa
+// il passo 2 con il campionatore bilineare dell'hardware.
+// Un invocazione = un quadrato 2x2 del RAW (FULL: 4 pixel d'uscita; BIN2: 1 pixel).
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer Raw { uint raw[]; };        // RAW10 impacchettato, parole da 32 bit
+layout(std430, binding = 1) readonly buffer Gain { uint gainq8[]; };    // guadagni Q8 per pixel del ritaglio
+                                                                       // (nero escluso), uint16 a coppie
+layout(std430, binding = 2) readonly buffer Lut { uint lut[]; };        // 4096 voci 0..255
+layout(rgba8, binding = 3) writeonly uniform image2D outImg;
+
+layout(push_constant) uniform P {
+    uint rawStride;   // byte per riga del RAW
+    uint cropX, cropY, cropW, cropH; // cropX multiplo di 4
+    uint cfa;         // gisp_cfa: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR
+    uint black01, black23; // nero per sito, 16 bit ciascuno
+    uint bin2;        // 1 = superpixel
+    int ccm[9];       // Q10
+} pc;
+
+const uint ONE = 16383u;
+
+uint rawByte(uint off) { return (raw[off >> 2] >> ((off & 3u) * 8u)) & 0xffu; }
+
+uint rawPixel(int x, int y) // coordinate nel ritaglio, riflesse ai bordi
+{
+    int w = int(pc.cropW), h = int(pc.cropH);
+    x = abs(x); y = abs(y);
+    if (x > w - 1) x = 2 * (w - 1) - x;
+    if (y > h - 1) y = 2 * (h - 1) - y;
+    uint ax = uint(x) + pc.cropX, ay = uint(y) + pc.cropY;
+    uint base = ay * pc.rawStride + (ax >> 2) * 5u;
+    uint k = ax & 3u;
+    return (rawByte(base + k) << 2) | ((rawByte(base + 4u) >> (2u * k)) & 3u);
+}
+
+uint lin(int x, int y)
+{
+    int w = int(pc.cropW), h = int(pc.cropH);
+    int rx = abs(x), ry = abs(y);
+    if (rx > w - 1) rx = 2 * (w - 1) - rx;
+    if (ry > h - 1) ry = 2 * (h - 1) - ry;
+    uint site = uint((ry + int(pc.cropY)) & 1) * 2u + uint(rx & 1);
+    uint b = site < 2u ? (pc.black01 >> (16u * site)) & 0xffffu : (pc.black23 >> (16u * (site - 2u))) & 0xffffu;
+    uint v = rawPixel(rx, ry);
+    uint d = v > b ? v - b : 0u;
+    uint gi = uint(ry) * pc.cropW + uint(rx);
+    uint g = (gainq8[gi >> 1] >> ((gi & 1u) * 16u)) & 0xffffu;
+    return min((d * g) >> 8, ONE);
+}
+
+int colorOf(uint site)
+{
+    // tabella di gisp_cfa_color
+    const int tab[16] = int[16](0, 1, 1, 2, 1, 0, 2, 1, 1, 2, 0, 1, 2, 1, 1, 0);
+    return tab[pc.cfa * 4u + site];
+}
+
+uint avg2(uint a, uint b) { return (a + b + 1u) >> 1; }
+uint avg4(uint a, uint b, uint c, uint d) { return (a + b + c + d + 2u) >> 2; }
+
+uvec3 demosaic(int x, int y)
+{
+    uint site = uint((y + int(pc.cropY)) & 1) * 2u + uint(x & 1);
+    int col = colorOf(site);
+    uint c = lin(x, y);
+    uvec3 o;
+    if (col == 1) {
+        uint hz = avg2(lin(x - 1, y), lin(x + 1, y)), vt = avg2(lin(x, y - 1), lin(x, y + 1));
+        int hcol = colorOf(site ^ 1u); // colore dei vicini orizzontali
+        o = hcol == 0 ? uvec3(hz, c, vt) : uvec3(vt, c, hz);
+    } else {
+        uint g = avg4(lin(x - 1, y), lin(x + 1, y), lin(x, y - 1), lin(x, y + 1));
+        uint dg = avg4(lin(x - 1, y - 1), lin(x + 1, y - 1), lin(x - 1, y + 1), lin(x + 1, y + 1));
+        o = col == 0 ? uvec3(c, g, dg) : uvec3(dg, g, c);
+    }
+    return o;
+}
+
+vec4 finish(uvec3 v)
+{
+    ivec3 s = ivec3(v);
+    uvec3 o;
+    for (int k = 0; k < 3; k++) {
+        int a = (pc.ccm[3 * k] * s.x + pc.ccm[3 * k + 1] * s.y + pc.ccm[3 * k + 2] * s.z + 512) >> 10;
+        o[k] = lut[uint(clamp(a, 0, int(ONE))) >> 2];
+    }
+    return vec4(vec3(o) / 255.0, 1.0);
+}
+
+void main()
+{
+    uvec2 q = gl_GlobalInvocationID.xy;
+    if (q.x * 2u >= pc.cropW || q.y * 2u >= pc.cropH) return;
+    int x = int(q.x * 2u), y = int(q.y * 2u);
+    if (pc.bin2 != 0u) {
+        uint r = 0u, b = 0u, g = 0u;
+        for (uint s = 0u; s < 4u; s++) {
+            uint v = lin(x + int(s & 1u), y + int(s >> 1));
+            int c = colorOf(s); // ritaglio con origine pari: il sito del campione s e' s
+            if (c == 0) r = v; else if (c == 2) b = v; else g += v;
+        }
+        imageStore(outImg, ivec2(q), finish(uvec3(r, (g + 1u) >> 1, b)));
+        return;
+    }
+    for (int dy = 0; dy < 2; dy++)
+        for (int dx = 0; dx < 2; dx++) imageStore(outImg, ivec2(x + dx, y + dy), finish(demosaic(x + dx, y + dy)));
+}
