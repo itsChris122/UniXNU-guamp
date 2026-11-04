@@ -327,6 +327,20 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
   return result;
 }
 
+// Section 15 of the variant (guamp-compose-keep): the buffer the panel shows now (the second buffer while flipped), so a composed
+// frame with an undrawable layer can start from the screen. 1 = va/stride set; 0 = no flip (the variant reads the GOP frame).
+extern "C" int guamp_scanout_shown(const volatile unsigned char **va, uint64_t *stride)
+{
+  using namespace gscan;
+  if (!va || !stride || !gK.read || !gK.flipOn || !gK.lock) return 0;
+  IOLockLock(gK.lock);
+  const unsigned at = gK.shown ? 1 : 0;
+  const int ok = gK.flipOn && gK.va[at] && gK.stride ? 1 : 0;
+  if (ok) { *va = gK.va[at]; *stride = gK.stride; }
+  IOLockUnlock(gK.lock);
+  return ok;
+}
+
 // The variant is about to write the GOP frame itself (a blank swap): show it and redraw it whole afterwards.
 extern "C" void guamp_scanout_external(void)
 {
