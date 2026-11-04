@@ -1968,11 +1968,14 @@ int ath10k_wmi_cmd_send(struct ath10k *ar, struct sk_buff *skb, u32 cmd_id)
 	if (ret == -EAGAIN) {
 		struct ath10k_htc_ep *ep = &ar->htc.endpoint[ar->wmi.eid];
 
-		ath10k_warn(ar, "wmi command %d timeout, restarting hardware\n",
+		ath10k_warn(ar, "wmi command %d timeout\n",
 			    cmd_id);
 		ath10k_warn(ar, "wmi endpoint %d: tx credits %d (credit size %d, flow %d), ul pipe %d\n",
 			    ar->wmi.eid, ep->tx_credits, ep->tx_credit_size, ep->tx_credit_flow_enabled, ep->ul_pipe_id);
-		ath10k_core_start_recovery(ar);
+		/* guamp 04/11: no hardware restart here. This port has no ieee80211_restart_hw (a log line): the restart only
+		 * powered the block down for good (fin43, fin45: every later command -108, then the RRI panic). The command
+		 * fails, its caller sees -EAGAIN (a join fails, wifid tries again); gw_wmi_timeout() counts and says it. */
+		gw_wmi_timeout(cmd_id);
 	}
 
 	return ret;

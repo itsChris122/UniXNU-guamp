@@ -21,6 +21,7 @@ void nw_wifi_trace_error(int level, const char *what);
  * the last commands and the events of a quiet second are logged with the "wifi: quiet" lines. */
 void gw_note_wmi_cmd(unsigned id); void gw_note_wmi_event(unsigned id);
 void gw_note_mgmt_drop(int why); void gw_note_htt_t2h(unsigned type);
+void gw_wmi_timeout(unsigned cmd_id);   /* guamp 04/11: a WMI command without credit for 10 s (wmi.c) */
 #define trace_ath10k_wmi_cmd(ar, id, buf, len) gw_note_wmi_cmd((unsigned)(id))
 #define trace_ath10k_wmi_dbglog(...) ((void)0)
 #define trace_ath10k_wmi_diag(...) ((void)0)
