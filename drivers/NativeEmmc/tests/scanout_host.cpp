@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 #include "../GuampScanoutCore.h"
 // guampLerp, guampLerp2 and guampTap, extracted from scripts/guamp-canvas-variant.py by the runner.
@@ -137,6 +138,18 @@ int main()
     CHECK(!gscan::layout(s, mem.data(), mem.size(), 750, 1666, 720, 1600, c.data(), r.data()), "tap past the end refused");
     CHECK(!gscan::layout(s, mem.data(), mem.size() - 64, 750, 1666, 720, 1600, nullptr, nullptr), "short memory refused");
     CHECK(!gscan::layout(s, mem.data(), mem.size(), 750, 1666, 720, 1600, nullptr, nullptr), "unscaled size mismatch refused");
+  }
+  // Early-frame fingerprint: black 0, white 255, pure green 149, empty source 0, stride honoured.
+  {
+    std::vector<uint8_t> px(3008 * 1666, 0);
+    CHECK(gscan::meanLuma(px.data(), 3008, 750, 1666) == 0, "black luma");
+    std::fill(px.begin(), px.end(), 255);
+    CHECK(gscan::meanLuma(px.data(), 3008, 750, 1666) == 255, "white luma %u", gscan::meanLuma(px.data(), 3008, 750, 1666));
+    for (size_t i = 0; i < px.size(); i += 4) { px[i] = 0; px[i + 1] = 255; px[i + 2] = 0; px[i + 3] = 255; }
+    CHECK(gscan::meanLuma(px.data(), 3008, 750, 1666) == 149, "green luma %u", gscan::meanLuma(px.data(), 3008, 750, 1666));
+    CHECK(gscan::meanLuma(nullptr, 3008, 750, 1666) == 0 && gscan::meanLuma(px.data(), 3008, 0, 1666) == 0, "empty");
+    std::vector<uint8_t> one(4, 255);
+    CHECK(gscan::meanLuma(one.data(), 4, 1, 1) == 255, "1x1");
   }
   run(750, 1666, 720, 1600, 1, 1, false, 120);
   run(750, 1666, 720, 1600, 1, 1, true, 80);
