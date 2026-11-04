@@ -26,6 +26,8 @@
 // off-command dopo il livello 0 e on-command prima del primo livello, come guamp-touch-wake.
 // Logs: one line at start, one per brightness request (rate-limited, says display off/on), failed sends (rate-limited).
 #include "GuampBacklightCore.h"
+// GuampGpuDcvs.inc (GpuService.inc, included before this file in NativeEmmc.cpp): set when the display comes on.
+extern "C" volatile uint32_t guamp_gpu_dcvs_wake;
 
 namespace backlight {
 using namespace guamp_backlight;
@@ -103,6 +105,9 @@ class GuampBacklight : public IOService {
   // DRM_PANEL_EARLY_EVENT_BLANK di sde_kms, prima dei comandi del pannello e del livello; una volta per cambio.
   bool evKnown = false, evOn = false;
   void touchEvent(bool on) {
+    // GuampGpuDcvs.inc guamp-gpu-wake-ms: the display coming on is a burst of GPU work (wallpaper, lock screen, the render
+    // server's surfaces made again); the governor goes to the top at once instead of after its first busy window.
+    if (on && (!evKnown || !evOn)) guamp_gpu_dcvs_wake = 1;
     if (!touch::gEventsMode || (evKnown && evOn == on)) return;
     evKnown = true;
     evOn = on;

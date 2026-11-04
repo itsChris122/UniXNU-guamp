@@ -30,6 +30,10 @@
 extern "C" {
 volatile uint32_t guamp_gpu_dcvs_hold;
 volatile uint32_t guamp_gpu_dcvs_boost;   // set by a blocked GPU fence wait, cleared here
+// GuampBacklight.inc sets it when the display comes on (standby -> awake): the top for guamp-gpu-wake-ms (default 1500, 0 off) whatever
+// the busy share, then the usual steps down. fin45: after the wake the GPU sat at 320 MHz while the wallpaper and the render server's
+// surfaces were drawn again, and only went to 900 MHz later (wallpaper late).
+volatile uint32_t guamp_gpu_dcvs_wake;
 // patches/native-adreno/0010 (weak stand-ins for a kernel without it): the submissions' cost and the mappings their maintenance skipped.
 __attribute__((weak)) volatile uint64_t native_adreno_submit_cost[8];
 __attribute__((weak)) volatile uint64_t native_adreno_publish_skipped[2];
@@ -51,7 +55,8 @@ volatile uint8_t *gCc, *gGpu;
 gp_state gS;
 gp_gov gG;
 uint32_t gCxMin = GP_RPM_LOW_SVS, gMxMin = GP_RPM_MIN_SVS;
-unsigned gBoostOn = 0, gBoosts = 0;
+unsigned gBoostOn = 0, gBoosts = 0, gWakeMs = 1500, gWakes = 0;
+unsigned gWakeWindows = 0;   // governor windows the top is still held for after a display wake
 
 uint32_t rd(void *, unsigned block, uint32_t off) {
   return *reinterpret_cast<volatile uint32_t *>((block == GG2_GPUCC ? gCc : gGpu) + off);
@@ -76,8 +81,8 @@ const gp_ops kOps = {nullptr, corner, bus, gdsc, none, none};
 
 void logState(unsigned busy, unsigned switches, unsigned fails, const uint32_t *ms) {
   IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u "
-        "465:%u 320:%u xo:%u | boosts %u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails,
-        busy * 100u / GP_GOV_WINDOW, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], gBoosts);
+        "465:%u 320:%u xo:%u | boosts %u wakes %u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails,
+        busy * 100u / GP_GOV_WINDOW, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], gBoosts, gWakes);
 }
 
 // Every 10 s with the level line: the GPU submissions since the previous line, their mean time in the kernel and in its cache
@@ -133,6 +138,15 @@ void thread(void *, wait_result_t) {
         held = true;
         break;
       }
+      if (gWakeMs && guamp_gpu_dcvs_wake) {   // the display came on: straight to the top and held there
+        guamp_gpu_dcvs_wake = 0;
+        gWakeWindows = (gWakeMs + GP_GOV_WINDOW - 1) / GP_GOV_WINDOW;
+        gWakes = gWakes + 1;
+        if (gS.level != gS.top) {
+          boosted = true;
+          break;
+        }
+      }
       if (gBoostOn && guamp_gpu_dcvs_boost) {
         guamp_gpu_dcvs_boost = 0;
         if (gS.level != gS.top) {
@@ -150,7 +164,12 @@ void thread(void *, wait_result_t) {
       continue;
     }
     if (boosted) ++gBoosts;
-    const unsigned prev = gS.level, target = boosted ? gp_gov_boost(&gG, &gS) : gp_gov_window(&gG, &gS, busy);
+    const bool waking = gWakeWindows != 0;
+    if (waking) gWakeWindows = gWakeWindows - 1;
+    if (waking) gG.quiet = 0;   // no step down while the wake hold lasts
+    const unsigned prev = gS.level,
+                   target = boosted || (waking && gS.level != gS.top) ? gp_gov_boost(&gG, &gS)
+                                                                        : waking ? gS.level : gp_gov_window(&gG, &gS, busy);
     if (target != prev) {
       const int e = gp_set_level(&kIo, &kOps, &gS, target);
       if (!e) {
@@ -219,6 +238,7 @@ void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
   gS.top = gp_gov_top(bin, cap);
   unsigned up = 0, minMhz = 0;
   PE_parse_boot_argn("guamp-gpu-boost", &gBoostOn, sizeof(gBoostOn));
+  PE_parse_boot_argn("guamp-gpu-wake-ms", &gWakeMs, sizeof(gWakeMs));
   PE_parse_boot_argn("guamp-gpu-up", &up, sizeof(up));
   PE_parse_boot_argn("guamp-gpu-min", &minMhz, sizeof(minMhz));
   gBoostOn = gBoostOn == 1;
