@@ -24,7 +24,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '103179d2b90906bcebecd40796aa32835883f650356c4cf89ef1ce22264e1aac'
+PATCHED_SHA256 = 'c7861635aa7d2dd79cd0449d22c5e0a9b3abf7484d510586e56d2cb1825382a0'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -949,6 +949,13 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         if(composeWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose",&v,sizeof v);composeWanted=v!=0;}
         return composeWanted==1;
     }
+    // guamp-compose-undrawable (default 0): a single-layer swap refused for its format (reason 4) is composed as an empty frame
+    // instead of rejected. Off: the rejection is the render server's cue to fall back to a drawable surface (boot lock screen).
+    int composeUndrawableWanted=-1;
+    bool composeUndrawableOn() {
+        if(composeUndrawableWanted<0){unsigned v=0;PE_parse_boot_argn("guamp-compose-undrawable",&v,sizeof v);composeUndrawableWanted=v!=0;}
+        return composeUndrawableWanted==1;
+    }
     // The persistent layers go (a single-layer or blank swap replaced the screen, or teardown).
     void composeReset() {
         for(auto &s: composeCurrent){OSSafeReleaseNULL(s.memory);s={};}
@@ -1214,12 +1221,15 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
 # The composed path in the validator (after the single-layer and blank checks) and in the queue kick.
 EDITS.append(('''        if(accepted)addValidated(request);else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;''',
-              '''        // guamp composition (canvas variant section 12): what the single-layer path refused for its layers, geometry or format.
+              '''        // guamp composition (canvas variant section 12): what the single-layer path refused for its layers or geometry.
         // reason 4 is a single full-screen layer whose surface this port cannot draw directly (the boot compositor frame is an
-        // AGX tile-compressed 'b3a8' BGRA, 2 planes): the composition skips the unsupported format and keeps the previous frame
-        // instead of a hard reject, which the family logs as "verify_swap failed for swap id" once per swap (2111 at boot, fin43).
+        // AGX tile-compressed 'b3a8' BGRA, 2 planes). It stays a hard reject by default: the refusal ("verify_swap failed for
+        // swap id", once per swap) is what makes the render server give up the compressed surface and send the lock screen as
+        // plain BGRA a few seconds later. Accepting it as an empty composed frame (5c6c01a, fin44..fin46d) told the server the
+        // frame was on screen: the boot logo stayed, nothing else came, and the lock screen's idle timer turned the panel off
+        // about 30 s later (no lock screen until the power key). guamp-compose-undrawable=1 brings that path back for tests.
         bool composed=false;
-        if(!accepted && enabled==1 && request && (reason==2 || reason==3 || reason==4)) {
+        if(!accepted && enabled==1 && request && (reason==2 || reason==3 || (reason==4 && composeUndrawableOn()))) {
             if(composeAccepts(bytes)){reason=6;accepted=composed=true;guamp_compose[0]=guamp_compose[0]+1;}
             else guamp_compose[12]=guamp_compose[12]+1;
         }
