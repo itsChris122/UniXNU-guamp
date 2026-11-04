@@ -18,6 +18,10 @@ trust.json) as audio/HAL/GuampAudio.driver/*; the kernel shows that directory ov
 guamp-audio-plugin=1 (patches/xnu/zzzzz-guamp-audio-plugin.patch), and audiomxd loads it only with its CDHash in the trust cache.
 --no-gpu leaves the GPU files out (audio-only addon on top of BASE).
 
+The output also carries ".guamp-keep" (every name of the output plus baseband/, see compose-guamp-delta-addon.py and
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-addon-prune.patch): booted as it is, the patched kernel removes from Data the files that an
+earlier addon wrote and this one no longer has. A .guamp-keep of BASE is replaced. --no-keep leaves it out.
+
 Layout (UniXNU make-gpu-addon.py), little endian: "NGPUADD2", u32 count, u32 0, u64 total bytes; per file u32 path bytes (with NUL,
 at most 160), u32 mode, u64 size, u64 compressed size, the path padded to 8 bytes, the zlib stream padded to 8 bytes."""
 import argparse
@@ -28,6 +32,13 @@ from pathlib import Path
 
 MAGIC = b'NGPUADD2'
 EXECUTABLES = ('NativeAdrenoMetal', 'libvulkan_freedreno.dylib')
+KEEP = '.guamp-keep'
+KEEP_PREFIXES = ('baseband/',)
+
+
+def keep_entry(names):
+    lines = sorted({n for n in names if n != KEEP} | {KEEP}) + list(KEEP_PREFIXES)
+    return (KEEP, 0o644, ('NGPUKEEP1\n' + ''.join(line + '\n' for line in lines)).encode())
 
 
 def pad(data):
@@ -105,6 +116,7 @@ def main():
     parser.add_argument('--prime-list', type=Path, help='absolute .metallib paths the render server compiles ahead')
     parser.add_argument('--audio', type=Path, help='OUTDIR of build-guamp-audio-plugin.sh (GuampAudio.driver + trust.json)')
     parser.add_argument('--no-gpu', action='store_true', help='leave the GPU plugin files out (with --audio: audio-only addon)')
+    parser.add_argument('--no-keep', action='store_true', help='no .guamp-keep entry (the kernel prunes nothing)')
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
     clients = [name for name in (args.clients or '').split(',') if name]
@@ -112,7 +124,7 @@ def main():
         sys.exit('--clients takes process names separated by commas')
     if args.output.exists():
         sys.exit(f'Refuse to overwrite {args.output}')
-    base = read_addon(args.base)
+    base = [entry for entry in read_addon(args.base) if entry[0] != KEEP]
     if args.no_gpu and (args.publish or clients or args.prime_list):
         sys.exit('--no-gpu excludes --publish, --clients and --prime-list')
     added = [] if args.no_gpu else plugin_files(args.plugin, args.publish, clients, args.prime_list)
@@ -124,14 +136,17 @@ def main():
     clash = sorted(name for name, _, _ in added if name in names)
     if clash:
         sys.exit('BASE already has: ' + ', '.join(clash))
+    entries = base + added
+    if not args.no_keep:
+        entries.append(keep_entry([name for name, _, _ in entries]))
     body = b''
-    for name, mode, data in base + added:
+    for name, mode, data in entries:
         encoded = name.encode() + b'\0'
         if len(encoded) > 160 or '..' in name.split('/') or name.startswith('/'):
             sys.exit('Bad addon path ' + name)
         packed = zlib.compress(data, 9)
         body += struct.pack('<IIQQ', len(encoded), mode, len(data), len(packed)) + pad(encoded) + pad(packed)
-    blob = MAGIC + struct.pack('<IIQ', len(base) + len(added), 0, 24 + len(body)) + body
+    blob = MAGIC + struct.pack('<IIQ', len(entries), 0, 24 + len(body)) + body
     args.output.write_bytes(blob)
     for name, mode, data in added:
         print(f'{mode:o} {len(data):>10} {name}')
