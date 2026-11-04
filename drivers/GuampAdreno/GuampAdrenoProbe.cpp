@@ -65,6 +65,9 @@ extern volatile uint32_t native_adreno_client_cleans, native_adreno_reassert_mod
 extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_imports_sweep;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
+// patches/native-adreno/0014: the process that last submitted from the window holding an address, and the ban of a process.
+int32_t native_adreno_window_owner(uint64_t iova, char *name, unsigned name_bytes);
+void native_adreno_ban_pid(int32_t pid);
 boolean_t ml_get_interrupts_enabled(void);
 boolean_t ml_at_interrupt_context(void);
 int get_preemption_level(void);

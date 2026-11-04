@@ -91,6 +91,11 @@ static inline grc_action grc_decide(grc_state *s, uint32_t now, grc_reason why) 
   return GRC_RECOVER;
 }
 
+// A hang blamed on a client process (patches/native-adreno/0014: the hung IB1 lies in that process's GPU window, and it is not the
+// render server): that process is banned from the GPU and the GPU restarted for the others without spending the window's budget (fin47:
+// three Maps hangs in a minute parked the GPU for the whole system). A parked GPU stays parked.
+static inline grc_action grc_decide_client(const grc_state *s) { return s->parked ? GRC_KEEP : GRC_RECOVER; }
+
 // The restart's check: ok resumes (every fence was signalled, so nothing is pending), a failure parks.
 static inline grc_action grc_done(grc_state *s, bool ok) {
   if (!ok) {

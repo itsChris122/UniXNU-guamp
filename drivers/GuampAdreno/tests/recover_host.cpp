@@ -146,6 +146,15 @@ int main() {
     uint32_t ring[64] = {};
     expect(grc_plan_ring(0, 5, 64, &p) && p.pads && !grc_fill_ring(ring, 64, 0, &p, &h, 0, 0), "a plan with pads is not written");
   }
+  // a client's hang (native-adreno 0014): recovered, the window's budget untouched; nothing once parked
+  {
+    grc_state s;
+    grc_init(&s, 2000);
+    for (unsigned i = 0; i < 10; ++i) expect(grc_decide_client(&s) == GRC_RECOVER, "client hangs never park the GPU");
+    expect(s.inWindow == 0, "client hangs spend no budget");
+    for (unsigned i = 0; i < kGrcMaxRecoveries; ++i) expect(grc_decide(&s, 100, GRC_IRQ) == GRC_RECOVER, "render server hangs");
+    expect(grc_decide(&s, 101, GRC_IRQ) == GRC_PARK && grc_decide_client(&s) == GRC_KEEP, "a parked GPU stays parked");
+  }
   expect(grc_name(GRC_TIMEOUT)[0] == 'f' && grc_name(GRC_SMMU)[0] == 's', "names");
   std::printf("recover_host: %u checks, %u failures\n", checks, failures);
   return failures ? 1 : 0;
