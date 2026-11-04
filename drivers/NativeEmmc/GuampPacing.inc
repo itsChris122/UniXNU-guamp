@@ -57,7 +57,8 @@ static bool clocksOn()
 }
 }  // namespace gpacing
 
-// 1 = frame counter, line and vtotal, read at mach time *at; 0 = not available now. The display's work loop (refresh tick) only.
+// 1 = frame counter, line and vtotal, read at mach time *at; 0 = not available now. Called by the refresh tick (display work
+// loop) and by the 10 s report; a rare overlap only disturbs the stuck-counter bookkeeping of one call.
 extern "C" int guamp_display_scan(uint32_t *frame, uint32_t *line, uint32_t *vtotal, uint64_t *at)
 {
   using namespace gpacing;
@@ -114,7 +115,19 @@ void log()
   for (unsigned i = 0; i < 24; ++i) now[i] = guamp_pacing[i];
   const uint64_t hw[5] = {gP.reads, gP.stuckTimes, gP.clocksOff, gP.engineOff, gP.held};
   const uint64_t t = mach_absolute_time();
-  const bool moved = now[0] != last[0] || now[7] != last[7];
+  // fin44: the INTF counters were read only by the refresh tick, which never ran (no vsync client): sampled here as well, so the
+  // real panel rate is in every line (frames counted over the report, in mHz).
+  static uint32_t sampleFrame = 0;
+  static uint64_t sampleAt = 0;
+  uint32_t f = 0, l = 0, vt = 0;
+  uint64_t at = 0, sampledMhz = 0;
+  const bool sampled = guamp_display_scan(&f, &l, &vt, &at) == 1;
+  if (sampled) {
+    const uint64_t spanNs = sampleAt && at > sampleAt ? toNs(at - sampleAt) : 0;
+    if (spanNs) sampledMhz = (uint64_t)(uint32_t)(f - sampleFrame) * 1000000000000ull / spanNs;
+    sampleFrame = f; sampleAt = at;
+  } else sampleAt = 0;
+  const bool moved = now[0] != last[0] || now[7] != last[7] || sampled;
   if (lastAt && moved) {
     const uint64_t span = toNs(t - lastAt);
     const uint64_t swaps = now[0] - last[0], intervals = now[21] - last[21];
@@ -129,11 +142,13 @@ void log()
     IOLog("GuampPacing: CA swaps +%llu (%llu.%llu fps), interval mean %llu.%llu ms max %llu.%llu ms, idle gaps +%llu, buffers %llu; "
           "swap->complete mean %llu us max %llu us; vsync %llu Hz clients %02llx (vsync %s): sent +%llu (panel +%llu timer +%llu, "
           "late +%llu), after the vblank %llu us; panel %llu.%03llu Hz (%llu measures) vtotal %llu frames +%u; INTF reads +%llu "
-          "stuck +%llu enables %llu, clocks off +%llu engine off +%llu held +%llu\n",
+          "stuck +%llu enables %llu, clocks off +%llu engine off +%llu held +%llu; sampled %s %llu.%03llu Hz line %u/%u; "
+          "IOMFBDisplayRefresh %s\n",
           swaps, fps10 / 10, fps10 % 10, meanUs / 1000, (meanUs / 100) % 10, maxUs / 1000, (maxUs / 100) % 10, now[19] - last[19],
           now[6], latUs, latMaxUs, now[17], now[15], now[16] ? "on" : "off", sent, panel, now[9] - last[9], now[10] - last[10],
           afterUs, mhz / 1000, mhz % 1000, now[18], now[13], (uint32_t)(now[14] - last[14]), hw[0] - lastHw[0], hw[1] - lastHw[1],
-          gP.enables, hw[2] - lastHw[2], hw[3] - lastHw[3], hw[4] - lastHw[4]);
+          gP.enables, hw[2] - lastHw[2], hw[3] - lastHw[3], hw[4] - lastHw[4], sampled ? "yes" : "no", sampledMhz / 1000,
+          sampledMhz % 1000, l, vt, now[22] ? "published (60 Hz fixed)" : "not published");
   }
   if (moved || !lastAt) {
     guamp_pacing[2] = 0;   // the longest interval / latency are per report

@@ -22,7 +22,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'ea3a7cecaf830708e6b36f6d340d674b5c40b3d568c96bee1fce536599ed9e93'
+PATCHED_SHA256 = '226875923013958521cab8cd53f56ca41a13f88dace317a1a9a87da1612f7cf9'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1394,6 +1394,33 @@ EDITS.append(('''        IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);''', '''        IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);
         guampPacingRetired(request);   // section 14'''))
+# 14b. (fin44, 04/11) No client ever registered for the vsync message (GuampPacing 'clients 00' all boot), and that is by design:
+#     QuartzCore 21H461 (dyld cache) takes the IOMFB vsync path (IOMobileFramebufferGetVSyncRunLoopSource / EnableVSyncNotifications,
+#     selector 72 type 5) only when CADeviceUseVBL() is true: CA_FORCE_TIMER set in its environment, or ChipID 0x7000 / 0x8010
+#     (___CADeviceUseVBL_block_invoke 0x189582620, bit 1 of IOMFBServer +925, CA::WindowServer::IOMFBServer::add_vsync_source
+#     0x189510f9c). Otherwise the render server runs its own display timer at the heartbeat interval
+#     (IOMFBDisplay 0x1894f5944: CA_HEARTBEAT_RATE, else the minimum refresh interval read from IOMFBDisplayRefresh, else 1/60 s).
+#     The family publishes IOMFBDisplayRefresh only through setDisplayRefreshProperties, which this port called only above 60 Hz,
+#     so the render server never had the panel's timing words (minimum, maximum 1/24 s, step). guamp-refresh-props (default 1,
+#     0 = as before) publishes them at 60 Hz too, as one fixed rate (maximum = minimum = 1/60 s, the panel has no variable refresh),
+#     so the frame-rate server has no lower rate to fall to. guamp_pacing[22] = 1 when they were published.
+EDITS.append(('''        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);''',
+              '''        unsigned hz=60;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));   // section 14b: 60 Hz published too (guamp-refresh-props)
+        if(primary && ((hz>60 && hz<=240) || (hz==60 && guampRefreshProps()))) {
+            native_legacy_set_refresh_properties(this);guamp_pacing[22]=1;
+        }'''))
+EDITS.append(('''        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(hz<=60 || hz>240)return true;
+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));''',
+              '''        unsigned hz=60;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(hz<60 || hz>240 || (hz==60 && !guampRefreshProps()))return true;
+        unsigned locked=hz==60?1:0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));   // 60 Hz: one fixed rate'''))
+EDITS.append(('    void guampPacingClients() {\n',
+              '''    // Section 14b: IOMFBDisplayRefresh at 60 Hz (guamp-refresh-props, default 1).
+    static bool guampRefreshProps() {unsigned v=1;PE_parse_boot_argn("guamp-refresh-props",&v,sizeof v);return v!=0;}
+    void guampPacingClients() {
+'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
