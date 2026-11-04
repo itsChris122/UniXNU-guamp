@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7496,6 +7496,22 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	native_gpu_addon_mount(p, scratch, 0x600, daemons_source, sizeof(daemons_source), daemons_point, sizeof(daemons_point),
+ 	    "/System/Library/LaunchDaemons/com.apple.backboardd.plist",
+ 	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
++	/* iOS launchd never reads the plists of /System/Library/LaunchDaemons: it loads every system job from the prebuilt
++	 * /System/Library/xpc/launchd.plist (launchd checks no signature of it). Jobs the iPadOS image lacks (the Watch daemons
++	 * nanoregistryd and nanoregistrylaunchd of the iPhone) need that file with their definitions added, so with boot-arg
++	 * guamp-xpc-overlay=1 the owner directory /private/var/ngpu/xpc (addon content: launchd.plist + guamp-xpc.txt) is laid over
++	 * /System/Library/xpc before launchd starts. Off by default: a broken launchd.plist would stop the boot. */
++	{
++		uint32_t xpc_overlay = 0;
++		if (PE_parse_boot_argn("guamp-xpc-overlay", &xpc_overlay, sizeof(xpc_overlay)) && xpc_overlay == 1) {
++			static const char xpc_source[] = "/private/var/ngpu/xpc", xpc_point[] = "/System/Library/xpc";
++			static volatile int native_gpu_addon4_stage = 0, native_gpu_addon4_status = -1;
++			native_gpu_addon_mount(p, scratch, 0x600, xpc_source, sizeof(xpc_source), xpc_point, sizeof(xpc_point),
++			    "/System/Library/xpc/extensions.plist", "/System/Library/xpc/guamp-xpc.txt", &native_gpu_addon4_stage,
++			    &native_gpu_addon4_status);
++			printf("GuampGpuAddon: xpc overlay stage %d status %d\n", native_gpu_addon4_stage, native_gpu_addon4_status);
++		}
++	}
+ 	/* The default iPadOS 17 wallpaper's layered animation with PNG images in place of its HEIC ones (no hardware HEVC decoder here).
+ 	 * The overlay carries the animation's documents and the PNG images; the sealed assets directory stays visible below it. */
+ 	static const char wallpaper_source[] = "/private/var/ngpu/wallpaper",
