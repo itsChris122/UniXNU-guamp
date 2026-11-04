@@ -1,0 +1,31 @@
+guamp: supportsExtendedXR10Formats withheld in the render server only (AegirPoster CAMetalLayerInvalid, fin47)
+
+fin47 (0017 lines): AegirPoster died every 8 s with "CAMetalLayerInvalid | unsupported extended range format". QuartzCore's
+layer_private_check_pixel_format (iPadOS 17.7.11) raises it when a CAMetalLayer gets an XR10 format (fourcc_to_format 0x21..0x23) and
+the device's supportsExtendedXR10Formats is NO; the bridge withheld that answer in every process because the render server's own
+framebuffer must stay 8-bit (int-089). A client's layer draws into its own drawables, which the render server samples as textures
+(BGR10_XR / BGRA10_XR are made here: backboardd's textures f550 and f554), so the answer is now the runtime's outside backboardd.
+NMB_XR10=0 withholds it everywhere, NMB_XR10=1 offers it in backboardd too. Applies after 0001-0003, 0009-0017 and 0030.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 087f816..3f2161e 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2893,7 +2893,16 @@ static void installAnswers(Class cls) {
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
+-   if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
++   // guamp (UniXNU-guamp patches/adreno-metal/0018): withheld in the render server only. A client's CAMetalLayer with an XR10 pixel format
++   // (AegirPoster: layer_private_check_pixel_format asks the device supportsExtendedXR10Formats and raises CAMetalLayerInvalid
++   // "unsupported extended range format", fin47, a crash every 8 s) renders into its own drawables, which the render server samples as
++   // textures (BGR10_XR / BGRA10_XR textures are made here: backboardd's own f550 and f554); its framebuffer stays 8-bit BGRX.
++   // NMB_XR10=0 withholds it everywhere again, NMB_XR10=1 offers it in the render server too.
++   if(!strcmp(name,"supportsExtendedXR10Formats")) {
++    const char *v=getenv("NMB_XR10");const char *who=getprogname();
++    const bool renderServer=who && !strcmp(who,"backboardd");
++    if(v?!strtoul(v,nullptr,0):renderServer)value=0;
++   }
+    gAnswers[sel]=value;
+    class_addMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
+    break;
