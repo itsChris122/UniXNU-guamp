@@ -16,7 +16,7 @@ import hashlib
 root=Path(__file__).resolve().parents[1]
 path=root/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp'
 PRISTINE='273b030afee897e48c30bc917c4df8a9c4d94a189d073ef80c0e0a15caef82ee'
-FINAL_RECORDED='200b02f2817be3966e1d9da5593b70d4b5974f8a7521ac390f5c7d1e666730ad'
+FINAL_RECORDED='a923387d6846fd565f06d581b5f3861e732d5b0195adecaf3e279ef8391308d8'
 raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
 if digest==FINAL_RECORDED:
     print('GuampAks: pinned key-wrap variant already prepared')
@@ -37,7 +37,7 @@ edits=[
   'namespace {\n'
   'constexpr uint8_t kWrapTag[8] = {\'G\', \'U\', \'A\', \'M\', \'P\', \'A\', \'K\', \'S\'};\n'
   'constexpr size_t kWrapMaxKey = 64;\n'
-  'uint32_t gKeyOpLogs;\n'
+  'uint32_t gKeyOpLogs, gUnsupportedLogs;\n'
   'IOReturn keyOp(uint32_t selector, IOExternalMethodArguments *args) {\n'
   '    if (args->scalarInputCount != 2 || !args->scalarInput) return kIOReturnBadArgument;\n'
   '    uint8_t in[kWrapMaxKey + sizeof kWrapTag], out[kWrapMaxKey + sizeof kWrapTag];\n'
@@ -94,6 +94,15 @@ edits=[
   '            if (native_aks_wrap_enabled()) rc = keyOp(selector, args);\n'
   '            break;\n'
   '        default: break;\n'),
+ ('        native_aks_call(selector, (int32_t)rc);\n',
+  '        // Selectors this stand-in does not provide (no keybag, no secret): 2 create bag, 3 save bag, 15 change secret (set,\n'
+  '        // change or remove a passcode), 49 verify password. They fail as before; logged so a passcode attempt is visible.\n'
+  '        if (rc == kAksUnsupported && (selector == 2 || selector == 3 || selector == 15 || selector == 49) && gUnsupportedLogs < 32) {\n'
+  '            gUnsupportedLogs = gUnsupportedLogs + 1;\n'
+  '            IOLog("GuampAks: selector %u not provided rc 0x%x%s\\n", selector, rc,\n'
+  '                  selector == 15 ? " (aks_change_secret: passcode not set, keybag unchanged)" : "");\n'
+  '        }\n'
+  '        native_aks_call(selector, (int32_t)rc);\n'),
  ('extern "C" uint32_t native_aks_lock_state(void);\n',
   'extern "C" uint32_t native_aks_lock_state(void);\nextern "C" uint32_t native_aks_state_flags(void);   // guamp-aks-nopass (scripts/guamp-aks-variant.py)\n'),
  ('constexpr uint64_t kUnlockedSinceBoot = 4;\nconstexpr uint32_t kStateFlags = 4;\n',
