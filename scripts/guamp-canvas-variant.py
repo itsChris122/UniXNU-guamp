@@ -16,13 +16,15 @@ Without the two arguments the canvas is off. Section 11: the guamp display argum
 are code defaults since 28/10; an explicit key still wins.
 Section 12 (guamp-compose, default 1): swaps with several layers (a video in a page) or a partial rectangle, which froze the screen
 when refused, are composed in software.
+Section 15 (guamp-compose-keep, default 1): a layer the composition cannot draw keeps its last picture (or the screen)
+instead of turning the frame black.
 Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and follows the panel's INTF_1 counters
 (guamp-vsync-hw); swap rate, swap -> completion latency and vsync messages are counted for the 'GuampPacing:' line.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '226875923013958521cab8cd53f56ca41a13f88dace317a1a9a87da1612f7cf9'
+PATCHED_SHA256 = '103179d2b90906bcebecd40796aa32835883f650356c4cf89ef1ce22264e1aac'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1420,6 +1422,90 @@ EDITS.append(('    void guampPacingClients() {\n',
               '''    // Section 14b: IOMFBDisplayRefresh at 60 Hz (guamp-refresh-props, default 1).
     static bool guampRefreshProps() {unsigned v=1;PE_parse_boot_argn("guamp-refresh-props",&v,sizeof v);return v!=0;}
     void guampPacingClients() {
+'''))
+# 15. Video in Safari, black screen (04/11, fin45): a layer the composition cannot draw (AGX-compressed 'b3a8' or any other unknown
+#     format, a transform, a bad geometry) was dropped from the persistent layers, so the frame was the black background plus the
+#     drawable layers: with the page (or the full-screen player UI) undrawable and a video that is still dark or stalled, the whole
+#     screen went black. guamp-compose-keep (default 1, 0 = as before): such a layer keeps the source it showed before (stale
+#     instead of black); when it never had one, the frame is not filled black but seeded from what the panel shows (the buffer the
+#     scanout points at, guamp_scanout_shown() of drivers/NativeEmmc/GuampScanout.inc, else the GOP frame), on whole redraws only.
+#     Diagnostics: [24] undrawable updates that kept a stale source, [25] frames seeded from the screen, [26] mean luma of the
+#     last drawn 4:2:0 layer (16 samples of its middle row), [27] 4:2:0 draws with that mean <= 20 (dark video), [28] 4:2:0 draws
+#     whose samples equal the previous draw's (same picture: a stalled decoder), [29] the last samples' hash. Logged by
+#     GuampDisplayExt.inc as 'GuampDisplay: compose keep: ...'.
+EDITS.append(('extern "C" {volatile uint64_t guamp_compose[24];volatile uint32_t guamp_compose_layer[4][14];}',
+              'extern "C" {volatile uint64_t guamp_compose[30];volatile uint32_t guamp_compose_layer[4][14];\n'
+              '__attribute__((weak)) int guamp_scanout_shown(const volatile unsigned char **,uint64_t *){return 0;}}'))
+EDITS.append(('    uint32_t refs,count,background;bool fill;uint64_t serial;\n',
+              '    uint32_t refs,count,background;bool fill,seed;uint64_t serial;   // seed: section 15, start from the screen\n'))
+EDITS.append(('    int composeWanted=-1;\n',
+              '    int composeWanted=-1;\n'
+              '    // Section 15: undrawable layers keep the picture (guamp-compose-keep); bit i: layer i is undrawable at the moment.\n'
+              '    int composeKeepWanted=-1;uint32_t composeHoles=0;\n'
+              '    bool composeKeepOn() {\n'
+              '        if(composeKeepWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose-keep",&v,sizeof v);composeKeepWanted=v!=0;}\n'
+              '        return composeKeepWanted==1;\n'
+              '    }\n'))
+EDITS.append(('        composeBackground=0xff000000U;\n        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // the scanout no longer shows the compose buffer\n',
+              '        composeBackground=0xff000000U;composeHoles=0;\n        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // the scanout no longer shows the compose buffer\n'))
+EDITS.append(('''            if(!(updated&bit))continue;
+            OSSafeReleaseNULL(composeCurrent[i].memory);composeCurrent[i]={};
+            if(disabled&bit){guamp_compose_layer[i][13]=5;continue;}
+            const unsigned result=composeLayer(bytes,i,displayWidth,displayHeight,&composeCurrent[i]);
+            composeGen[i]=composeGen[i]+1;composeCurrent[i].slot=i;composeCurrent[i].gen=composeGen[i];
+            guamp_compose_layer[i][13]=result;
+            if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
+''', '''            if(!(updated&bit))continue;
+            if(disabled&bit) {
+                OSSafeReleaseNULL(composeCurrent[i].memory);composeCurrent[i]={};composeHoles&=~bit;
+                guamp_compose_layer[i][13]=5;continue;
+            }
+            GuampLayerSource fresh={};
+            const unsigned result=composeLayer(bytes,i,displayWidth,displayHeight,&fresh);
+            guamp_compose_layer[i][13]=result;
+            if(result>=1 && result<=3)guamp_compose[5+result]=guamp_compose[5+result]+1;
+            if(result>=1 && result<=3 && composeKeepOn()) {
+                // Section 15: undrawable; the layer keeps the source it showed (same generation: nothing to redraw), else a hole.
+                composeHoles|=bit;
+                if(composeCurrent[i].memory)guamp_compose[24]=guamp_compose[24]+1;
+                continue;
+            }
+            OSSafeReleaseNULL(composeCurrent[i].memory);composeCurrent[i]=fresh;composeHoles&=~bit;
+            composeGen[i]=composeGen[i]+1;composeCurrent[i].slot=i;composeCurrent[i].gen=composeGen[i];
+'''))
+EDITS.append(('        bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;\n',
+              '        bzero(set,sizeof(*set));set->refs=1;set->background=composeBackground;set->fill=true;\n'
+              '        for(unsigned i=0;i<4;++i)if((composeHoles&(1u<<i)) && !composeCurrent[i].memory){set->fill=false;set->seed=true;}   // section 15\n'))
+EDITS.append(('''            guamp_compose[13]=guamp_compose[13]+1;
+        }
+''', '''            guamp_compose[13]=guamp_compose[13]+1;
+        } else if(set->seed && whole) {
+            // Section 15: an undrawable layer without a source: start from what the panel shows instead of black.
+            const volatile unsigned char *screen=nullptr;uint64_t screenStride=0;
+            if(guamp_scanout_shown(&screen,&screenStride)!=1 || !screen || screenStride!=frame.rowBytes) {
+                screen=reinterpret_cast<const volatile unsigned char *>(bootMapping->getVirtualAddress());screenStride=frame.rowBytes;
+            }
+            if(screenStride>=(uint64_t)frame.width*4 && screenStride*frame.height<=bootMapping->getLength()) {
+                for(uint32_t y=0;y<frame.height;++y) {
+                    const volatile uint32_t *s=reinterpret_cast<const volatile uint32_t *>(screen+(uint64_t)y*screenStride);
+                    uint32_t *d=out+(uint64_t)y*frame.width;
+                    for(uint32_t x=0;x<frame.width;++x)d[x]=s[x];
+                }
+                guamp_compose[25]=guamp_compose[25]+1;
+            }
+        }
+'''))
+EDITS.append(('''            if(drawn<0)drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4,dirty[0],dirty[1],dirty[2],dirty[3]);
+''', '''            if(drawn<0)drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4,dirty[0],dirty[1],dirty[2],dirty[3]);
+            if(drawn>0 && l.kind) {   // section 15: 16 luma samples of the video's middle row (valid: guampComposeDraw checked it)
+                const unsigned char *row=l.base+l.offset+(uint64_t)(l.sy+l.sh/2)*l.stride;
+                uint64_t sum=0,hash=1469598103934665603ULL;
+                for(uint32_t k=0;k<16;++k){const unsigned char v=row[l.sx+(uint64_t)l.sw*k/16];sum+=v;hash=(hash^v)*1099511628211ULL;}
+                guamp_compose[26]=sum/16;
+                if(sum/16<=20)guamp_compose[27]=guamp_compose[27]+1;
+                if(hash==guamp_compose[29])guamp_compose[28]=guamp_compose[28]+1;
+                guamp_compose[29]=hash;
+            }
 '''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()

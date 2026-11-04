@@ -77,8 +77,10 @@ extern "C" volatile uint64_t guamp_copy_latest[10];
 // format, [10] compose ticks, [11] map failures, [12] swaps refused by the composition too, [13] background fills, [14] most layers,
 // [15] 4:2:0 planes with two different offsets. Per layer: format, planes, surface w h, src x y w h, dst x y w h, transform, result.
 // [16] composed swaps with nothing to draw (retired, previous frame kept), [17] requests dumped (guamp-compose-dump).
+// Section 15: [24] undrawable layers that kept a stale source, [25] frames seeded from the screen, [26] last video luma,
+// [27] dark video draws, [28] video draws with the same samples as the previous one, [29] their hash.
 // [18] BGRA layer ticks, [19] 4:2:0 layer ticks, [20] scanout copy ticks, [21] whole redraws, [22] partial, [23] unchanged.
-extern "C" volatile uint64_t guamp_compose[24];
+extern "C" volatile uint64_t guamp_compose[30];
 extern "C" volatile uint32_t guamp_compose_layer[4][14];
 // package/LegacyDisplayProbe.cpp: the surface of the last swap refused for its surface (reason 4): width, height, format, planes,
 // row bytes, allocation, descriptor bytes.
@@ -194,10 +196,10 @@ static char fourcc(uint32_t format, unsigned shift)
 // before the scanout copy), layers drawn and skipped; then every layer that changed since the previous report.
 static void composeLog(uint64_t f)
 {
-  static uint64_t last[24] = {};
+  static uint64_t last[30] = {};
   static uint32_t lastLayer[4][14] = {};
-  uint64_t now[24];
-  for (unsigned i = 0; i < 24; i++) now[i] = guamp_compose[i];
+  uint64_t now[30];
+  for (unsigned i = 0; i < 30; i++) now[i] = guamp_compose[i];
   if (now[0] != last[0] || now[1] != last[1] || now[12] != last[12] || now[3] != last[3]) {
     const uint64_t frames = now[2] - last[2];
     const uint32_t skipped = (uint32_t)now[9];
@@ -223,7 +225,14 @@ static void composeLog(uint64_t f)
           fourcc(l[0], 8), fourcc(l[0], 0), l[1], l[2], l[3], l[4], l[5], l[6], l[7], (int)l[8], (int)l[9], l[10], l[11], l[12], l[13]);
     for (unsigned j = 0; j < 14; j++) lastLayer[i][j] = l[j];
   }
-  for (unsigned i = 0; i < 24; i++) last[i] = now[i];
+  // Section 15 (guamp-compose-keep): undrawable layers kept / frames seeded from the screen, and what the video layer shows.
+  if (now[24] != last[24] || now[25] != last[25] || now[5] != last[5]) {
+    IOLog("GuampDisplay: compose keep: stale layers kept +%llu, frames seeded from the screen +%llu; video luma %llu "
+          "(dark draws +%llu, same picture +%llu of +%llu 420 draws)
+", now[24] - last[24], now[25] - last[25], now[26],
+          now[27] - last[27], now[28] - last[28], now[5] - last[5]);
+  }
+  for (unsigned i = 0; i < 30; i++) last[i] = now[i];
 }
 
 static void copyLog()
