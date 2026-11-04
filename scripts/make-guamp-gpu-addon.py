@@ -16,6 +16,10 @@ accelerator (guamp-adreno=1), and the code only runs when its CDHashes (DIR/trus
 --audio DIR adds GuampAudio.driver (DIR = the OUTDIR of package/GuampAudio/build-guamp-audio-plugin.sh: GuampAudio.driver/ and
 trust.json) as audio/HAL/GuampAudio.driver/*; the kernel shows that directory over /System/Library/Audio/Plug-Ins/HAL only with
 guamp-audio-plugin=1 (patches/xnu/zzzzz-guamp-audio-plugin.patch), and audiomxd loads it only with its CDHash in the trust cache.
+--camera DIR adds the capture plug-in (DIR = the OUTDIR of package/GuampISP/build-guamp-isp-plugin.sh: H6ISP.mediacapture
+and trust.json) as mediacapture/H6ISP.mediacapture; the kernel shows that directory over /System/Library/MediaCapture only with
+guamp-camera-ios=1|2 (patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-camera-plugin.patch), and mediaserverd loads it only
+with its CDHash in the trust cache.
 --no-gpu leaves the GPU files out (audio-only addon on top of BASE).
 
 Layout (UniXNU make-gpu-addon.py), little endian: "NGPUADD2", u32 count, u32 0, u64 total bytes; per file u32 path bytes (with NUL,
@@ -96,6 +100,13 @@ def audio_files(directory):
     return files
 
 
+def camera_files(directory):
+    dylib = directory / 'H6ISP.mediacapture'
+    if not dylib.is_file() or not (directory / 'trust.json').is_file():
+        sys.exit(f'{directory}: build it first (package/GuampISP/build-guamp-isp-plugin.sh {directory})')
+    return [('mediacapture/H6ISP.mediacapture', 0o755, dylib.read_bytes())]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--base', type=Path, required=True, help='the existing guamp addon (iphone-res)')
@@ -104,6 +115,7 @@ def main():
     parser.add_argument('--clients', help='other processes with their own Metal device, comma separated ("*" = all)')
     parser.add_argument('--prime-list', type=Path, help='absolute .metallib paths the render server compiles ahead')
     parser.add_argument('--audio', type=Path, help='OUTDIR of build-guamp-audio-plugin.sh (GuampAudio.driver + trust.json)')
+    parser.add_argument('--camera', type=Path, help='OUTDIR of build-guamp-isp-plugin.sh (H6ISP.mediacapture + trust.json)')
     parser.add_argument('--no-gpu', action='store_true', help='leave the GPU plugin files out (with --audio: audio-only addon)')
     parser.add_argument('output', type=Path)
     args = parser.parse_args()
@@ -118,8 +130,10 @@ def main():
     added = [] if args.no_gpu else plugin_files(args.plugin, args.publish, clients, args.prime_list)
     if args.audio:
         added += audio_files(args.audio)
+    if args.camera:
+        added += camera_files(args.camera)
     if not added:
-        sys.exit('nothing to add (--no-gpu without --audio)')
+        sys.exit('nothing to add (--no-gpu without --audio or --camera)')
     names = {name for name, _, _ in base}
     clash = sorted(name for name, _, _ in added if name in names)
     if clash:

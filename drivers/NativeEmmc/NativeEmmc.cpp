@@ -1334,6 +1334,7 @@ static void usbProbe()
 #include "GuampSnsRpc.inc"     // FastRPC listener of the ADSP sensors PD (guamp-sensors=2): persist registry, SMMU 0x1c3
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
 #include "GuampCamera.inc"     // camera step 1 (guamp-camera=1): PM8008 + MCLK + CCI chip id of the 4 sensors, own thread; after GuampAudioHw.inc (shared SE1 I2C)
+#include "GuampCamIos.inc"     // camera service for iOS (guamp-camera-ios=1|2): AppleH6CamIn + RAW ring user client, test pattern
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1490,6 +1491,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   jackdev::start();      // guamp-audio-jack=1: MBHC thread (waits for the wcd937x register link) + /dev/guamp-jack
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
   camera::start();    // guamp-camera=1: chip id probe of the four sensors (PM8008, CCI), then all off; after audiohw::start (bus lock)
+  camios::start();    // guamp-camera-ios=1|2: AppleH6CamIn for CMCapture (H6ISP.mediacapture plug-in), RAW ring, test pattern
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start

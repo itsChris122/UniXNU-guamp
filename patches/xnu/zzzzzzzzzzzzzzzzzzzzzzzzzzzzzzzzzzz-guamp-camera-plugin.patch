@@ -1,0 +1,63 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8689284..ca581a3 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9369,6 +9369,33 @@ native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
+ 	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
+ 	    native_guamp_baseband_folder_status, logging_error);
+ }
++/* guamp: the camera capture plug-in H6ISP.mediacapture (package/GuampISP of the device repository: FigCaptureDevice/Stream
++ * over the AppleH6CamIn kernel service, software ISP and 3A in mediaserverd) shown inside /System/Library/MediaCapture, the
++ * sealed directory (empty on the 21H461 OS volume: H9ISP.mediacapture lives in the dyld cache) from which CMCapture's
++ * FigCaptureGetCaptureDeviceCreateFunction dlopen()s /System/Library/MediaCapture/H6ISP.mediacapture once
++ * IOServiceMatching("AppleH6CamIn") finds the service. Same read-only union bindfs view as the audio plug-in; only with
++ * boot-arg guamp-camera-ios=1|2 (default off), which also publishes the kernel service (drivers/NativeEmmc/GuampCamIos.inc).
++ * The file comes from the payload addon (names mediacapture/H6ISP.mediacapture) and still has to pass AMFI through the owner
++ * trust cache. Never panics: stage 5 = mounted, the sealed directory and our plug-in both visible. */
++volatile int native_guamp_camera_plugin_stage = 0;
++volatile int native_guamp_camera_plugin_status = -1;
++static int
++native_guamp_camera_plugin_enabled(void)
++{
++	uint32_t mode = 0;
++	return PE_parse_boot_argn("guamp-camera-ios", &mode, sizeof(mode)) && (mode == 1 || mode == 2);
++}
++static void
++native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/ngpu/mediacapture", point[] = "/System/Library/MediaCapture";
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point,
++	    "/System/Library/MediaCapture/H6ISP.mediacapture", &native_guamp_camera_plugin_stage, &native_guamp_camera_plugin_status);
++	printf("guamp-camera-plugin: addon files %d, written %d, same %d, failed %d (last error %d); %s stage %d status %d
++",
++	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
++	    point, native_guamp_camera_plugin_stage, native_guamp_camera_plugin_status);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -9378,10 +9405,12 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	int iphone_res = native_guamp_iphone_res_enabled();
+ 	/* guamp-audio-plugin=1 likewise installs the addon (it carries GuampAudio.driver) and mounts the HAL view after it. */
+ 	int audio_plugin = native_guamp_audio_plugin_enabled();
+-	if (enabled != 1 && !iphone_res && !audio_plugin) {
++	/* guamp-camera-ios=1|2 likewise installs the addon (it carries H6ISP.mediacapture) and mounts the MediaCapture view. */
++	int camera_plugin = native_guamp_camera_plugin_enabled();
++	if (enabled != 1 && !iphone_res && !audio_plugin && !camera_plugin) {
+ 		return;
+ 	}
+-	if (iphone_res || audio_plugin) {
++	if (iphone_res || audio_plugin || camera_plugin) {
+ 		native_guamp_iphone_res_ngpu(p, scratch);
+ 	}
+ 	native_gpu_addon_install(p, scratch);
+@@ -9399,6 +9428,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 		native_guamp_audio_plugin_mount(p, scratch);
+ 	}
+ 	native_guamp_baseband_mount(p, scratch);	/* guamp-baseband=1|2: Mav16 firmware views for ABM (04/11) */
++	if (camera_plugin) {
++		native_guamp_camera_plugin_mount(p, scratch);	/* guamp-camera-ios=1|2: H6ISP.mediacapture (05/11) */
++	}
+ 	if (enabled != 1) {
+ 		return;
+ 	}
