@@ -44,6 +44,45 @@ unsigned gLogAll = 1;
 // The session line. A sound that ended with frames still queued (STOP -> draining) is logged when its tail has been
 // played (pollPending(), from the wanted() hook of the ADSP sink) or when the next open comes first, so "played" is final.
 extern "C" int guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out);
+// fin45 (04/11, audio a scatti e volume che "va e viene"): the constant was written once per boot, at the first open. Its
+// page is a clean, file-backed page of the dyld shared cache (a code page), so under memory pressure (fin45: 1000-2000 free
+// pages for minutes, ~300k 4K pages read again) the VM can drop it and later read it back from storage with the original
+// 24000000.0: from then on the HAL's IO cycles run late again. Sessions after a few minutes without sound wrote only ~90 %
+// of real time (919040 frames while the DSP took 2121 periods: 240 pre-roll waits and 6 underruns in 21 s, each one a
+// ~300 ms re-pre-roll gap; the boot sound at 62 s was clean, as were all sounds of fin37d, played close together). Now the
+// constant is checked at every open and every gHostClockEvery writes (one copyin, in audiomxd's context) and written again
+// when it reads 24 MHz. guamp-audio-hostclock-every=<writes> (default 256, ~2.7 s of 512-frame writes; 0 = only at open).
+constexpr uint64_t kHostClockApple = 0x4176e36000000000ULL;   // 24000000.0
+uint64_t gHostClockUnslid = 0x1b6b93908ULL;
+uint32_t gHostClockEvery = 256;
+bool gHostClockArgs = false, gHostClockFirst = true;
+uint32_t gHostClockChecks = 0, gHostClockWrites = 0, gHostClockFails = 0;
+// Returns the guamp_coreaudio_host_clock result (0: the constant holds the timer frequency now). The caller is the opener.
+int hostClockCheck(const char *when) {
+  if (!gHostClockArgs) {
+    PE_parse_boot_argn("guamp-audio-hostclock", &gHostClockUnslid, sizeof(gHostClockUnslid));
+    PE_parse_boot_argn("guamp-audio-hostclock-every", &gHostClockEvery, sizeof(gHostClockEvery));
+    gHostClockArgs = true;
+  }
+  if (!gHostClockUnslid) return -1;
+  uint64_t seen = 0;
+  const int r = guamp_coreaudio_host_clock(gHostClockUnslid, &seen);
+  gHostClockChecks = gHostClockChecks + 1;
+  const bool wrote = r == 0 && seen == kHostClockApple;
+  if (wrote) gHostClockWrites = gHostClockWrites + 1;
+  if (r) gHostClockFails = gHostClockFails + 1;
+  if (gHostClockFirst) {   // the line of the first open, as before
+    gHostClockFirst = false;
+    IOLog("GuampAudioDev: CoreAudio host clock constant at %llx (unslid) read %llx, result %d\n",
+          static_cast<unsigned long long>(gHostClockUnslid), static_cast<unsigned long long>(seen), r);
+  } else if ((wrote && (gHostClockWrites <= 32 || !(gHostClockWrites % 64))) || (r && gHostClockFails <= 8)) {
+    IOLog("GuampAudioDev: CoreAudio host clock constant at %s read %llx, result %d: %s (written %u times, %u checks, %u "
+          "failures)\n", when, static_cast<unsigned long long>(seen), r,
+          wrote ? "back at 24 MHz (page read again from storage), timer frequency written again" : "check failed",
+          gHostClockWrites, gHostClockChecks, gHostClockFails);
+  }
+  return r;
+}
 
 struct SessionLine {
   bool pending = false, cut = false;
@@ -142,17 +181,8 @@ int adOpen(dev_t dev, int flags, int devtype, struct proc *p) {
   gOpens = gOpens + 1;
   // CoreAudio's 24 MHz host clock constant set to the 19.2 MHz timer (guamp_coreaudio_host_clock, patch ...-audio-hostclock):
   // the opener is the audio server, which has the constant's page mapped. guamp-audio-hostclock=<unslid address>, 0 = off.
-  static bool hostClockDone = false;
-  static uint32_t hostClockTries = 0;
-  if (!hostClockDone && hostClockTries < 8) {
-    uint64_t unslid = 0x1b6b93908ULL, seen = 0;
-    PE_parse_boot_argn("guamp-audio-hostclock", &unslid, sizeof(unslid));
-    const int r = unslid ? guamp_coreaudio_host_clock(unslid, &seen) : -1;
-    hostClockTries++;
-    hostClockDone = r <= 0;
-    IOLog("GuampAudioDev: CoreAudio host clock constant at %llx (unslid) read %llx, result %d\n",
-          static_cast<unsigned long long>(unslid), static_cast<unsigned long long>(seen), r);
-  }
+  // Every open (fin45: the page can come back from storage with 24 MHz after the first write; see hostClockCheck).
+  (void)hostClockCheck("open");
   gStream.reset();
   gStream.beginSession();
   gWrittenFrames = 0;
@@ -208,6 +238,8 @@ int adRead(dev_t dev, struct uio *uio, int ioflag) { return ENODEV; }
 int adWrite(dev_t dev, struct uio *uio, int ioflag) {
   if (uio_resid(uio) % GUAMP_AUDIO_BYTES_PER_FRAME) return EINVAL;
   gWrites = gWrites + 1;
+  // Also while a long sound plays (writes come from the opener, audiomxd's IO thread; no lock: the counters are only logged)
+  if (gHostClockEvery && !(gWrites % gHostClockEvery)) (void)hostClockCheck("write");
   uint8_t buf[1024];
   bool took = false;
   while (uio_resid(uio) > 0) {
