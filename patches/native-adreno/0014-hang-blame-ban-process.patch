@@ -1,0 +1,76 @@
+guamp: the process that last submitted from each client window, and banned processes refused (hang blamed on its client, not the GPU)
+
+diff -ru a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+--- a/NativeAdrenoSubmit.cpp	2026-11-04 16:04:57.966393908 +0100
++++ b/NativeAdrenoSubmit.cpp	2026-11-04 16:04:58.018393907 +0100
+@@ -116,6 +116,59 @@
+  * longest maintenance in us. native_adreno_publish_window (board: guamp-adreno-publish-window, default 1) keeps a submission's
+  * maintenance to its client's window; 0 walks every client's mappings on every submission, as before. */
+ extern "C" {volatile uint64_t native_adreno_submit_cost[8];volatile uint32_t native_adreno_publish_window=1;}
++/* guamp (UniXNU-guamp patches/native-adreno/0014): which process last submitted from each client GPU window, so the board's hang
++ * recovery (GuampAdrenoRecover.inc) can name the process whose IB hung the GPU from the IB1 address; and the processes it banned, whose
++ * submissions are refused from then on (kIOReturnNotPermitted: Turnip reports the device lost to that process only), as msm bans the
++ * guilty context of a hang instead of the whole GPU. */
++extern "C" int proc_selfpid(void);
++extern "C" void proc_selfname(char *,int);
++struct NativeAdrenoWindowOwner {uint64_t start,bytes;int32_t pid;char name[20];};
++extern "C" {
++NativeAdrenoWindowOwner native_adreno_window_owners[32];
++volatile int32_t native_adreno_banned_pids[8];
++volatile uint32_t native_adreno_banned_refused;
++}
++static void noteWindowOwner(uint64_t start,uint64_t bytes)
++{
++    const int32_t pid=proc_selfpid();
++    unsigned free_slot=32;
++    for(unsigned i=0;i<32;++i) {
++        NativeAdrenoWindowOwner &o=native_adreno_window_owners[i];
++        if(o.bytes && o.start==start) {
++            if(o.pid!=pid || o.bytes!=bytes) {o.bytes=bytes;o.pid=pid;proc_selfname(o.name,sizeof o.name);}
++            return;
++        }
++        if(!o.bytes && free_slot==32)free_slot=i;
++    }
++    if(free_slot==32)free_slot=(unsigned)(start>>20)%32;   /* full: overwrite one */
++    NativeAdrenoWindowOwner &o=native_adreno_window_owners[free_slot];
++    o.start=start;o.bytes=bytes;o.pid=pid;proc_selfname(o.name,sizeof o.name);
++}
++static bool bannedCaller()
++{
++    const int32_t pid=proc_selfpid();
++    for(unsigned i=0;i<8;++i)if(native_adreno_banned_pids[i] && native_adreno_banned_pids[i]==pid)return true;
++    return false;
++}
++/* The process that last submitted from the window holding iova: its pid and name (name may be null), or -1. */
++extern "C" int32_t native_adreno_window_owner(uint64_t iova,char *name,unsigned name_bytes)
++{
++    for(unsigned i=0;i<32;++i) {
++        const NativeAdrenoWindowOwner &o=native_adreno_window_owners[i];
++        if(o.bytes && iova>=o.start && iova-o.start<o.bytes) {
++            if(name && name_bytes) {unsigned n=0;for(;n+1<name_bytes && n<sizeof o.name && o.name[n];++n)name[n]=o.name[n];name[n]=0;}
++            return o.pid;
++        }
++    }
++    return -1;
++}
++extern "C" void native_adreno_ban_pid(int32_t pid)
++{
++    for(unsigned i=0;i<8;++i)if(native_adreno_banned_pids[i]==pid)return;
++    for(unsigned i=0;i<8;++i)if(!native_adreno_banned_pids[i]) {native_adreno_banned_pids[i]=pid;return;}
++    for(unsigned i=0;i<7;++i)native_adreno_banned_pids[i]=native_adreno_banned_pids[i+1];
++    native_adreno_banned_pids[7]=pid;
++}
+ static uint64_t submitNowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
+ /* guamp (UniXNU-guamp patches/native-adreno/0012): the write-combine re-assertion only for BOs a cache-mode event may have touched
+  * (NativeAdrenoReassertPlan.h). native_adreno_reassert_mode (board: guamp-adreno-reassert, default 1; 0 = every BO of the window at
+@@ -159,6 +212,10 @@
+             if(spent>native_adreno_submit_cost[4])native_adreno_submit_cost[4]=spent;
+         }
+     } cost_note{submit_began};
++    if(window_bytes) {
++        if(bannedCaller()) {native_adreno_banned_refused=native_adreno_banned_refused+1;return kIOReturnNotPermitted;}
++        noteWindowOwner(window_start,window_bytes);
++    }
+     if(!native_adreno_publish_window)window_bytes=0;
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;

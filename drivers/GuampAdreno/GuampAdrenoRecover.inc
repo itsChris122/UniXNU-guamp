@@ -154,7 +154,17 @@ void recover(Session &s, grc_reason why, uint32_t stalled, uint32_t fsr) {
         "ib1 %08x%08x rem %u, irq errors %08x, cb0 fsr %08x far %08x%08x\n", grc_name(why), stalled, completed + 1, newest,
         gr(s, 0x210), gr(s, 0x821), gr(s, 0x806), gr(s, 0x807), gr(s, 0x929), gr(s, 0x928), gr(s, 0x92a), gIrqErrors, fsr,
         rd(s.smmu, gRec.bank0 + 0x64), rd(s.smmu, gRec.bank0 + 0x60));
-  const grc_action action = grc_decide(&gRec.core, nowMs(), why);
+  // guamp-gpu-blame (default 1): the process whose IB hung is banned instead of the GPU parked (patches/native-adreno/0014).
+  const uint64_t ib1 = (uint64_t(gr(s, 0x929)) << 32) | gr(s, 0x928);
+  char who[20] = {};
+  const int32_t pid = bootArg("guamp-gpu-blame", 1) ? native_adreno_window_owner(ib1, who, sizeof who) : -1;
+  const bool client = pid > 0 && strncmp(who, "backboardd", sizeof who) != 0;
+  if (client) {
+    native_adreno_ban_pid(pid);
+    IOLog("GuampAdreno: recover: the hung IB1 %08x%08x is %s[%d]'s: that process is banned from the GPU (its submissions refused), "
+          "the GPU restarted for the others\n", uint32_t(ib1 >> 32), uint32_t(ib1), who, pid);
+  }
+  const grc_action action = client ? grc_decide_client(&gRec.core) : grc_decide(&gRec.core, nowMs(), why);
   if (action == GRC_PARK) {
     park(s, fsr, "too many hangs");
     return;
