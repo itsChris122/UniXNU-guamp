@@ -9,7 +9,9 @@
 // Stage 4: guamp-touch-usb=0|1 (cable state told to the firmware, default 1), guamp-touch-ovl=<partition> (boot code
 // overlay, default the border one), guamp-touch-recode=0, guamp-touch-diag=<n> (raw stack of the first n interrupts and
 // firmware status words, default 16, 0 off), guamp-touch-irqonly=1 (read the stack only after an interrupt).
-// guamp-touch-wake=1 (default 0): tap-to-wake with the screen off, see the "wake" block before thread().
+// guamp-touch-wake=<bits> (default 0): wake from the screen off by the firmware gesture mode only (1 = id 0x81, the
+// double tap 0x80 only with bit 4), see the "wake" block before thread(). guamp-touch-release-ms /
+// guamp-touch-release-max-ms: the lost "finger up" guard (re-reads the stack, see the thread loop).
 // guamp-touch-events=1|2 (default 0): la catena display -> touch di Linux (resume con download completo a ogni
 // accensione del display di iOS, suspend allo spegnimento), vedi il blocco "events" dopo displayState().
 // guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
@@ -24,6 +26,7 @@
 #include "HxProtocol.h"
 #include "GuampTouchBoard.h"
 #include "GuampSoftTouchCore.h"
+#include "GuampTouchPolicyCore.h"   // guamp-touch-wake decisions, release guard
 #include "GuampDsiStateCore.h"   // guamp-dsi-dump=1: DD register addresses (ddDump)
 #include "GeniSpiCpp.inc"
 #include "HxProtocolCpp.inc"
@@ -706,13 +709,13 @@ void irq(void *) {
 //                gesture request 0x11 in 0x10007FFC, write overlay 11 (gesture), reply 0x22. The interrupt stays on.
 //   gesture      himax_wake_event_parse: 4 equal ids + CC 44 in the event stack (0x80 = double tap, the only one the
 //                Motorola driver reports, gesture_cust_en[0] via the tap sensor; the firmware decides which it detects,
-//                every listed id is accepted here and logged) -> one short Power press through the PMIC button sink
+//                every report is logged, the guamp-touch-wake bits choose which wake) -> one short Power press through the PMIC button sink
 //                (gWakeRequests): backboardd wakes the display on Power exactly as on the hardware key, while a touch
 //                with the display off is dropped by backboardd (no AppleMultitouch wake mode behind this digitizer).
 //                The PMIC thread presses only while the display is still off, so a late gesture never locks the phone.
-//   display on   GuampBacklight sends the on-command (11/29) before the first level, displayState(true). Here: ic_reset
-//                (pin reset), SMWP off, cable state, hx83102d_0f_overlay(3): wait for the border request 0x55, overlay 12,
-//                reply 0x66, ic_reset (sense on).
+//   display on   GuampBacklight sends the on-command (11/29) before the first level, displayState(true). Here:
+//                hx83102d_0f_overlay(3): wait for the border request 0x55, overlay 12, reply 0x66, ic_reset (sense on),
+//                then SMWP off and the cable state (no pin reset first: HX_RESUME_SET_FW skips it in Linux).
 // No request within guamp-touch-wake-wait ms (default 500): guamp-touch-wake-force=1 (default) swaps from safe mode
 // (sense off, overlay, reply, sense on), 0 leaves the overlay as it is.
 // Default 0: the panel sleep-in over DSI while the boot loader's video stream runs and the firmware's gesture mode have
@@ -769,17 +772,70 @@ void logSwap(const char *what, int r) {
         gChip.ovl_seen, gChip.ovl_wait_ms, gChip.ovl_reply, gChip.ovl_handshake, gChip.smwp_word, cs);
   if (r < 0) IOLog("GuampTouch: %s: error %d stage %d\n", what, r, gChip.stage);
 }
+// guamp 05/11 (single tap only, no scanning with the display off): guamp-touch-wake=<bits> (GuampTouchPolicyCore.h)
+//   1 gesture mode at display off, wake on id 0x81      2 + every other listed id except 0x80
+//   4 + 0x80 double tap (excluded unless asked for)     8 + any non-empty firmware report while in gesture mode
+// Firmware study (TWRP hlt_Himax_firmware.bin, CID 1205, Andes NDS32 code): overlay 11 (gesture) is a 224-byte stub
+// (state 7 / 8 handling) at 0x20007800; the main image reads 0x10007FFC == 0x22 and SMWP == A55AA55A at start; no
+// immediate 0x81, a single 0x80 (a call argument) and no CC 44 construction were found in the 32-bit code (the 16-bit
+// forms were not decoded): whether this firmware reports 0x81 (Himax "finger gesture") or anything at all on one tap is
+// only answered by the device ("suspended irq" rows). Linux (himax_v3_mmi, guamp-default.config) only ever reports 0x80;
+// no register selects the gestures, gesture_cust_en is a driver-side filter.
+// Display off without a confirmed gesture mode (no overlay, CRC, reply or SMWP read-back): sense off and the interrupt
+// masked, so nothing scans; display on then reloads the whole firmware (evResume, the hx83102d_0f_overlay rescue).
+// Display on after a gesture mode: as _himax_chip_common_resume with SMWP: overlay(3) first (request 0x55, overlay 12,
+// reply 0x66, ic_reset), then SMWP off and the cable state; a border swap that fails or a firmware not at 05 reloads all.
+unsigned gWakeMode;
+bool gWakeGesture;            // the last display off left the firmware in gesture mode (else: sense off)
+volatile uint32_t gWakeRescues;
+void evIrq(bool on);
+uint32_t evResume(bool useIrq, const char *why);
+const char *wakeModeName(unsigned m) {
+  switch (m & guamp_touch_wake::kAll) {
+    case 1: return "0x81";
+    case 3: return "0x81 + other gestures";
+    case 5: return "0x81 + double tap";
+    case 9: return "0x81 + any report";
+    case 11: return "0x81 + other gestures + any report";
+    default: return "custom";
+  }
+}
 void wakeSuspend() {
-  hx_set_smwp(&gChip, 1);
-  logSwap("suspend (display off)", hx_overlay_swap(&gChip, &gFw, gFw.ovl[1], HX_OVL_GESTURE_REQUEST, HX_OVL_GESTURE_REPLY,
-                                                   0, gWakeWait, static_cast<int>(gWakeForce)));
+  const uint32_t smwp = hx_set_smwp(&gChip, 1);
+  const int r = hx_overlay_swap(&gChip, &gFw, gFw.ovl[1], HX_OVL_GESTURE_REQUEST, HX_OVL_GESTURE_REPLY, 0, gWakeWait,
+                                static_cast<int>(gWakeForce));
+  logSwap("suspend (display off)", r);
+  gWakeGesture = guamp_touch_wake::gestureActive(r, gChip.ovl_loaded, gFw.ovl[1], gChip.ovl_reply, smwp);
+  if (gWakeGesture) {
+    IOLog("GuampTouch: wake: gesture mode active (overlay %d %s, smwp %08x), accepting %s (mode %u)\n", gChip.ovl_loaded,
+          r == 1 ? "on request" : "forced", smwp, wakeModeName(gWakeMode), gWakeMode);
+    return;
+  }
+  evIrq(false);
+  const int so = hx_sense_off(&gChip);
+  IOLog("GuampTouch: wake: gesture mode NOT active (swap %d, overlay %d reply %02x, smwp %08x): sense off rc %d central "
+        "%02x, irq masked, no scanning until display on (Power key only)\n", r, gChip.ovl_loaded, gChip.ovl_reply, smwp, so,
+        gChip.central_state);
 }
 void wakeResume() {
-  hx_pin_reset(&gChip);
-  hx_set_smwp(&gChip, 0);
-  gChip.usb_word = write32_verify(&gChip, HX_ADDR_USB_DETECT, gChip.usb_in ? HX_HANDSHAKE_PWD : 0);
-  logSwap("resume (display on)", hx_overlay_swap(&gChip, &gFw, gFw.ovl[2], HX_OVL_BORDER_REQUEST, HX_OVL_BORDER_REPLY,
-                                                 1, gWakeWait, static_cast<int>(gWakeForce)));
+  uint32_t central = 0;
+  if (gWakeGesture) {
+    const int r = hx_overlay_swap(&gChip, &gFw, gFw.ovl[2], HX_OVL_BORDER_REQUEST, HX_OVL_BORDER_REPLY, 1, gWakeWait,
+                                  static_cast<int>(gWakeForce));
+    hx_set_smwp(&gChip, 0);
+    gChip.usb_word = write32_verify(&gChip, HX_ADDR_USB_DETECT, gChip.usb_in ? HX_HANDSHAKE_PWD : 0);
+    logSwap("resume (display on)", r);
+    hx_reg_read32(&gChip, HX_ADDR_CENTRAL_STATE, &central);
+    if (guamp_touch_wake::resumeOk(r, gChip.ovl_loaded, gFw.ovl[2], gChip.ovl_reply, central)) {
+      IOLog("GuampTouch: wake: normal mode restored (border overlay %d, central %08x, smwp %08x)\n", gChip.ovl_loaded, central,
+            gChip.smwp_word);
+      return;
+    }
+  }
+  gWakeRescues = gWakeRescues + 1;
+  central = evResume(true, gWakeGesture ? "touch wake: border swap failed" : "touch wake: scanning was off");
+  IOLog("GuampTouch: wake: normal mode by full reload %u: central %08x (%s)\n", gWakeRescues, central,
+        (central & 0xFF) == 0x05 ? "running" : "NOT running");
 }
 
 bool armIrq() {
@@ -1488,10 +1544,14 @@ void thread(void *param, wait_result_t) {
   PE_parse_boot_argn("guamp-touch-wake-dsi", &wakeDsi, sizeof(wakeDsi));
   if (gWakeWait > 5000) gWakeWait = 5000;
   gWakeDsi = wakeDsi != 0;
-  const bool wakeOk = wake && useIrq && gFwOk && gFw.ovl[1] > 0 && gFw.ovl[2] > 0 && gFw.part[gFw.ovl[1]].size;
+  gWakeMode = wake & guamp_touch_wake::kAll;
+  if (gWakeMode) gWakeMode |= guamp_touch_wake::kFinger;   // every mode includes the single contact id 0x81
+  const bool wakeOk = gWakeMode && useIrq && gFwOk && gFw.ovl[1] > 0 && gFw.ovl[2] > 0 && gFw.part[gFw.ovl[1]].size;
   if (wake)
-    IOLog("GuampTouch: wake %s (gesture overlay %d, border %d, irq %d, panel commands %s, wait %u ms, force %u)\n",
-          wakeOk ? "armed" : "NOT armed", gFw.ovl[1], gFw.ovl[2], useIrq, gWakeDsi ? "on" : "off", gWakeWait, gWakeForce);
+    IOLog("GuampTouch: wake %s, mode %u (%s; double tap %s) (gesture overlay %d, border %d, irq %d, panel commands %s, "
+          "wait %u ms, force %u)\n", wakeOk ? "armed" : "NOT armed", gWakeMode, wakeModeName(gWakeMode),
+          (gWakeMode & guamp_touch_wake::kDoubleTap) ? "accepted" : "ignored", gFw.ovl[1], gFw.ovl[2], useIrq,
+          gWakeDsi ? "on" : "off", gWakeWait, gWakeForce);
   uint32_t displayGen = gDisplayGen;
   bool suspended = false;
   unsigned gestLog = 0;
@@ -1532,15 +1592,57 @@ void thread(void *param, wait_result_t) {
   nanoseconds_to_absolutetime(static_cast<uint64_t>(releaseMs) * 1000 * 1000ULL, &releaseTicks);
   IOLog("GuampTouch: release guard %u ms without interrupts or valid reports (%s)\n", releaseMs,
         releaseMs ? "contact held until the firmware reports the finger up" : "off");
-  // Sicurezza lunga: vero se un contatto e' premuto da releaseMs senza interruzioni ne' report validi.
+  // guamp 05/11 (fin46b, live-20261104-143602 ~146/150 s: "release guard 1" con il dito fermo apposta): il silenzio non
+  // e' un dito alzato. Scaduti releaseMs si rilegge lo stack (GuampTouchPolicyCore.h guamp_touch_guard): si rilascia solo
+  // se il firmware dice 0 contatti o il bus non risponde, altrimenti si riarma; guamp-touch-release-max-ms (default
+  // 30000, 0 = mai) di silenzio rilascia comunque (ultima rete).
+  unsigned releaseMaxMs = 30000;
+  PE_parse_boot_argn("guamp-touch-release-max-ms", &releaseMaxMs, sizeof(releaseMaxMs));
+  IOLog("GuampTouch: release guard: stack re-read after %u ms of silence, safety limit %u ms\n", releaseMs, releaseMaxMs);
+  uint64_t lastGuard = 0;
+  uint32_t guardKeeps = 0;
+  // Vero se un contatto e' premuto da releaseMs senza interruzioni, report validi ne' controlli della guardia.
   auto lostUp = [&]() {
-    return releaseMs && down && mach_absolute_time() - (lastAct > lastGood ? lastAct : lastGood) > releaseTicks;
+    uint64_t last = lastAct > lastGood ? lastAct : lastGood;
+    if (lastGuard > last) last = lastGuard;
+    return releaseMs && down && mach_absolute_time() - last > releaseTicks;
+  };
+  // Rilegge lo stack e decide; true = contatto rilasciato (gia' pubblicato).
+  auto guard = [&]() -> bool {
+    uint8_t gev[HX_EVENT_LEN];
+    struct hx_report grep = {};
+    const int rc = hx_read_event(&gChip, gev);
+    const int parsed = rc ? HX_ERR_BUS : hx_parse_event(gev, gChip.x_res ? gChip.x_res : GT_PANEL_X,
+                                                         gChip.y_res ? gChip.y_res : GT_PANEL_Y, &grep);
+    const uint64_t now = mach_absolute_time();
+    uint64_t silentNs = 0;
+    absolutetime_to_nanoseconds(now - (lastAct > lastGood ? lastAct : lastGood), &silentNs);
+    const uint64_t silentMs = silentNs / 1000000ull;
+    const guamp_touch_guard::Verdict v =
+        guamp_touch_guard::verdict(rc, parsed, grep.point_cnt, grep.count, silentMs, releaseMaxMs);
+    if (!guamp_touch_guard::releases(v)) {
+      lastGuard = now;
+      guardKeeps = guardKeeps + 1;
+      if (guardKeeps <= 16 || (guardKeeps & 255) == 0)
+        IOLog("GuampTouch: release guard check %u: silent %llu ms, stack rc %d parse %d point_cnt %02x contacts %u: %s\n",
+              guardKeeps, (unsigned long long)silentMs, rc, parsed, grep.point_cnt, grep.count, guamp_touch_guard::name(v));
+      return false;
+    }
+    struct hx_report up = {};
+    down = false;
+    gReleases = gReleases + 1;
+    if (gReleases <= 16 || (gReleases & 255) == 0)
+      IOLog("GuampTouch: release guard %u: silent %llu ms, stack rc %d parse %d point_cnt %02x: %s\n", gReleases,
+            (unsigned long long)silentMs, rc, parsed, grep.point_cnt, guamp_touch_guard::name(v));
+    publish(up);
+    return true;
   };
   for (;;) {
     if (useIrq) {
       // Woken by the IRQ, or after 20 ms at the latest: works even if the IRQ line never fires.
       // Con guamp-touch-softdetect anche alla scadenza della mappa seguente (softdetect::waitMs, 1..20 ms).
-      assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, softdetect::waitMs(), 1000 * 1000);
+      // Display off (guamp-touch-wake): the interrupt or the display change wakes the thread, 1 s otherwise.
+      assert_wait_timeout((event_t)&gIrqEvents, THREAD_UNINT, suspended ? 1000u : softdetect::waitMs(), 1000 * 1000);
       if (gIrqEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
       else thread_block(THREAD_CONTINUE_NULL);
     } else {
@@ -1587,19 +1689,24 @@ void thread(void *param, wait_result_t) {
     }
     if (suspended) {
       // Gesture mode: only interrupts matter, and only a gesture report (8 bytes of the stack) counts.
-      if (!fromIrq) continue;
-      if (hx_read_event(&gChip, ev)) continue;
-      const int id = hx_parse_gesture(ev);
+      // Without a confirmed gesture mode the chip is in sense off with the interrupt masked: nothing to read.
+      if (!fromIrq || !gWakeGesture) continue;
+      const int rc = hx_read_event(&gChip, ev);
+      bool nonEmpty = false;
+      for (unsigned i = 0; !rc && i < sizeof(ev); ++i) nonEmpty = nonEmpty || ev[i];
+      const int id = rc ? 0 : hx_parse_gesture(ev);
+      const guamp_touch_wake::Decision d = guamp_touch_wake::decide(gWakeMode, id, rc == 0, nonEmpty);
       if (gestLog < 24 || id) {
         gestLog++;
-        IOLog("GuampTouch: suspended irq %u: %02x %02x %02x %02x %02x %02x %02x %02x -> %s %02x\n", gIrqs, ev[0], ev[1], ev[2],
-              ev[3], ev[4], ev[5], ev[6], ev[7], id ? "gesture" : "no gesture", id);
+        IOLog("GuampTouch: suspended irq %u rc %d: %02x %02x %02x %02x %02x %02x %02x %02x -> %s %02x (%s): %s\n", gIrqs, rc,
+              ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], id ? "gesture" : "no gesture", id,
+              guamp_touch_wake::idName(id), d.why);
       }
-      if (id && !gDisplayOn && mach_absolute_time() - lastWake > wakeGapTicks) {
+      if (d.verdict == guamp_touch_wake::kWake && !gDisplayOn && mach_absolute_time() - lastWake > wakeGapTicks) {
         lastWake = mach_absolute_time();
         __atomic_fetch_add(&gWakeRequests, 1, __ATOMIC_RELEASE);
-        IOLog("GuampTouch: wake: gesture %02x (%s), Power press requested (%u)\n", id,
-              id == HX_GEST_DOUBLE_TAP ? "double tap" : id == 0x81 ? "finger gesture" : "other", gWakeRequests);
+        IOLog("GuampTouch: wake: gesture %02x (%s), Power press requested (%u)\n", id, guamp_touch_wake::idName(id),
+              gWakeRequests);
       }
       continue;
     }
@@ -1619,14 +1726,7 @@ void thread(void *param, wait_result_t) {
     if (ddLate && mach_absolute_time() >= ddLate) { ddLate = 0; ddDump("60s"); }
     if (irqOnly && useIrq && !fromIrq) {
       // No interrupt for 20 ms: only the lost "finger up" guard (long, see releaseMs).
-      if (lostUp()) {
-        struct hx_report up = {};
-        down = false;
-        gReleases = gReleases + 1;
-        if (gReleases <= 16 || (gReleases & 255) == 0)
-          IOLog("GuampTouch: release guard %u: no interrupt or valid report for %u ms, contact released\n", gReleases, releaseMs);
-        publish(up);
-      }
+      if (lostUp()) guard();
       continue;
     }
     struct hx_report rep;
@@ -1702,14 +1802,7 @@ void thread(void *param, wait_result_t) {
       if (parsed != HX_ERR_EMPTY) gBad = gBad + 1;
       // A lost "finger up" report left iOS with a stuck contact: released only by the long guard (releaseMs without
       // interrupts or valid reports), never by an empty stack or a filtered report while the finger is held.
-      if (lostUp()) {
-        struct hx_report up = {};
-        down = false;
-        gReleases = gReleases + 1;
-        if (gReleases <= 16 || (gReleases & 255) == 0)
-          IOLog("GuampTouch: release guard %u: no interrupt or valid report for %u ms, contact released\n", gReleases, releaseMs);
-        publish(up);
-      }
+      if (lostUp()) guard();
       continue;
     }
     lastGood = mach_absolute_time();
