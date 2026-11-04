@@ -1,0 +1,57 @@
+guamp: an uncaught Objective-C exception's name, reason and throw frames to the kernel log (AegirPoster SIGABRT, fin45)
+
+fin45 (live-20261103-195840, kpan-20261104-021110): AegirPoster aborted three times at 89-102 s with the same stack, symbolized on the
+iPadOS 17.7.11 cache (slide 0x4f64000): __pthread_kill <- abort <- demangling_terminate_handler <- _objc_terminate <- std::terminate <-
+_dispatch_client_callout <- FBSMainRunLoopSerialQueue _targetQueue_performNextIfPossible <- CFRunLoop source0: an uncaught exception
+in a FrontBoard main-queue block, not a fault inside libvulkan_freedreno (the "image" of the exit line is only the last image loaded).
+ExceptionDiag.h already keeps "SHENGTHROW name | reason | frames" in the heap for sheng's kernel scan, which guamp has not: the same
+text now also goes out as "problem exc<k> ..." lines (8 of 38 characters), printed by native-adreno 0009 as
+"GuampMetal: client AegirPoster: problem exc0 ...". Applies after 0001-0003, 0009-0016 and 0030.
+
+diff --git a/ExceptionDiag.h b/ExceptionDiag.h
+index 3f35f6e..3736ec8 100644
+--- a/ExceptionDiag.h
++++ b/ExceptionDiag.h
+@@ -14,6 +14,11 @@ namespace exceptiondiag {
+ 
+ static NSUncaughtExceptionHandler *gPrevious;
+ static char *gText;   // kept referenced: the text must stay in the heap until the process is gone
++// guamp (UniXNU-guamp patches/adreno-metal/0017): guamp's kernel has no heap scan for SHENGTHROW, so the text also goes to the kernel as
++// "problem exc<k> <38 characters>" lines (native-adreno 0009 prints them as "GuampMetal: client <process>: ..."), set by the plugin.
++// fin45: AegirPoster aborted three times in std::terminate from an uncaught exception in a FrontBoard main-queue block, no reason
++// anywhere in the kernel log.
++static void (*gReport)(const char *line);
+ 
+ static void handler(NSException *exception) {
+     @autoreleasepool {
+@@ -25,6 +30,15 @@ static void handler(NSException *exception) {
+         for (NSUInteger i = 0; i < frames.count && i < 20; ++i) [text appendFormat:@" %llx", (unsigned long long)frames[i].unsignedLongLongValue];
+         for (NSUInteger i = 0; i < text.length; ++i) if ([text characterAtIndex:i] < 32 || [text characterAtIndex:i] > 126) [text replaceCharactersInRange:NSMakeRange(i, 1) withString:@"?"];
+         if (const char *utf8 = text.UTF8String) gText = strdup(utf8);
++        if (gReport && gText) {
++            const char *body = gText + strlen("SHENGTHROW ");
++            const size_t length = strlen(body);
++            for (unsigned k = 0; k < 8 && (size_t)k * 38 < length; ++k) {
++                char line[48];
++                snprintf(line, sizeof line, "exc%u %.38s", k, body + (size_t)k * 38);
++                gReport(line);
++            }
++        }
+     }
+     if (gPrevious) gPrevious(exception);
+ }
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 88679ae..fa6f848 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -289,6 +289,10 @@ static id deviceForPort(unsigned port) {
+         if (tried) return device;
+         tried = true;
+         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
++        // guamp 0017: and to the kernel log, through the same text stream as the client problems, from this process's accelerator port.
++        static unsigned gExceptionPort;
++        gExceptionPort = port;
++        exceptiondiag::gReport = [](const char *line) {clientFailure(gExceptionPort, "problem", line);};
+         // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
+         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
+         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
