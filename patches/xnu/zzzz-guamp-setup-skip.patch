@@ -76,7 +76,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	{"com.apple.fairplayd.A2", GUAMP_SLIM_NOW | GUAMP_SLIM_FAIRPLAY, 1},
 +	{"com.apple.iconservices.iconservicesagent", GUAMP_SLIM_ALL, 0},
 +	{"com.apple.identityservicesd", GUAMP_SLIM_ALL, 1},
-+	{"com.apple.itunescloudd", GUAMP_SLIM_ALL, 1},
++	{"com.apple.itunescloudd", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},	/* 04/11: NOT in the 29/10 list: MusicWidgets looked it up 6348 times (10 tries per service, error 3) */
 +	{"com.apple.knowledgeconstructiond", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.locationd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.mediaanalysisd", GUAMP_SLIM_ALL | GUAMP_SLIM_MEDIA, 1},
