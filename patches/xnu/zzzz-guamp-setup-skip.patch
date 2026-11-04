@@ -545,8 +545,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			{"/chosen", "mac-address-wifi0"}, {"/chosen", "mac-address-bluetooth0"}, {"/product", "product-id"},
 +			{"/product", "wifi-chipset"}, {"/product", "bluetooth-le"}, {"/arm-io/wlan", "local-mac-address"},
 +			/* 29/10 (scripts/make-guamp-siri-adt.py): "touch-id" is cached from a "mesa" node; "assistant" (Siri) is read live, listed so a
-+			 * Siri ADT also refreshes anything derived from it */
-+			{"/product", "assistant"}, {"/arm-io/mesa", "name"},
++			 * Siri ADT also refreshes anything derived from it; 05/11 camera (scripts/make-guamp-camera-adt.py): still/front/rear-facing-camera, camera-flash */
++			{"/product", "assistant"}, {"/arm-io/mesa", "name"}, {"/arm-io/isp", "camera-front"}, {"/arm-io/isp", "camera-rear"}, {"/product/camera", "flash"},
 +		};
 +		uint32_t stamp = 2166136261u;           /* FNV-1a over name, size and bytes of each property */
 +		for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {

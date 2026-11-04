@@ -1,0 +1,45 @@
+#version 450
+// SPDX-License-Identifier: BSD-2-Clause
+// guamp-isp, passo GPU 2: immagine R'G'B' (passo 1) -> scala con il campionatore bilineare -> NV12 in un buffer
+// (lo stesso IOSurface/VkBuffer che va a CoreVideo come 420v/420f). Un invocazione = blocco 4x2 d'uscita:
+// 2 parole Y (4 byte per riga) e 1 parola CbCr (2 coppie).
+// Per riduzioni oltre 2x usare BIN2 nel passo 1 (il campionatore bilineare da solo farebbe aliasing).
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D srcImg; // filtro lineare, clamp to edge
+layout(std430, binding = 1) writeonly buffer Out { uint outw[]; };
+
+layout(push_constant) uniform P {
+    uint outW, outH;
+    uint yOff, yStride;   // in parole da 32 bit
+    uint uvOff, uvStride; // in parole da 32 bit
+    vec4 ky;              // Y = dot(ky.rgb, rgb) * 255 + ky.w
+    vec4 kcb, kcr;        // C = dot(k.rgb, rgb) * 255 + 128
+    vec4 lim;             // ymin, ymax, cmin, cmax
+} pc;
+
+void main()
+{
+    uvec2 b = gl_GlobalInvocationID.xy;
+    if (b.x * 4u >= pc.outW || b.y * 2u >= pc.outH) return;
+    vec2 inv = 1.0 / vec2(pc.outW, pc.outH);
+    vec3 c[2][4];
+    for (uint j = 0u; j < 2u; j++) {
+        uint yw = 0u;
+        for (uint i = 0u; i < 4u; i++) {
+            vec2 uv = (vec2(b.x * 4u + i, b.y * 2u + j) + 0.5) * inv;
+            c[j][i] = texture(srcImg, uv).rgb;
+            float y = clamp(dot(pc.ky.rgb, c[j][i]) * 255.0 + pc.ky.w + 0.5, pc.lim.x, pc.lim.y);
+            yw |= uint(y) << (8u * i);
+        }
+        outw[pc.yOff + (b.y * 2u + j) * pc.yStride + b.x] = yw;
+    }
+    uint cw = 0u;
+    for (uint p = 0u; p < 2u; p++) {
+        vec3 m = (c[0][2u * p] + c[0][2u * p + 1u] + c[1][2u * p] + c[1][2u * p + 1u]) * 0.25;
+        float cb = clamp(dot(pc.kcb.rgb, m) * 255.0 + 128.5, pc.lim.z, pc.lim.w);
+        float cr = clamp(dot(pc.kcr.rgb, m) * 255.0 + 128.5, pc.lim.z, pc.lim.w);
+        cw |= (uint(cb) | (uint(cr) << 8)) << (16u * p);
+    }
+    outw[pc.uvOff + b.y * pc.uvStride + b.x] = cw;
+}

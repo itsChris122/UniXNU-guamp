@@ -53,3 +53,9 @@ One line per sensor: `GuampCamera: <sensor> chip id 0x.... (expected 0x....): OK
 `guamp-camera-cci=100|400|1000` timing set, `guamp-camera-pmgpio=1` programs PM8008 GPIO1 like the DT.
 GuampCameraRdi.h is the unused skeleton of the TPG -> CSID -> TFE RDI test frame. Sensor register tables are vendor
 data and stay out of this repo (GCAM v1 file, parser `gcam::gcamFind`). Host tests: `tests/run-camera-tests.sh` (WSL).
+
+Boot argument `guamp-cam2=1|2` (GuampCamss.inc + GuampCamssCore.h, default off): CAMSS RAW capture test, TPG (1) or
+sensor (2, needs a `guamp_camss_sensor_*` provider) -> CSIPHY 2.0.1 / CSID 530 -> TFE 530 RDI write master -> N frames
+in SMMU stream 0x400 buffers; report with counters, CSID/TFE errors and per-buffer FNV/histogram, ending with one
+`GuampCamss: RESULT ...` line. Consumer and sensor interface: GuampCamssApi.h (supersedes GuampCameraRdi.h). Host
+tests: `tests/run-camss-tests.sh` (WSL).
