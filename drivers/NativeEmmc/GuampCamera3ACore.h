@@ -183,7 +183,81 @@ inline unsigned lensRamp(uint16_t cur, uint16_t target, uint16_t maxStep, uint16
   return n;
 }
 
-// ---- EEPROM AF calibration (main module) -----------------------------------------------------------------------------
+// Lens control over any CCI writer (GuampCamera3A.inc: gcam::Cci; tests: a simulated VCM). Moves of up to kLensJump codes
+// are written at once (an AF step); longer ones in kLensJump steps kLensStepUs apart, park in kParkStep steps
+// kParkStepUs apart, so the lens never slams into its end stop (the click Linux avoids with its launch/park tables).
+constexpr uint16_t kLensJump = 120, kParkStep = 40;
+constexpr unsigned kLensStepUs = 2000, kParkStepUs = 4000;
+struct AfCal { uint16_t inf, macro; bool valid; };   // EEPROM calibration (parseAfCal below) or the defaults
+struct LensIo {
+  void *ctx;
+  int (*write)(void *, uint8_t cci, uint8_t slave7, const Write &w);   // 0 or negative error
+  void (*delayUs)(void *, unsigned us);
+};
+struct LensCtl {
+  const LensIo *io = nullptr;
+  const Lens *l = nullptr;
+  uint16_t dac = 0, lo = 0, hi = kDacMax;   // current DAC, usable range (calibrated infinity .. macro, widened a bit)
+  bool on = false;
+  unsigned writes = 0;
+  int lastError = 0;
+  int wr(const Write &w) {
+    ++writes;
+    const int r = io->write(io->ctx, l->cci, l->slave7, w);
+    if (r) lastError = r;
+    return r;
+  }
+  void wait(unsigned us) { if (us) io->delayUs(io->ctx, us); }
+  // Rail already on (caller). Init list, then the lens stays at its rest position (park).
+  int powerUp(const LensIo *i, const Lens *lens, const AfCal &cal) {
+    if (!i || !lens) return kErrInval;
+    io = i; l = lens; on = false; dac = lens->park; lastError = 0;
+    // 10 % margin around the calibration: infinity of a hot module or a lens pointing down sits slightly outside it.
+    const uint16_t span = cal.macro > cal.inf ? static_cast<uint16_t>(cal.macro - cal.inf) : 0;
+    const uint16_t m = static_cast<uint16_t>(span / 10);
+    lo = cal.inf > m ? static_cast<uint16_t>(cal.inf - m) : 0;
+    hi = cal.macro + m > kDacMax ? kDacMax : static_cast<uint16_t>(cal.macro + m);
+    for (unsigned k = 0; k < lens->nInit; ++k) {
+      const int r = wr({lens->init[k].reg, lens->init[k].val, 1, 1});
+      if (r) return r;
+      wait(lens->init[k].delayUs);
+    }
+    on = true;
+    return kOk;
+  }
+  uint16_t clamp(uint16_t t) const { return t < lo ? lo : t > hi ? hi : t; }
+  // AF move: inside [lo, hi]; long moves ramped.
+  int move(uint16_t target) {
+    if (!on) return kErrInval;
+    target = clamp(target);
+    uint16_t steps[kDacMax / kLensJump + 2];
+    const unsigned n = lensRamp(dac, target, kLensJump, steps, sizeof(steps) / sizeof(steps[0]));
+    for (unsigned k = 0; k < n; ++k) {
+      if (k) wait(kLensStepUs);
+      const int r = wr(lensDac(steps[k]));
+      if (r) return r;
+      dac = steps[k];
+    }
+    return kOk;
+  }
+  // Back to rest in small steps, then the driver's power-down bit (the caller then drops the rail).
+  int park() {
+    if (!on) return kOk;
+    uint16_t steps[kDacMax / kParkStep + 2];
+    const unsigned n = lensRamp(dac, l->park, kParkStep, steps, sizeof(steps) / sizeof(steps[0]));
+    int r = kOk;
+    for (unsigned k = 0; k < n && !r; ++k) {
+      r = wr(lensDac(steps[k]));
+      if (!r) dac = steps[k];
+      wait(kParkStepUs);
+    }
+    const int p = wr(lensPowerDown());
+    on = false;
+    return r ? r : p;
+  }
+};
+
+// ---- EEPROM AF calibration (main module)-----------------------------------------------------------------------------
 constexpr uint16_t kAfBlock = 0x27, kAfLen = 24, kAfCrc = 0x3f, kAfInf = 0x2d, kAfMacro = 0x31;
 constexpr uint8_t kEepromSlave7 = 0x50;    // the usual 0xA0 module EEPROM address: not in the saved blobs, to verify
 
@@ -205,8 +279,6 @@ inline uint16_t crc16Buypass(const uint8_t *p, size_t n) {
   }
   return c;
 }
-
-struct AfCal { uint16_t inf, macro; bool valid; };
 
 // buf = EEPROM bytes kAfBlock .. kAfCrc + 1 (26 bytes). Valid when the CRC matches (either variant), both DACs are in
 // range and macro > inf + 50 (the vendor library rejects inverted values).

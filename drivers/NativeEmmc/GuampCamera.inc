@@ -13,6 +13,7 @@
 //   guamp-camera-mclk=24|19  24 MHz from GPLL9 (default; falls back to 19.2 MHz TCXO if GPLL9 does not lock) or 19.2
 //   guamp-camera-cci=100|400|1000  CCI timing set (default 400; the CCI clock is the 19.2 MHz TCXO, so the bus
 //                         runs at about half the nominal rate)
+//   guamp-camera-af=1|3      after the sensors: lens driver + EEPROM AF probe (GuampCamera3A.inc), 3 = also macro
 //   guamp-camera-pmgpio=1    also program PM8008 GPIO1 as the DT does (func1 output); default: only log it
 #include "GuampCameraCore.h"
 #include "GuampCameraRdi.h"   // skeleton only (step 2), nothing in this file calls it
@@ -177,6 +178,8 @@ void pmGpio1() {
   pmWrite(nullptr, gcam::kPmChip, gcam::kPmGpio1 + 0x46, 0x80);        // enable
 }
 
+namespace af { void probe(gcam::Cci &cci, const gcam::CciTiming &t); void start(); }   // GuampCamera3A.inc
+
 void probeThread(void *, wait_result_t) {
   if (gDelay) IOSleep(gDelay * 1000u);
   IOLock *lock = audiohw::gLock ? audiohw::gLock : gOwnLock;
@@ -221,6 +224,7 @@ void probeThread(void *, wait_result_t) {
             s.cci, s.slave7, s.idReg, p.rc == 0 ? "OK" : p.rc == gcam::kErrMismatch ? "WRONG ID" : p.rc == gcam::kErrNack ? "NACK" : "FAILED",
             p.rc, p.cciStatus);
     }
+    if (!r) af::probe(cci, t);                                       // guamp-camera-af (lens drivers, EEPROM AF block)
     cciPins(false);
     camssDown();
   }
@@ -242,6 +246,7 @@ void start() {
   PE_parse_boot_argn("guamp-camera-mclk", &gMclkMhz, sizeof(gMclkMhz));
   PE_parse_boot_argn("guamp-camera-cci", &gCciKhz, sizeof(gCciKhz));
   PE_parse_boot_argn("guamp-camera-pmgpio", &gPmGpio, sizeof(gPmGpio));
+  af::start();
   if (gDelay > 600) gDelay = 600;
   if (gCciKhz != 100 && gCciKhz != 1000) gCciKhz = 400;
   gMask &= 0xf;

@@ -8,6 +8,23 @@ int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 }
+// kern/sched_prim.h (flash wake-up of the PMIC thread)
+typedef void *event_t;
+typedef struct thread *thread_t;
+typedef int wait_result_t;
+typedef int wait_interrupt_t;
+typedef void (*thread_continue_t)(void *, wait_result_t);
+#define THREAD_UNINT 0
+#define THREAD_AWAKENED 0
+#define THREAD_CONTINUE_NULL ((thread_continue_t)0)
+extern "C" {
+wait_result_t assert_wait_timeout(event_t event, wait_interrupt_t interruptible, uint32_t interval, uint32_t scale_factor);
+wait_result_t thread_block(thread_continue_t continuation);
+thread_t current_thread(void);
+int clear_wait(thread_t thread, wait_result_t result);
+int thread_wakeup_prim(event_t event, bool one_thread, wait_result_t result);
+}
+#define thread_wakeup(x) thread_wakeup_prim((x), false, THREAD_AWAKENED)
 void IOSleep(unsigned ms);
 void IODelay(unsigned us);
 typedef int IOReturn;
@@ -55,5 +72,7 @@ constexpr unsigned kPmi632 = 2;   // PmicService.inc board constant
 void use(unsigned tick) {
   if (pmic::torch::init()) pmic::torch::poll(tick);
   pmic::torch::request(500);
+  pmic::torch::flashRequest(2, 500, 200);
+  pmic::torch::nap(25);
   pmic::torch::shutdown(true);
 }

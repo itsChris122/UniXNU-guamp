@@ -1334,6 +1334,7 @@ static void usbProbe()
 #include "GuampSnsRpc.inc"     // FastRPC listener of the ADSP sensors PD (guamp-sensors=2): persist registry, SMMU 0x1c3
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
 #include "GuampCamera.inc"     // camera step 1 (guamp-camera=1): PM8008 + MCLK + CCI chip id of the 4 sensors, own thread; after GuampAudioHw.inc (shared SE1 I2C)
+#include "GuampCamera3A.inc"   // camera 3A kernel side: lens drivers, EEPROM AF, exposure writes (guamp-camera-af=1|3 probe)
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
