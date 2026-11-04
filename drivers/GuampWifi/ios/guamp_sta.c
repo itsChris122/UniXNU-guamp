@@ -24,6 +24,7 @@
  * be joined (a wrong passphrase), the standing one is joined again.
  */
 #include <IOKit/IOLib.h>                /* IOMallocData: plain functions, no kalloc startup sites */
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
@@ -60,10 +61,44 @@ static unsigned heard_count;
 static struct hakios_sta_channel channels[CHANNELS_MOST];
 static unsigned channel_count;
 
+/*
+ * guamp 05/11 (fin47): what a scan gives iOS is what that scan heard, as a driver of Apple's does: on the channels asked for
+ * (all when none were named) and heard while it ran. The station keeps every access point it ever heard, so a scan of 3
+ * channels handed wifid 9 networks from other channels and up to 33 s old (fin47 "result N ... age 24795 ms"); wifid's
+ * auto-join compares the results with the scan it asked for (channels, SSIDs, age) and found nothing usable.
+ */
+struct heard_filter {
+	const struct hakios_sta_scan *scan;
+	uint32_t max_age_ms;
+};
+
+static bool
+heard_in_scan(const struct hakios_sta_bss *bss, const struct heard_filter *filter)
+{
+	if (filter == NULL) {
+		return true;
+	}
+	if (bss->age_ms > filter->max_age_ms) {
+		return false;
+	}
+	if (filter->scan->frequency_count == 0) {
+		return true;
+	}
+	for (unsigned i = 0; i < filter->scan->frequency_count && i < 64; i++) {
+		if (filter->scan->frequencies[i] == bss->frequency) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
-heard_one(const struct hakios_sta_bss *bss, __unused void *context)
+heard_one(const struct hakios_sta_bss *bss, void *context)
 {
 	/* (only the thread writes the list, and it reads the count without the lock) */
+	if (!heard_in_scan(bss, context)) {
+		return;
+	}
 	if (heard_count < HEARD_MOST) {
 		lck_mtx_lock(&sta_lock);
 		heard[heard_count++] = *bss;
@@ -147,11 +182,18 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			bzero(&fallback, sizeof(fallback));
 			lck_mtx_unlock(&sta_lock);
 		} else if (do_scan) {
+			uint64_t began, ended;
+			struct heard_filter filter = { .scan = &scan };
+
+			clock_get_uptime(&began);
 			error = ops->scan(&scan);
+			clock_get_uptime(&ended);
+			absolutetime_to_nanoseconds(ended - began, &ended);
+			filter.max_age_ms = (uint32_t)(ended / 1000000) + 500;   /* (heard since the scan began, with a margin) */
 			lck_mtx_lock(&sta_lock);
 			heard_count = 0;
 			lck_mtx_unlock(&sta_lock);
-			ops->heard(heard_one, NULL);
+			ops->heard(heard_one, &filter);
 			hakios_apple80211_event(HAKIOS_STA_SCAN_DONE, error);
 		}
 
