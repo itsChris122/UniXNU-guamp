@@ -262,7 +262,9 @@ struct Sm6115Runtime {
   // The transport is stepped even after a Wi-Fi failure (error set): only the CE poll stops. The result is the
   // Wi-Fi error (so Wi-Fi loops end), or the transport error that failed it.
   int pump() {
-    if(pumping)return error;
+    // guamp 05/11: a pump nested in this one (a wait inside control.step or a CE handler) still reads the copy engines:
+    // gw_snoc_poll_ce keeps itself from nesting (gw_servicing_ce); only the RPM and control steps are not re-entered
+    if(pumping) { if(ath10kStarted&&!error) gw_snoc_poll_ce(); return error; }
     pumping=true;
     int e=owner.stepRpm(nowMs());
     if(!e&&control.stage!=WifiControl::Off&&control.stage!=WifiControl::Prepared&&control.stage!=WifiControl::Failed)

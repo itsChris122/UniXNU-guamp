@@ -156,9 +156,9 @@ static const struct ath10k_hif_ops gw_hif={
 static const struct ath10k_bus_ops gw_bus={.read32=ath10k_snoc_read32,.write32=ath10k_snoc_write32};
 static int gw_napi_poll(struct napi_struct *n,int budget) {
   struct ath10k *ar=container_of(n,struct ath10k,napi);
-  gw_ce_users++;
+  gw_ce_users++; lx_pump_hold++;   /* (guamp 05/11: no work or timers started inside the handlers, lx_rt.c) */
   for(unsigned i=0;i<12&&gw_ce_live;i++) ath10k_ce_per_engine_service(ar,i);   /* (guamp 04/11: checked before each engine) */
-  gw_ce_users--; gw_rri_release_if_idle(ar);
+  lx_pump_hold--; gw_ce_users--; gw_rri_release_if_idle(ar);
   int done=ath10k_htt_txrx_compl_task(ar,budget);
   if(done<budget) napi_complete_done(n,done); return done;
 }
@@ -238,7 +238,7 @@ int gw_snoc_start(const struct lx_platform *platform,const struct gw_snoc_board 
 static volatile unsigned gw_trace_polls,gw_trace_steps;
 void gw_snoc_poll_ce(void) {
   if(!gw_ar||gw_boot_error||gw_servicing_ce||!gw_ce_live)return;
-  gw_servicing_ce=true; gw_ce_users++;
+  gw_servicing_ce=true; gw_ce_users++; lx_pump_hold++;
   const bool trace=nw_wifi_trace_budget&&nw_wifi_trace_take(&gw_trace_polls);
   for(unsigned i=0;i<12&&gw_ce_live;i++) {   /* (guamp 04/11: a handler may have powered the block down: stop there) */
     if(trace) nw_wifi_trace("poll_ce %u: ath10k_ce_per_engine_service ce%u (ctrl +0x%x)",gw_trace_polls,i,
@@ -246,6 +246,7 @@ void gw_snoc_poll_ce(void) {
     ath10k_ce_per_engine_service(gw_ar,i);
   }
   if(trace) nw_wifi_trace("poll_ce %u: napi_schedule",gw_trace_polls);
+  lx_pump_hold--;
   if(gw_ce_live) napi_schedule(&gw_ar->napi);
   gw_servicing_ce=false; gw_ce_users--; gw_rri_release_if_idle(gw_ar);
 }
@@ -305,6 +306,8 @@ void gw_note_mgmt_drop(int why) { if(why>=0&&why<6) gw_mgmt_drops[why]++; }
 void gw_wmi_timeout(unsigned cmd_id) {
   static unsigned timeouts; timeouts++;
   lx_log(3,"ath10k: WMI command %#x had no credit for 10 s (%u so far): refused, no hardware restart (this port cannot restart the chip)",cmd_id,timeouts);
+  /* guamp 05/11: where the wait was: inside a copy engine service (then nobody read the answers), and the dispatcher hold */
+  lx_log(3,"ath10k: the wait ran with copy engine service %s, users %u, dispatcher hold %u",gw_servicing_ce?"on the stack":"idle",gw_ce_users,lx_pump_hold);
 }
 void gw_note_htt_t2h(unsigned type) { gw_htt_types[type<23?type:23]++; }
 /* Everything since the last call: WMI events by id, management frames dropped by reason, HTT messages by type; with

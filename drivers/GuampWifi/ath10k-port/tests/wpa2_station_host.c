@@ -212,6 +212,17 @@ static void silent_firmware_cases(void) {
   CHECK(g_conn_done == NW_RES_TIMEOUT && g_auth_tx >= 1 && g_auth_tx <= 3, "silent join: timed out with %d authentications sent", g_auth_tx);
   g_ap_silent = 0; nw_wifi_disconnect(); spin(3);
 }
+/* guamp 05/11 (fin46b): a dispatcher round inside a copy engine handler (lx_pump_hold set) starts no queued work; the next
+ * round outside it does */
+static int g_held_work_ran;
+static void held_work(struct work_struct *w) { (void)w; g_held_work_ran++; }
+static void pump_hold_cases(void) {
+  static struct work_struct w; INIT_WORK(&w, held_work); g_held_work_ran = 0;
+  lx_pump_hold++; queue_work(system_wq, &w); lx_delay_ms(2);
+  CHECK(g_held_work_ran == 0, "no work starts while a copy engine handler holds the dispatcher");
+  lx_pump_hold--; lx_pump();
+  CHECK(g_held_work_ran == 1, "the held work runs in the next round");
+}
 int main(void) {
   lx_plat = &plat; lx_root_init();
   for (int i = 0; i < 12; i++) { static const int br[12] = { 10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540 }; rates[i].bitrate = br[i]; }
@@ -312,6 +323,7 @@ int main(void) {
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
   control_regression_cases();
   channel_move_cases();
+  pump_hold_cases();
   silent_firmware_cases();
   m4_status_missing_case();
   tkip_group_case();

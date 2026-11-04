@@ -191,6 +191,14 @@ static void where(int kind, const void *fn) {
   if (nw_wifi_trace_budget && kind >= 1 && kind <= 3 && nw_wifi_trace_take(&g_trace_where))
     nw_wifi_trace("pump %u: runs %s, fn lx_now_ms+0x%llx (64-bit offset), depth %d", g_trace_where,
                   kind == 1 ? "irq" : kind == 2 ? "timer" : "work", (unsigned long long)nw_wifi_where[1], g_depth); }
+/*
+ * guamp 05/11 (fin46b: a join whose MGMT_TX_SEND waited 10 s for a WMI credit with 0 WMI events read meanwhile): while a copy
+ * engine handler runs (gw_snoc_poll_ce, gw_napi_poll hold this), a dispatcher round started inside it -- a udelay/mdelay or a
+ * wait in the handler -- runs no timers and no work. Otherwise queued work (the management frame transmit) began inside the
+ * handler, waited for a WMI answer, and no copy engine was read while it waited (gw_servicing_ce kept every nested poll out).
+ * The work runs in the next round, outside the handler.
+ */
+volatile unsigned lx_pump_hold;
 /* The dispatcher: interrupts first, then due timers, then one round of queued work. */
 int lx_pump(void) {
   int ran = 0;
@@ -210,6 +218,7 @@ int lx_pump(void) {
     if (r == IRQ_WAKE_THREAD && g_irq[i].t) g_irq[i].t(g_irq[i].irq, g_irq[i].id);
     g_nrunning--;
   }
+  if (lx_pump_hold) { g_depth--; where(0, 0); return ran; }
   u64 now = lx_now_ms();
   struct list_head *p, *n;
   for (p = g_timers.next; p != &g_timers; p = n) {

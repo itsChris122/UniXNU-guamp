@@ -115,6 +115,7 @@ typedef struct { int unused; } wait_queue_head_t;
 #define wake_up_interruptible(w) ((void)(w))
 extern void (*lx_log_tap)(int level, const char *line);   /* sees every line after it is logged */
 int lx_pump(void);               /* runs one round of ready work; returns nonzero if anything ran */
+extern volatile unsigned lx_pump_hold;   /* guamp 05/11: nonzero inside a copy engine handler: no timers, no work (lx_rt.c) */
 void lx_idle(unsigned int ms);   /* nothing ready: let the clock advance and device events arrive */
 /* The condition may have side effects (a command is sent when it is evaluated): it is evaluated once per round, and never again after the wait ends. */
 #define wait_event_timeout_once(w, cond, tmo_j) ({ \
