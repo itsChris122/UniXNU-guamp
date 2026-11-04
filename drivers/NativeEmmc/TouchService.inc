@@ -1519,8 +1519,23 @@ void thread(void *param, wait_result_t) {
   uint32_t seen = gIrqEvents;
   bool down = false;
   uint32_t polls = 0;
-  uint64_t lastGood = 0, releaseTicks = 0;
-  nanoseconds_to_absolutetime(100 * 1000 * 1000ULL, &releaseTicks);
+  // guamp 04/11 (pressione prolungata ignorata in fin44/45): il firmware Himax manda un report quando il dito arriva o si
+  // muove e poi tace finche' il dito resta fermo (kpan-20261104-021110: contatti di 2 report, "released" 20 -> 26 dalla
+  // guardia); Linux (himax_report_points) rilascia solo col report esplicito "tutte su" (point_cnt 0 / 0xFF), mai a tempo.
+  // Prima la guardia rilasciava dopo 100 ms senza report valido: ogni dito fermo diventava un tap e iOS non vedeva mai
+  // il tocco lungo. Ora il contatto resta premuto finche' il firmware non dice "su"; resta solo una sicurezza lunga
+  // contro un "su" perso: guamp-touch-release-ms (default 3000, 0 = mai) senza NESSUNA interruzione e nessun report
+  // valido. Uno stack tutto a zero (HX_ERR_EMPTY, "nessun dato") o un report scartato dai filtri non rilasciano piu'.
+  uint64_t lastGood = 0, lastAct = 0, releaseTicks = 0;
+  unsigned releaseMs = 3000;
+  PE_parse_boot_argn("guamp-touch-release-ms", &releaseMs, sizeof(releaseMs));
+  nanoseconds_to_absolutetime(static_cast<uint64_t>(releaseMs) * 1000 * 1000ULL, &releaseTicks);
+  IOLog("GuampTouch: release guard %u ms without interrupts or valid reports (%s)\n", releaseMs,
+        releaseMs ? "contact held until the firmware reports the finger up" : "off");
+  // Sicurezza lunga: vero se un contatto e' premuto da releaseMs senza interruzioni ne' report validi.
+  auto lostUp = [&]() {
+    return releaseMs && down && mach_absolute_time() - (lastAct > lastGood ? lastAct : lastGood) > releaseTicks;
+  };
   for (;;) {
     if (useIrq) {
       // Woken by the IRQ, or after 20 ms at the latest: works even if the IRQ line never fires.
@@ -1533,6 +1548,7 @@ void thread(void *param, wait_result_t) {
     }
     const bool fromIrq = useIrq && gIrqEvents != seen;
     seen = gIrqEvents;
+    if (fromIrq) lastAct = mach_absolute_time();
     polls = polls + 1;
     if (gEventsMode && gEvGen != evGen) {
       evGen = gEvGen;
@@ -1602,11 +1618,13 @@ void thread(void *param, wait_result_t) {
     }
     if (ddLate && mach_absolute_time() >= ddLate) { ddLate = 0; ddDump("60s"); }
     if (irqOnly && useIrq && !fromIrq) {
-      // No interrupt for 20 ms: only the lost "finger up" guard.
-      if (down && mach_absolute_time() - lastGood > releaseTicks) {
+      // No interrupt for 20 ms: only the lost "finger up" guard (long, see releaseMs).
+      if (lostUp()) {
         struct hx_report up = {};
         down = false;
         gReleases = gReleases + 1;
+        if (gReleases <= 16 || (gReleases & 255) == 0)
+          IOLog("GuampTouch: release guard %u: no interrupt or valid report for %u ms, contact released\n", gReleases, releaseMs);
         publish(up);
       }
       continue;
@@ -1682,11 +1700,14 @@ void thread(void *param, wait_result_t) {
     if (parsed == HX_ERR_EMPTY) empties = empties + 1;
     if (drop) {
       if (parsed != HX_ERR_EMPTY) gBad = gBad + 1;
-      // A lost "finger up" report left iOS with a stuck contact: release after 100 ms without a valid report.
-      if (down && mach_absolute_time() - lastGood > releaseTicks) {
+      // A lost "finger up" report left iOS with a stuck contact: released only by the long guard (releaseMs without
+      // interrupts or valid reports), never by an empty stack or a filtered report while the finger is held.
+      if (lostUp()) {
         struct hx_report up = {};
         down = false;
         gReleases = gReleases + 1;
+        if (gReleases <= 16 || (gReleases & 255) == 0)
+          IOLog("GuampTouch: release guard %u: no interrupt or valid report for %u ms, contact released\n", gReleases, releaseMs);
         publish(up);
       }
       continue;
