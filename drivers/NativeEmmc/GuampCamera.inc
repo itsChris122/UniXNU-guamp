@@ -199,7 +199,7 @@ void pmGpio1() {
   pmWrite(nullptr, gcam::kPmChip, gcam::kPmGpio1 + 0x46, 0x80);        // enable
 }
 
-namespace af { void probe(gcam::Cci &cci, const gcam::CciTiming &t); void start(); }   // GuampCamera3A.inc
+namespace af { void probe(gcam::Cci &cci, const gcam::CciTiming &t); void start(); void lensClose(); }   // GuampCamera3A.inc
 
 // ---- hardware up/down (shared by the probe, the session test and the API) ------------------------------------------
 bool gHwUp, gChipWasOn, gPmUp, gCamss;
@@ -380,6 +380,7 @@ int sensorStatus(gcam::Status *st) {
 void sensorClose() {
   if (!gSessionLock) return;
   IOLockLock(gSessionLock);
+  af::lensClose();                                                   // lens opened by the iOS service (GuampCamIosHooks.inc)
   if (gSess.state != gcam::kOff) {
     const int r = gSess.close();
     IOLog("GuampCamera: %s close (stream off + power down): rc %d\n", gSess.s ? gSess.s->name : "-", r);

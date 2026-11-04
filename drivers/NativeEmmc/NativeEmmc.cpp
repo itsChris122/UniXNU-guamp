@@ -1335,7 +1335,10 @@ static void usbProbe()
 #include "GuampGpuZap.inc"     // a610_zap through TrustZone PAS (guamp-adreno-zap=1|2), the NativeAdreno zap callback; after GuampAdsp.inc
 #include "GuampCamera.inc"     // camera step 1 (guamp-camera=1): PM8008 + MCLK + CCI chip id of the 4 sensors, own thread; after GuampAudioHw.inc (shared SE1 I2C)
 #include "GuampCamera3A.inc"   // camera 3A kernel side: lens drivers, EEPROM AF, exposure writes (guamp-camera-af=1|3 probe)
+#include "GuampCamIos.inc"     // camera service for iOS (guamp-camera-ios=1|2): AppleH6CamIn + RAW ring user client, test pattern; before GuampCamss.inc: its weak guamp_camss_* declarations precede the definitions
+#define GUAMP_CAMSS_SENSOR_BRIDGE 1   // GuampCamss.inc drives the sensor through camera:: (GuampCamera.inc session API)
 #include "GuampCamss.inc"      // CAMSS RAW capture (guamp-cam2=1 TPG | 2 sensor): CSIPHY/CSID/TFE RDI -> buffers, guamp_camss_* API; after GuampCamera.inc and GuampAudioPlay.inc (SMMU)
+#include "GuampCamIosHooks.inc" // integration: guamp_camios_hw_exposure/focus/flash -> sensor session, lens drivers, GuampTorch flash
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
@@ -1493,6 +1496,7 @@ static void startLater(thread_call_param_t, thread_call_param_t)
   audiodev::start();  // guamp-audio-dev=1: /dev/guamp-audio PCM node (null sink until the ADSP PCM path), own thread
   camera::start();    // guamp-camera=1: chip id probe of the four sensors (PM8008, CCI), then all off; after audiohw::start (bus lock)
   camss::start();     // guamp_camss_* API locks; guamp-cam2=1|2: RAW capture test thread (waits for camera::start's probe)
+  camios::start();    // guamp-camera-ios=1|2: AppleH6CamIn for CMCapture (H6ISP.mediacapture plug-in), RAW ring, test pattern
 }
 
 // Called by ArmDTPlatform::configure; the kext load must not run inside the platform's own start
