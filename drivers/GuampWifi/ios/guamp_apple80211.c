@@ -708,6 +708,22 @@ get(struct apple80211req *request)
 		index = result_next++;
 		lck_mtx_unlock(&apple80211_lock);
 		there = hakios_sta_heard(index, bss);
+		/*
+		 * guamp 04/11: what each result says, the first 150 (address, channel, signal, AGE, elements; never the name).
+		 * wifid's auto-join takes a result only on a channel it asked for (CHANNEL and CHANNEL_FLAGS & 0x2018), with a
+		 * known name, and adds the cache entry's age to AGE (__WiFiDeviceCopyPreparedScanResults 0x10001b0a0): to see
+		 * whether the saved network is among them and how old it looks.
+		 */
+		if (there) {
+			static unsigned results_said;
+
+			if (results_said < 150) {
+				results_said++;
+				printf("GuampWiFi: apple80211: result %u: %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm age %u ms, %u bytes of elements\n",
+				    index, bss->bssid[0], bss->bssid[1], bss->bssid[2], bss->bssid[3], bss->bssid[4], bss->bssid[5],
+				    bss->frequency, (int)bss->rssi, bss->age_ms, bss->elements_length);
+			}
+		}
 		error = there ? give_network(request, bss) : EIO;
 		IOFreeData(bss, sizeof(*bss));
 		return error;
