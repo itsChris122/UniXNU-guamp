@@ -310,5 +310,22 @@ inline void catchUp(State &s, unsigned t, volatile u8 *to, const volatile u8 *fr
   }
   s.bufValid[t] = true;
 }
+
+// Mean luma (0..255, BT.601 integer weights 77/150/29 on premultiplied BGRA) of an 8x8 grid of source pixels: a cheap
+// picture fingerprint for the early-frame log (boot logo ~black, lock screen wallpaper brighter). 0 for an empty source.
+inline u32 meanLuma(const u8 *src, u64 stride, u32 w, u32 h)
+{
+  if (!src || !w || !h) return 0;
+  u32 sum = 0;
+  for (u32 j = 0; j < 8; ++j) {
+    const u64 y = (u64)h * (2 * j + 1) / 16;
+    for (u32 i = 0; i < 8; ++i) {
+      const u64 x = (u64)w * (2 * i + 1) / 16;
+      const u8 *p = src + y * stride + x * 4;   // B, G, R, A
+      sum += (77u * p[2] + 150u * p[1] + 29u * p[0]) >> 8;
+    }
+  }
+  return sum / 64;
+}
 }  // namespace gscan
 #endif

@@ -37,6 +37,7 @@ volatile int gHold = 0;
 struct Kernel {
   bool read = false, diff = false, neon = false, flipWanted = false;
   unsigned fullEvery = 600, idleMs = 60;
+  unsigned earlyFrames = 12;   // guamp-scanout-early=<n> (default 12, 0 = none): the first n frames logged one by one
   uint64_t flipOffset = 0x500000;
   uint32_t flushMask = 0;     // pipe bit (+ the CTL bit, guamp-flip-flush-ctl=0 leaves it out)
   IOLock *lock = nullptr;
@@ -102,6 +103,7 @@ static void readOptions()
   v = 0; PE_parse_boot_argn("guamp-scanout-flip", &v, sizeof(v)); gK.flipWanted = v == 1;
   PE_parse_boot_argn("guamp-copy-diff-full", &gK.fullEvery, sizeof(gK.fullEvery));
   PE_parse_boot_argn("guamp-flip-idle-ms", &gK.idleMs, sizeof(gK.idleMs));
+  PE_parse_boot_argn("guamp-scanout-early", &gK.earlyFrames, sizeof(gK.earlyFrames));
   if (gK.idleMs > 1000) gK.idleMs = 1000;
   uint32_t off = 0x500000;
   PE_parse_boot_argn("guamp-flip-offset", &off, sizeof(off)); gK.flipOffset = off;
@@ -312,6 +314,12 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     if (gK.flipOn && gK.st.rowsDrawn && target != gK.shown) point(target);
     gK.frames = gK.frames + 1;
     if (!changed) gK.unchanged = gK.unchanged + 1;
+    // The first frames of the boot, one line each (the log line's time is when the panel got it): which picture reached the
+    // screen when (boot logo / lock screen, 05/11: off ~35 s after the display power-on, ~20 s after the first frame).
+    if (gK.frames <= gK.earlyFrames)
+      IOLog("GuampScanout: early frame %llu: luma %u, changed rows %u, drawn rows %llu box %u,%u-%u,%u, buffer %u (shown %u)\n",
+            gK.frames, meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH), changed, gK.st.rowsDrawn,
+            gK.st.box[0], gK.st.box[1], gK.st.box[2], gK.st.box[3], target, gK.shown);
     gK.rows = gK.rows + gK.st.rowsDrawn; gK.pixels = gK.pixels + gK.st.pixelsDrawn;
     if (gK.st.rowsDrawn) for (unsigned i = 0; i < 4; ++i) gK.box[i] = gK.st.box[i];
     gK.scanTicks = gK.scanTicks + (t1 - t0); gK.drawTicks = gK.drawTicks + (t2 - t1);
