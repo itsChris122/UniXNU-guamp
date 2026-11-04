@@ -228,8 +228,7 @@ static void composeLog(uint64_t f)
   // Section 15 (guamp-compose-keep): undrawable layers kept / frames seeded from the screen, and what the video layer shows.
   if (now[24] != last[24] || now[25] != last[25] || now[5] != last[5]) {
     IOLog("GuampDisplay: compose keep: stale layers kept +%llu, frames seeded from the screen +%llu; video luma %llu "
-          "(dark draws +%llu, same picture +%llu of +%llu 420 draws)
-", now[24] - last[24], now[25] - last[25], now[26],
+          "(dark draws +%llu, same picture +%llu of +%llu 420 draws)\n", now[24] - last[24], now[25] - last[25], now[26],
           now[27] - last[27], now[28] - last[28], now[5] - last[5]);
   }
   for (unsigned i = 0; i < 30; i++) last[i] = now[i];
