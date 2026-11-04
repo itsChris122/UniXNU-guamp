@@ -91,6 +91,7 @@ static struct {
   u8 group_cipher;   /* the access point's RSN group cipher suite: 4 CCMP, 2 TKIP (WPA/WPA2 mixed networks) */
   /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */
   u8 gtk[32]; int gtk_len, gtk_idx; u64 m4_replay; u32 m4_cookie; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames; unsigned join_frames;
+  int mgmt_sent, mgmt_waits, mgmt_waits_said; unsigned mgmt_status_at_send;   /* (guamp 04/11: see send_auth) */
   u8 gtk_last[32]; unsigned gtk_last_len; int gtk_last_idx;   /* the group key last installed (to answer a repeat without installing) */
 } C;
 static u32 g_next_m4_cookie;
@@ -274,8 +275,21 @@ static struct sk_buff *new_frame(unsigned body) {
 static void mgmt_header(struct sk_buff *skb, u16 fc) {
   struct ieee80211_hdr *h = skb_put_zero(skb, 24); h->frame_control = cpu_to_le16(fc);
   memcpy(h->addr1, C.ap.bssid, 6); memcpy(h->addr2, g_vif->addr, 6); memcpy(h->addr3, C.ap.bssid, 6); h->seq_ctrl = cpu_to_le16(C.seq++ << 4); }
+/*
+ * guamp 04/11 (fin45): 8 authentications in 2.4 s and not one transmit status (acked or not): the firmware did not send
+ * them, every MGMT_TX_SEND took a WMI credit that never came back (endpoint 2: tx credits 0), and the next WMI command
+ * timed out (fin43 the same after the association). A retry is sent only when the previous management frame of the join
+ * has its transmit status; otherwise the retry waits (it still counts), so the firmware's queue is not filled while it
+ * cannot send. Said once per join, with whether the access point's beacons are heard on the channel at all.
+ */
+extern unsigned nw_mgmt_tx[2];
+static unsigned mgmt_statuses(void) { return nw_mgmt_tx[0] + nw_mgmt_tx[1]; }
+/* (a frame whose status never comes is retried after 3 waiting steps, ~0.9 s: at most 3 frames in a silent join, not 8) */
+static int mgmt_previous_pending(void) { return C.mgmt_sent && mgmt_statuses() == C.mgmt_status_at_send && C.mgmt_waits++ < 3; }
+static void mgmt_sent_now(void) { C.mgmt_sent = 1; C.mgmt_waits = 0; C.mgmt_status_at_send = mgmt_statuses(); }
 static void send_auth(void) {
   struct sk_buff *skb = new_frame(8); if (!skb) return;
+  mgmt_sent_now();
   mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);
   u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;      /* open system, sequence 1, status 0 */
   tx_frame(skb); }
@@ -367,6 +381,7 @@ static void build_cap_ies(enum nl80211_band band) {
 }
 static void send_assoc(void) {
   struct sk_buff *skb = new_frame(256); if (!skb) return;
+  mgmt_sent_now();
   mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ASSOC_REQ);
   u16 caps = WLAN_CAPABILITY_ESS | (C.secure ? WLAN_CAPABILITY_PRIVACY : 0) | WLAN_CAPABILITY_SHORT_SLOT_TIME;
   u8 *b = skb_put(skb, 4); b[0] = caps; b[1] = caps >> 8; b[2] = 10; b[3] = 0;                   /* listen interval 10 */
@@ -888,8 +903,15 @@ static void timer_fn(struct work_struct *w) {
         char why[480]; nw_wifi_quiet_report(why, sizeof why, 1);
         lx_log(4, "wifi: authentication unanswered: %u frames from the access point during the join", g_current_link_frames - C.join_frames);
         log_long(4, "authentication unanswered:", why);
-        connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */ lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
-  case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; } send_assoc(); } break;
+        connect_done(NW_RES_TIMEOUT); return; }   /* 8 tries: 11 filled the firmware's management queue (01/11: WMI timeout, hardware restart, crash) */
+      if (mgmt_previous_pending()) {
+        if (!C.mgmt_waits_said++) lx_log(4, "wifi: the previous authentication has no transmit status yet: not sending another (%u frames from the access point on %u MHz since the join began)",
+                                        g_current_link_frames - C.join_frames, C.ap.freq);
+        C.last_tx = now; break; }
+      lx_log(6, "wifi: authentication sent again (try %d)", C.tries + 1); send_auth(); } break;
+  case NW_STA_ASSOC: if (now - C.last_tx >= STEP_TIMEOUT_MS) { if (++C.tries > 7) { connect_done(NW_RES_TIMEOUT); return; }
+      if (mgmt_previous_pending()) { if (!C.mgmt_waits_said++) lx_log(4, "wifi: the previous association request has no transmit status yet: not sending another"); C.last_tx = now; break; }
+      send_assoc(); } break;
   case NW_STA_KEYS: break;
   case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;
   default: return; }
@@ -930,6 +952,8 @@ static void start_connect(const struct nw_request *request) {
   r = add_station(); if (r) { lx_log(3, "wifi: station setup failed: %d", r); connect_done(NW_RES_FAILED); return; }
   link_changed(BSS_CHANGED_BSSID | BSS_CHANGED_TXPOWER);
   C.state = NW_STA_AUTH; C.tries = 0; C.started = lx_now_ms(); nw_wifi_stats.stage = 7; C.join_frames = g_current_link_frames;
+  C.mgmt_sent = 0; C.mgmt_waits_said = 0;
+  { char discard[480]; nw_wifi_quiet_report(discard, sizeof discard, 0); }   /* (guamp 04/11: the join's report counts the join only) */
   lx_log(6, "wifi: connecting to %02x:%02x:%02x:%02x:%02x:%02x on %u MHz, signal %d dBm (heard %llu ms ago), transmit power %d dBm", C.ap.bssid[0], C.ap.bssid[1], C.ap.bssid[2], C.ap.bssid[3], C.ap.bssid[4], C.ap.bssid[5], C.ap.freq, C.ap.signal, (unsigned long long)(lx_now_ms() - C.ap.seen), g_vif->bss_conf.txpower);
   send_auth();   /* guamp 02/11: no deauthentication first: sent unassociated it jammed the firmware management queue (fin26/fin27: no tx status, WMI timeout, hardware restart, phone frozen) */ lx_queue_delayed(&g_timer, 100); }
 

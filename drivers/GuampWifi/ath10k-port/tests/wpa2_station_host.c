@@ -122,6 +122,7 @@ static void send_rekey_msg1(void) { g_replay++; for(int i=0;i<32;i++) g_anonce[i
 
 /* ---- the fake driver ---- */
 static int n_tx, n_setkey, n_state, n_disable_group, n_disable_pairwise, g_expect_gtk_id=1, g_fail_pairwise, g_fail_group; static int g_states[8]; static struct ieee80211_key_conf *g_pk, *g_gk; static struct sk_buff *g_last_data, *g_pending_m2_skb, *g_pending_m4_skb;
+static int g_ap_silent, g_auth_tx;   /* guamp 04/11: an access point (or firmware) that answers nothing, sends no transmit status */
 static u8 g_auth_seen, g_assoc_seen, g_msg2_seen, g_msg4_seen; static int g_scan_req, g_scan_ssids, g_scan_duration, g_scan_result, g_msg4_tx_count, g_group_m4_count; static u32 g_scan_first_freq;
 static int g_ready_start_error,g_ready_add_error,n_ready_starts,n_ready_stops,n_ready_adds,n_ready_removes;
 static int op_start(struct ieee80211_hw *hw) { (void)hw;n_ready_starts++;return g_ready_start_error; }
@@ -160,7 +161,7 @@ static void op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *c, struc
     if (g_last_data) kfree_skb(g_last_data); g_last_data = skb; return;
   }
   struct ieee80211_hdr *h = (void *)skb->data; u16 fc = le16_to_cpu(h->frame_control);
-  if (ieee80211_is_auth(h->frame_control)) { g_auth_seen = 1; u8 b[6] = { 0, 0, 2, 0, 0, 0 }; inject(mgmt_to_sta(IEEE80211_STYPE_AUTH, b, 6), 2437); }
+  if (ieee80211_is_auth(h->frame_control)) { g_auth_seen = 1; g_auth_tx++; if (!g_ap_silent) { u8 b[6] = { 0, 0, 2, 0, 0, 0 }; inject(mgmt_to_sta(IEEE80211_STYPE_AUTH, b, 6), 2437); } }
   else if (ieee80211_is_assoc_req(h->frame_control)) { g_assoc_seen = 1;
     const u8 *ie = skb->data + 24 + 4; unsigned left = skb->len - 28; int ssid_ok = 0, rsn_ok = 0;
     while (left >= 2 && left >= 2u + ie[1]) { if (ie[0] == 0 && ie[1] == strlen(SSID) && !memcmp(ie + 2, SSID, ie[1])) ssid_ok = 1; if (ie[0] == 48 && ie[1] == 20) { rsn_ok = 1; g_assoc_rsn_group = ie[7]; } left -= 2 + ie[1]; ie += 2 + ie[1]; }
@@ -202,6 +203,15 @@ static void spin(int ms) { for (int i = 0; i < ms; i++) { nw_sta_run(); lx_pump(
 #include "wpa2_control_cases.inc"
 #include "wpa2_ready_cases.inc"
 
+/* guamp 04/11 (fin45): no answer and no transmit status: the join gives up after its 8 steps having sent at most 3
+ * authentications, instead of filling the firmware's management queue with 8 */
+static void silent_firmware_cases(void) {
+  g_open = 1; beacon(); g_ap_silent = 1; g_auth_tx = 0; g_conn_done = -1;
+  CHECK(nw_wifi_connect((const u8 *)SSID, strlen(SSID), NULL, NULL, 0) == 0, "join accepted with a silent access point");
+  spin(3500);
+  CHECK(g_conn_done == NW_RES_TIMEOUT && g_auth_tx >= 1 && g_auth_tx <= 3, "silent join: timed out with %d authentications sent", g_auth_tx);
+  g_ap_silent = 0; nw_wifi_disconnect(); spin(3);
+}
 int main(void) {
   lx_plat = &plat; lx_root_init();
   for (int i = 0; i < 12; i++) { static const int br[12] = { 10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540 }; rates[i].bitrate = br[i]; }
@@ -302,6 +312,7 @@ int main(void) {
   CHECK(st.state==NW_STA_IDLE && g_power_done==2 && g_power_on==1 && g_power_result==NW_RES_OK,"software radio-on re-enables station requests");
   control_regression_cases();
   channel_move_cases();
+  silent_firmware_cases();
   m4_status_missing_case();
   tkip_group_case();
   ready_regression_cases(hw);
