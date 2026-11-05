@@ -1,0 +1,155 @@
+guamp: each Metal process's frame report to the kernel once a second (NMB_PERF=1, set by guamp-gpu-perf), for the GuampGpuPerf lines
+
+The kernel side (UniXNU-guamp drivers/GuampAdreno/GuampGpuPerf.inc, patches/native-adreno/0019) measures each job's GPU time with
+CP_ALWAYS_ON_COUNTER; what only the process knows comes from here. The frontend counts frames (a drawable presented, or in a process
+that presents none, the render server, a commit with a render pass; commits within 4 ms are one frame) and the vsync periods lost
+between two frames less than 100 ms apart, and native_bridge_metal_perf_sample() gives the deltas of counters the frontend already
+keeps: time inside its calls (draws, binds, passes, blits, resource creation, uploads, commits), resource waits, command buffer waits
+beyond those, commit to completion, shader compiles, and the GPU scanout copy's frames, cost and wait. The plugin's thread sends the
+nonzero fields once a second as markers 0x2000..0x3fff (IOServiceOpen 0x4147xxxx, refused like the progress markers): about 20 calls
+a second while the process draws, none while it is idle. Without NMB_PERF: no thread and two relaxed atomics per frame.
+Applies after 0001-0003, 0009-0022 and 0030; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 6777a88..11ed922 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -303,6 +303,36 @@ static void applyBoardTurnipDebug(unsigned port) {
+         setenv("TU_DEBUG", text, 1);
+     CFRelease(value);
+ }
++// guamp (UniXNU-guamp patches/adreno-metal/0023): NMB_PERF=1 (the board adds it to NativeMetalEnv with guamp-gpu-perf) sends this
++// process's frame report (native_bridge_metal_perf_sample) to the kernel once a second, for its GuampGpuPerf lines: each field that is
++// not zero as two markers, 0x3000 | field << 8 | value >> 12 then 0x2000 | (value & 0xfff), and 0x3f00, 0x2001 to end it (the kernel's
++// GuampGpuPerfCore.h). About 20 refused opens a second while the process draws, none while it is idle; without NMB_PERF no thread.
++static void startPerfReport(unsigned port) {
++    const char *on = getenv("NMB_PERF");
++    if (!on || !strtoul(on, nullptr, 0)) return;
++    Gpu *gpu = makeGpu(port);
++    if (!gpu || !gpu->openFn) return;
++    if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
++        if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);   // the thread keeps using the port
++    }
++    pthread_t thread;
++    if (pthread_create(&thread, nullptr, [](void *argument) -> void * {
++            Gpu *g = static_cast<Gpu *>(argument);
++            uint32_t fields[12];
++            for (;;) {
++                sleep(1);
++                if (!native_bridge_metal_perf_sample(fields)) continue;
++                for (unsigned k = 0; k < 12; ++k) {
++                    if (!fields[k]) continue;
++                    g->mark(0x3000u | k << 8 | fields[k] >> 12);
++                    g->mark(0x2000u | (fields[k] & 0xfff));
++                }
++                g->mark(0x3f00u);
++                g->mark(0x2001u);
++            }
++            return nullptr;
++        }, gpu) == 0) pthread_detach(thread);
++}
+ static id deviceForPort(unsigned port) {
+     static id device;
+     static bool tried;
+@@ -320,6 +350,7 @@ static id deviceForPort(unsigned port) {
+         // runtime keeps within a texture's rows (bridge patch 0016). A board's NativeTurnipDebug comes first and replaces this default.
+         applyBoardTurnipDebug(port);
+         setenv("TU_DEBUG", "nocb", 0);
++        startPerfReport(port);   // guamp 0023: only with NMB_PERF (after NativeMetalEnv is in the environment)
+         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
+         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
+         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+diff --git a/NativeBridgeMetalFrontend.h b/NativeBridgeMetalFrontend.h
+index 980a6b0..48c63dc 100644
+--- a/NativeBridgeMetalFrontend.h
++++ b/NativeBridgeMetalFrontend.h
+@@ -22,6 +22,8 @@ extern void (*native_bridge_metal_problem_hook)(const char *);
+ size_t native_bridge_metal_telemetry(char *out, size_t size);
+ // A client process's compile cost so far as one short line (the plugin streams it into the process's kernel row).
+ size_t native_bridge_metal_client_brief(char *out, size_t size);
++// guamp 0023 (NMB_PERF): this process's frame report since the previous call, twelve fields (see the definition); false: nothing happened.
++bool native_bridge_metal_perf_sample(uint32_t out[12]);
+ // The render thread's frames so far (commits with a render pass, the U row) and their CPU time in microseconds, for the frame-rate overlay.
+ void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us);
+ // What the scanout copy costs, by step, in nanoseconds (gpupresent::Cost in GpuScanoutPresenter.h, its A4 and A5 rows): frames served, then
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f0f7ed8..d70d834 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -140,6 +140,21 @@ struct LongFrame {uint64_t at,gapUs,cpuUs;};
+ static LongFrame gLongFrames[8];
+ static std::atomic<uint32_t> gLongFrameCount;
+ static std::mutex gLongFrameLock;
++// guamp (UniXNU-guamp patches/adreno-metal/0023, NMB_PERF): the frames this process makes, for the kernel's GuampGpuPerf lines. A frame
++// is a drawable presented (presentDrawable:), or, in a process that never presented one (the render server, which swaps surfaces), a
++// commit with a render pass (commits within 4 ms of the previous one are the same frame). lost: the vsync periods (16.7 ms) skipped
++// between two frames less than 100 ms apart, i.e. inside an animation. Two atomics and a clock read per frame; nothing else.
++static std::atomic<uint64_t> gPerfFrames,gPerfLost,gPerfLastUs;
++static std::atomic<bool> gPerfPresents;
++static void perfFrame(bool present) {
++ if(present)gPerfPresents.store(true,std::memory_order_relaxed);
++ else if(gPerfPresents.load(std::memory_order_relaxed))return;
++ const uint64_t now=nowUs(),last=gPerfLastUs.exchange(now,std::memory_order_relaxed);
++ const uint64_t gap=last && now>last?now-last:0;
++ if(!present && last && gap<4000){gPerfLastUs.store(last,std::memory_order_relaxed);return;}
++ gPerfFrames.fetch_add(1,std::memory_order_relaxed);
++ if(gap && gap<100000) {const uint64_t periods=(gap+8333)/16667;if(periods>1)gPerfLost.fetch_add(periods-1,std::memory_order_relaxed);}
++}
+ static void noteFrameCost() {
+  static thread_local uint64_t lastCpu,lastWall;
+  static std::atomic<uint32_t> renderCommits;
+@@ -2119,8 +2134,8 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
++- (void)presentDrawable:(id<MTLDrawable>)drawable {perfFrame(true);[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
++- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {perfFrame(true);[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+ - (void)enqueue {}
+ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
+  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
+@@ -2179,7 +2194,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
+  self.committed=YES;
+  self.committedUs=nowUs();
+- if(encodedWork.passes)noteFrameCost();
++ if(encodedWork.passes){noteFrameCost();perfFrame(false);}
+  commitCpu=threadCpuUs();commitTid=threadIdLow();sampleWindowClose();
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+@@ -3472,6 +3487,34 @@ extern "C" void native_bridge_metal_frame_cost(uint64_t *frames,uint64_t *cpu_us
+ 
+ // The scanout service's cost so far (native_bridge_metal_present_cost): frames, the ns of import, texture, encode, submit and wait, the copy
+ // forms taken, and the textures made and reused.
++// guamp 0023: the frame report since the previous call, the kernel's GuampGpuPerfCore.h fields: [0] frames, [1] lost vsync periods,
++// [2] time inside the bridge's calls (draws, binds, passes, blits, resource creation and uploads, commits), [3] its waits for resources
++// in GPU use, [4] the process's command buffer waits beyond those, [5] commit to completion summed, [6] command buffers completed,
++// [7] the window in ms, [8] shader compiles (pipelines, libraries, functions), [9] scanout copies, [10] their cost, [11] their wait;
++// times in units of 10 us. Returns false when nothing was committed or presented since the previous call (then nothing is sent).
++extern "C" bool native_bridge_metal_perf_sample(uint32_t out[12]) {
++ static uint64_t last[13];static uint64_t lastAt;
++ const uint64_t now=nowUs();
++ auto t=[](const Timed &x){return x.total.load(std::memory_order_relaxed);};
++ const uint64_t v[13]={gPerfFrames.load(),gPerfLost.load(),
++  t(gTimeDraw)+t(gTimeBind)+t(gTimePassOpen)+t(gTimePassClose)+t(gTimeBlit)+t(gTimeCreate)+t(gTimeRegion)+t(gTimeCommit),
++  t(gTimeResourceWait),t(gTimeWaitCompleted)+t(gTimeWaitScheduled),t(gTimeEncodeToCommit),gTimeEncodeToCommit.count.load(),0,
++  t(gTimePipeline)+t(gTimeLibrary)+t(gTimeFunction),gPresent[0].load(),
++  (gPresent[1].load()+gPresent[2].load()+gPresent[3].load()+gPresent[4].load()+gPresent[5].load())/1000,gPresent[5].load()/1000,gCommits.load()};
++ uint64_t d[13];
++ for(unsigned i=0;i<13;i++){d[i]=v[i]>=last[i]?v[i]-last[i]:0;last[i]=v[i];}
++ const uint64_t span=lastAt && now>lastAt?now-lastAt:0;lastAt=now;
++ const bool moved=d[0] || d[12];
++ if(!moved)return false;
++ // The resource waits run through waitUntilCompleted, so they are taken out of the command buffer waits.
++ d[4]=d[4]>d[3]?d[4]-d[3]:0;
++ d[7]=span/1000;   // ms
++ for(unsigned i=0;i<12;i++) {
++  const uint64_t value=(i==0 || i==1 || i==6 || i==7 || i==9)?d[i]:d[i]/10;
++  out[i]=value>0xfffff?0xfffff:(uint32_t)value;
++ }
++ return true;
++}
+ extern "C" void native_bridge_metal_present_cost(const uint64_t *values) {
+  for(unsigned i=0;i<6;i++)gPresent[i].store(values[i]);
+  gPresentForms[0].store(values[6]);gPresentForms[1].store(values[7]);gPresentForms[2].store(values[8]);
