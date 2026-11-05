@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index ee466f2..73ff0f2 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9286,6 +9286,89 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
+@@ -9286,6 +9286,103 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
  		native_guamp_lsv_watch_start();	/* keeps a good copy of the stores lsd writes in this boot */
  	}
  }
@@ -20,6 +20,7 @@ index ee466f2..73ff0f2 100644
 + * CommCenter logging subsystems get private data enabled: those logs can then hold device identifiers and stay on the phone.
 + * CommCenter itself runs only with guamp-slim-commcenter=1 (setup skip). Never panics: every step only records its status. */
 +#include <pexpert/device_tree.h>
++extern bool IOGetBootManifestHash(char *, size_t *);	/* IOKitBSDInit.cpp, as kern_sysctl.c declares it */
 +volatile int native_guamp_baseband_stage = 0;
 +volatile int native_guamp_baseband_status = -1;
 +volatile int native_guamp_baseband_preboot_stage = 0;
@@ -52,14 +53,27 @@ index ee466f2..73ff0f2 100644
 +		}
 +	}
 +	char hash[97] = "";
++	const char *hash_source = "none";
 +	if (mode == 2) {
-+		DTEntry chosen = NULL;
-+		const void *value = NULL;
-+		unsigned int value_size = 0;
-+		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
-+		    SecureDTGetProperty(chosen, "boot-manifest-hash", &value, &value_size) == kSuccess && value_size && value_size <= 48) {
-+			for (unsigned i = 0; i < value_size; i++) {
-+				snprintf(hash + 2 * i, 3, "%02X", ((const uint8_t *)value)[i]);
++		/* 05/11 (fin49): the hash is published on IODeviceTree:/chosen at root mount (offline-owner-boot-manifest.patch), not in
++		 * the flattened ADT SecureDT reads, so only the registry copy has it; launchd and kern.bootobjectspath use that one. */
++		char digest[48];
++		size_t digest_size = sizeof(digest);
++		if (IOGetBootManifestHash(digest, &digest_size) && digest_size && digest_size <= sizeof(digest)) {
++			for (unsigned i = 0; i < digest_size; i++) {
++				snprintf(hash + 2 * i, 3, "%02X", (uint8_t)digest[i]);
++			}
++			hash_source = "registry";
++		} else {
++			DTEntry chosen = NULL;
++			const void *value = NULL;
++			unsigned int value_size = 0;
++			if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++			    SecureDTGetProperty(chosen, "boot-manifest-hash", &value, &value_size) == kSuccess && value_size && value_size <= 48) {
++				for (unsigned i = 0; i < value_size; i++) {
++					snprintf(hash + 2 * i, 3, "%02X", ((const uint8_t *)value)[i]);
++				}
++				hash_source = "adt";
 +			}
 +		}
 +		if (!hash[0]) {
@@ -83,16 +97,16 @@ index ee466f2..73ff0f2 100644
 +		}
 +	}
 +	printf("guamp-baseband=%u: addon files %d, written %d, same %d, failed %d (last error %d); %s stage %d status %d; preboot %s "
-+	    "stage %d status %d, folder stage %d status %d; private telephony logging %d\n", mode, native_gpu_addon_files,
++	    "stage %d status %d, folder stage %d status %d; private telephony logging %d; manifest hash from %s\n", mode, native_gpu_addon_files,
 +	    native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error, point,
 +	    native_guamp_baseband_stage, native_guamp_baseband_status, mode == 2 ? (hash[0] ? hash : "(no boot-manifest-hash)") : "(off)",
 +	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
-+	    native_guamp_baseband_folder_status, logging_error);
++	    native_guamp_baseband_folder_status, logging_error, hash_source);
 +}
  static void
  native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -9315,6 +9398,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -9315,6 +9412,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	if (audio_plugin) {
  		native_guamp_audio_plugin_mount(p, scratch);
  	}

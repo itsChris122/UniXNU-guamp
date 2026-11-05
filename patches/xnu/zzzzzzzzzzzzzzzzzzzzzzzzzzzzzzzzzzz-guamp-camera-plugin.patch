@@ -4,7 +4,7 @@ index 8689284..ca581a3 100644
 +++ b/bsd/kern/kern_exec.c
 @@ -9369,6 +9369,32 @@ native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
  	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
- 	    native_guamp_baseband_folder_status, logging_error);
+ 	    native_guamp_baseband_folder_status, logging_error, hash_source);
  }
 +/* guamp: the camera capture plug-in H6ISP.mediacapture (package/GuampISP of the device repository: FigCaptureDevice/Stream
 + * over the AppleH6CamIn kernel service, software ISP and 3A in mediaserverd) shown inside /System/Library/MediaCapture, the
