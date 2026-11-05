@@ -57,6 +57,9 @@ __attribute__((weak)) volatile uint64_t native_adreno_wc_bo_events;
 // the render server's last fence.
 __attribute__((weak)) volatile uint64_t native_adreno_throttle_stats[4];
 __attribute__((weak)) volatile uint32_t native_adreno_compositor_fence;
+// patches/native-adreno/0019: job slots kept for the render server ([0] app waits, [1] app refusals, [2] app us, [3] render server
+// waits, [4] render server refusals, [5] render server us, [6] render server longest us, [7] app longest us).
+__attribute__((weak)) volatile uint64_t native_adreno_slot_stats[8];
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 // patches/native-adreno/0019: the re-assertion's pages ([0] checked, [1] found reset and written back, [2] BO passes) and its time
@@ -150,6 +153,18 @@ void logSubmits() {
     IOLog("GuampGpu: app submissions held +%llu (to the limit +%llu), %llu us each, longest %llu us; render server fence %u\n",
           tw - th[0], tl - th[1], (tu - th[2]) / (tw - th[0]), native_adreno_throttle_stats[3], native_adreno_compositor_fence);
   th[0] = tw; th[1] = tl; th[2] = tu;
+  // patch 0019: waits for a job slot. A render server refusal is what set backboardd's device lost in fin50 (fence 462 frozen).
+  static uint64_t sl[6];
+  bool slots_moved = false;
+  for (unsigned i = 0; i < 6; ++i) slots_moved |= native_adreno_slot_stats[i] != sl[i];
+  if (slots_moved)
+    IOLog("GuampGpu: job slots: apps waited +%llu (refused +%llu) %llu us each, longest %llu us; render server waited +%llu "
+          "(refused +%llu) %llu us each, longest %llu us\n", native_adreno_slot_stats[0] - sl[0], native_adreno_slot_stats[1] - sl[1],
+          native_adreno_slot_stats[0] != sl[0] ? (native_adreno_slot_stats[2] - sl[2]) / (native_adreno_slot_stats[0] - sl[0]) : 0,
+          native_adreno_slot_stats[7], native_adreno_slot_stats[3] - sl[3], native_adreno_slot_stats[4] - sl[4],
+          native_adreno_slot_stats[3] != sl[3] ? (native_adreno_slot_stats[5] - sl[5]) / (native_adreno_slot_stats[3] - sl[3]) : 0,
+          native_adreno_slot_stats[6]);
+  for (unsigned i = 0; i < 6; ++i) sl[i] = native_adreno_slot_stats[i];
   // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
   static uint64_t ro[3];
   const uint64_t om = native_adreno_publish_ro_owned[0], ob = native_adreno_publish_ro_owned[1], os = native_adreno_publish_ro_owned[2];

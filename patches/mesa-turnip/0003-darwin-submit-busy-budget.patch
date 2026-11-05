@@ -1,0 +1,61 @@
+turnip darwin: a busy kernel (job slots shared by every process, or a full ring) is retried for TU_DARWIN_SUBMIT_BUSY_MS (default 10000) before the device is set lost, not 64 attempts in under a millisecond (fin50: backboardd lost its device behind Maps, render server fence frozen; with native-adreno 0019)
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 85e59ec..cecefd4 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -876,7 +876,12 @@ darwin_note_fence(uint32_t fence)
+ }
+ 
+ /* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
+- * are taken. */
++ * are taken.
++ * guamp (UniXNU-guamp patches/mesa-turnip/0003): the slots are shared by every process. fin50 (Maps): backboardd's own jobs had all
++ * retired, so each of its 64 attempts waited for nothing and the device was set lost in well under a millisecond while the apps' jobs
++ * held every slot ("submit: no free job slot", the render server never submitted again). A busy kernel (and a momentarily full ring,
++ * kIOReturnNoResources) is now retried for TU_DARWIN_SUBMIT_BUSY_MS (default 10000) of wall time, pausing 0.2 ms doubling to 4 ms
++ * between attempts once the oldest own fence has retired; the device is set lost only after that. */
+ static VkResult
+ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *entries,
+                     unsigned count, uint32_t *fence)
+@@ -888,25 +893,33 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+    for (unsigned i = 0; i < count; i++)
+       req.buffers[i] = entries[i];
+ 
+-   for (unsigned attempt = 0; attempt < 64; attempt++) {
++   static int64_t busy_ms = -1;
++   if (busy_ms < 0)
++      busy_ms = debug_get_num_option("TU_DARWIN_SUBMIT_BUSY_MS", 10000);
++   const uint64_t deadline = os_time_get_nano() + (uint64_t)busy_ms * 1000000ull;
++   unsigned pause_us = 200;
++   for (unsigned attempt = 0;; attempt++) {
+       NativeAdrenoAbiSubmitReply reply = {};
+       kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
+       if (kr == KERN_SUCCESS) {
+          *fence = (uint32_t)reply.fence;
+          return VK_SUCCESS;
+       }
+-      if (kr != kIOReturnBusy)
++      if (kr != kIOReturnBusy && kr != kIOReturnNoResources)
+          return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++      if (os_time_get_nano() >= deadline)
++         return vk_device_set_lost(&dev->vk, "submit: no free job slot in %lld ms (%u attempts)", (long long)busy_ms, attempt + 1);
+ 
+       pthread_mutex_lock(&dw.lock);
+       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+       pthread_mutex_unlock(&dw.lock);
+-      if (!oldest)
+-         usleep(100);
+-      else if (dw_wait_fence_locked_free(dev, oldest, os_time_get_nano() + 5000000000ull) != VK_SUCCESS)
+-         return vk_device_set_lost(&dev->vk, "submit: GPU did not retire a job");
++      if (oldest && dw_wait_fence_locked_free(dev, oldest, MIN2(deadline, os_time_get_nano() + 5000000000ull)) == VK_ERROR_DEVICE_LOST)
++         return VK_ERROR_DEVICE_LOST;
++      /* the slots are other processes' jobs: give them time to retire */
++      usleep(pause_us);
++      if (pause_us < 4000)
++         pause_us *= 2;
+    }
+-   return vk_device_set_lost(&dev->vk, "submit: no free job slot");
+ }
+ 
+ static VkResult

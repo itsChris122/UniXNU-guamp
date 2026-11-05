@@ -72,6 +72,10 @@ extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_import
 // priority uses, and its switches (guamp-gpu-other-depth, default 2, 0 off, max 4; guamp-gpu-other-wait-us, default 50000).
 extern volatile uint32_t native_adreno_compositor_fence, native_adreno_other_depth, native_adreno_other_wait_us;
 extern uint32_t (*native_adreno_retired_fence)(void);
+// patches/native-adreno/0019: job slots kept for the render server (guamp-gpu-rs-slots, default 2, max 6, 0 off), an app's wait for
+// them (guamp-gpu-slot-wait-us, default 200000) and the render server's wait for a free slot (guamp-gpu-rs-slot-wait-us, default
+// 2000000; 0 = refused busy at once, as before).
+extern volatile uint32_t native_adreno_rs_slots, native_adreno_slot_wait_us, native_adreno_rs_slot_wait_us;
 // guamp-copy-wait-compositor (default 1): the display copy (guamp_adreno_wait_submitted, guamp_adreno_ring_marks) follows the render
 // server's last fence instead of the ring's newest; 0, or before the render server's first submission: the ring's newest, as before.
 volatile uint32_t gCopyWaitCompositor = 1;
@@ -902,6 +906,14 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   }
   native_adreno_other_wait_us = bootArg("guamp-gpu-other-wait-us", 50000);
   native_adreno_retired_fence = &retiredFence;
+  {
+    const uint32_t reserve = bootArg("guamp-gpu-rs-slots", 2);
+    native_adreno_rs_slots = reserve > 6 ? 6 : reserve;
+  }
+  native_adreno_slot_wait_us = bootArg("guamp-gpu-slot-wait-us", 200000);
+  native_adreno_rs_slot_wait_us = bootArg("guamp-gpu-rs-slot-wait-us", 2000000);
+  IOLog("GuampAdreno: job slots kept for the render server %u of 8 (apps wait up to %u us, the render server up to %u us)\n",
+        native_adreno_rs_slots, native_adreno_slot_wait_us, native_adreno_rs_slot_wait_us);
   IOLog("GuampAdreno: display copy waits for the render server's fence %u; other processes at most %u submissions in flight "
         "(wait up to %u us)\n", gCopyWaitCompositor, native_adreno_other_depth, native_adreno_other_wait_us);
   native_adreno_ro_imports_owned = bootArg("guamp-adreno-ro-imports-owned", 1) ? 1 : 0;

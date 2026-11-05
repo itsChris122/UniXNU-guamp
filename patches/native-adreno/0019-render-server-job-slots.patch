@@ -1,0 +1,102 @@
+guamp: job slots kept for the render server (guamp-gpu-rs-slots, default 2): an app submits only while more than that many of the eight slots are idle, waiting outside the lock at most guamp-gpu-slot-wait-us; the render server waits for a free slot (at most guamp-gpu-rs-slot-wait-us) instead of being refused busy (fin50: backboardd Turnip device lost, fence 462 frozen)
+
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index dc1cb0b..aaec6e9 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -639,6 +639,57 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
+ /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
+  * taken outside the connection lock, [3] the longest wait in us. */
+ extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
++/* guamp (UniXNU-guamp patches/native-adreno/0019): job slots kept for the render server. The submit object has eight job slots for every
++ * process together. fin50 (05/11, Maps): the apps' jobs (about 90 ms each on the GPU) held all eight, backboardd's submission was refused
++ * busy, and its Turnip, whose own jobs had all retired, retried 64 times in well under a millisecond and set the device lost ("submit: no
++ * free job slot", 391 s): the render server's fence stayed at 462 for good and the screen froze on Maps (2 fps, then nothing).
++ *  - A process other than the render server submits only while more than native_adreno_rs_slots (guamp-gpu-rs-slots, default 2, max 6,
++ *    0 off) slots are idle; it first waits for that outside the lock, at most native_adreno_slot_wait_us (guamp-gpu-slot-wait-us, default
++ *    200000), then is refused busy (its Turnip waits and asks again).
++ *  - The render server never needs a reserve but, when every slot is taken, waits outside the lock for one, at most
++ *    native_adreno_rs_slot_wait_us (guamp-gpu-rs-slot-wait-us, default 2000000), instead of being refused at once.
++ * native_adreno_slot_stats: [0] app waits, [1] app refusals, [2] app us waited, [3] render server waits, [4] render server refusals,
++ * [5] render server us waited, [6] the render server's longest wait in us, [7] an app's longest. */
++extern "C" {volatile uint32_t native_adreno_rs_slots=2,native_adreno_slot_wait_us=200000,native_adreno_rs_slot_wait_us=2000000;
++    volatile uint64_t native_adreno_slot_stats[8];}
++/* Idle job slots once what the CP already passed is retired; SIZE_MAX without a usable submit object (the call itself then answers). */
++static size_t idleSlotsLocked()
++{
++    if(!g.submit || g.submit->poisoned())return SIZE_MAX;
++    if(g.submit->retireCompleted())return SIZE_MAX;
++    return g.submit->idleSlots();
++}
++static size_t slotsWanted(bool other)
++{
++    const uint32_t reserve=native_adreno_rs_slots>6?6:native_adreno_rs_slots;
++    return other?size_t(reserve)+1:1;
++}
++/* other: not the render server; live: the connection still open (its close ends the wait). */
++static void waitForSlots(bool other,const volatile bool *live)
++{
++    const uint64_t limit=other?native_adreno_slot_wait_us:native_adreno_rs_slot_wait_us;
++    if(!limit)return;
++    const size_t want=slotsWanted(other);
++    IOLockLock(g.lock);
++    size_t idle=idleSlotsLocked();
++    IOLockUnlock(g.lock);
++    if(idle>=want)return;
++    const uint64_t began=g.clock.now_us(g.clock.cookie);
++    uint64_t waited=0;
++    for(;;) {
++        /* the board's pause until the next GPU interrupt (at most 100 us), else 1 ms asleep: no spinning for up to two seconds */
++        if(!g.clock.idle || g.clock.idle(g.clock.cookie))IOSleep(1);
++        IOLockLock(g.lock);
++        idle=*live?idleSlotsLocked():SIZE_MAX;
++        IOLockUnlock(g.lock);
++        waited=g.clock.now_us(g.clock.cookie)-began;
++        if(idle>=want || waited>=limit)break;
++    }
++    volatile uint64_t *st=native_adreno_slot_stats+(other?0:3);
++    st[0]=st[0]+1;st[2]=st[2]+waited;
++    volatile uint64_t &longest=native_adreno_slot_stats[other?7:6];
++    if(waited>longest)longest=waited;
++}
+ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+ {
+     if(method==NativeAdrenoMethodSetMetadata && input && input_size==sizeof(NativeAdrenoAbiMetadata)) {
+@@ -700,11 +751,23 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+                 if(waited>native_adreno_throttle_stats[3])native_adreno_throttle_stats[3]=waited;
+             }
+         }
++        /* guamp 0019: the render server's job slots (above), waited for outside the lock; the kernel's own client is left alone. */
++        const bool slotted=method==NativeAdrenoMethodSubmit && connection->live_ && !connection->kernel_ && g.clock.now_us;
++        if(slotted)waitForSlots(connection->other_,&connection->live_);
+         IOLockLock(g.lock);
++        bool slot_refused=false;
++        if(slotted && connection->live_) {
++            const size_t idle=idleSlotsLocked();
++            if(idle!=SIZE_MAX && idle<slotsWanted(connection->other_)) {
++                slot_refused=true;
++                volatile uint64_t &refused=native_adreno_slot_stats[connection->other_?1:4];
++                refused=refused+1;
++            }
++        }
+         /* guamp-gpu-all: the limits of a process other than the render server, checked and counted under the same lock as the call. */
+         const bool limited=native_adreno_gpu_all && connection->other_ && connection->live_;
+         uint64_t freed=0;
+-        status=kIOReturnSuccess;
++        status=slot_refused?kIOReturnBusy:kIOReturnSuccess;   /* guamp 0019 */
+         /* guamp (patch 0006): a live connection is refused nothing but a BoAlloc over its own ceiling (guamp-gpu-all-bo, now 768 MiB by
+          * default: a runaway process, which then faults in Turnip, as jetsam would have ended it). The table reserve and the total of all
+          * processes are applied at open (native_adreno_new_user_client): a refused map made Turnip fault on -2 (fin1, SpringBoard). */
+diff --git a/NativeAdrenoSubmit.h b/NativeAdrenoSubmit.h
+index 84a4785..b542db5 100644
+--- a/NativeAdrenoSubmit.h
++++ b/NativeAdrenoSubmit.h
+@@ -86,6 +86,8 @@ public:
+     IOReturn observeFence(uint32_t fence,const NativeAdrenoRingClock *,uint32_t timeout_us);
+     bool poisoned() const {return poisoned_;}
+     size_t outstanding() const;
++    /* guamp (UniXNU-guamp patches/native-adreno/0019): job slots not taken (call retireCompleted() first for an exact count). */
++    size_t idleSlots() const {return sizeof jobs_/sizeof jobs_[0]-outstanding();}
+     NativeAdrenoSubmitStats stats() const {return stats_;}
+ };
+ #endif
