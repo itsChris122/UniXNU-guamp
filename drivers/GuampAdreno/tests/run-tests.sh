@@ -65,6 +65,9 @@ if [ -e "$WORK/na/NativeAdrenoProcFence.h" ]; then
 else
   echo "NativeAdrenoProcFence.h missing (patch 0017 not applied)"; rc=1
 fi
+echo "== the display copy's fence: render server's last or the ring's newest at the swap, the later (GuampCopyTarget.h, fin49)"
+clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined "$HERE/copy_target_host.cpp" -o "$WORK/copy_target" && "$WORK/copy_target" || rc=1
+g++ $FLAGS -Wvolatile "$HERE/copy_target_host.cpp" -o "$WORK/copy_target_gcc" && "$WORK/copy_target_gcc" >/dev/null || rc=1
 extract() {   # source output: the statements of dropViews between "if(!view)return;" and "view->release();"
   python3 -I - "$1" "$2" <<'PY' || return 1
 import sys

@@ -25,6 +25,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "NativeAdrenoGpuContext.h"
+#include "GuampCopyTarget.h"
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoCpInit.h"
 #include "NativeAdrenoIrq.h"
@@ -797,10 +798,17 @@ int naAccelerator() {
 // The fence the display copy waits for: the render server's last one (patch 0017), else the ring's newest. The CP runs the ring in
 // order, so the render server's fence covers every job queued before it (the app frames it composites); app jobs queued after it no
 // longer keep the screen waiting (05/11 Maps: 43 copy waits timed out at 500 ms behind the app's own work).
+// fin49 (glitches): also the ring's newest fence when the display last accepted a swap (guamp_adreno_note_swap), whichever is later
+// (GuampCopyTarget.h): everything handed out before the swap has run when the copy reads the surface.
+static volatile uint32_t gSwapFence;
+extern "C" void guamp_adreno_note_swap(void) {
+  NativeAdrenoRing *ring = gRing;
+  if (!ring || ring->poisoned() || gGpuParked) return;
+  __atomic_store_n(&gSwapFence, ring->lastSubmitted(), __ATOMIC_RELEASE);
+}
 static uint32_t copyTarget(NativeAdrenoRing *ring) {
-  const uint32_t newest = ring->lastSubmitted();
-  const uint32_t own = gCopyWaitCompositor ? __atomic_load_n(&native_adreno_compositor_fence, __ATOMIC_ACQUIRE) : 0u;
-  return own && int32_t(newest - own) >= 0 ? own : newest;
+  return guampCopyTarget(ring->lastSubmitted(), __atomic_load_n(&native_adreno_compositor_fence, __ATOMIC_ACQUIRE),
+                         __atomic_load_n(&gSwapFence, __ATOMIC_ACQUIRE), gCopyWaitCompositor != 0);
 }
 // patch 0017: the CP timestamp of the fence page (the newest fence the GPU retired), for the soft priority; 0 without a ring.
 static uint32_t retiredFence(void) {

@@ -25,7 +25,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'baf115da216cae04bba5bfbe6e3b051cfdb34233cb8270a7f3edf478acaec306'
+PATCHED_SHA256 = '2b1ad4c65a2b898cf2bcfd7f62b19844527bc07f8c9fe3dfdb3bd7888b3129f4'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1611,6 +1611,17 @@ EDITS.append(('''            if(drawn<0)drawn=guampComposeDraw(out,frame.width,f
 EDITS.append(('extern "C" {volatile uint64_t guamp_compose[30];', 'extern "C" {volatile uint64_t guamp_compose[33];'))
 EDITS.append(('            if(drawn>0 && l.kind) {   // section 15: 16 luma samples',
               '            if(drawn>0 && (l.kind==1 || l.kind==2)) {   // section 15 (video layers, section 16): 16 luma samples'))
+# 16b. (fin49, "the GPU glitches a lot") With native-adreno 0017 the deferred copy waited only for the render server's last fence.
+#     Now the display also notes the ring's newest fence when it accepts a swap (guamp_adreno_note_swap, drivers/GuampAdreno) and the
+#     copy waits for the later of the two (GuampCopyTarget.h): everything handed out before the swap has run when the surface is
+#     read, and app work queued after the swap still does not hold the screen. guamp-copy-wait-compositor=0: the ring's newest.
+EDITS.append(('    {if(submitted)*submitted=0;if(retired)*retired=0;return -1;}\n',
+              '    {if(submitted)*submitted=0;if(retired)*retired=0;return -1;}\n'
+              "// Section 16b: the ring's newest fence at an accepted swap, for the copy's GPU wait (drivers/GuampAdreno; weak: no GPU probe).\n"
+              '__attribute__((weak)) void guamp_adreno_note_swap(void){}\n'))
+EDITS.append(('        guampPacingAccepted(request);   // section 14\n',
+              '        guampPacingAccepted(request);   // section 14\n'
+              '        guamp_adreno_note_swap();   // section 16b: the copy waits for what was handed out before this swap\n'))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
