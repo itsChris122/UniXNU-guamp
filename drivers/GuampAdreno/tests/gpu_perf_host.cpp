@@ -50,6 +50,9 @@ int main() {
   send(&s, bb, GpFieldCommits, 4);
   send(&s, bb, GpFieldC2c, 3200);      // 32 ms over 4 command buffers
   send(&s, bb, GpFieldWait, 0x123456); // saturates
+  send(&s, bb, GpFieldScanFrames, 2);
+  send(&s, bb, GpFieldScanCost, 300);  // 1.5 ms a copy
+  send(&s, bb, GpFieldScanWait, 100);
   send(&s, bb, kGpFieldEnd, 4);
   CHECK(s.p[bb].reports == 2 && s.p[bb].user[GpFieldLost] == 1 && s.p[bb].user[GpFieldWait] == 0xfffff);
   gp_mark(&s, bb, 0x1fff);
@@ -82,7 +85,7 @@ int main() {
   b.swapDoneUs = 18000;
   gp_format_proc(line, sizeof line, out[0], b.spanUs, &b);
   std::printf("%s\n", line);
-  CHECK(!std::strcmp(line, "backboardd[61] fr 2 lost 1 | cpu 3.10 res 0.00 wait 5242.88 c2c 8.00 comp 0.00 cb 4 | gpu 2.50 queue 0.50 "
+  CHECK(!std::strcmp(line, "backboardd[61] fr 2 lost 1 | cpu 3.10 res 0.00 wait 5242.88 c2c 8.00 comp 0.00 cb 4 | scanout 2 cost 1.50 wait 0.50 | gpu 2.50 queue 0.50 "
                            "max 5.00 jobs 4/1 kern 0.20 | scan copies 2 wait 2.00 map 0.40 swaps 2 swap>done 9.00 late 0 [ms/fr]"));
   // Without frames: per second of the interval; without a report: said so; no governor: fixed clock.
   GpProc quiet = {};

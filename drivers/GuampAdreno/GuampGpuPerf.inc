@@ -12,7 +12,8 @@
 //   GuampGpuPerf: 2.0s gpu 41% (ts) 38% (rbbm) | 702 MHz (now 745) | jobs 240
 //       ts: the jobs' own GPU time (end - start samples) over the interval; rbbm: the governor's RBBM_STATUS samples (GuampGpuDcvs.inc,
 //       "-" without the governor); MHz: the governor's time-weighted clock, "fixed" without it; jobs: user jobs released.
-//   GuampGpuPerf: backboardd[61] fr 118 lost 3 | cpu 3.10 res 0.20 wait 4.00 c2c 8.40 comp 0.00 cb 236 | gpu 5.20 queue 1.10
+//   GuampGpuPerf: backboardd[61] fr 118 lost 3 | cpu 3.10 res 0.20 wait 4.00 c2c 8.40 comp 0.00 cb 236 | scanout 118 cost 1.50
+//       wait 0.50 | gpu 5.20 queue 1.10
 //       max 9.80 jobs 236 kern 0.31 | scan copies 118 wait 2.00 map 0.40 swaps 118 swap>done 9.00 late 0 [ms/fr]
 //     fr/lost  frames and skipped vsync periods inside animations (the bridge's count, adreno-metal 0023)
 //     cpu      time inside the bridge's calls (encode, resources, commit); res: its waits for resources still in GPU use;
@@ -20,6 +21,8 @@
 //              handler per command buffer (not per frame); comp: shader compiles; cb: command buffers
 //     gpu      GPU time from the CP samples; queue: from the kernel taking the job to the CP starting it (waits behind other jobs);
 //              max: the longest job; jobs: released (a "/n" says only n carried samples); kern: the kernel's time in submit()
+//     scanout  the bridge's GPU scanout copy (backboardd's GpuScanoutPresenter): copies, cost (import, texture, encode, submit,
+//              wait) and its wait for completion, per copy
 //     scan     backboardd only (guamp-canvas-variant.py counters): CPU copies of the swapped surface, the wait for the GPU before
 //              each (guamp-copy-gpu-wait) and the map + cache maintenance, CA swaps, swap to completion, late vsync messages
 //   [ms/fr] the times are per frame; "[ms per s]" when the process reported no frame (then per second of the interval).

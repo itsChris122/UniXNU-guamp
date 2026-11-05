@@ -7,7 +7,7 @@
 //   reports patches/adreno-metal/0023 (NMB_PERF): about once a second each Metal process sends its frame numbers as markers
 //           0x2000..0x3fff (IOServiceOpen type 0x4147xxxx, the same refused open as the plugin's progress markers): a field is two
 //           markers, 0x3000 | field << 8 | value >> 12, then 0x2000 | (value & 0xfff) (20 bits); field 15 ends the report, which then
-//           counts. Fields: GpFieldFrames .. GpFieldCompile, times in units of 10 us;
+//           counts. Fields: GpFieldFrames .. GpFieldScanWait, times in units of 10 us;
 //   board   the GPU's busy share and clock from the governor (GuampGpuDcvs.inc) and the display copy's waits (passed in by the caller).
 // gp_take() hands the interval's numbers out and starts the next interval; gp_format_*() write the lines (no printf needed).
 #ifndef GUAMP_GPU_PERF_CORE_H
@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum : unsigned {kGpProcs = 8, kGpFields = 9, kGpFieldEnd = 15};
+enum : unsigned {kGpProcs = 8, kGpFields = 12, kGpFieldEnd = 15};
 enum : unsigned {
   GpFieldFrames = 0,    // frames presented (a drawable presented, or for a process that presents none a commit with a render pass)
   GpFieldLost = 1,      // vsync periods (16.7 ms) skipped between two frames of one animation (gaps under 100 ms)
@@ -25,7 +25,10 @@ enum : unsigned {
   GpFieldC2c = 5,       // commit to completion handler, summed over the command buffers
   GpFieldCommits = 6,   // command buffers committed
   GpFieldWindow = 7,    // the report's own window in ms
-  GpFieldCompile = 8    // pipeline, library and function creation (shader compiles)
+  GpFieldCompile = 8,   // pipeline, library and function creation (shader compiles)
+  GpFieldScanFrames = 9,  // the GPU scanout copy (backboardd's GpuScanoutPresenter): frames copied
+  GpFieldScanCost = 10,   // its import, texture, encode, submit and wait, summed
+  GpFieldScanWait = 11    // of which the wait for the copy's completion
 };
 constexpr uint64_t kGpTicksPerMs = 19200;   // CP_ALWAYS_ON_COUNTER on bengal: the 19.2 MHz XO
 
@@ -203,6 +206,14 @@ inline size_t gp_format_proc(char *buf, size_t size, const GpProc &p, uint64_t s
     l.ms(per(p.user[GpFieldCompile] * 10));
     l.put(" cb ");
     l.num(commits);
+    if (const uint64_t copies = p.user[GpFieldScanFrames]) {   // per copied frame
+      l.put(" | scanout ");
+      l.num(copies);
+      l.put(" cost ");
+      l.ms(p.user[GpFieldScanCost] * 10 / copies);
+      l.put(" wait ");
+      l.ms(p.user[GpFieldScanWait] * 10 / copies);
+    }
   } else {
     l.put(" (no frame report)");
   }
