@@ -206,7 +206,7 @@ int main() {
 
   GuampCamIosInfo info = {};
   CHECK(call(uc, kGuampCamSelGetInfo, {}, &info, sizeof(info)) == kIOReturnSuccess);
-  CHECK(info.abiVersion == 2 && info.sensorCount == 2 && info.sensor[0].cell == kGuampCellGm1st && info.sensor[1].cell == kGuampCell4h7);
+  CHECK(info.abiVersion == 2 && info.sensorCount == 4 && info.sensor[0].cell == kGuampCellGm1st && info.sensor[1].cell == kGuampCell4h7 && info.sensor[2].cell == kGuampCellOv02b1b && info.sensor[3].cell == kGuampCellOv02b10);
   CHECK(info.sensor[0].testPattern == (kTpg ? 2u : 0u));
   GuampCamIosStatus st = {};
   CHECK(call(uc, kGuampCamSelGetStatus, {0}, &st, sizeof(st)) == kIOReturnSuccess && st.state == kGuampStateClosed);

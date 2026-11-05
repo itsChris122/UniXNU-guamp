@@ -316,7 +316,12 @@ int main() {
 #else
 int main() {
   camios::start();
-  CHECK(camios::gBackend == &camios::camss::kBackend && camios::gSensors == 2);
+  CHECK(camios::gBackend == &camios::camss::kBackend && camios::gSensors == 4);   // back, front, depth, macro (agent 7)
+  CHECK(camios::gSensor[2].info.position == kGuampCamDepth && camios::gSensor[2].info.cell == kGuampCellOv02b1b &&
+        camios::gSensor[2].info.bayer == kGuampBayerMono && !camios::gSensor[2].info.hasAutoFocus);
+  CHECK(camios::gSensor[3].info.position == kGuampCamMacro && camios::gSensor[3].info.cell == kGuampCellOv02b10 &&
+        camios::gSensor[3].info.hasAutoFocus && camios::gSensor[3].info.chipId == 0x2b && camios::gSensor[3].info.fullWidth == 1600);
+  CHECK(camios::gSensor[1].info.focalLengthUm == 2670 && camios::gSensor[0].info.cell == kGuampCellGm1st);
   AppleH6CamIn *svc = static_cast<AppleH6CamIn *>(camios::gService);
   IOUserClient *uc = nullptr;
   CHECK(svc->newUserClient(nullptr, nullptr, GUAMP_CAMIOS_CONNECT_TYPE, nullptr, &uc) == kIOReturnSuccess && uc);

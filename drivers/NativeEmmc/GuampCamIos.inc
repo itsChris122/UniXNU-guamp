@@ -15,6 +15,7 @@
 // IOBufferMemoryDescriptor, IOUserClient: included by NativeEmmc.cpp before this file
 #include "GuampCamIosAbi.h"
 #include "GuampCamssApi.h"
+#include "GuampCameraSecondary.h"   // gcam::iosFacts: lens, geometry and gain limits of every cell (agent 7)
 
 extern "C" void guamp_torch_request(uint32_t permille);   // PmicService.inc (GuampTorch, PMI632 flash LED)
 
@@ -273,24 +274,30 @@ bool available() {
 }
 
 int probe(void *, uint32_t index, GuampCamIosSensorInfo *info) {
-  // Cell 0 S5KGM1ST (back, DW9767 AF, PMI632 flash), cell 1 S5K4H7 (front). Depth/macro OV02B are not offered to iOS.
-  // Agent 7 (secondary cameras) adds index 2 = OV02B1B depth (cell 2, mono) and 3 = OV02B10 macro (cell 3, GT9772 AF).
-  if (index > 1) return -1;
+  // index = position order = DT cell: 0 S5KGM1ST back (DW9767 AF, PMI632 flash), 1 S5K4H7 front, 2 OV02B1B depth (mono),
+  // 3 OV02B10 macro (GT9772 AF, rear flash). The plug-in makes capture streams only for back and front; the macro is a
+  // source of the back stream (GuampCamMacroPolicy.h), the depth sensor is listed but iOS has no use for it
+  // (cam7-secondarie.md section 3). Lens and geometry from the sensor module blobs (gcam::iosFacts).
+  if (index >= GUAMP_CAMIOS_MAX_SENSORS || index >= gcam::kSensors) return -1;
+  const gcam::IosFacts f = gcam::iosFacts(index);
   *info = {};
   info->present = 1;
-  info->position = index == 0 ? kGuampCamBack : kGuampCamFront;
-  info->cell = index == 0 ? kGuampCellGm1st : kGuampCell4h7;
-  info->chipId = gTpg ? 0 : index == 0 ? 0x08d1 : 0x487b;
+  info->position = f.use;                                  // gcam::Use == GuampCamIosPosition
+  info->cell = index;                                      // GuampCamIosCell
+  info->chipId = gTpg ? 0 : f.chipId;
   info->testPattern = gTpg ? 2 : 0;
-  info->fullWidth = index == 0 ? 4000 : 3264;              // GM1ST 2x2-binned (quad Bayer remosaic not used) / 4H7 full
-  info->fullHeight = index == 0 ? 3000 : 2448;
-  info->bayer = kGuampBayerGRBG;                           // replaced by the first frame's bayer (frame metadata wins)
+  info->fullWidth = f.fullW;                               // GM1ST 2x2-binned 4000x3000 (quad Bayer remosaic not used)
+  info->fullHeight = f.fullH;
+  // First guess, replaced by the bayer of the first frame (frame metadata wins): GM1ST GBRG, 4H7 GRBG, OV02B1B Y,
+  // OV02B10 RGGB after the sensor-side mirror + flip (guamp-camera-macro-flip=1; BGGR with 0 or 2).
+  static constexpr uint32_t kFirstBayer[4] = {kGuampBayerGBRG, kGuampBayerGRBG, kGuampBayerMono, kGuampBayerRGGB};
+  info->bayer = kFirstBayer[index];
   info->bitDepth = 10;
-  info->hasAutoFocus = index == 0;
-  info->hasFlash = index == 0;
-  info->focalLengthUm = index == 0 ? 4730 : 2580;
-  info->fNumberQ8 = index == 0 ? 461 : 563;
-  info->pixelSizeNm = index == 0 ? 1600 : 1120;            // binned GM1ST pitch
+  info->hasAutoFocus = f.hasAf;
+  info->hasFlash = f.hasFlash;
+  info->focalLengthUm = f.focalUm;
+  info->fNumberQ8 = f.fNumberQ8;
+  info->pixelSizeNm = f.pixelNm;                           // GM1ST: binned pitch 1.6 um
   return 0;
 }
 
@@ -325,9 +332,9 @@ int setMode(void *, uint32_t sensor, uint32_t modeIndex, uint32_t maxFpsQ8, uint
   if (r) { IOLog("GuampCamIos: guamp_camss_open cell %u mode %u: %d\n", c.cell, c.mode, r); return -1; }
   gOpenSensor = sensor;
   // Geometry the sensor driver programs; the authoritative values travel with every frame (GuampCamIosFrame).
-  const bool back = c.cell == kGuampCellGm1st, full = c.mode == 1;
-  m->width = gTpg ? c.width : back ? (full ? 4000 : 2000) : (full ? 3264 : 1632);
-  m->height = gTpg ? c.height : back ? (full ? 3000 : 1500) : (full ? 2448 : 1224);
+  const bool back = c.cell == kGuampCellGm1st, full = c.mode == 1, ov02b = c.cell >= kGuampCellOv02b1b;
+  m->width = gTpg ? c.width : ov02b ? 1600 : back ? (full ? 4000 : 2000) : (full ? 3264 : 1632);   // OV02B: one mode
+  m->height = gTpg ? c.height : ov02b ? 1200 : back ? (full ? 3000 : 1500) : (full ? 2448 : 1224);
   m->rawFormat = kGuampRawMipi10;
   m->bayer = gSensor[sensor].info.bayer;
   m->strideBytes = m->width * 10 / 8;
@@ -335,7 +342,7 @@ int setMode(void *, uint32_t sensor, uint32_t modeIndex, uint32_t maxFpsQ8, uint
   m->minFpsQ8 = minFpsQ8 ? minFpsQ8 : 15u << 8;
   m->minExposureUs = 30;
   m->maxExposureUs = (256u * 1000000u) / (m->minFpsQ8 ? m->minFpsQ8 : 15u << 8);
-  m->maxAnalogGainQ8 = 16u << 8;                           // g3a gain_max main/front
+  m->maxAnalogGainQ8 = c.cell < gcam::kSensors ? static_cast<uint32_t>(gcam::iosFacts(c.cell).maxGainX16) << 4 : 16u << 8;   // OV02B 15.5x
   m->maxDigitalGainQ8 = 256;
   m->blackLevel = 64;
   m->binning = back && !full && !gTpg ? 2 : 1;
