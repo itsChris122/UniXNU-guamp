@@ -1,0 +1,164 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 0420587..7729ff6 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9621,6 +9621,151 @@ native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
+ 	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
+ 	    native_guamp_baseband_folder_status, logging_error, hash_source);
+ }
++/* guamp 06/11: per-model files of the cellular stack for this phone's own model name. CommCenter takes a carrier bundle's
++ * device-specific overlay from findMatchingFile (CarrierBundleUtilities): the bundle file overrides_<A>_<B>....plist whose '_' tokens
++ * hold capabilities::ct::compatibleHardwareConfigurationString() (libTelephonyCapabilities, a switch on the telephony product: "J121"
++ * for J121AP, "" for a model it does not know, which logs "Model name is empty" and skips the overlay). The files for this phone's
++ * name come in the payload addon (scripts/make-guamp-baseband-addon.py --model-files NAME, names model-files/<sealed dir>/<file>),
++ * adapted from the J121 ones without the Mav16 modem's own settings, and are written into Data's /private/var/ngpu by
++ * native_gpu_addon_install. The addon's list /private/var/ngpu/model-files/views ("NGPUVIEWS1\n", then one "<sealed dir>|<file>\n"
++ * per view, only directories under /System/) says which sealed directories get the read-only union bindfs view of
++ * /private/var/ngpu/model-files<sealed dir>, as the ThermalMonitor view of zzzz-guamp-iphone-res.patch: the union falls through to
++ * the sealed directory for every name ours lacks, so the bundle's own files stay the sealed ones. boot-arg guamp-model-files=0 skips
++ * the views. Never panics: a missing or malformed list only logs; stage 5 = the sealed directory and our file both visible. */
++/* guamp-model-files pure BEGIN */
++#define NATIVE_GUAMP_MODEL_VIEWS_MAX 128
++#define NATIVE_GUAMP_MODEL_POINT_MAX 192
++#define NATIVE_GUAMP_MODEL_OWN_MAX 64
++/* Splits the view list in place into points[] and owns[]. Returns the number of views, or -1 when the list is malformed (no magic,
++ * a line without its newline, a NUL, no '|' or more than one, an empty file name or one with '/', a directory that is not an
++ * absolute path below /System/ without "..", "//" or a trailing '/', more than NATIVE_GUAMP_MODEL_VIEWS_MAX views) or empty. */
++static int
++native_guamp_model_views_parse(char *list, size_t size, const char **points, const char **owns, int max)
++{
++	static const char magic[] = "NGPUVIEWS1\n";
++	const size_t magic_size = sizeof(magic) - 1;
++	if (!list || size < magic_size || memcmp(list, magic, magic_size)) {
++		return -1;
++	}
++	int count = 0;
++	size_t at = magic_size;
++	while (at < size) {
++		char *line = list + at, *bar = NULL;
++		size_t length = 0;
++		while (at + length < size && line[length] != '\n') {
++			if (!line[length]) {
++				return -1;
++			}
++			if (line[length] == '|') {
++				if (bar) {
++					return -1;
++				}
++				bar = line + length;
++			}
++			length++;
++		}
++		if (at + length == size || !bar || count >= max) {
++			return -1;
++		}
++		line[length] = 0;
++		at += length + 1;
++		*bar = 0;
++		const char *point = line, *own = bar + 1;
++		size_t point_length = (size_t)(bar - line), own_length = strlen(own);
++		if (point_length <= 8 || point_length >= NATIVE_GUAMP_MODEL_POINT_MAX || strncmp(point, "/System/", 8) ||
++		    point[point_length - 1] == '/') {
++			return -1;
++		}
++		for (size_t k = 0; k + 1 < point_length; ++k) {
++			if ((point[k] == '.' && point[k + 1] == '.') || (point[k] == '/' && point[k + 1] == '/')) {
++				return -1;
++			}
++		}
++		if (!own_length || own_length >= NATIVE_GUAMP_MODEL_OWN_MAX || strchr(own, '/') || strstr(own, "..")) {
++			return -1;
++		}
++		points[count] = point;
++		owns[count] = own;
++		count++;
++	}
++	return count ? count : -1;
++}
++/* guamp-model-files pure END */
++volatile int native_guamp_model_files_views = -1;
++volatile int native_guamp_model_files_mounted = 0;
++static void
++native_guamp_model_files_mount(proc_t p, user_addr_t scratch)
++{
++	uint32_t enabled = 1;
++	PE_parse_boot_argn("guamp-model-files", &enabled, sizeof(enabled));
++	if (enabled != 1) {
++		return;
++	}
++	static const char list_path[] = "/private/var/ngpu/model-files/views";
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int error = vnode_open(list_path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
++	if (error) {
++		if (error != ENOENT) {
++			printf("guamp-model-files: %s error %d\n", list_path, error);
++		}
++		return;
++	}
++	char *list = NULL;
++	size_t size = 0;
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (!(error = vnode_getattr(vp, &va, ctx))) {
++		if (va.va_data_size < 1 || va.va_data_size > 16384) {
++			error = EFBIG;
++		} else if (!(list = kalloc_data((vm_size_t)va.va_data_size, Z_WAITOK))) {
++			error = ENOMEM;
++		} else {
++			size = (size_t)va.va_data_size;
++			int resid = 0;
++			error = vn_rdwr(UIO_READ, vp, (caddr_t)list, (int)size, 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
++			    vfs_context_proc(ctx));
++			if (!error && resid) {
++				error = EIO;
++			}
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	const char *points[NATIVE_GUAMP_MODEL_VIEWS_MAX], *owns[NATIVE_GUAMP_MODEL_VIEWS_MAX];
++	int count = error ? -1 : native_guamp_model_views_parse(list, size, points, owns, NATIVE_GUAMP_MODEL_VIEWS_MAX);
++	native_guamp_model_files_views = count;
++	if (count < 0) {
++		printf("guamp-model-files: %s unusable (error %d)\n", list_path, error ? error : EINVAL);
++	} else {
++		static char source[256], own[256];
++		const char *failed = NULL;
++		int failed_stage = 0, failed_status = 0;
++		for (int i = 0; i < count; i++) {
++			volatile int stage = 0, status = -1;
++			int n = snprintf(source, sizeof(source), "/private/var/ngpu/model-files%s", points[i]);
++			int m = snprintf(own, sizeof(own), "%s/%s", points[i], owns[i]);
++			if (n > 0 && (size_t)n < sizeof(source) && m > 0 && (size_t)m < sizeof(own)) {
++				native_gpu_addon_mount(p, scratch, 0x400, source, (size_t)n + 1, points[i], strlen(points[i]) + 1, points[i], own,
++				    &stage, &status);
++			} else {
++				status = ENAMETOOLONG;
++			}
++			if (stage == 5) {
++				native_guamp_model_files_mounted++;
++			} else if (!failed) {
++				failed = points[i];
++				failed_stage = stage;
++				failed_status = status;
++			}
++		}
++		printf("guamp-model-files: %d views, %d mounted (stage 5); first failure %s stage %d status %d\n", count,
++		    native_guamp_model_files_mounted, failed ? failed : "none", failed_stage, failed_status);
++	}
++	if (list) {
++		kfree_data(list, size);
++	}
++}
+ /* guamp: the camera capture plug-in H6ISP.mediacapture (package/GuampISP of the device repository: FigCaptureDevice/Stream
+  * over the AppleH6CamIn kernel service, software ISP and 3A in mediaserverd) shown inside /System/Library/MediaCapture, the
+  * sealed directory (empty on the 21H461 OS volume: H9ISP.mediacapture lives in the dyld cache) from which CMCapture's
+@@ -9679,6 +9824,7 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 		native_guamp_audio_plugin_mount(p, scratch);
+ 	}
+ 	native_guamp_baseband_mount(p, scratch);	/* guamp-baseband=1|2: Mav16 firmware views for ABM (04/11) */
++	native_guamp_model_files_mount(p, scratch);	/* model-files/views: per-model telephony files for this phone (06/11) */
+ 	if (camera_plugin) {
+ 		native_guamp_camera_plugin_mount(p, scratch);	/* guamp-camera-ios=1|2: H6ISP.mediacapture (05/11) */
+ 	}

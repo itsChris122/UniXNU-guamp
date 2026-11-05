@@ -9,7 +9,8 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-baseband.patch shows over /usr/standalo
 (zzzzzzzzzzzzzzzzz-guamp-addon-manifest.patch): after one boot with it the files stay in Data and later addons need not carry them.
 
   make-guamp-baseband-addon.py (--bbfw FILE.bbfw | --ipsw URL_OR_FILE) [--base ADDON] [--stub qdsp6sw.mbn] [--kernel KERNEL.macho]
-                               --out OUT.gpuaddon
+                               [--model-files NAME --rootfs 21H461_ROOT [--carrier BUNDLE ...]] --out OUT.gpuaddon
+  make-guamp-baseband-addon.py --model-files NAME --rootfs 21H461_ROOT [--base ADDON] --out OUT.gpuaddon   (no firmware)
 
 Size (05/11): the Mav16 files take 33.8 MB compressed, 30.7 MB of it qdsp6sw.mbn; next to the 54.4 MB kernel the 80 MiB ramdisk
 leaves about 28 MB for the whole addon. --stub qdsp6sw.mbn (see elf_skeleton) brings the firmware to about 3.2 MB; --kernel prints
@@ -19,12 +20,39 @@ the room left.
 carries both; an entry name present in both is refused. Apple firmware: it only goes into the boot payload, never into a repository.
 A ".guamp-keep" of --base (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-addon-prune.patch) is rebuilt with the firmware names and
 baseband/ added; without one in --base the output has none and the kernel prunes nothing.
+
+--model-files NAME (06/11): the cellular stack's per-model files for this phone, under its own model name instead of J121. Who looks
+for what (21H461, read from the binaries):
+  * CommCenter: the device-specific overlay of a carrier bundle is the bundle file overrides_<A>_<B>....plist one of whose '_'
+    tokens equals capabilities::ct::compatibleHardwareConfigurationString() (findMatchingFile in CarrierBundleUtilities.dylib; the
+    caller logs "Model name is empty" / "No device specific overlay file name found in the base bundle"). That string comes from a
+    switch on the telephony product in libTelephonyCapabilities ("J121" for J121AP, "" for an unknown product); the product comes
+    from MobileGestalt HWModelStr through TelephonyUtilParseHardwareModel ("<letter><number><suffix>", e.g. J121AP) and the model
+    table of libTelephonyUtil. NAME is that string for this phone, as the model table gives it: the files are overrides_<NAME>.plist.
+    The signatures/ files of the bundle (CBSignature, signature of the .der.pri) are Apple's and are not made; the PRI they sign is
+    not carried (below).
+  * ABM (ABMHelper diag::getFileInfo + libETLDMC ETLDMCFileName): /usr/lib/bbmasks/<"%c%d%s" of the parsed HWModelStr>_<profile>.dmc
+    (J121_Default.dmc ...; profiles Default Lite Audio GPS Tput None FullPacket Sleep Coex VoLTE SUPL Powerlog RF STx Verbose SFT).
+    The name is always a letter and a number, never a model name like "guamp", and the masks are Qualcomm DIAG log masks for the
+    Mav16 modem; the bridge never connects the DIAG channel to this phone's modem. No mask is made.
+  * thermalmonitord: /System/Library/ThermalMonitor/<hw.model>-Info.plist, already iphone-res/ThermalMonitor/motorola,guamp-Info.plist
+    (zzzz-guamp-iphone-res.patch); --thermal-from (J121AP name) is only for an ADT whose hw.model is J121AP.
+Each overrides_*.plist of the 21H461 root (--rootfs, the mounted OS volume) with J121 among its tokens gives the bundle's
+overrides_<NAME>.plist without the keys that describe the Mav16 modem and the J121 hardware (HARDWARE_KEYS: the carrier PRI/GRI
+pushed into an Apple modem, the iPad's on-body SAR table, files written into the Apple modem's EFS); a bundle left with nothing is
+skipped. Which bundles: --carrier (repeatable, default Default.bundle, the base bundle; "all" for every bundle with something left,
+108 on 21H461). The files travel as model-files/<sealed dir>/overrides_<NAME>.plist and model-files/views lists the views that
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-model-files.patch mounts (one union bindfs view per bundle directory, so keep the list
+short); model-files/ joins the prefixes of a rebuilt .guamp-keep.
 """
 from pathlib import Path
 import argparse
+import contextlib
 import hashlib
 import io
 import json
+import plistlib
+import re
 import struct
 import urllib.request
 import zipfile
@@ -37,6 +65,19 @@ PREFIX = 'baseband/standalone/Baseband/Mav16/'
 BBFW_NAME = 'Firmware/vinyl_02_Mav16-11.00.01.Release.bbfw'
 BBFW_SHA256 = 'f0066dd01c4407f3104cff4fde86172ca5c14cec355e6b25f4777a2c61bee1d2'
 LIMIT = 64 * 1024 * 1024
+CARRIER_BUNDLES = 'System/Library/Carrier Bundles/iPad'
+SOURCE_MODEL = 'J121'
+# Keys of the J121 overlays that describe the Mav16 modem or the J121 hardware, not the carrier: dropped for this phone.
+HARDWARE_KEYS = {
+    'DerPriFileName': 'carrier PRI (.der.pri) for the Mav16 modem: CommCenter pushes it over BSP 0xa000, the bridge drops it',
+    'DerPriFileVersion': 'version of that PRI',
+    'GRIFileName': 'Mav16 global settings image (.gri), pushed like the PRI',
+    'GRIVersion': 'version of that GRI',
+    'OnBodyThresholdParametersFile': "J121's on-body SAR thresholds (com.apple.bodythreshold_*.plist): the iPad's antennas",
+    'EFSFiles': "files written into the Apple modem's EFS (e.g. Verizon IMS qpconfig.xml): not this phone's modem",
+}
+VIEWS_MAGIC = 'NGPUVIEWS1\n'
+MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9,.+-]{0,30}')
 RAMDISK = 80 * 1024 * 1024   # GuampBoot FAT ramdisk (boot image at most 96 MiB)
 
 
@@ -102,6 +143,52 @@ class Remote(io.RawIOBase):
         return len(data)
 
 
+def model_files(rootfs, name, carriers):
+    """(entries, views, report) for --model-files: see the module docstring."""
+    if not MODEL_NAME.fullmatch(name) or name.upper() == SOURCE_MODEL:
+        raise SystemExit(f'--model-files {name!r}: one token of overrides_<A>_<B>.plist ([A-Za-z0-9,.+-], no "_"), not J121')
+    base = Path(rootfs) / CARRIER_BUNDLES
+    if not base.is_dir():
+        raise SystemExit(f'--rootfs {rootfs}: no {CARRIER_BUNDLES} (the mounted 21H461 OS volume)')
+    every = sorted(p.name for p in base.iterdir() if p.name.endswith('.bundle') and p.is_dir())
+    wanted = every if 'all' in carriers else sorted(set(carriers))
+    missing = sorted(set(wanted) - set(every))
+    if missing:
+        raise SystemExit(f'--carrier bundles not in {base}: {missing}')
+    entries, views, report = [], [], {}
+    target = f'overrides_{name}.plist'
+    for bundle in wanted:
+        sources = sorted(p for p in (base / bundle).glob('overrides_*.plist')
+                         if SOURCE_MODEL in p.name[len('overrides_'):-len('.plist')].split('_'))
+        if not sources:
+            if 'all' not in carriers:
+                report[bundle] = 'no J121 overlay'
+            continue
+        assert len(sources) == 1, f'{bundle}: more than one J121 overlay {[p.name for p in sources]}'
+        source = plistlib.loads(sources[0].read_bytes())
+        assert isinstance(source, dict), f'{sources[0]}: not a dictionary'
+        kept = {key: value for key, value in source.items() if key not in HARDWARE_KEYS}
+        dropped = sorted(set(source) - set(kept))
+        if not kept:
+            report[bundle] = f'{sources[0].name}: only Mav16/J121 keys {dropped}, skipped'
+            continue
+        if (base / bundle / target).exists():
+            raise SystemExit(f'{base / bundle / target} already exists on the sealed volume')
+        point = f'/{CARRIER_BUNDLES}/{bundle}'
+        entry = f'model-files{point}/{target}'
+        assert len(entry.encode()) + 1 <= 160 and len(point.encode()) < 192 and '|' not in point and '..' not in point, entry
+        data = plistlib.dumps(kept, fmt=plistlib.FMT_XML, sort_keys=True)
+        entries.append((entry, 0o644, len(data), zlib.compress(data, 9)))
+        views.append(f'{point}|{target}')
+        report[bundle] = f'{sources[0].name} -> {target}, kept {sorted(kept)}, dropped {dropped}'
+    if views:
+        assert len(views) <= 128, 'more than 128 views: pass fewer --carrier'
+        listing = (VIEWS_MAGIC + ''.join(line + '\n' for line in views)).encode()
+        assert len(listing) <= 16384, 'view list over 16 KiB: pass fewer --carrier'
+        entries.append(('model-files/views', 0o644, len(listing), zlib.compress(listing, 9)))
+    return entries, views, report
+
+
 def bbfw_bytes(options):
     if options.bbfw:
         return options.bbfw.read_bytes()
@@ -130,20 +217,35 @@ def read_addon(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group()
     source.add_argument('--bbfw', type=Path, help='the Mav16 .bbfw already extracted from the IPSW')
     source.add_argument('--ipsw', help='the 21H461 IPSW (file or URL, board.toml [ipsw] url): only the bbfw is read')
     parser.add_argument('--base', type=Path, help='an existing addon whose entries are kept in the output')
     parser.add_argument('--stub', action='append', default=[], metavar='NAME',
                         help='firmware file (path inside Mav16, e.g. qdsp6sw.mbn) carried as an ELF skeleton: see elf_skeleton()')
+    parser.add_argument('--model-files', metavar='NAME',
+                        help="this phone's compatibleHardwareConfigurationString: J121 overlays adapted as overrides_NAME.plist")
+    parser.add_argument('--rootfs', type=Path, help='the mounted 21H461 OS volume (for --model-files)')
+    parser.add_argument('--carrier', action='append', default=[], metavar='BUNDLE',
+                        help='carrier bundle for --model-files (repeatable; default Default.bundle; "all" for every bundle)')
     parser.add_argument('--kernel', type=Path, help='kernel.macho of the image: prints the GBPK estimate against the 80 MiB ramdisk')
     parser.add_argument('--out', required=True, type=Path)
     options = parser.parse_args()
     assert not options.out.exists(), 'exists: %s' % options.out
-    bbfw = bbfw_bytes(options)
-    digest = hashlib.sha256(bbfw).hexdigest()
-    if digest != BBFW_SHA256:
-        raise SystemExit(f'unexpected bbfw SHA-256 {digest} (expected {BBFW_SHA256}, {BBFW_NAME} of 21H461)')
+    if not (options.bbfw or options.ipsw or options.model_files):
+        parser.error('one of --bbfw, --ipsw or --model-files is required')
+    if bool(options.model_files) != bool(options.rootfs):
+        parser.error('--model-files and --rootfs go together')
+    if options.carrier and not options.model_files:
+        parser.error('--carrier needs --model-files')
+    if options.stub and not (options.bbfw or options.ipsw):
+        parser.error('--stub needs --bbfw or --ipsw')
+    digest, bbfw = None, b''
+    if options.bbfw or options.ipsw:
+        bbfw = bbfw_bytes(options)
+        digest = hashlib.sha256(bbfw).hexdigest()
+        if digest != BBFW_SHA256:
+            raise SystemExit(f'unexpected bbfw SHA-256 {digest} (expected {BBFW_SHA256}, {BBFW_NAME} of 21H461)')
     entries = []
     if options.base:
         entries = read_addon(options.base)
@@ -154,8 +256,8 @@ def main():
     names = {name for name, *_ in entries}
     added = 0
     stubs, stubbed = list(options.stub), []
-    with zipfile.ZipFile(io.BytesIO(bbfw)) as archive:
-        for info in archive.infolist():
+    with zipfile.ZipFile(io.BytesIO(bbfw)) if bbfw else contextlib.nullcontext() as archive:
+        for info in archive.infolist() if archive else []:
             if info.is_dir():
                 continue
             name = PREFIX + info.filename
@@ -171,9 +273,16 @@ def main():
             added += 1
     if set(stubs) - set(stubbed):
         raise SystemExit(f'--stub names not in the bbfw: {sorted(set(stubs) - set(stubbed))}')
+    model_report, views, made = {}, [], []
+    if options.model_files:
+        made, views, model_report = model_files(options.rootfs, options.model_files, options.carrier or ['Default.bundle'])
+        for entry in made:
+            assert entry[0] not in names, 'entry already in --base: %s' % entry[0]
+            entries.append(entry)
+            names.add(entry[0])
     if had_keep:
         lines = sorted((set(keep) - {p for p in keep if p.endswith('/')}) | names | {'.guamp-keep'})
-        lines += sorted({p for p in keep if p.endswith('/')} | {'baseband/'})
+        lines += sorted({p for p in keep if p.endswith('/')} | {'baseband/'} | ({'model-files/'} if options.model_files else set()))
         listing = ('NGPUKEEP1\n' + ''.join(line + '\n' for line in lines)).encode()
         entries.append(('.guamp-keep', 0o644, len(listing), zlib.compress(listing, 9)))
     assert len(entries) <= 4096
@@ -184,8 +293,10 @@ def main():
     addon = MAGIC + struct.pack('<IIQ', len(entries), 0, 24 + len(body)) + body
     if len(addon) > LIMIT:
         raise SystemExit(f'addon of {len(addon)} bytes is over the {LIMIT}-byte limit: build it without --base and boot it once')
-    report = dict(bbfw_sha256=digest, firmware_files=added, stubs=stubbed, base_entries=len(entries) - added, entries=len(entries),
-                  bytes=len(addon), sha256=hashlib.sha256(addon).hexdigest())
+    report = dict(bbfw_sha256=digest, firmware_files=added, stubs=stubbed, base_entries=len(entries) - added - len(made),
+                  model_entries=len(made), entries=len(entries), bytes=len(addon), sha256=hashlib.sha256(addon).hexdigest())
+    if options.model_files:
+        report.update(model_name=options.model_files, model_views=views, model_bundles=model_report)
     if options.kernel:
         # GBPK = kernel + ADT + trust cache + addon (+ ~12 KiB of headers, fin48); the FAT ramdisk is 80 MiB, its tables take a few
         # hundred KiB: 512 KiB of margin and 256 KiB for ADT and trust cache.
