@@ -66,7 +66,7 @@ index 0420587..7729ff6 100644
 +				return -1;
 +			}
 +		}
-+		if (!own_length || own_length >= NATIVE_GUAMP_MODEL_OWN_MAX || strchr(own, '/') || strstr(own, "..")) {
++		if (!own_length || own_length >= NATIVE_GUAMP_MODEL_OWN_MAX || strchr(own, '/') || strnstr(own, "..", own_length)) {
 +			return -1;
 +		}
 +		points[count] = point;
