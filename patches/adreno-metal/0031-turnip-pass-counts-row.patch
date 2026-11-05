@@ -1,0 +1,51 @@
+guamp: telemetry row "TU" with Turnip's pass counters (GMEM, sysmem, multisampled, let past "sysmem" by TU_GUAMP_GMEM, exact edge stores, policy, last sysmem reason), right after the W5/X rows (needs mesa-turnip 0003; without it the row is not written)
+
+Read through dlsym of tu_guamp_render_counts in the libvulkan_freedreno.dylib the device already opened (RTLD_NOLOAD, as 0030 does
+for the client-cleans bracket). Placed after X so that guamp-metal-rows=6 still shows it. Applies after 0001-0003, 0009-0022 and 0030;
+the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f0f7ed8..7977d2a 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -3215,6 +3215,32 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+  // X counts the commits past 8, 16 and 32 ms of GPU time, and past 16 and 32 ms of commit-to-callback, since the process began. H1..H5 are
+  // the heaviest commits of the last minute, heaviest first: when one committed (seconds of uptime), what it held, and the textures (a
+  // replaceRegion, a texture made, a surface imported) and buffers (a buffer made, a buffer-to-texture copy) that led to it.
++ // guamp (UniXNU-guamp patches/adreno-metal/0031; Turnip: patches/mesa-turnip/0003): where Turnip rendered the passes, right after the
++ // frame's GPU time. TU g<GMEM passes> s<sysmem passes> m<multisampled in GMEM>/<multisampled in sysmem> p<passes TU_GUAMP_GMEM let past
++ // TU_DEBUG "sysmem"> x<tile stores made exact at a host-imported edge> pol<0 none, 1 msaa, 2 owned, 3 all> and the last sysmem reason.
++ // A Turnip without 0003 has no tu_guamp_render_counts and the row is not written.
++ char tuRow[96]={};
++ {
++  static unsigned (*tuCounts)(uint64_t *,unsigned,const char **);
++  static unsigned tuTries;
++  if(!tuCounts && tuTries<64) {
++   ++tuTries;
++   Dl_info info={};
++   if(dladdr((const void *)&native_bridge_metal_telemetry,&info) && info.dli_fname) {
++    char path[1024];snprintf(path,sizeof path,"%s",info.dli_fname);
++    if(char *slash=strrchr(path,'/')) {
++     snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"libvulkan_freedreno.dylib");
++     if(void *lib=dlopen(path,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD))   // the device opened it already; never load a second copy
++      tuCounts=(unsigned (*)(uint64_t *,unsigned,const char **))dlsym(lib,"tu_guamp_render_counts");
++    }
++   }
++  }
++  uint64_t c[8]={};const char *reason=nullptr;
++  if(tuCounts && tuCounts(c,8,&reason)>=7)
++   snprintf(tuRow,sizeof tuRow,"TU g%llu s%llu m%llu/%llu p%llu x%llu pol%llu %.30s",(unsigned long long)c[0],(unsigned long long)c[1],
++    (unsigned long long)c[2],(unsigned long long)c[6],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[5],
++    reason?reason:"-");
++ }
+  {
+   std::lock_guard<std::mutex> lock(gWindowLock);
+   const FrameWindow &w=gWindow;
+@@ -3222,6 +3248,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+    (unsigned long long)w.mean,(unsigned long long)w.p99,(unsigned long long)w.rpX10,(unsigned long long)w.kpxMean);
+   row("X spikes gpu8=%llu gpu16=%llu gpu32=%llu ctc16=%llu ctc32=%llu",(unsigned long long)w.spikes[0],(unsigned long long)w.spikes[1],
+    (unsigned long long)w.spikes[2],(unsigned long long)w.spikes[3],(unsigned long long)w.spikes[4]);
++  if(tuRow[0])row("%s",tuRow);   // guamp 0031
+   HeavyCommit heavy[5];
+   memcpy(heavy,w.heavy,sizeof heavy);
+   std::sort(heavy,heavy+5,[](const HeavyCommit &a,const HeavyCommit &b){return a.gpu>b.gpu;});
