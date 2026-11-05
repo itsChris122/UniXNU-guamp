@@ -49,6 +49,10 @@ __attribute__((weak)) volatile uint32_t native_adreno_wc_epoch;
 // patches/native-adreno/0016: cache-mode events that named their BO (only that BO is re-asserted); native_adreno_wc_epoch then counts
 // the unnamed ones (imports, non-BO views), which reach only BOs with a CPU view.
 __attribute__((weak)) volatile uint64_t native_adreno_wc_bo_events;
+// patches/native-adreno/0017: the soft priority's waits ([0] submissions that waited, [1] to the limit, [2] us, [3] longest us) and
+// the render server's last fence.
+__attribute__((weak)) volatile uint64_t native_adreno_throttle_stats[4];
+__attribute__((weak)) volatile uint32_t native_adreno_compositor_fence;
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 }
@@ -119,6 +123,13 @@ void logSubmits() {
           rw - prev[2], rn - prev[3], rc - prev[4], rb - prev[5], native_adreno_reassert_stats[3], native_adreno_reassert_stats[5],
           native_adreno_wc_epoch, native_adreno_wc_bo_events);
   prev[0] = cm; prev[1] = cb; prev[2] = rw; prev[3] = rn; prev[4] = rc; prev[5] = rb;
+  // patch 0017: app submissions held back so the render server's jobs do not queue behind their backlog.
+  static uint64_t th[3];
+  const uint64_t tw = native_adreno_throttle_stats[0], tl = native_adreno_throttle_stats[1], tu = native_adreno_throttle_stats[2];
+  if (tw != th[0])
+    IOLog("GuampGpu: app submissions held +%llu (to the limit +%llu), %llu us each, longest %llu us; render server fence %u\n",
+          tw - th[0], tl - th[1], (tu - th[2]) / (tw - th[0]), native_adreno_throttle_stats[3], native_adreno_compositor_fence);
+  th[0] = tw; th[1] = tl; th[2] = tu;
   // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
   static uint64_t ro[3];
   const uint64_t om = native_adreno_publish_ro_owned[0], ob = native_adreno_publish_ro_owned[1], os = native_adreno_publish_ro_owned[2];
