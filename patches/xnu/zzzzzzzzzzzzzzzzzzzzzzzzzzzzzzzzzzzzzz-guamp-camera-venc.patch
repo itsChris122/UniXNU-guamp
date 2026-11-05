@@ -1,10 +1,8 @@
-diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index ec58603..ee23cbf 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9425,6 +9425,34 @@ native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
- 	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
- 	    point, native_guamp_camera_plugin_stage, native_guamp_camera_plugin_status);
+@@ -9805,6 +9805,34 @@ native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
+ 	printf("guamp-camera-plugin: %s stage %d status %d\n", cmc_point, native_guamp_camera_cmcapture_stage,
+ 	    native_guamp_camera_cmcapture_status);
  }
 +/* guamp: the software H.264 encoder H264H7.videoencoder (package/GuampVideoEncoder of the device repository) shown inside
 + * /System/Library/VideoEncoders, the sealed directory (empty on the 21H461 OS volume: the Apple encoders live in the dyld cache)
@@ -37,7 +35,7 @@ index ec58603..ee23cbf 100644
  static void
  native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -9460,6 +9488,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -9841,6 +9869,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	if (camera_plugin) {
  		native_guamp_camera_plugin_mount(p, scratch);	/* guamp-camera-ios=1|2: H6ISP.mediacapture (05/11) */
  	}
