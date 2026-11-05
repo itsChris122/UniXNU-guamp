@@ -1,0 +1,420 @@
+guamp: metal2vulkan runtime patches 0025-0027, the bridge's CPU per frame (agent gpu-bridge, 06/11)
+
+0025: docs/FAST-PATHS.md and tests/fast_paths.rs class PaddedReadsPolicy::AliasWrites, the value 0008 adds; without it the
+metal2vulkan lib tests do not compile (E0004 in the ledger's exhaustive match). Test only, no runtime change.
+0026: the spare command pools and descriptor pools are reset as their command buffer gives them back (completion thread, inside
+a section of the exit guard, vkResetCommandPool/vkResetDescriptorPool added to the guard's table and primed), not by the next
+taker on the encoding thread: backboardd's render thread no longer pays the reset of its command buffer's pool and of each
+descriptor pool its draws open. A pool whose reset there fails, or one given back while the process exits, stays dirty and its
+taker resets it as before. Measured on lavapipe with 0027 (40 draws a frame): encoding thread CPU per frame 1537 -> 1331 us
+(4 interleaved pairs). metal2vulkan-runtime lib tests spares/exit_guard/descriptor_arena/prime: 40 passed.
+0027: example draw_costs (FRAMES=400 cargo run --release -p metal2vulkan-runtime --example draw_costs): a Core Animation-like
+frame loop that prints the D/C/B phases per draw, per close and per commit and the encoding thread's CPU, for host A/B.
+
+diff --git a/bridge/patches/0025-fast-paths-ledger-alias-writes.patch b/bridge/patches/0025-fast-paths-ledger-alias-writes.patch
+new file mode 100644
+index 0000000..6332d1f
+--- /dev/null
++++ b/bridge/patches/0025-fast-paths-ledger-alias-writes.patch
+@@ -0,0 +1,26 @@
++diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
++index 63966c5..4d5cd9d 100644
++--- a/crates/metal2vulkan/src/tests/fast_paths.rs
+++++ b/crates/metal2vulkan/src/tests/fast_paths.rs
++@@ -81,7 +81,7 @@ fn choices() -> Vec<Choice> {
++         choice!(p.nan_and_min_max: NanMinMaxPolicy { Native, Exact }),
++         choice!(p.rounding_order: RoundingOrderPolicy { Native, Exact }),
++         choice!(p.half_blend: HalfBlendPolicy { Device, Exact }),
++-        choice!(p.padded_reads: PaddedReadsPolicy { Alias, Shadow }),
+++        choice!(p.padded_reads: PaddedReadsPolicy { Alias, AliasWrites, Shadow }),
++     ]
++ }
++ 
++diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
++index 2951be2..e54b40c 100644
++--- a/docs/FAST-PATHS.md
+++++ b/docs/FAST-PATHS.md
++@@ -39,7 +39,7 @@ a cell that names another source took its numbers there.
++ | The `half` conversion converts the value itself (no `NoContraction` barrier), so the device's compiler may fold it into the instruction computing the value, rounding once. | `half_rounding = HalfRoundingPolicy::Native` | `half_rounding = HalfRoundingPolicy::Exact` (with the rows above) | The row above's: on NVIDIA (RTX 3090), and on lavapipe for a loaded texel (Mesa 26.0.8), the pair is dropped whether or not the barrier stands, so the barrier does not restore the rounding there. `NativeHalfConversion` (`native-half-conversion`) | At its merge: A2X 0.99-1.02 s without the barrier against 1.00-1.05 s with it; Xgc within a round's spread |
++ | A `half` texel's NaN is the rounding's own NaN, not the texel's bits (the keep's four instructions a texel are left out). | `half_rounding = HalfRoundingPolicy::Native` and `nan_and_min_max = NanMinMaxPolicy::Native` | `nan_and_min_max = NanMinMaxPolicy::Exact` (the keep under native half rounding, master ecd39568bb); `half_rounding = HalfRoundingPolicy::Exact` also keeps it, at that row's cost. The same switch also gives Metal's full rule: `0x7e00` for every NaN but a one-texel read, nearest sample or gather of a 16-bit float texture, by the slot's format class read as data, a heap handle's class index and a runtime sampler's filter. A gather with a `half` result fetches its four texels where the class is a half-float one, since NVIDIA's gather hands back every NaN as `0x7fffffff`. **Not yet exact:** a cube gather, bicubic and emulated linear, fetched or compared samples. Possible, not built: the runtime sampler's filter read as push data rather than specialized, which would spare the remake below. Measured on the RTX 5080: under the switch no `half` lane of the runtime lane's texel reads, samples and gathers differs from Metal's (1,469 differ by default). Under the switch `DeviceNanEncoding` is still announced; the consumer logs notes, so no device fact is built to drop it | NaN bits the device's (`0x7FFF` on the RTX 5080), where Metal hands back a 16-bit float texel's own bits on a read, nearest sample or gather, and `0x7e00` for a 32-bit or small float texel's NaN and a linear sample's. `NativeHalfConversion` (`native-half-conversion`); the read also records `DeviceNanEncoding` (`device-nan-encoding`) | Measured on top of the NaN switch's own row (its probe with the keep, c0a814a13, against its probe without, 3e8a01c54): A2X 341,299 → 347,519 words, 1.82-1.86 → 1.81-1.87 s, GPU 0.115-0.117 → 0.115-0.116 ms, within noise; Xgc14 and Xgc15 read no `half` texel (words unchanged). The full rule (its probe a5c642ebe against the same tip without it, 851650c81): A2X 347,519 → 372,429 words (+7.2%), creation 1.85-1.88 → 1.99-2.04 s; where a linear runtime sampler is bound at the draw the sampler word's filter is now specialized, so the first draw remakes (1.94-1.96 s) and its GPU time rises 0.115-0.117 → 0.124-0.125 ms; with a nearest sampler GPU 0.115-0.116 → 0.115-0.117 ms; Xgc14 and Xgc15 words unchanged. On the RTX 3090 the same pair: A2X creation 2.91-3.06 → 3.17-3.23 s, the first draw's remake 3.0 s and its GPU time 0.17-0.18 → 0.79-1.15 ms, with a nearest sampler 0.17-0.18 ms both |
++ | A fragment function without fast math returns a `half` color to a blended attachment: the device blends in its own arithmetic and rounds once, where Metal blends a 16-bit float attachment in `half` arithmetic (each factor, product and sum rounded to `half`). | `half_blend = HalfBlendPolicy::Device` | `half_blend = HalfBlendPolicy::Exact`: the function computes Metal's blend in the interlocked storage form, for a `half4` output into `R16Float`, `RG16Float` or `RGBA16Float` where that form is exact for the pipeline (RADV, ANV, NVIDIA, MoltenVK); elsewhere, and for lavapipe, 32-bit float, 8-bit, a module naming no math mode or a blend of the second source, the device's blend and its note stay | 2.5 `half` ulps at the largest operand on NVIDIA (the blend color and one minus it), two on RADV, ANV and lavapipe (16-bit float); two `float` ulps (32-bit float, one on NVIDIA); one or two codes (8-bit, extended range); MoltenVK stores Metal's bytes. Measured with and without the factors' magnitudes at 0bcc0163e5. `HalfOutputPrecision` (`half-output-precision`) | A probe at 924fc11603 (a `half4` over a 1920x1080 `RGBA16Float` target, One / OneMinusSourceAlpha): making 11.1 → 24.0 ms; GPU 25 → 82 us one draw, 506 → 2291 us 32 overlapping draws (the interlock orders them). RTX 3090 (the same draw at 50a065eb98): making 12.9 → 27.4 ms; GPU 45 → 115 us one draw, 648 → 3268 us 32 overlapping draws |
++-| A texture over a buffer whose rows (or an array's slices) lie with bytes between them, and which only reads (its usage, as Metal reports it, holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block writes; `Unknown` holds them all), is an image over the buffer's bytes at Metal's row pitch, as one of packed rows is: the driver's own linear image, a `DRM_FORMAT_MOD_LINEAR` image at that pitch, or one over a dma-buf of the pages. Its subresources hold the bytes between its rows, which Metal never writes, and its first move reaches them. The runtime's choice: no pipeline differs. | `padded_reads = PaddedReadsPolicy::Alias` | `padded_reads = PaddedReadsPolicy::Shadow`: the runtime's shadow image of the texels, copied in from the buffer before each use (`shadowed-texture`), whose copies address the texels alone | The bytes between the rows stay the program's as far as the driver's first move of the image keeps them, unannounced, as for packed rows (the known gap below); `runtime_lane::pitched_surfaces::a_texture_that_only_reads_keeps_every_byte_of_its_pages` fails on a driver whose move changes one | Measured on ANV (Iris Xe, Mesa 26.2.4; `surface_texture_costs::read_only_padded_costs`): a frame that samples four `BGRA8Unorm` tiles over no-copy pages (1307x512 at 5248- and 5376-byte rows, 300x200 at 1216, 1913x96 at 7680) in one pass completes about 0.36 ms later as shadows (the median of 15 interleaved pairs, 0.08 to 0.60 ms), with about 56 µs more encoding and 91 µs more process CPU; a texture's making costs the same either way, about 45 µs |
+++| A texture over a buffer whose rows (or an array's slices) lie with bytes between them, and which only reads (its usage, as Metal reports it, holds no `RenderTarget`, `ShaderWrite`, `ShaderAtomic` or block writes; `Unknown` holds them all), is an image over the buffer's bytes at Metal's row pitch, as one of packed rows is: the driver's own linear image, a `DRM_FORMAT_MOD_LINEAR` image at that pitch, or one over a dma-buf of the pages. Its subresources hold the bytes between its rows, which Metal never writes, and its first move reaches them. The runtime's choice: no pipeline differs. | `padded_reads = PaddedReadsPolicy::Alias` | `padded_reads = PaddedReadsPolicy::Shadow`: the runtime's shadow image of the texels, copied in from the buffer before each use (`shadowed-texture`), whose copies address the texels alone; `padded_reads = PaddedReadsPolicy::AliasWrites`: the alias for every such texture, a render target and a texture a shader writes too, whose layout transitions and load and store operations may then write the bytes between the rows (a window server's padded framebuffers keep nothing there), with no shadow copy in or out | The bytes between the rows stay the program's as far as the driver's first move of the image keeps them, unannounced, as for packed rows (the known gap below); `runtime_lane::pitched_surfaces::a_texture_that_only_reads_keeps_every_byte_of_its_pages` fails on a driver whose move changes one | Measured on ANV (Iris Xe, Mesa 26.2.4; `surface_texture_costs::read_only_padded_costs`): a frame that samples four `BGRA8Unorm` tiles over no-copy pages (1307x512 at 5248- and 5376-byte rows, 300x200 at 1216, 1913x96 at 7680) in one pass completes about 0.36 ms later as shadows (the median of 15 interleaved pairs, 0.08 to 0.60 ms), with about 56 µs more encoding and 91 µs more process CPU; a texture's making costs the same either way, about 45 µs |
++ | A computed `half` or `float` color blended into an extended-range attachment (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10`) rounds the blend's source as a loaded one; Metal's compiler rounds it by how it computed it. Every device. | The in-shader blend's loaded rounding (no switch) | **Not built yet:** Metal's rounding per shape is probed, not modelled | One code. `ExtendedRangeBlendSource` (`extended-range-blend-source`), `ExtendedRangeFloatBlendSource` (`extended-range-float-blend-source`) | Not measured |
++ | A bicubic sample of an 8- or 16-bit normalized texture sums its taps exactly and rounds half up; Metal truncates its row terms, row sums and column terms first. Every device. | The exact sum (no switch) | **Not built yet:** Metal's datapath is pinned (17.75M lanes measured, no miss); its emitter is not written | One grid step (1/4080 at 8 bits) within about 2^-21 of a tie. `BicubicFilterArithmetic` (`bicubic-filter-arithmetic`) | Not measured (Metal's form is expected no larger) |
++ | A bicubic sample of an extended-range texture (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10` and their sRGB twins) sums its taps' steps exactly, rounds half up and clamps into the format's decoded endpoints; within 0.014 of a grid step of a rounding tie Metal may round the other way. Every device. | The exact sum (no switch) | **None known:** no model of Metal's datapath tried fits; 3,317,760 lanes measured on the M3 Max (macOS 26.7) | One grid step (1/8160 a color lane, 1/8192 an sRGB color lane, 1/4080 alpha), 4,050 of the lanes measured, each within 0.014 of a step of a tie. `BicubicFilterArithmetic` (`bicubic-filter-arithmetic`) | No accurate form |
+diff --git a/bridge/patches/0026-reset-spares-as-given-back.patch b/bridge/patches/0026-reset-spares-as-given-back.patch
+new file mode 100644
+index 0000000..e8fe0b1
+--- /dev/null
++++ b/bridge/patches/0026-reset-spares-as-given-back.patch
+@@ -0,0 +1,218 @@
++diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++index 023b8ed..b4d62c1 100644
++--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++@@ -1137,7 +1137,8 @@ impl Drop for CommandBufferShared {
++         // state.
++         let pool = lock(&self.state).pool.take();
++         if let Some(pool) = pool {
++-            self.device.shared().spares.give_command_pool(pool);
+++            let shared = self.device.shared();
+++            shared.spares.give_command_pool(shared, pool);
++         }
++     }
++ }
++@@ -2735,7 +2736,8 @@ impl CommandBufferShared {
++             // buffer that completed gives back its descriptor pools too, one that failed releases
++             // them here.
++             if let Some(pool) = state.pool.take() {
++-                self.device.shared().spares.give_command_pool(pool);
+++                let shared = self.device.shared();
+++                shared.spares.give_command_pool(shared, pool);
++             }
++             if state.status == CommandBufferStatus::Completed {
++                 state.descriptors.give_back();
++diff --git a/crates/metal2vulkan-runtime/src/descriptor_arena.rs b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++index f54f31d..17a54b6 100644
++--- a/crates/metal2vulkan-runtime/src/descriptor_arena.rs
+++++ b/crates/metal2vulkan-runtime/src/descriptor_arena.rs
++@@ -192,6 +192,7 @@ impl DescriptorArena {
++                         DescriptorPool {
++                             raw: raw_pool,
++                             room: Room::of(needs, sets),
+++                            clean: false,
++                         }
++                     }
++                 };
++diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
++index 50856aa..2a46726 100644
++--- a/crates/metal2vulkan-runtime/src/device/prime.rs
+++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
++@@ -416,6 +416,10 @@ impl Primer<'_> {
++         let pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(vulkan)?;
++         self.made(Call::CreateCommandPool);
++         self.hold(pool);
+++        // SAFETY: the pool is this priming's, and nothing of it is pending.
+++        unsafe { device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()) }
+++            .map_err(vulkan)?;
+++        self.made(Call::ResetCommandPool);
++         let allocate = vk::CommandBufferAllocateInfo::default()
++             .command_pool(pool)
++             .level(vk::CommandBufferLevel::PRIMARY)
++@@ -847,6 +851,11 @@ impl Primer<'_> {
++             let pool = device.create_descriptor_pool(&info, None).map_err(vulkan)?;
++             self.made(Call::CreateDescriptorPool);
++             self.hold(pool);
+++            // Reset while it holds no set yet, as a spare is as its command buffer gives it back.
+++            device
+++                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+++                .map_err(vulkan)?;
+++            self.made(Call::ResetDescriptorPool);
++             // A set of it, written: the runtime releases its pools with their sets.
++             let info = vk::DescriptorSetAllocateInfo::default()
++                 .descriptor_pool(pool)
++diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
++index 9f98943..d8bb935 100644
++--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
+++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
++@@ -303,6 +303,10 @@ calls! {
++     // (`Device::drain_queues`).
++     QueueWaitIdle => c"vkQueueWaitIdle",
++     ResetFences => c"vkResetFences",
+++    // A spare command pool or descriptor pool, reset as its command buffer gives it back, off the
+++    // encoding thread (`spares.rs`).
+++    ResetCommandPool => c"vkResetCommandPool",
+++    ResetDescriptorPool => c"vkResetDescriptorPool",
++     DestroyCommandPool => c"vkDestroyCommandPool",
++     DestroyFence => c"vkDestroyFence",
++     DestroySemaphore => c"vkDestroySemaphore",
++diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
++index 39ac4d8..70c317a 100644
++--- a/crates/metal2vulkan-runtime/src/spares.rs
+++++ b/crates/metal2vulkan-runtime/src/spares.rs
++@@ -20,12 +20,17 @@
++ //! - **Descriptor pools are bounded.** At most [`DESCRIPTOR_POOLS`] descriptor pools of at most
++ //!   [`DESCRIPTORS`] descriptors together; a descriptor pool given back past them releases the
++ //!   oldest spares first, so the spares follow the shapes in use.
++-//! - **Reset by the taker**, on the thread that encodes: the program's own, or one running the
++-//!   program's code (a handler). A section of the exit guard (a host step's recording on the
++-//!   scheduler's thread) calls only the guard's table of entry points, which holds no reset, so a
++-//!   command buffer or command recorded there makes its pools as before; what it made is given back
++-//!   all the same. A command buffer that encoded nothing, whose submissions record only their
++-//!   barriers, in sections, takes its spare command pool at its commit, on the committing thread.
+++//! - **Reset as given back**, inside a section of the exit guard, on the thread that gives it back
+++//!   (the completion thread, or the one that drops a command buffer): the reset is off the thread
+++//!   that encodes, which before paid a reset for its command buffer's pool and for each descriptor
+++//!   pool its draws opened (on Turnip a command pool's reset frees its command streams' objects).
+++//!   A pool whose reset there failed, or one given back once the process is exiting, stays dirty,
+++//!   and its taker resets it as before, on the thread that encodes: the program's own, or one
+++//!   running the program's code (a handler). A section of the exit guard (a host step's recording
+++//!   on the scheduler's thread) takes no spare, so a command buffer or command recorded there makes
+++//!   its pools as before; what it made is given back all the same. A command buffer that encoded
+++//!   nothing, whose submissions record only their barriers, in sections, takes its spare command
+++//!   pool at its commit, on the committing thread.
++ //! - **Given back once nothing of them is pending.** A command buffer that completed
++ //!   (`CommandBufferStatus::Completed`) gives back its command pool and its descriptor pools; one
++ //!   that failed, once its work ended, gives back its command pool and releases its descriptor
++@@ -37,7 +42,7 @@
++ use super::descriptor_arena::{Room, SetNeeds};
++ use super::device::{lock, DeviceShared};
++ use super::error::{vulkan, Error};
++-use super::exit_guard;
+++use super::exit_guard::{self, Call};
++ use super::release::{self, Released};
++ use ash::vk;
++ use std::collections::VecDeque;
++@@ -62,6 +67,8 @@ pub(super) struct CommandPool {
++     family: u32,
++     made: [Vec<vk::CommandBuffer>; 2],
++     handed: [usize; 2],
+++    /// Reset as it was given back, nothing handed out since: its taker need not reset it.
+++    clean: bool,
++ }
++ 
++ impl CommandPool {
++@@ -72,6 +79,7 @@ impl CommandPool {
++             family,
++             made: [Vec::new(), Vec::new()],
++             handed: [0, 0],
+++            clean: false,
++         }
++     }
++ 
++@@ -102,6 +110,8 @@ impl CommandPool {
++ pub(super) struct DescriptorPool {
++     pub(super) raw: vk::DescriptorPool,
++     pub(super) room: Room,
+++    /// Reset as it was given back, no set allocated since: its taker need not reset it.
+++    pub(super) clean: bool,
++ }
++ 
++ /// A device's spares.
++@@ -127,6 +137,9 @@ impl Spares {
++         let Some(mut pool) = take_command_pool(&mut lock(&self.command_pools), family) else {
++             return Ok(None);
++         };
+++        if std::mem::take(&mut pool.clean) {
+++            return Ok(Some(pool));
+++        }
++         // SAFETY: the pool is the caller's alone now, and nothing of it is pending: a command
++         // buffer that completed gave it back.
++         let reset = unsafe {
++@@ -145,7 +158,20 @@ impl Spares {
++ 
++     /// Keep `pool`, of a command buffer whose work ended or that was never submitted: nothing of
++     /// it is pending, and nothing else holds it. Never released here (the module docs).
++-    pub(super) fn give_command_pool(&self, pool: CommandPool) {
+++    pub(super) fn give_command_pool(&self, device: &DeviceShared, mut pool: CommandPool) {
+++        if let Some(_busy) = exit_guard::enter() {
+++            // SAFETY: the pool is the caller's alone, and nothing of it is pending.
+++            let reset = unsafe {
+++                device
+++                    .vk()
+++                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::empty())
+++            };
+++            exit_guard::called(Call::ResetCommandPool);
+++            if reset.is_ok() {
+++                pool.reset_handed();
+++                pool.clean = true;
+++            }
+++        }
++         keep_command_pool(&mut lock(&self.command_pools), pool);
++     }
++ 
++@@ -160,9 +186,12 @@ impl Spares {
++             return Ok(None);
++         }
++         let pool = take_descriptor_pool(&mut lock(&self.descriptor_pools), needs);
++-        let Some(pool) = pool else {
+++        let Some(mut pool) = pool else {
++             return Ok(None);
++         };
+++        if std::mem::take(&mut pool.clean) {
+++            return Ok(Some(pool));
+++        }
++         // SAFETY: the pool is the caller's alone now, and nothing uses its sets: a command buffer
++         // that completed gave it back.
++         let reset = unsafe {
++@@ -180,7 +209,17 @@ impl Spares {
++ 
++     /// Keep `pool` of `device`, of a command buffer that completed, releasing the oldest spares
++     /// past the bounds (or `pool` itself, when it alone is past them).
++-    pub(super) fn give_descriptor_pool(&self, device: &DeviceShared, pool: DescriptorPool) {
+++    pub(super) fn give_descriptor_pool(&self, device: &DeviceShared, mut pool: DescriptorPool) {
+++        if let Some(_busy) = exit_guard::enter() {
+++            // SAFETY: the pool is the caller's alone, and nothing uses its sets.
+++            let reset = unsafe {
+++                device
+++                    .vk()
+++                    .reset_descriptor_pool(pool.raw, vk::DescriptorPoolResetFlags::empty())
+++            };
+++            exit_guard::called(Call::ResetDescriptorPool);
+++            pool.clean = reset.is_ok();
+++        }
++         let past = keep_descriptor_pool(&mut lock(&self.descriptor_pools), pool);
++         for raw in past {
++             // SAFETY: nothing uses the pool's sets (the caller's, or a spare's), and nothing else
++diff --git a/crates/metal2vulkan-runtime/src/tests/spares.rs b/crates/metal2vulkan-runtime/src/tests/spares.rs
++index 3a76dcd..97100cd 100644
++--- a/crates/metal2vulkan-runtime/src/tests/spares.rs
+++++ b/crates/metal2vulkan-runtime/src/tests/spares.rs
++@@ -22,6 +22,7 @@ fn descriptor_pool(n: u64, needs: &SetNeeds, sets: u32) -> DescriptorPool {
++     DescriptorPool {
++         raw: vk::DescriptorPool::from_raw(n),
++         room: Room::of(needs, sets),
+++        clean: false,
++     }
++ }
++ 
+diff --git a/bridge/patches/0027-draw-costs-example.patch b/bridge/patches/0027-draw-costs-example.patch
+new file mode 100644
+index 0000000..65e4b73
+--- /dev/null
++++ b/bridge/patches/0027-draw-costs-example.patch
+@@ -0,0 +1,145 @@
++diff --git a/crates/metal2vulkan-runtime/Cargo.toml b/crates/metal2vulkan-runtime/Cargo.toml
++index 364edb4..143910c 100644
++--- a/crates/metal2vulkan-runtime/Cargo.toml
+++++ b/crates/metal2vulkan-runtime/Cargo.toml
++@@ -71,3 +71,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(m2v_gpu)", "cfg(m2v_cpu_ic
++ 
++ [build-dependencies]
++ sha2.workspace = true
+++
+++[[example]]
+++name = "draw_costs"
+++path = "examples/draw_costs.rs"
++diff --git a/crates/metal2vulkan-runtime/examples/draw_costs.rs b/crates/metal2vulkan-runtime/examples/draw_costs.rs
++new file mode 100644
++index 0000000..0adab8a
++--- /dev/null
+++++ b/crates/metal2vulkan-runtime/examples/draw_costs.rs
++@@ -0,0 +1,127 @@
+++//! A compositor-like frame loop for measuring the runtime's CPU cost per draw, per pass close and per commit
+++//! (guamp bench, local): each frame one render pass of DRAWS draws over a 256x256 BGRA target, the draws
+++//! switching between two pipelines every four, each with its own vertex bytes, as Core Animation encodes.
+++//!
+++//! FRAMES=400 cargo run --release -p metal2vulkan-runtime --example draw_costs
+++mod common;
+++
+++use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+++use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
+++use metal2vulkan_runtime::{
+++    ClearColor, Device, LoadAction, PipelineOptions, RenderPassDescriptor, ResourceOptions, StoreAction,
+++    TextureDescriptor,
+++};
+++use std::time::{Duration, Instant};
+++
+++const DRAWS: usize = 40;
+++
+++/// This thread's CPU time: what the encoding thread spends, whatever else runs on the machine.
+++fn thread_cpu() -> Duration {
+++    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+++    // SAFETY: `t` is a valid out pointer.
+++    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+++    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+++}
+++
+++fn main() -> common::Result<()> {
+++    let frames: usize = std::env::var("FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+++    let device = Device::system_default()?;
+++    println!("device: {}", device.name());
+++    let library = common::library(&device)?;
+++    let vertex = library.new_function_with_name("colored_vertex")?;
+++    let colored = library.new_function_with_name("colored_fragment")?;
+++    let sampled = library.new_function_with_name("sampled_fragment")?;
+++    let make = |fragment: &metal2vulkan_runtime::Function, blend: bool| {
+++        let mut d = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
+++        d.fragment = Some(StageSource::Function(fragment.function_descriptor()));
+++        let mut c = ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm);
+++        if blend {
+++            c.blending_enabled = true;
+++        }
+++        d.color_attachments[0] = Some(c);
+++        device.new_render_pipeline_state(&d, &PipelineOptions::default())
+++    };
+++    let a = make(&colored, false)?;
+++    let b = make(&sampled, true)?;
+++    let mut t = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, 256, 256, false);
+++    t.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+++    t.resource_options = ResourceOptions::private();
+++    let target = device.new_texture(&t)?;
+++    let mut s = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, 64, 64, false);
+++    s.usage = TextureUsage::SHADER_READ;
+++    s.resource_options = ResourceOptions::private();
+++    let source = device.new_texture(&s)?;
+++    let colors: Vec<u8> = (0..6).flat_map(|_| [1.0f32, 0.2, 0.0, 0.5]).flat_map(|v| v.to_le_bytes()).collect();
+++    let colors = device.new_buffer_with_bytes(&colors, ResourceOptions::shared())?;
+++    let queue = device.new_command_queue()?;
+++    let (mut draw_t, mut close_t, mut commit_t, mut open_t) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+++    let mut last = None;
+++    let mut measured = 0;
+++    let mut cpu_t = Duration::ZERO;
+++    for frame in 0..frames {
+++        let warm = frame < 20;
+++        let mut pass = RenderPassDescriptor::new();
+++        let color = &mut pass.color_attachments[0];
+++        color.texture = Some(target.clone());
+++        color.load_action = LoadAction::Clear;
+++        color.store_action = StoreAction::Store;
+++        color.clear_color = ClearColor::new(0.0, 0.0, 1.0, 1.0);
+++        let c0 = thread_cpu();
+++        let t0 = Instant::now();
+++        let command_buffer = queue.command_buffer()?;
+++        let mut encoder = command_buffer.render_command_encoder(&pass)?;
+++        let t1 = Instant::now();
+++        for i in 0..DRAWS {
+++            if i % 4 == 0 {
+++                match (i / 4) % 2 {
+++                    0 => encoder.set_render_pipeline_state(&a)?,
+++                    _ => {
+++                        encoder.set_render_pipeline_state(&b)?;
+++                        encoder.set_fragment_texture(Some(&source), 0)?;
+++                    }
+++                }
+++            }
+++            let x = (i % 8) as f32 / 8.0 * 2.0 - 1.0;
+++            let y = (i / 8) as f32 / 8.0 * 2.0 - 1.0;
+++            let q: [[f32; 2]; 6] = [[x, y], [x + 0.2, y], [x, y + 0.2], [x + 0.2, y], [x + 0.2, y + 0.2], [x, y + 0.2]];
+++            let bytes: Vec<u8> = q.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+++            encoder.set_vertex_bytes(&bytes, 0)?;
+++            encoder.set_vertex_buffer(Some(&colors), 0, 1)?;
+++            encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)?;
+++        }
+++        let t2 = Instant::now();
+++        encoder.end_encoding()?;
+++        let t3 = Instant::now();
+++        command_buffer.commit()?;
+++        let t4 = Instant::now();
+++        let c4 = thread_cpu();
+++        if !warm {
+++            open_t += t1 - t0;
+++            draw_t += t2 - t1;
+++            close_t += t3 - t2;
+++            commit_t += t4 - t3;
+++            cpu_t += c4 - c0;
+++            measured += 1;
+++        }
+++        if let Some(previous) = last.replace(command_buffer) {
+++            let previous: metal2vulkan_runtime::CommandBuffer = previous;
+++            previous.wait_until_completed_for(Duration::from_secs(30)).map_err(|_| "timeout")?;
+++        }
+++    }
+++    if let Some(l) = last {
+++        l.wait_until_completed_for(Duration::from_secs(30)).map_err(|_| "timeout")?;
+++    }
+++    let ph = metal2vulkan_runtime::phase_timings();
+++    let d = ph[11].max(1) as f64;
+++    println!("phases per draw ns: settle {:.0} cmd {:.0} heap {:.0} rec {:.0}; per close: end {:.0} sh {:.0} book {:.0}; per commit: state {:.0} prep {:.0} plan {:.0} sub {:.0}", ph[0] as f64/d, ph[1] as f64/d, ph[2] as f64/d, ph[3] as f64/d, ph[4] as f64/ph[12].max(1) as f64, ph[5] as f64/ph[12].max(1) as f64, ph[6] as f64/ph[12].max(1) as f64, ph[7] as f64/ph[13].max(1) as f64, ph[8] as f64/ph[13].max(1) as f64, ph[9] as f64/ph[13].max(1) as f64, ph[10] as f64/ph[13].max(1) as f64);
+++    let n = measured as f64;
+++    println!("encoding thread CPU per frame: {:.1} us", cpu_t.as_secs_f64() * 1e6 / n);
+++    println!(
+++        "frames {measured}: open {:.1} us, draw {:.1} us each, close {:.1} us, commit {:.1} us",
+++        open_t.as_secs_f64() * 1e6 / n,
+++        draw_t.as_secs_f64() * 1e6 / n / DRAWS as f64,
+++        close_t.as_secs_f64() * 1e6 / n,
+++        commit_t.as_secs_f64() * 1e6 / n
+++    );
+++    Ok(())
+++}
