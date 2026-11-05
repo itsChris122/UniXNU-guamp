@@ -24,6 +24,8 @@
 // guamp-touch-events=1|2 (TouchService.inc): ogni cambio acceso/spento (il primo livello > 0 di iOS compreso) va al touch
 // prima dei comandi del pannello e del livello (EARLY_EVENT_BLANK di Linux); con guamp-touch-events-dsi=1 (default) anche
 // off-command dopo il livello 0 e on-command prima del primo livello, come guamp-touch-wake.
+// guamp-backlight-wake-wait / -wake-luma (GuampBacklightCore.h): display on waits (at most 500 ms) for the first lit frame
+// the scanout draws, so the wallpaper comes up with the light instead of after it; one line per held display-on.
 // Logs: one line at start, one per brightness request (rate-limited, says display off/on), failed sends (rate-limited).
 #include "GuampBacklightCore.h"
 // GuampGpuDcvs.inc (GpuService.inc, included before this file in NativeEmmc.cpp): set when the display comes on.
@@ -77,6 +79,10 @@ class GuampBacklight : public IOService {
   uint32_t failuresInRow = 0, retries = 0, testStage = 0;
   bool broken = false, known = false;                  // known: the panel has been sent a level by us
   uint64_t fadeStart = 0, period = 0;
+  // guamp-backlight-wake-wait: a display-on held until the first lit frame (wakeGoal/wakeFade: the request, kept for later).
+  uint32_t wakeWait = guamp_backlight::kWakeWaitMs, wakeGoal = 0, wakeFade = 0;
+  bool waking = false;
+  uint64_t wakeStart = 0;
   guamp_backlight::LogGate gate;
   volatile uint64_t pending = 0;                       // bit 63 new, goal << 16, fade ms (newest wins)
 
@@ -112,6 +118,16 @@ class GuampBacklight : public IOService {
     evKnown = true;
     evOn = on;
     touch::displayEvent(on);
+  }
+  // The panel's side of display on (touch event, GPU boost, on-command): at once for a held display-on, else from apply().
+  void wakePanel() {
+    backlight::DsiGuard guard;
+    touchEvent(true);
+    if (panelAsleep) {
+      panelAsleep = false;
+      panelCommand(true);
+    }
+    touch::displayState(true);
   }
   void apply(uint32_t next) {
     if (broken || (known && next == level)) return;
@@ -151,9 +167,32 @@ class GuampBacklight : public IOService {
             "timeout %08x, %u us)%s\n", next, guamp_backlight::resultName(r), d.hw, d.ctrl, d.line, d.intCtrl, d.status,
             d.fifo, d.ack, d.timeouts, d.waitedUs, broken ? "; DSI access stopped" : "");
   }
+  // A held display-on: the fade starts once the scanout drew a lit frame or the time is up.
+  void startFade(uint32_t goal, uint32_t ms) {
+    from = level;
+    to = goal;
+    retries = 0;
+    fadeStart = mach_absolute_time();
+    nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &period);
+  }
+  bool waitStep(IOTimerEventSource *sender) {
+    using namespace guamp_backlight;
+    const uint64_t waitedMs = (backlight::nowUs() - wakeStart) / 1000u;
+    const bool lit = __atomic_load_n(&gWakeGate.lit, __ATOMIC_ACQUIRE) != 0;
+    if (!wakeGateOpens(lit, waitedMs, wakeWait)) { sender->setTimeoutMS(kWakePollMs); return false; }
+    waking = false;
+    gWakeGate.waiting = 0;
+    if (lit) gWakeGate.litOpens = gWakeGate.litOpens + 1; else gWakeGate.timeouts = gWakeGate.timeouts + 1;
+    if (mayLog())
+      IOLog("GuampBacklight: display on held %llu ms: %s (held %u, lit %u, timed out %u)\n", waitedMs,
+            lit ? "lit frame drawn" : "no lit frame, time limit", gWakeGate.gates, gWakeGate.litOpens, gWakeGate.timeouts);
+    startFade(wakeGoal, wakeFade);
+    return true;
+  }
   static void fadeStep(OSObject *owner, IOTimerEventSource *sender) {
     GuampBacklight *self = static_cast<GuampBacklight *>(owner);   // static: getMetaClass answers AppleARMBacklight
     if (!self) return;
+    if (self->waking && !self->waitStep(sender)) return;
     const uint32_t next = guamp_backlight::fadeLevel(self->from, self->to, mach_absolute_time() - self->fadeStart, self->period);
     self->apply(next);
     if (next != self->to) { sender->setTimeoutMS(guamp_backlight::kStepMs); return; }
@@ -174,12 +213,33 @@ class GuampBacklight : public IOService {
             goal == 0 && self->level != 0 ? ", display off" : goal != 0 && self->level == 0 ? ", display on" : "",
             backlight::gRequests, backlight::gSends, backlight::gFailures, dropped ? ", log lines dropped" : "");
     }
+    if (self->waking) {
+      if (goal) {                                      // still waking: the newest level and fade wait in its place
+        self->wakeGoal = goal;
+        self->wakeFade = ms;
+        return;
+      }
+      // Off again before the first lit frame: the panel and the touch were woken (wakePanel) while the level stayed 0, so
+      // the off path of apply() must run as if the panel were lit (known = false: "not sent by us" sends the 0 again).
+      self->waking = false;
+      guamp_backlight::gWakeGate.waiting = 0;
+      self->known = false;
+    }
     self->fade->cancelTimeout();
-    self->from = self->level;
-    self->to = goal;
-    self->retries = 0;
-    self->fadeStart = mach_absolute_time();
-    nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &self->period);
+    if (goal && self->known && self->level == 0 && self->wakeWait && !self->broken) {
+      // Display on after a standby: light only with a lit frame on the panel (GuampBacklightCore.h, guamp-backlight-wake-wait).
+      __atomic_store_n(&guamp_backlight::gWakeGate.lit, 0u, __ATOMIC_RELEASE);
+      __atomic_store_n(&guamp_backlight::gWakeGate.waiting, 1u, __ATOMIC_RELEASE);
+      guamp_backlight::gWakeGate.gates = guamp_backlight::gWakeGate.gates + 1;
+      self->waking = true;
+      self->wakeGoal = goal;
+      self->wakeFade = ms;
+      self->wakeStart = backlight::nowUs();
+      self->wakePanel();
+      self->fade->setTimeoutMS(guamp_backlight::kWakePollMs);
+      return;
+    }
+    self->startFade(goal, ms);
     fadeStep(self, self->fade);
   }
   static void testFired(OSObject *owner, IOTimerEventSource *sender) {
@@ -227,6 +287,7 @@ class GuampBacklight : public IOService {
     return true;
   }
 public:
+  void setWakeWait(uint32_t ms) { wakeWait = ms; }   // guamp-backlight-wake-wait, from start()
   bool startBacklight(bool control, bool selfTest) {
     loop = IOWorkLoop::workLoop();
     fade = IOTimerEventSource::timerEventSource(this, &GuampBacklight::fadeStep);
@@ -319,6 +380,10 @@ void start() {
   if (enabled != 1) return;
   PE_parse_boot_argn("guamp-backlight-control", &control, sizeof(control));
   PE_parse_boot_argn("guamp-backlight-test", &selfTest, sizeof(selfTest));
+  unsigned wakeWait = kWakeWaitMs, wakeLuma = kWakeLuma;
+  PE_parse_boot_argn("guamp-backlight-wake-wait", &wakeWait, sizeof(wakeWait));
+  PE_parse_boot_argn("guamp-backlight-wake-luma", &wakeLuma, sizeof(wakeLuma));
+  gWakeGate.luma = wakeLuma > 255 ? 255u : wakeLuma;
   gGccDisp = mapPhysical(kGccDispAhbPage, 0x1000);
   gDispcc = mapPhysical(kDispccPhys, 0x3000);
   gDsi = mapPhysical(kDsiPhys, 0x1000);
@@ -331,6 +396,7 @@ void start() {
     if (service) service->release();
     return;
   }
+  service->setWakeWait(wakeWaitMs(wakeWait));
   if (!service->startBacklight(control == 1, selfTest == 1)) {
     IOLog("GuampBacklight: work loop not started\n");
     service->detach(IOService::getPlatform());

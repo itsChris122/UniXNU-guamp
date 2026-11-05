@@ -46,6 +46,9 @@ __attribute__((weak)) volatile uint64_t native_adreno_publish_client[2];
 __attribute__((weak)) volatile uint32_t native_adreno_client_cleans_maps[2];
 __attribute__((weak)) volatile uint64_t native_adreno_reassert_stats[6];
 __attribute__((weak)) volatile uint32_t native_adreno_wc_epoch;
+// patches/native-adreno/0016: cache-mode events that named their BO (only that BO is re-asserted); native_adreno_wc_epoch then counts
+// the unnamed ones (imports, non-BO views), which reach only BOs with a CPU view.
+__attribute__((weak)) volatile uint64_t native_adreno_wc_bo_events;
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 }
@@ -111,10 +114,10 @@ void logSubmits() {
                  rn = native_adreno_reassert_stats[1], rc = native_adreno_reassert_stats[2], rb = native_adreno_reassert_stats[4];
   if (dn)
     IOLog("GuampGpu: submit coherence: client-cleaned imports %llu mappings %llu KiB each (maps flagged %u, refused %u); re-assert "
-          "ran %llu skipped %llu checks %llu BOs %llu, missed %llu pages, fallback %llu, events %u\n",
+          "ran %llu skipped %llu checks %llu BOs %llu, missed %llu pages, fallback %llu, events %u, BO events %llu\n",
           (cm - prev[0]) / dn, (cb - prev[1]) / dn >> 10, native_adreno_client_cleans_maps[0], native_adreno_client_cleans_maps[1],
           rw - prev[2], rn - prev[3], rc - prev[4], rb - prev[5], native_adreno_reassert_stats[3], native_adreno_reassert_stats[5],
-          native_adreno_wc_epoch);
+          native_adreno_wc_epoch, native_adreno_wc_bo_events);
   prev[0] = cm; prev[1] = cb; prev[2] = rw; prev[3] = rn; prev[4] = rc; prev[5] = rb;
   // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
   static uint64_t ro[3];

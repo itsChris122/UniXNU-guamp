@@ -487,6 +487,24 @@ int main() {
     }
   }
 
+  // guamp-backlight-wake-wait: the held display-on opens on a lit frame or at the limit; black frames do not count
+  {
+    check(wakeWaitMs(0) == 0 && wakeWaitMs(500) == 500 && wakeWaitMs(100000) == kWakeWaitMaxMs, "wake wait capped");
+    check(!wakeFrameLit(1, kWakeLuma) && wakeFrameLit(88, kWakeLuma) && wakeFrameLit(kWakeLuma, kWakeLuma), "lit threshold");
+    check(!wakeGateOpens(false, 499, 500) && wakeGateOpens(false, 500, 500) && wakeGateOpens(true, 0, 500), "gate opens");
+    gWakeGate.waiting = 0; gWakeGate.lit = 0;
+    wakeNoteFrame(200);
+    check(!gWakeGate.lit, "no display-on waiting: frames ignored");
+    gWakeGate.waiting = 1;
+    wakeNoteFrame(1);    // the black first frame after the standby (live-20261105-152838, luma 1)
+    check(!gWakeGate.lit, "black frame keeps the light off");
+    wakeNoteFrame(88);   // the lock screen (luma 88)
+    check(gWakeGate.lit, "lit frame opens");
+    wakeNoteFrame(0);
+    check(gWakeGate.lit, "stays open until the next display-on");
+    gWakeGate.waiting = 0; gWakeGate.lit = 0;
+  }
+
   // Rate limit: burst, then one per refill period, dropped lines counted
   {
     LogGate g;

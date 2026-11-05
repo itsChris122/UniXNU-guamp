@@ -59,6 +59,27 @@ constexpr uint32_t kMaxLevel = 0xccc, kMinLevel = 16, kDefaultLevel = 0x666;
 constexpr uint32_t kStepMs = 16, kMaxFadeMs = 5000;
 constexpr uint32_t kBusyTimeoutUs = 20000, kDoneTimeoutUs = 50000;     // a scheduled DMA leaves within one frame (16.7 ms)
 
+// guamp-backlight-wake-wait=<ms> (default 500, 0 = off, capped at 2000): display on (a level above 0 after 0) holds the LEDs
+// at 0 until the scanout has drawn a lit frame since the request, at most that long. After a standby the render server's
+// first frame is black (05/11 live-152838: request 120.490, black frame 120.613, lock screen 120.974): the panel lit up
+// ~480 ms before the wallpaper. The panel's own wake (touch, on-command) and the GPU boost do not wait.
+// guamp-backlight-wake-luma=<n> (default 6): the mean luma (GuampScanoutCore.h meanLuma, 0..255) a frame needs to count.
+constexpr uint32_t kWakeWaitMs = 500, kWakeWaitMaxMs = 2000, kWakeLuma = 6, kWakePollMs = 4;
+constexpr uint32_t wakeWaitMs(uint32_t asked) { return asked > kWakeWaitMaxMs ? kWakeWaitMaxMs : asked; }
+constexpr bool wakeFrameLit(uint32_t luma, uint32_t threshold) { return luma >= threshold; }
+constexpr bool wakeGateOpens(bool lit, uint64_t waitedMs, uint32_t maxMs) { return lit || waitedMs >= maxMs; }
+// Between the backlight's work loop (waiting) and the scanout's copy thread (lit, luma), both in NativeEmmc.
+struct WakeGate {
+  volatile uint32_t waiting = 0, lit = 0, luma = kWakeLuma;
+  volatile uint32_t gates = 0, litOpens = 0, timeouts = 0;   // display-ons held, opened by a lit frame, by the time limit
+};
+inline WakeGate gWakeGate;
+// The scanout's word on one frame while a display-on waits: drawn = the frame reached the scanout through it (else the
+// variant copies it itself, and the luma of the source is all there is).
+inline void wakeNoteFrame(uint32_t luma) {
+  if (gWakeGate.waiting && !gWakeGate.lit && wakeFrameLit(luma, gWakeGate.luma)) __atomic_store_n(&gWakeGate.lit, 1u, __ATOMIC_RELEASE);
+}
+
 // 0 stays 0 (LEDs off); any other request is kept between bl-min and the normal maximum. Negative = 0.
 constexpr uint32_t clampLevel(int64_t asked) {
   return asked <= 0 ? 0u : asked < (int64_t)kMinLevel ? kMinLevel : asked > (int64_t)kMaxLevel ? kMaxLevel : (uint32_t)asked;

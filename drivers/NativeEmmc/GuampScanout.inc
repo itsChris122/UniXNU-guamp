@@ -279,8 +279,16 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
 {
   using namespace gscan;
   readOptions();
-  if (!gK.diff && !gK.flipWanted) return 0;
-  if (held()) return 0;
+  // guamp-backlight-wake-wait (GuampBacklightCore.h): a frame the variant copies itself counts by its source's luma (64 reads).
+  const bool gateFrame = guamp_backlight::gWakeGate.waiting && src && srcW && srcH && srcStride * (srcH - 1) + (uint64_t)srcW * 4 <= srcBytes;
+  if (!gK.diff && !gK.flipWanted) {
+    if (gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
+    return 0;
+  }
+  if (held()) {
+    if (gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
+    return 0;
+  }
   IOLockLock(gK.lock);
   if (held()) { IOLockUnlock(gK.lock); return 0; }
   int result = 1;
@@ -314,6 +322,8 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     if (gK.flipOn && gK.st.rowsDrawn && target != gK.shown) point(target);
     gK.frames = gK.frames + 1;
     if (!changed) gK.unchanged = gK.unchanged + 1;
+    // guamp-backlight-wake-wait: this frame is drawn (and, with the flip, pointed at): the light may come up with it.
+    if (gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
     // The first frames of the boot, one line each (the log line's time is when the panel got it): which picture reached the
     // screen when (boot logo / lock screen, 05/11: off ~35 s after the display power-on, ~20 s after the first frame).
     if (gK.frames <= gK.earlyFrames)
@@ -332,6 +342,8 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     }
   } while (false);
   IOLockUnlock(gK.lock);
+  // Refused: the variant copies it itself.
+  if (result != 1 && gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
   return result;
 }
 
