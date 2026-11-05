@@ -1,0 +1,75 @@
+guamp: metal2vulkan bridge patch 0024, an _sRGB extended-range blend beyond fast math's model takes the rounded model (AegirPoster)
+
+fin48/fin49: AegirPoster died at every boot on "render pipeline: Unsupported { feature: ExtendedRangeBlend(SrgbForm), needs:
+NotImplemented, ... calliope_star_fsh }": QuartzCore's poster shader blends into BGRA10_XR_sRGB (its CAMetalLayer is XR10 since
+0018) with a blend fast math's measured model does not hold, and metal2vulkan refused the pipeline. Without fast math every such
+blend is built (the output rounded to half first, each term's product and the sum rounded); bridge/patches/0024 takes that model
+for these blends instead of the refusal, in Blend::of and in Blend::for_output (a half4 output or a float4 one rounded to half).
+The result may differ from Metal's fast arithmetic by those roundings (not measured); the unit expectations of the two refused
+cases (tests.rs) now expect no gap. The GPU workflow stacks every bridge/patches/*.patch after the device patches, so the new
+file is built. Applies after 0001-0003, 0009-0021 and 0030.
+
+diff --git a/bridge/patches/0024-xr10-srgb-blend-rounded.patch b/bridge/patches/0024-xr10-srgb-blend-rounded.patch
+new file mode 100644
+index 0000000..ec76459
+--- /dev/null
++++ b/bridge/patches/0024-xr10-srgb-blend-rounded.patch
+@@ -0,0 +1,58 @@
++diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
++index 0b004f2..2c0f06c 100644
++--- a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
+++++ b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
++@@ -765,10 +765,18 @@ fn planned_for(
++     let narrow = narrow(eq);
++     // The rounded model holds for any blend into an `_sRGB` form, a mask of one color channel,
++     // and the color channels' blend color difference.
+++    // guamp (UniXNU-guamp, AdrenoMetal bridge patch 0024): an `_sRGB` form's blend that fast math's
+++    // model does not hold takes the rounded model instead of the refusal, which every such blend
+++    // holds without fast math (the function's output rounded to `half` first): QuartzCore's
+++    // `calliope_star_fsh` of AegirPoster (iPadOS 17.7.11) blends so into `BGRA10_XR_sRGB` and its
+++    // process died at every refused pipeline (fin48, fin49). The result may differ from Metal's fast
+++    // arithmetic by the rounding of the output and of each term, which no measurement bounds here.
+++    let math = if math == BlendMath::Fast && srgb && (!narrow || masked) {
+++        BlendMath::Rounded
+++    } else {
+++        math
+++    };
++     let fast = math == BlendMath::Fast;
++-    if fast && srgb && (!narrow || masked) {
++-        return Err(refused(ExtendedRangeBlend::SrgbForm));
++-    }
++     let opaque_ = !has_alpha;
++     let color = match colors {
++         0 => None,
++@@ -864,6 +872,14 @@ impl Blend {
++         }
++         if output != Some(FloatFmt::F32) || form.srgb() {
++             let b = Blend::of(eq, form, written, BlendMath::Fast)?;
+++            // guamp bridge patch 0024: an `_sRGB` form's blend that took the rounded model takes a
+++            // `half4` output or a `float4` one rounded to `half` first, as without fast math.
+++            if b.math == BlendMath::Rounded {
+++                return match output {
+++                    Some(FloatFmt::Half | FloatFmt::F32) => Ok(b),
+++                    _ => Err(refused(ExtendedRangeBlend::Output)),
+++                };
+++            }
++             b.takes(output)?;
++             return Ok(b);
++         }
++diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs b/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
++index 2b1115c..112dc4e 100644
++--- a/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
+++++ b/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
++@@ -1380,9 +1380,10 @@ fn blends_outside_the_model_are_refused_by_name() {
++         source_rgb: F::SourceAlpha,
++         ..premul
++     };
++-    assert_eq!(gap(&over, srgb, ALL), Some(ExtendedRangeBlend::SrgbForm));
+++    // guamp bridge patch 0024: an `_sRGB` form's blend beyond fast math's model takes the rounded one.
+++    assert_eq!(gap(&over, srgb, ALL), None);
++     let rgb = ColorWriteMask::ALL.difference(ColorWriteMask::ALPHA);
++-    assert_eq!(gap(&premul, srgb, rgb), Some(ExtendedRangeBlend::SrgbForm));
+++    assert_eq!(gap(&premul, srgb, rgb), None);
++     // A `float4` output: the blends whose color lanes take one term alone, unmasked.
++     let takes = |eq: &BlendEquation, mask: ColorWriteMask, fmt: Option<FloatFmt>| match Blend::of(
++         eq,
