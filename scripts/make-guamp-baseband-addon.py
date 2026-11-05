@@ -136,6 +136,8 @@ def main():
     parser.add_argument('--base', type=Path, help='an existing addon whose entries are kept in the output')
     parser.add_argument('--stub', action='append', default=[], metavar='NAME',
                         help='firmware file (path inside Mav16, e.g. qdsp6sw.mbn) carried as an ELF skeleton: see elf_skeleton()')
+    parser.add_argument('--thermal-from', type=Path, metavar='ADDON',
+                        help='addon holding iphone-res/ThermalMonitor/motorola,guamp-Info.plist (e.g. resa37-watch): copied as J121AP-Info.plist')
     parser.add_argument('--kernel', type=Path, help='kernel.macho of the image: prints the GBPK estimate against the 80 MiB ramdisk')
     parser.add_argument('--out', required=True, type=Path)
     options = parser.parse_args()
@@ -171,6 +173,19 @@ def main():
             added += 1
     if set(stubs) - set(stubbed):
         raise SystemExit(f'--stub names not in the bbfw: {sorted(set(stubs) - set(stubbed))}')
+    if options.thermal_from:
+        # The baseband ADT makes hw.model J121AP: thermalmonitord then loads the stock iPad Pro J121AP-Info.plist (sensors this phone
+        # never reports) instead of iphone-res/ThermalMonitor/motorola,guamp-Info.plist (zzzz-guamp-iphone-res.patch), and never
+        # publishes the battery-health notifications Settings waits for (fin49: battery "Service", Battery Health page empty). The
+        # same profile under the J121AP name shadows the stock one in the same union view.
+        source = 'iphone-res/ThermalMonitor/motorola,guamp-Info.plist'
+        found = [entry for entry in read_addon(options.thermal_from) if entry[0] == source]
+        if not found:
+            raise SystemExit(f'{source} not in {options.thermal_from}')
+        target = 'iphone-res/ThermalMonitor/J121AP-Info.plist'
+        assert target not in names, 'entry already in --base: %s' % target
+        entries.append((target,) + tuple(found[0][1:]))
+        names.add(target)
     if had_keep:
         lines = sorted((set(keep) - {p for p in keep if p.endswith('/')}) | names | {'.guamp-keep'})
         lines += sorted({p for p in keep if p.endswith('/')} | {'baseband/'})
