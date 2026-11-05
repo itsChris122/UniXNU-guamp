@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9805,6 +9805,34 @@ native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
+@@ -9805,6 +9805,33 @@ native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
  	printf("guamp-camera-plugin: %s stage %d status %d\n", cmc_point, native_guamp_camera_cmcapture_stage,
  	    native_guamp_camera_cmcapture_status);
  }
@@ -29,13 +29,12 @@
 +	static const char source[] = "/private/var/ngpu/videoencoders", point[] = "/System/Library/VideoEncoders";
 +	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point,
 +	    "/System/Library/VideoEncoders/H264H7.videoencoder", &native_guamp_venc_stage, &native_guamp_venc_status);
-+	printf("guamp-venc: %s stage %d status %d
-+", point, native_guamp_venc_stage, native_guamp_venc_status);
++	printf("guamp-venc: %s stage %d status %d\n", point, native_guamp_venc_stage, native_guamp_venc_status);
 +}
  static void
  native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -9841,6 +9869,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -9841,6 +9868,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	if (camera_plugin) {
  		native_guamp_camera_plugin_mount(p, scratch);	/* guamp-camera-ios=1|2: H6ISP.mediacapture (05/11) */
  	}
