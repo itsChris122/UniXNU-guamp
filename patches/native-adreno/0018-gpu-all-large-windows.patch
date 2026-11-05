@@ -1,0 +1,37 @@
+guamp: large gpu-all windows only for the processes that need them (Maps, Photos, WebKit GPU), the others the board default
+
+diff -ru a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp	2026-11-05 17:36:08.241313354 +0100
++++ b/NativeAdrenoPublish.cpp	2026-11-05 17:36:08.269313355 +0100
+@@ -164,6 +164,7 @@
+ }
+ #include "NativeAdrenoGpuAll.h"
+ extern "C" {char native_adreno_gpu_all_small[96]="Widget,Extension";volatile uint32_t native_adreno_gpu_all_small_mib=128;}
++extern "C" {char native_adreno_gpu_all_large[96]="Maps,MobileSlideShow,WebKit.GPU";volatile uint32_t native_adreno_gpu_all_large_mib=512;}
+ static bool nameHolds(const char *name,size_t bytes,const char *word)
+ {
+     for(size_t i=0;i<bytes && name[i];++i) {
+@@ -341,8 +342,23 @@
+                     if(*word && nameHolds(name_,sizeof name_,word)) {want=native_adreno_gpu_all_small_mib;break;}
+                 }
+             }
++            /* guamp (UniXNU-guamp patches/native-adreno/0018): processes named in native_adreno_gpu_all_large (board: guamp-gpu-all-large,
++             * default "Maps,MobileSlideShow,WebKit.GPU") get native_adreno_gpu_all_large_mib (guamp-gpu-all-largewin, default 512); every
++             * other one the board's window. fin49: with 384 MiB for every app the six live clients took all 1792 MiB of windows ("free
++             * window 0") while their BOs were 149 MiB in all, and Maps, opened last, got what was left: "buffer refused: OutOfMemory(Device)". */
++            if(native_adreno_gpu_all_large_mib && native_adreno_gpu_all_large[0] && want!=native_adreno_gpu_all_small_mib) {
++                char list[sizeof native_adreno_gpu_all_large];
++                strlcpy(list,native_adreno_gpu_all_large,sizeof list);
++                for(char *word=list,*next;word && *word;word=next) {
++                    next=word;while(*next && *next!=',')++next;if(*next)*next++=0;else next=nullptr;
++                    if(*word && nameHolds(name_,sizeof name_,word)) {want=native_adreno_gpu_all_large_mib;break;}
++                }
++            }
+             if(slot<NativeAdrenoAllClients && !g.windows.take(want<<20,gpuAllConfig(1,64)<<20,&win_start,&win_bytes))
+                 slot=NativeAdrenoAllClients;
++            if(slot<NativeAdrenoAllClients)
++                IOLog("NativeAdreno: gpu-all: %.20s window %u MiB (asked %u), %u MiB of windows free\n",name_,uint32_t(win_bytes>>20),
++                      uint32_t(want),uint32_t(g.windows.freeBytes()>>20));
+             dynamic=slot<NativeAdrenoAllClients;
+         }
+     } else {
