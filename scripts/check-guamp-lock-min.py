@@ -5,7 +5,7 @@ The kernel writes com.apple.springboard.plist (native_guamp_pref3) at every boot
 SBMinimumLockscreenIdleTime as a 2-byte integer whose value bytes native_guamp_setup_skip() sets from guamp-lock-min.
 The added C of the patch (the array and the guamp-lock-min block) is compiled on the host with stand-ins for
 PE_parse_boot_argn and printf; for each boot argument the bytes it leaves must be a valid binary plist with the asked
-floor (default 60, at most 600, 0 = none) and the other keys unchanged."""
+floor (default 40, at most 600, 0 = none) and the other keys unchanged."""
 import os, plistlib, re, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -18,7 +18,7 @@ data = bytes(int(x, 16) for x in m.group(2).split(','))
 assert len(data) == int(m.group(1)) and data[at - 1] == 0x11, 'value bytes not after an int16 marker'
 assert src.count('native_guamp_pref3') >= 6
 array = src[src.index('#define NATIVE_GUAMP_PREF3_LOCK_MIN'):src.index('};', src.index('static uint8_t native_guamp_pref3')) + 2]
-s = src.index('\tunsigned int guamp_lock_min = 60;')
+s = src.index('\tunsigned int guamp_lock_min = 40;')
 e = src.index('\t}\n', src.index('if (native_guamp_pref3[NATIVE_GUAMP_PREF3_LOCK_MIN - 1] == 0x11)')) + 3
 prog = r'''#include <stdint.h>
 #include <stdio.h>
@@ -39,8 +39,9 @@ work = tempfile.mkdtemp()
 open(os.path.join(work, 't.c'), 'w').write(prog)
 exe = os.path.join(work, 't')
 subprocess.check_call(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', os.path.join(work, 't.c'), '-o', exe])
+assert data[at:at + 2] == bytes([0, 40]), 'plist default is not 40'
 base = None
-for arg, want in ((None, 60), ('0', 0), ('45', 45), ('600', 600), ('601', 600), ('100000', 600)):
+for arg, want in ((None, 40), ('0', 0), ('45', 45), ('600', 600), ('601', 600), ('100000', 600)):
     r = subprocess.run([exe] + ([arg] if arg else []), capture_output=True, check=True)
     v = plistlib.loads(r.stderr)
     assert v.pop('SBMinimumLockscreenIdleTime') == want, (arg, want)
