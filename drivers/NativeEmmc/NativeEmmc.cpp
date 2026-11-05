@@ -47,6 +47,8 @@
 #include <libkern/crypto/sha2.h>
 #include <pexpert/pexpert.h>
 
+namespace gbmarks { static void read(); static void reprint(); }   // GuampBootMarks.inc, included further down
+
 struct guamp_msgbuf {               // bsd/sys/msgbuf.h
   int msg_magic;
   int msg_size;
@@ -973,6 +975,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
     if (++busyDumps <= 30 && busyDumps % 3 == 0) guampBusyDump();   // every 30 s up to 5 minutes
     dispext::log();
     guampPerfSample();
+    gbmarks::reprint();
     uint64_t busyNs = 0;
     absolutetime_to_nanoseconds(busy - lastBusy, &busyNs);
     IOLog("NativeEmmc: %llu read requests in the last period, %llu blocks each on average, aggregate request latency %llu%%\n",
@@ -1311,6 +1314,7 @@ static void usbProbe()
 #include "BtService.inc"
 #include "GuampBtNub.inc"
 #include "GuampWifiPrep.inc"
+#include "GuampBootMarks.inc"    // GuampBoot checkpoints from its RAM ring (guamp-gb-marks=0 off), after GuampWifiPrep.inc (guamp_phys_*)
 #include "GuampSimService.inc"   // GuampSim registry service: SIM snapshot for guamp-ctd (guamp-sim=1 | guamp-sim-fake=1)
 #if defined(GUAMP_WIFI_REDWOOD) && GUAMP_WIFI_REDWOOD
 #include "GuampWlanNub.inc"     // Wi-Fi mode 2: IO80211Controller/IONetworkInterface for en0 (guamp-wifi-start=2)
@@ -1342,6 +1346,7 @@ static void usbProbe()
 
 static void startLater(thread_call_param_t, thread_call_param_t)
 {
+  gbmarks::read();   // before the card: the line exists even when the eMMC start fails
   Card &card = gCard;
   if (!linkMetaClass()) { native_emmc_stage = 12; IOLog("NativeEmmc: IOStorageFamily metaclass not linked\n"); return; }
   card.gate = IOLockAlloc();

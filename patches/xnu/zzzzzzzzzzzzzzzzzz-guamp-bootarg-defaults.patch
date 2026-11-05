@@ -1,6 +1,6 @@
 --- a/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
 +++ b/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
-@@ -187,13 +187,41 @@
+@@ -187,13 +187,43 @@
  	return arg_found;
  }
  
@@ -9,12 +9,14 @@
 + * and an empty addon. A key on the boot line always wins (=0 turns a feature off); only "guamp-" keys fall back to the table, and
 + * guamp-defaults=0 on the boot line disables the whole table. To change a default (for example guamp-ls-auto) edit only this
 + * string; Codex/emmc/argomenti-predefiniti-1030.txt lists the same keys for the image composer (guamp-defaults-1030 is its marker).
++ * 05/11 (boot speed): guamp-emmc-ra-slots=128 guamp-emmc-ra-adapt=1 (fin47: 45 % of the 64 KiB read-ahead never served,
++ * 180-210 MB per 10 s with the card 76-79 % busy from 11 to 61 s); not yet run on the phone, =32 / =0 give back the old reads.
 + */
 +static char guamp_bootarg_defaults[] =
 +    "guamp-defaults-1030=1 guamp-gpu-all=1 guamp-gpu-all-deny=mediaserverd guamp-ca-metal-reset=1 guamp-ca-metal-noframe=900 guamp-disk-capacity=64 "
 +    "guamp-adsp=1 guamp-adsp-ipc=6 guamp-adsp-delay=8 guamp-audio-dev=1 guamp-audio-plugin=1 guamp-audio-hw=1 guamp-audio-hw-att=12 "
 +    "guamp-audio-mic=1 guamp-audio-mic-gain=30 guamp-sensors=2 guamp-slim=1 guamp-wifi-start=2 guamp-wifi-ui=1 guamp-biokit=1 "
-+    "guamp-emmc-ra=64 guamp-ls-auto=3";
++    "guamp-emmc-ra=64 guamp-emmc-ra-slots=128 guamp-emmc-ra-adapt=1 guamp-ls-auto=3";
 +
 +static boolean_t
 +guamp_bootarg_default(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
@@ -43,7 +45,7 @@
  }
  
  boolean_t
-@@ -213,7 +241,10 @@
+@@ -213,7 +243,10 @@
  	char            *arg_ptr,
  	int                     strlen)
  {
