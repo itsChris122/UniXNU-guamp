@@ -12,15 +12,29 @@ NMB_XR10_TARGETS=1 (default 1 in the other processes); the display then needs gu
 frame. NMB_XR10_IMPORT=0 turns the mapping off. Every distinct XR10 import is logged once (at most 12 a process) as
 "native-metal: XR10 surface '<fourcc>' (0x...) planes P plane N usage U: format A -> B made|refused", and a refused texture over a
 two-plane surface names its fourcc and format; both reach the kernel log through 0020 ("GuampMetal: client <process>: problem pr..").
-Both switches can be set from the boot line (guamp-m2v-env, 0019). Applies after 0001-0003, 0009-0020 and 0030; host check:
+The render server, whose problems reach the kernel only as telemetry rows (fin49: none of its 0021 lines were seen), gets an
+"XR m<mapped> k<kept at 0> r<refused> <latest line>" row, and its SR row (the last refused surface) now ends with the asked usage
+(u<hex>): a 'b3a8' refused at format 0 with u5 or u2 is a render target kept by NMB_XR10_TARGETS. Both switches can be set from the boot line (guamp-m2v-env, 0019). Applies after 0001-0003, 0009-0020 and 0030; host check:
 scripts/check-adreno-metal-xr10.py (the Objective-C++ itself is compiled by the CI only).
 
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index b0bade9..757848d 100644
+index b0bade9..f0f7ed8 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
-@@ -497,6 +497,45 @@ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescripto
-                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+@@ -487,16 +487,60 @@ static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint
+ static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
+ // The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
+ // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
+-struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
++struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,usage;};   // usage: guamp 0021
+ static SurfaceRefusal gSurfaceLastRefusal;
+ // Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row.
+ extern "C" volatile uint32_t native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate;
+ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
+  gSurfaceRefusals++;
+  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
+-                   d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
++                   d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0,d?(uint64_t)d.usage:0};
   std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
  }
 +// guamp (UniXNU-guamp patches/adreno-metal/0021): extended-range (XR10) surfaces. Since 0018 the clients' CAMetalLayers (posters, apps)
@@ -56,16 +70,21 @@ index b0bade9..757848d 100644
 + for(int i=0;i<4;i++){const char c=(char)((fourcc>>(24-8*i))&0xff);out[i]=c>=0x20 && c<0x7f?c:'.';}
 + out[4]=0;
 +}
-+// Once per distinct text, at most 12 a process: NSLog, and the kernel log through 0020's channel (not counted as a problem).
++// Once per distinct text, at most 12 a process: NSLog, and the kernel log through 0020's channel (not counted as a problem). The render
++// server has no such channel (its problems reach the kernel as telemetry rows): the latest text is kept for its XR row, next to the
++// counts of XR10 imports mapped, kept at format 0 and refused (fin49: none of its 0021 lines were seen).
++static std::atomic<uint64_t> gXrMapped,gXrKept,gXrRefused;
++static char gXrLast[200];
 +static void noteSurfaceFormat(const char *text) {
 + static std::mutex lock;static std::set<std::string> said;
 + {std::lock_guard<std::mutex> guard(lock);if(said.size()>=12 || !said.insert(text).second)return;}
++ {std::lock_guard<std::mutex> guard(gProblemLock);strlcpy(gXrLast,text,sizeof gXrLast);}
 + NSLog(@"%s",text);forwardProblem(text);
 +}
  static void noteFormat(uint32_t format,bool made) {
   std::lock_guard<std::mutex> lock(gProblemLock);
   if(!made)gTextureRefusals++;
-@@ -1268,7 +1307,10 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+@@ -1268,7 +1312,10 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
   const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
   NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
    IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));
@@ -77,7 +96,7 @@ index b0bade9..757848d 100644
   NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
   texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
  }
-@@ -2694,6 +2736,22 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+@@ -2694,6 +2741,23 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
   const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
   if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
@@ -89,8 +108,9 @@ index b0bade9..757848d 100644
 + if(xrFormat && askedFormat==MTLPixelFormatInvalid) {
 +  const bool target=(d.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))!=0;
 +  if(xr10ImportOn() && (!target || xr10TargetsOn())) {
-+   MTLTextureDescriptor *mapped=[d copy];mapped.pixelFormat=(MTLPixelFormat)xrFormat;d=mapped;xrMapped=true;
++   MTLTextureDescriptor *mapped=[d copy];mapped.pixelFormat=(MTLPixelFormat)xrFormat;d=mapped;xrMapped=true;gXrMapped++;
 +  } else {
++   gXrKept++;
 +   char line[200];char name[5];fourccText(fourcc,name);
 +   snprintf(line,sizeof line,"native-metal: XR10 surface '%s' (0x%08x) planes %zu plane %lu usage 0x%lx: format 0 kept (%s)",name,fourcc,planes,
 +            (unsigned long)plane,(unsigned long)d.usage,target?"render target, NMB_XR10_TARGETS=1 maps it":"NMB_XR10_IMPORT=0");
@@ -100,7 +120,7 @@ index b0bade9..757848d 100644
   if(planes)gSurfacePlanar++;
   void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
   if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
-@@ -2717,6 +2775,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+@@ -2717,6 +2781,15 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
    bool fresh;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<500 && seen.insert(line).second;}
    if(fresh)journal(line);
   }
@@ -110,8 +130,25 @@ index b0bade9..757848d 100644
 +  snprintf(line,sizeof line,"native-metal: XR10 surface '%s' (0x%08x) planes %zu plane %lu usage 0x%lx: format %lu%s%lu %s",name,fourcc,planes,
 +           (unsigned long)plane,(unsigned long)d.usage,(unsigned long)askedFormat,xrMapped?" -> ":" = ",(unsigned long)d.pixelFormat,
 +           texture?"made":"refused");
++  if(!texture)gXrRefused++;
 +  noteSurfaceFormat(line);
 + }
   if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
   gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
  }
+@@ -3287,9 +3360,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+   if(!profiling)row("PR compiling=%u libs=%u/%u made=%u rate=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,
+    native_prime_made,native_prime_rate);
+   const SurfaceRefusal &r=gSurfaceLastRefusal;
+-  if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
+-   (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
+-   (unsigned long long)r.height,r.pixelFormat);
++  if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u u%llx",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),
++   (char)(r.format>>8),(char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,
++   (unsigned long long)r.width,(unsigned long long)r.height,r.pixelFormat,(unsigned long long)r.usage);
++  // guamp 0021: the XR10 imports (mapped / kept at format 0 / refused) and the latest XR10 line, without its "native-metal: " prefix.
++  if(gXrLast[0])row("XR m%llu k%llu r%llu %.70s",(unsigned long long)gXrMapped.load(),(unsigned long long)gXrKept.load(),
++   (unsigned long long)gXrRefused.load(),strncmp(gXrLast,"native-metal: ",14)?gXrLast:gXrLast+14);
+   if(!profiling) {
+    row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
+    row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
