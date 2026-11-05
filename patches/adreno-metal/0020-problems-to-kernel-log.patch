@@ -1,0 +1,36 @@
+guamp: every distinct problem of a Metal process to the kernel log in pieces (Maps "null buffer", fin48)
+
+fin48 (kpan-20261105-151331): Maps died at 446.8 s on "VectorKit received null buffer from Metal"; the kernel saw only its first
+problem's 46 characters ("native-metal: commandBuffer refused: command b"). The buffer refusals and the reason of the refused
+command buffer never reached any log the board keeps. Each distinct problem (at most 24 a process, "no device answer" left out) now
+goes out as "problem pr<k> <38 characters>", up to 6 pieces. NMB_PROBLEMS_TO_KERNEL=0 (guamp-m2v-env) turns it off.
+Applies after 0001-0003, 0009-0019 and 0030; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 3f2161e..b0bade9 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -453,7 +453,23 @@ static char gLastProblems[2][200];
+ static char gFirstProblem[200];
+ // Called once with the first problem, on the thread that hit it: a polling reader missed WidgetRenderer's, which crashed within its first second.
+ void (*native_bridge_metal_problem_hook)(const char *);
++// guamp (UniXNU-guamp patches/adreno-metal/0020): every distinct problem's whole text to the kernel, not only the first problem's 46
++// characters: "problem pr<k> <38 characters>", up to 6 pieces, at most 24 problems a process (native-adreno 0009 prints them as
++// "GuampMetal: client <process>: ..."). fin48: Maps died on "VectorKit received null buffer from Metal" after "commandBuffer refused:
++// command b...", and neither the buffer refusals nor the command buffer's reason reached any log. NMB_PROBLEMS_TO_KERNEL=0 turns it off.
++static void forwardProblem(const char *text) {
++ static const bool on=[]{const char *v=getenv("NMB_PROBLEMS_TO_KERNEL");return !v || strtoul(v,nullptr,0)!=0;}();
++ if(!on || !text || !native_bridge_metal_problem_hook || !strncmp(text,"native-metal: no device answer",30))return;
++ static std::mutex lock;static std::set<std::string> said;
++ {std::lock_guard<std::mutex> guard(lock);if(said.size()>=24 || !said.insert(text).second)return;}
++ const size_t length=strlen(text);
++ for(unsigned k=0;k<6 && (size_t)k*38<length;k++) {
++  char line[48];snprintf(line,sizeof line,"pr%u %.38s",k,text+(size_t)k*38);
++  native_bridge_metal_problem_hook(line);
++ }
++}
+ static void noteProblem(NSString *what) {
++ forwardProblem(what.UTF8String);
+  gProblems++;
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  // A device answer the runtime lacks is reported at creation in every process and is harmless: the first problem is the next one.
