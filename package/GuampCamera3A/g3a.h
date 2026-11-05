@@ -21,7 +21,8 @@ extern "C" {
 /* ---- statistics (a view, nothing is copied) ------------------------------------------------------------------------
  * Per zone, row by row: sums of R, G, B (G = mean of the two greens) over the counted 2x2 quads, black removed, before
  * WB, in sensor units; count = quads summed (unsaturated); sat = quads with a saturated channel (not in the sums);
- * sharp = contrast measure (sum |dG|) of the zone. hist: 256 bins of linear luma (WB applied) 0..white, may be NULL.
+ * sharp = contrast measure of the zone (gisp: sum of the second difference |G - 2 G1 + G2| between sampled quads;
+ * a first difference sum |dG| does not fall with defocus on plain edges, see tests/g3a_gisp_test.c). hist: 256 bins of linear luma (WB applied) 0..white, may be NULL.
  * white = saturation level in the units of the sums (gisp: white - black). */
 typedef struct {
     uint32_t zones_x, zones_y;
@@ -91,7 +92,8 @@ void g3a_awb_reset(g3a_awb_state *st);
 int g3a_awb_run(const g3a_stats *s, const g3a_awb_config *c, g3a_awb_state *st, float raw[3]);
 
 /* ---- contrast autofocus ------------------------------------------------------------------------------------------- */
-enum g3a_af_state { G3A_AF_IDLE = 0, G3A_AF_COARSE, G3A_AF_FINE, G3A_AF_FOCUSED, G3A_AF_FAILED };
+/* enum tag g3a_af_status (not g3a_af_state): in C++ an enum and a struct of the same name clash. */
+enum g3a_af_status { G3A_AF_IDLE = 0, G3A_AF_COARSE, G3A_AF_FINE, G3A_AF_FOCUSED, G3A_AF_FAILED };
 typedef struct {
     uint16_t dac_lo, dac_hi;    /* lens range from the kernel (calibrated infinity .. macro) */
     uint16_t coarse_steps;      /* positions of the coarse scan (12) */
@@ -110,7 +112,7 @@ typedef struct {
     int state;
     uint16_t dac;               /* position asked last (apply it) */
     uint16_t best_dac, step;
-    float best_fv, worst_fv, lock_fv, lock_luma;
+    float best_fv, worst_fv, lock_fv, lock_luma; /* lock_luma: during a scan, the luma it started with */
     uint16_t settle, below, drift;
     uint16_t pos[64]; float fv[64]; uint16_t n;   /* samples of the current pass */
     uint16_t fine_end;
@@ -121,7 +123,10 @@ void g3a_af_default(g3a_af_config *c, uint16_t dac_lo, uint16_t dac_hi);
 /* Focus value of the ROI: sum(sharp) / sum(G), independent of exposure to first order. */
 float g3a_af_measure(const g3a_stats *s, const g3a_af_config *c, float *luma);
 void g3a_af_start(g3a_af_state *st, const g3a_af_config *c);
-/* One frame (stats taken with the lens at the position asked before): returns the DAC to program now. */
+/* One frame (stats taken with the lens at the position asked before): returns the DAC to program now.
+ * A scan whose ROI luma moves by more than x1.5 from where it started (AE still converging, light changed) starts
+ * again: focus values of frames at different exposure are not comparable (read noise in the contrast term).
+ * Callers should also skip frames whose exposure is still pending (kGuampFrameSettingsPending). */
 uint16_t g3a_af_run(const g3a_stats *s, const g3a_af_config *c, g3a_af_state *st);
 
 /* ---- flash ---------------------------------------------------------------------------------------------------------

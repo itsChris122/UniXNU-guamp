@@ -263,6 +263,13 @@ uint16_t g3a_af_run(const g3a_stats *s, const g3a_af_config *c, g3a_af_state *st
     if (st->settle) { st->settle--; return st->dac; }
     float luma = 0.f;
     const float fv = g3a_af_measure(s, c, &luma);
+    if (st->state == G3A_AF_COARSE || st->state == G3A_AF_FINE) {
+        if (st->lock_luma <= 0.f) st->lock_luma = luma;
+        else if (luma > 1.5f * st->lock_luma || luma * 1.5f < st->lock_luma) {   /* exposure moved under the scan */
+            g3a_af_start(st, c);
+            return st->dac;
+        }
+    }
     if (st->state == G3A_AF_COARSE) {
         af_record(st, fv);
         const int peaked = st->best_fv > st->worst_fv * c->min_peak_ratio;
