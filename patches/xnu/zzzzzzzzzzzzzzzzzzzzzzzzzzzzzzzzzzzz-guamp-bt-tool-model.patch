@@ -1,0 +1,58 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 4a36cb7..002f09e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8098,6 +8098,7 @@ static int native_guamp_write_file(proc_t p, user_addr_t scratch, const char *pa
+ volatile int native_guamp_bt_tool_stage = 0;
+ volatile int native_guamp_bt_tool_status = -1;
+ volatile int native_guamp_bt_tool_written = 0;
++#include <pexpert/device_tree.h>
+ static void
+ native_guamp_bt_tool(proc_t p, user_addr_t scratch)
+ {
+@@ -8113,7 +8114,35 @@ native_guamp_bt_tool(proc_t p, user_addr_t scratch)
+ 		return;
+ 	}
+ 	static const char *const directories[] = {"/private/var/ngpu/etc", "/private/var/ngpu/etc/bluetool"};
+-	static const char *const models[] = {"motorola,guamp", "D22AP", "J120AP"};
++	/* 05/11 (fin49): the baseband ADT puts J121AP first in the root compatible, so HWModelStr is J121AP and BlueTool found no
++	 * J121AP override script: built-in Broadcom sequence, no "wake on", no com.apple.uart(.sk).bluetooth connect, bluetoothd exits
++	 * every ~10 s ("Bluetooth not available", shim opens 0). J121AP is written too, and so is the first root compatible string of
++	 * the ADT that booted (whatever a later ADT puts there), logged as "guamp-bt-tool: HWModel ...". */
++	const char *models[5] = {"motorola,guamp", "D22AP", "J120AP", "J121AP", NULL};
++	static char root_model[41];	/* path[96]: 31 + 40 + ".deepsleep.script" fits */
++	{
++		DTEntry root = NULL;
++		void const *compatible = NULL;
++		unsigned int compatible_size = 0;
++		size_t n = 0;
++		if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess &&
++		    SecureDTGetProperty(root, "compatible", &compatible, &compatible_size) == kSuccess) {
++			const char *c = (const char *)compatible;
++			while (n < compatible_size && n + 1 < sizeof(root_model) && c[n] && c[n] != '/') {
++				root_model[n] = c[n];
++				n++;
++			}
++		}
++		root_model[n] = 0;
++		int known = !n;
++		for (size_t m = 0; !known && models[m]; m++) {
++			known = !strcmp(models[m], root_model);
++		}
++		if (!known) {
++			models[4] = root_model;
++		}
++		printf("guamp-bt-tool: HWModel (root compatible) %s, %s\n", n ? root_model : "unknown", known ? "in the list" : "added");
++	}
+ 	static const char *const scripts[] = {"boot", "init", "deepsleep"};
+ 	static const char bt_boot[] = "wake on\nmsleep 100\nhci reset\nbcm -A\ndevice -D -S\nwake off\n";
+ 	static const char bt_idle[] = "msleep 10\n";
+@@ -8131,7 +8160,7 @@ native_guamp_bt_tool(proc_t p, user_addr_t scratch)
+ 		}
+ 	}
+ 	char path[96];
+-	for (size_t m = 0; !error && m < sizeof(models) / sizeof(models[0]); m++) {
++	for (size_t m = 0; !error && m < sizeof(models) / sizeof(models[0]) && models[m]; m++) {
+ 		for (size_t s = 0; s < sizeof(scripts) / sizeof(scripts[0]); s++) {
+ 			const char *text = s == 0 ? bt_boot : bt_idle;
+ 			snprintf(path, sizeof(path), "/private/var/ngpu/etc/bluetool/%s.%s.script", models[m], scripts[s]);
