@@ -1,0 +1,117 @@
+guamp: extended-range (XR10) client surfaces imported by the render server, with their fourcc in the log
+
+fin48 (0018: the clients' CAMetalLayers may take XR10 formats): the Home screen flickered after boot until the first standby. A
+client's XR10 drawable is an IOSurface of 'w30r' (BGR10_XR), 'w40a'/'w40m' (BGRA10_XR) or 'b3a8' (two planes, RGB10A8_2P_XR10),
+and backboardd's Core Animation, which takes this device for no Apple family and gets supportsExtendedXR10Formats NO, names no
+Metal format for them: newTextureWithDescriptor:iosurface:plane: is asked with MTLPixelFormatInvalid and refused (every boot's
+journal: "fourcc=0x62336138 fmt=0 made=0"), so the layer is missing from that frame. metal2vulkan makes all three over a surface
+(the integer twins of BGR10_XR and BGRA10_XR; RGB10A8_2P_XR10 over plane 0 of 'b3a8' with its alpha plane, surface_two_planes.rs).
+Now a format-0 texture over such a surface takes the format its fourcc means ('&' lossless spellings count as the plain ones: this
+GPU writes them uncompressed). The render server's own render targets (its boot 'b3a8' frame, captures) stay format 0 unless
+NMB_XR10_TARGETS=1 (default 1 in the other processes); the display then needs guamp-compose-xr10=3 (kernel section 16) to show such a
+frame. NMB_XR10_IMPORT=0 turns the mapping off. Every distinct XR10 import is logged once (at most 12 a process) as
+"native-metal: XR10 surface '<fourcc>' (0x...) planes P plane N usage U: format A -> B made|refused", and a refused texture over a
+two-plane surface names its fourcc and format; both reach the kernel log through 0020 ("GuampMetal: client <process>: problem pr..").
+Both switches can be set from the boot line (guamp-m2v-env, 0019). Applies after 0001-0003, 0009-0020 and 0030; host check:
+scripts/check-adreno-metal-xr10.py (the Objective-C++ itself is compiled by the CI only).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b0bade9..757848d 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -497,6 +497,45 @@ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescripto
+                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+  std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
+ }
++// guamp (UniXNU-guamp patches/adreno-metal/0021): extended-range (XR10) surfaces. Since 0018 the clients' CAMetalLayers (posters, apps)
++// may take XR10 pixel formats, whose drawables are IOSurfaces of 'w30r' (BGR10_XR), 'w40a'/'w40m' (BGRA10_XR) or 'b3a8' (two planes,
++// RGB10A8_2P_XR10), and the render server samples them. Its Core Animation names their Metal format only on a device it takes for
++// Apple3 or later with supportsExtendedXR10Formats, which backboardd is not answered (0002, 0018), and asks the texture with
++// MTLPixelFormatInvalid: refused ("fourcc=0x62336138 fmt=0 made=0" in every boot's journal) and the layer missing from that frame
++// (fin48: the Home flickered after boot). The runtime makes all three over a surface (BGR10_XR and BGRA10_XR in their integer twins,
++// RGB10A8_2P_XR10 over plane 0 of 'b3a8' with its alpha plane, metal2vulkan's surface_two_planes.rs), so a texture asked with
++// format 0 over such a surface takes the format its fourcc means ('&' spellings, lossless-compressed on Apple GPUs, are written
++// uncompressed here and count as the plain ones). The render server's own render targets (its 'b3a8' frame at boot, captures) keep
++// format 0 unless NMB_XR10_TARGETS=1 (the display then needs guamp-compose-xr10=3 to show such a frame); other processes map them too.
++// NMB_XR10_IMPORT=0 turns the mapping off. Each distinct XR10 import is logged once with its fourcc (and reaches the kernel log, 0020).
++static uint32_t xr10SurfaceFormat(uint32_t fourcc,size_t planes,NSUInteger plane) {
++ switch(fourcc) {
++  case 0x77333072u: case 0x26773372u: return planes<=1?554u:0u;                                       // 'w30r' '&w3r': BGR10_XR
++  case 0x77343061u: case 0x7734306du: case 0x26773461u: case 0x2677346du: return planes<=1?552u:0u;   // 'w40a' 'w40m' '&w4a' '&w4m': BGRA10_XR
++  case 0x62336138u: return planes==2 && plane==0?550u:0u;                                             // 'b3a8': RGB10A8_2P_XR10
++  default: return 0;
++ }
++}
++static bool isXr10PixelFormat(NSUInteger format) {return format>=550 && format<=555;}   // RGB10A8_2P_XR10 .. BGR10_XR_sRGB
++static bool xr10ImportOn() {
++ static const bool on=[]{const char *v=getenv("NMB_XR10_IMPORT");return !v || strtoul(v,nullptr,0)!=0;}();
++ return on;
++}
++static bool xr10TargetsOn() {
++ static const bool on=[]{const char *v=getenv("NMB_XR10_TARGETS");const char *who=getprogname();
++  return v?strtoul(v,nullptr,0)!=0:!(who && !strcmp(who,"backboardd"));}();
++ return on;
++}
++static void fourccText(uint32_t fourcc,char out[5]) {
++ for(int i=0;i<4;i++){const char c=(char)((fourcc>>(24-8*i))&0xff);out[i]=c>=0x20 && c<0x7f?c:'.';}
++ out[4]=0;
++}
++// Once per distinct text, at most 12 a process: NSLog, and the kernel log through 0020's channel (not counted as a problem).
++static void noteSurfaceFormat(const char *text) {
++ static std::mutex lock;static std::set<std::string> said;
++ {std::lock_guard<std::mutex> guard(lock);if(said.size()>=12 || !said.insert(text).second)return;}
++ NSLog(@"%s",text);forwardProblem(text);
++}
+ static void noteFormat(uint32_t format,bool made) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  if(!made)gTextureRefusals++;
+@@ -1268,7 +1307,10 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
+  const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+  NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));
+- if(!handle){NSString *why=lastError();NBLOG(@"native-metal: texture over surface refused: %@",why);sendWhy("srfwhy",why);return nil;}
++ if(!handle) {   // guamp 0021: with the surface's fourcc and the asked format
++  NSString *why=lastError();char name[5];fourccText(IOSurfaceGetPixelFormat(surface),name);
++  NBLOG(@"native-metal: texture over surface '%s' fmt %lu refused: %@",name,(unsigned long)d.pixelFormat,why);sendWhy("srfwhy",why);return nil;
++ }
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+ }
+@@ -2694,6 +2736,22 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
+  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
+  if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
++ // guamp 0021: an extended-range (XR10) surface that Core Animation could not name a Metal format for gets the one its fourcc means.
++ const uint32_t fourcc=IOSurfaceGetPixelFormat(surface);
++ const NSUInteger askedFormat=d.pixelFormat;
++ const uint32_t xrFormat=xr10SurfaceFormat(fourcc,planes,plane);
++ bool xrMapped=false;
++ if(xrFormat && askedFormat==MTLPixelFormatInvalid) {
++  const bool target=(d.usage&(MTLTextureUsageRenderTarget|MTLTextureUsageShaderWrite))!=0;
++  if(xr10ImportOn() && (!target || xr10TargetsOn())) {
++   MTLTextureDescriptor *mapped=[d copy];mapped.pixelFormat=(MTLPixelFormat)xrFormat;d=mapped;xrMapped=true;
++  } else {
++   char line[200];char name[5];fourccText(fourcc,name);
++   snprintf(line,sizeof line,"native-metal: XR10 surface '%s' (0x%08x) planes %zu plane %lu usage 0x%lx: format 0 kept (%s)",name,fourcc,planes,
++            (unsigned long)plane,(unsigned long)d.usage,target?"render target, NMB_XR10_TARGETS=1 maps it":"NMB_XR10_IMPORT=0");
++   noteSurfaceFormat(line);
++  }
++ }
+  if(planes)gSurfacePlanar++;
+  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
+@@ -2717,6 +2775,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+   bool fresh;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<500 && seen.insert(line).second;}
+   if(fresh)journal(line);
+  }
++ // guamp 0021: every extended-range import (or one of an XR10 Metal format) once in the log, with the fourcc, both formats and the outcome.
++ if(xrFormat || isXr10PixelFormat(d.pixelFormat)) {
++  char line[200];char name[5];fourccText(fourcc,name);
++  snprintf(line,sizeof line,"native-metal: XR10 surface '%s' (0x%08x) planes %zu plane %lu usage 0x%lx: format %lu%s%lu %s",name,fourcc,planes,
++           (unsigned long)plane,(unsigned long)d.usage,(unsigned long)askedFormat,xrMapped?" -> ":" = ",(unsigned long)d.pixelFormat,
++           texture?"made":"refused");
++  noteSurfaceFormat(line);
++ }
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ }
