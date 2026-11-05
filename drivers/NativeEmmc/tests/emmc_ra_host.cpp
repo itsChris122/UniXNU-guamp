@@ -19,6 +19,10 @@ static bool PE_parse_boot_argn(const char *name, void *out, int) {
 static void IOLog(const char *fmt, ...) { va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a); }
 static void *IOMallocZero(size_t n) { return calloc(1, n); }
 static void IOFree(void *p, size_t) { free(p); }
+struct IOLock { int held = 0; uint64_t takes = 0; };
+static IOLock *IOLockAlloc() { return new IOLock; }
+static void IOLockLock(IOLock *l) { if (l->held) { printf("FAIL: gLock taken twice\n"); exit(1); } l->held = 1; l->takes++; }
+static void IOLockUnlock(IOLock *l) { if (!l->held) { printf("FAIL: gLock released twice\n"); exit(1); } l->held = 0; }
 constexpr uint32_t kBlock = 512, kBounceBlocks = 128;
 
 static uint8_t pattern(uint64_t lba, uint32_t i) { return static_cast<uint8_t>((lba * 131 + i * 7 + (lba >> 8)) & 0xFF); }
@@ -49,13 +53,14 @@ struct IOMemoryDescriptor {
 
 #include "emmc_ra_extract.inc"
 
-static int failures = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 
+static int failures = 0;
 static bool readRun(uint64_t lba, uint32_t n, uint64_t end, int *how) {
   IOMemoryDescriptor d;
   d.bytes.assign(n * kBlock, 0);
-  int r = readAhead(lba, n, end, &d, 0);
+  int r = readAhead(lba, n, end, &d, 0, emmcra::gLastSeq);
+  if (emmcra::gLock && emmcra::gLock->held) { printf("FAIL: gLock left held\n"); failures++; }
   *how = r;
   if (r == 0) gCard.readBlocks(lba, n, d.bytes.data());   // the caller's usual path
   for (uint32_t b = 0; b < n; b++)
@@ -101,7 +106,7 @@ int main() {
   CHECK(emmcra::gFills == fills + 1);
   // 8. Card error during the fill: falls back to the usual path (0), no slot kept.
   gCard.fail = true;
-  CHECK(readAhead(40000, 8, 100000, nullptr, 0) == 0);
+  CHECK(readAhead(40000, 8, 100000, nullptr, 0, false) == 0);
   gCard.fail = false;
   CHECK(emmcra::find(40000, 8) == nullptr);
   // 9. Replacement: 40 fills in 32 slots keep the newest; the oldest is gone.
@@ -126,7 +131,8 @@ int main() {
   CHECK(emmcra::gUnused - unused >= 104);
   // 12. Slots: clamped to 8..256.
   gArgSlots = 4; emmcra::configure(); CHECK(emmcra::kSlots == 8);
-  gArgSlots = 999; emmcra::configure(); CHECK(emmcra::kSlots == 256);
+  gArgSlots = 999; emmcra::configure(); CHECK(emmcra::kSlots == 999);
+  gArgSlots = 5000; emmcra::configure(); CHECK(emmcra::kSlots == 1024);
   // 13. guamp-emmc-ra-adapt=1: a read outside the streams fills only to the end of its 16 KiB block (32 blocks);
   // the next read that continues it gets the full 64 KiB.
   gArgSlots = 32; gArgAdapt = 1; emmcra::configure();
@@ -150,6 +156,30 @@ int main() {
   emmcra::note(900008, 8);
   CHECK(readRun(900008, 8, 1000000, &how) && how == 1 && gCard.blocksRead - blocks == 128);
   emmcra::report();
+  // 14. tryHit (06/11): a run inside a slot is copied without the card, a miss returns 0 and reads nothing, a run
+  // crossing the slot end is a miss; the lock is released every time; an invalidated slot is no longer served.
+  gArgAdapt = 0; gArgSlots = 512; emmcra::configure();
+  CHECK(emmcra::kSlots == 512);
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  CHECK(readRun(1000000, 8, 2000000, &how) && how == 1);   // fill 128 blocks
+  {
+    uint64_t cmds = gCard.commands, fast = emmcra::gFastHits;
+    IOMemoryDescriptor d; d.bytes.assign(16 * kBlock, 0);
+    CHECK(emmcra::tryHit(1000040, 16, 2000000, &d, 0) == 1);
+    bool same = true;
+    for (uint32_t b = 0; b < 16; b++) for (uint32_t i = 0; i < kBlock; i++) same = same && d.bytes[b * kBlock + i] == value(1000040 + b, i);
+    CHECK(same && gCard.commands == cmds && emmcra::gFastHits == fast + 1);
+    CHECK(emmcra::tryHit(1000120, 16, 2000000, &d, 0) == 0);   // crosses the end of the slot
+    CHECK(emmcra::tryHit(3000000, 8, 4000000, &d, 0) == 0);    // nothing cached there
+    CHECK(gCard.commands == cmds && !emmcra::gLock->held);
+    emmcra::invalidate(1000050, 1);
+    CHECK(emmcra::tryHit(1000040, 16, 2000000, &d, 0) == 0);
+    CHECK(emmcra::tryHit(1000040, 128, 2000000, &d, 0) == 0);  // the read-ahead size or more: never cached
+    CHECK(emmcra::noteRequest(5000000, 8) == false && emmcra::noteRequest(5000008, 8) == true && !emmcra::gLock->held);
+  }
+  // 15. Off: tryHit never serves.
+  gArgRa = 0; emmcra::configure();
+  { IOMemoryDescriptor d; d.bytes.assign(8 * kBlock, 0); CHECK(emmcra::tryHit(1000000, 8, 2000000, &d, 0) == 0); }
   printf("emmc read-ahead host test: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? 1 : 0;
 }

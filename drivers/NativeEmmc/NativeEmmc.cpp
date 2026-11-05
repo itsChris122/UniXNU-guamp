@@ -114,7 +114,7 @@ static bool on() {
   }
   return gOn == 1;
 }
-// Card gate held.
+// emmcra::gLock held (the cache lock, 06/11: hits are counted without the card gate).
 static void add(int pid, const char *name, uint64_t bytes) {
   unsigned slot = kSlots;
   for (unsigned i = 0; i < kSlots; i = i + 1) {
@@ -126,7 +126,7 @@ static void add(int pid, const char *name, uint64_t bytes) {
   strlcpy(gTable[slot].name, name, sizeof(gTable[slot].name));
   gTable[slot].bytes = bytes;
 }
-// Card gate held: the period's table moves to the copy printed by report().
+// Card gate and emmcra::gLock held: the period table moves to the copy printed by report().
 static void take() {
   memcpy(gCopy, gTable, sizeof(gCopy));
   gOtherCopy = gOther;
@@ -184,23 +184,37 @@ constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for th
 // writeLogBlock), so even a range written later through another device is never served stale.
 // 03/11 (fin36 boot, 11-45 s: card 70-80 % busy, 33-39 MB/s asked, while the fills read 340-440 MB per 10 s ahead and the
 // hits used only 180-230 MB of it):
-// guamp-emmc-ra-slots=N (8..256, default 32): slots of the cache (N x K KiB). Many concurrent streams at boot evict a slot
+// guamp-emmc-ra-slots=N (8..1024 since 06/11, default 32): slots of the cache (N x K KiB). Many concurrent streams at boot evict a slot
 //   before it is read.
 // guamp-emmc-ra-adapt=1 (default 0 = always K KiB): a read that does not continue one of the last 8 streams only reads up to
 //   the end of its 16 KiB block (the userland page size: its other 4 KiB pages are the next faults), K KiB only for streams.
 // The "ra" line now also counts the blocks read ahead that left the cache (evicted or invalidated) without ever being
 // served ("unused"), the measure of the wasted card time.
+// 06/11 (fin50, 11-45 s: 46-53k hits per 10 s, ~80 % of the 4 KiB requests, each waiting the card gate behind ~30
+// queued requests: "gate wait 24663 us" per run against 456 us of data; 100-125 MB per 10 s of read-ahead left the
+// cache unused and 29k 4 KiB pages per 10 s were read twice with 1 GB free):
+// - a hit no longer waits for the card: the slot table is guarded by gLock (the cache lock, always taken after the card
+//   gate when both are held), a slot's data changes only while it is retired (count 0) and only under the card gate,
+//   so tryHit() copies a listed slot holding gLock alone, before doAsyncReadWrite takes the card gate;
+// - two requests missing the same range: the second finds the first one's slot once it has the gate (no second read);
+// - guamp-emmc-ra-slots up to 1024 (64 MiB at 64 KiB); the default table now asks 512 (32 MiB).
 namespace emmcra {
-constexpr unsigned kMaxSlots = 256, kStreams = 8, kSmallBlocks = 32;   // 32 blocks = 16 KiB
+constexpr unsigned kMaxSlots = 1024, kStreams = 8, kSmallBlocks = 32;   // 32 blocks = 16 KiB
 struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint32_t used; uint8_t *data; };
 static Slot gSlot[kMaxSlots];
 static unsigned kSlots = 32;   // guamp-emmc-ra-slots (the name of the former constant, so the loops read the same)
 static uint32_t gBlocks = 0, gClock = 0, gHistOn = 1, gAdapt = 0;
 static bool gLastSeq = false;
 static uint64_t gHits = 0, gFills = 0, gHitBlocks = 0, gExtraBlocks = 0, gBypass = 0, gUnused = 0, gSmall = 0;
+static uint64_t gFastHits = 0;   // hits served without the card gate (tryHit)
 static uint64_t gHist[6] = {}, gSeq = 0, gReqs = 0, gEnds[kStreams] = {};
 static unsigned gEndAt = 0;
+static IOLock *gLock = nullptr;
+static volatile bool gPanic = false;   // panic flush (guamp_emmc_flush): the kpan writes must not wait for gLock
+static void lock() { if (gLock) IOLockLock(gLock); }
+static void unlock() { if (gLock) IOLockUnlock(gLock); }
 static void configure() {
+  if (!gLock) gLock = IOLockAlloc();
   uint32_t hist = 1, kib = 0, slots = 32, adapt = 0;
   PE_parse_boot_argn("guamp-emmc-hist", &hist, sizeof(hist));
   gHistOn = hist ? 1 : 0;
@@ -223,18 +237,26 @@ static void configure() {
         "guamp-emmc-ra-slots=N guamp-emmc-ra-adapt=1)\n", gHistOn ? "on" : "off", gBlocks ? "on" : "off",
         gBlocks * kBlock / 1024, gBlocks ? kSlots : 0, gAdapt ? "16 KiB for non-stream reads" : "always full");
 }
-// Card gate held: one read request of count blocks at the card's lba. gLastSeq: it continues one of the last 8 streams.
-static void note(uint64_t lba, uint64_t count) {
-  if (!gHistOn && !(gBlocks && gAdapt)) return;
+// gLock held: one read request of count blocks at the card's lba. gLastSeq: it continues one of the last 8 streams.
+static bool note(uint64_t lba, uint64_t count) {
+  if (!gHistOn && !(gBlocks && gAdapt)) return false;
   if (gHistOn) {
     gReqs = gReqs + 1;
     gHist[count <= 1 ? 0 : count <= 8 ? 1 : count <= 16 ? 2 : count <= 32 ? 3 : count <= 128 ? 4 : 5] += 1;
   }
   gLastSeq = false;
   for (unsigned i = 0; i < kStreams; i = i + 1)
-    if (gEnds[i] == lba) { if (gHistOn) gSeq = gSeq + 1; gEnds[i] = lba + count; gLastSeq = true; return; }
+    if (gEnds[i] == lba) { if (gHistOn) gSeq = gSeq + 1; gEnds[i] = lba + count; gLastSeq = true; return true; }
   gEnds[gEndAt] = lba + count;
   gEndAt = (gEndAt + 1) % kStreams;
+  return false;
+}
+// No lock held: note() under gLock; the answer goes with the request (gLastSeq is shared by all the requests).
+static bool noteRequest(uint64_t lba, uint64_t count) {
+  lock();
+  const bool seq = note(lba, count);
+  unlock();
+  return seq;
 }
 static void retire(Slot &slot) {   // the slot leaves the cache: count what was read and never served
   if (slot.count > slot.used) gUnused += slot.count - slot.used;
@@ -242,14 +264,36 @@ static void retire(Slot &slot) {   // the slot leaves the cache: count what was 
 }
 // Card gate held: drops every slot overlapping [lba, lba + count).
 static void invalidate(uint64_t lba, uint64_t count) {
-  if (!gBlocks) return;
+  if (!gBlocks || gPanic) return;   // after a panic nothing reads again
+  lock();
   for (unsigned i = 0; i < kSlots; i = i + 1)
     if (gSlot[i].count && lba < gSlot[i].lba + gSlot[i].count && gSlot[i].lba < lba + count) retire(gSlot[i]);
+  unlock();
 }
 static Slot *find(uint64_t lba, uint32_t count) {
   for (unsigned i = 0; i < kSlots; i = i + 1)
     if (gSlot[i].count && lba >= gSlot[i].lba && lba + count <= gSlot[i].lba + gSlot[i].count) return &gSlot[i];
   return nullptr;
+}
+// gLock held: a hit, copied out of the slot.
+static int serve(Slot &slot, uint64_t lba, uint32_t count, IOMemoryDescriptor *buffer, uint64_t offset) {
+  gHits = gHits + 1;
+  gHitBlocks += count;
+  slot.age = ++gClock;
+  const uint32_t reach = static_cast<uint32_t>(lba - slot.lba) + count;
+  if (reach > slot.used) slot.used = reach;
+  return buffer->writeBytes(offset, slot.data + (lba - slot.lba) * kBlock, count * kBlock) == count * kBlock ? 1 : -1;
+}
+// No lock held (the card gate free or not): 1 when the run is entirely inside a slot and was copied, 0 when it is not
+// cached (the caller takes the card gate and goes on with readAhead), -1 on a copy error.
+static int tryHit(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescriptor *buffer, uint64_t offset) {
+  if (!gBlocks || count >= gBlocks || lba >= end) return 0;
+  lock();
+  Slot *slot = find(lba, count);
+  const int served = slot ? serve(*slot, lba, count, buffer, offset) : 0;
+  if (served > 0) gFastHits = gFastHits + 1;
+  unlock();
+  return served;
 }
 static Slot *victim() {
   unsigned best = 0;
@@ -261,9 +305,9 @@ static Slot *victim() {
 }
 // Blocks to read for a run of count blocks at lba: the full slot, or with guamp-emmc-ra-adapt=1 and a read outside the
 // recent streams only up to the end of its 16 KiB block.
-static uint64_t fillBlocks(uint64_t lba, uint32_t count, uint64_t room) {
+static uint64_t fillBlocks(uint64_t lba, uint32_t count, uint64_t room, bool seq) {
   uint64_t blocks = room < gBlocks ? room : gBlocks;
-  if (gAdapt && !gLastSeq) {
+  if (gAdapt && !seq) {
     const uint64_t small = (lba + count + kSmallBlocks - 1) / kSmallBlocks * kSmallBlocks - lba;
     if (small < blocks) { blocks = small; gSmall = gSmall + 1; }
   }
@@ -279,11 +323,13 @@ static void report() {
     lSeq = gSeq; lReqs = gReqs;
   }
   if (gBlocks) {
-    IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead, %llu small), bypass %llu, unused %llu KiB\n",
+    static uint64_t lFast;
+    IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead, %llu small), bypass %llu, unused %llu KiB; "
+          "%llu hits without the card gate, %u slots\n",
           gHits - lHits, (gHitBlocks - lHitBlocks) * kBlock / 1024, gFills - lFills, (gExtraBlocks - lExtra) * kBlock / 1024,
-          gSmall - lSmall, gBypass - lBypass, (gUnused - lUnused) * kBlock / 1024);
+          gSmall - lSmall, gBypass - lBypass, (gUnused - lUnused) * kBlock / 1024, gFastHits - lFast, kSlots);
     lHits = gHits; lFills = gFills; lHitBlocks = gHitBlocks; lExtra = gExtraBlocks; lBypass = gBypass; lUnused = gUnused;
-    lSmall = gSmall;
+    lSmall = gSmall; lFast = gFastHits;
   }
 }
 }  // namespace emmcra
@@ -507,6 +553,34 @@ public:
     __asm__ volatile("dsb sy" ::: "memory");
   }
 
+  // guamp-emmc-nap=1 (default, 06/11; =0 polls as before): the reader thread polled the status register through the
+  // whole ADMA2 data phase (fin50 boot: card active 75-78 % from 11 to 45 s, i.e. most of one core spinning, with the
+  // CPU saturated around the lock screen). Now a read of at least 32 KiB first sleeps (IODelay: XNU blocks the thread on
+  // a deadline timer when preemption is enabled, spins otherwise) for 3/4 of its expected data phase, from the fastest
+  // per-block time of polled runs (learned on the first 32), and polls only the rest. If the wake-ups come late (on
+  // average more than 150 us past the deadline over 256 naps) napping turns itself off for good.
+  static constexpr uint32_t kNapMinBlocks = 64;
+  uint32_t napOn = 0;
+  uint64_t napPerBlock = ~0ULL, napLearned = 0, napRuns = 0, napSlept = 0, napLate = 0, napOff = 0;
+  bool nap(uint32_t count, uint64_t from) {
+    if (!napOn || count < kNapMinBlocks || napLearned < 32 || napPerBlock == ~0ULL) return false;
+    const uint64_t ticks = napPerBlock * count * 3 / 4;
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(ticks, &ns);
+    if (ns < 150000) return false;
+    IODelay(static_cast<unsigned>(ns / 1000));
+    const uint64_t woke = mach_absolute_time(), due = from + ticks;
+    napRuns++;
+    napSlept += woke - from;
+    napLate += woke > due ? woke - due : 0;
+    if ((napRuns & 255) == 0) {
+      uint64_t lateNs = 0;
+      absolutetime_to_nanoseconds(napLate / napRuns, &lateNs);
+      if (lateNs > 150000) { napOn = 0; napOff = napRuns; }
+    }
+    return true;
+  }
+
   bool setupDma(bool cached) {
     dmaCached = cached;
     IOOptionBits options = static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
@@ -551,8 +625,14 @@ public:
     w16(rCmd, (18 << 8) | (1 << 5) | (1 << 4) | (1 << 3) | 0x2);
     bool ok = !wait(sCmdDone, 100);
     uint64_t t1 = mach_absolute_time();
+    const bool napped = ok && nap(count, t1);
     ok = ok && !wait(sXferDone, 2000);
     uint64_t t2 = mach_absolute_time();
+    if (ok && !napped && count >= kNapMinBlocks) {   // the bus floor: fastest data phase per block seen, polled runs only
+      const uint64_t perBlock = (t2 - t1) / count;
+      if (perBlock && perBlock < napPerBlock) napPerBlock = perBlock;
+      napLearned++;
+    }
     w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
     if (!ok) return false;
     __asm__ volatile("dsb sy" ::: "memory");
@@ -771,30 +851,34 @@ IOService *gPlatform = nullptr;
 
 // guamp-emmc-ra (see emmcra above), card gate held: 1 when the run [lba, lba + count) of a read-only window ending at end was
 // served (from a slot, or by one read-ahead command into a slot), 0 when the caller reads it as usual, -1 on a copy error.
-static int readAhead(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescriptor *buffer, uint64_t offset)
+// seq: the request continues a recent stream (emmcra::noteRequest). The slot table changes under gLock; the card read of
+// a fill goes into a retired slot (invisible to tryHit) with gLock released, so hits go on during the command.
+static int readAhead(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescriptor *buffer, uint64_t offset, bool seq)
 {
   using namespace emmcra;
   if (!gBlocks || count >= gBlocks || lba >= end) return 0;
+  lock();
   Slot *slot = find(lba, count);
-  if (slot) {
-    gHits = gHits + 1;
-    gHitBlocks += count;
-    slot->age = ++gClock;
-    const uint32_t reach = static_cast<uint32_t>(lba - slot->lba) + count;
-    if (reach > slot->used) slot->used = reach;
-    return buffer->writeBytes(offset, slot->data + (lba - slot->lba) * kBlock, count * kBlock) == count * kBlock ? 1 : -1;
+  if (slot) {   // filled by another request while this one waited for the gate
+    const int served = serve(*slot, lba, count, buffer, offset);
+    unlock();
+    return served;
   }
-  uint64_t blocks = fillBlocks(lba, count, end - lba);
-  if (blocks <= count) { gBypass = gBypass + 1; return 0; }
+  uint64_t blocks = fillBlocks(lba, count, end - lba, seq);
+  if (blocks <= count) { gBypass = gBypass + 1; unlock(); return 0; }
   slot = victim();
   if (slot->count) retire(*slot);
-  if (!gCard.readBlocks(lba, static_cast<uint32_t>(blocks), slot->data)) { gBypass = gBypass + 1; return 0; }
+  unlock();
+  if (!gCard.readBlocks(lba, static_cast<uint32_t>(blocks), slot->data)) { lock(); gBypass = gBypass + 1; unlock(); return 0; }
+  lock();
   slot->lba = lba;
   slot->count = static_cast<uint32_t>(blocks);
   slot->used = count;
   slot->age = ++gClock;
   gFills = gFills + 1;
   gExtraBlocks += blocks - count;
+  unlock();
+  // Still under the card gate: nothing can retire the slot (fills and invalidations hold the gate) or rewrite its data
   return buffer->writeBytes(offset, slot->data, count * kBlock) == count * kBlock ? 1 : -1;
 }
 
@@ -963,7 +1047,7 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
   if (report || !sampling) guamp_emmc_mirror_peak = 0;
   uint64_t reads = native_emmc_reads, rereads = native_emmc_rereads, last = native_emmc_last_lba;
   const bool who = report && emmcwho::on();
-  if (emmcwho::on() && (report || !sampling)) emmcwho::take();   // the first pass only starts the period
+  if (emmcwho::on() && (report || !sampling)) { emmcra::lock(); emmcwho::take(); emmcra::unlock(); }   // first pass: start
   IOLockUnlock(card.gate);
   static uint64_t lastReads = 0, lastBusy = 0, lastRequests = 0;
   static uint64_t lastActive = 0, lastMirror = 0, lastFlush = 0, lastQueue = 0;
@@ -1004,6 +1088,21 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
     }
     lastLock = native_emmc_t_lock; lastCmd = native_emmc_t_cmd; lastData = native_emmc_t_data; lastCopy = native_emmc_t_copy;
     lastRuns = native_emmc_t_runs;
+    {
+      static uint64_t lastNaps = 0, lastSlept = 0, lastLate = 0;
+      const Host &h = card.host;
+      if (h.napOn || h.napOff || h.napRuns != lastNaps) {
+        const uint64_t naps = h.napRuns - lastNaps;
+        uint64_t slept = 0, late = 0, floorNs = 0;
+        absolutetime_to_nanoseconds(h.napSlept - lastSlept, &slept);
+        absolutetime_to_nanoseconds(h.napLate - lastLate, &late);
+        if (h.napPerBlock != ~0ULL) absolutetime_to_nanoseconds(h.napPerBlock, &floorNs);
+        IOLog("NativeEmmc nap: %llu DMA reads slept %llu ms (late %llu us each), floor %llu ns/block from %llu runs, %s\n",
+              naps, slept / 1000000, naps ? late / 1000 / naps : 0, floorNs, h.napLearned,
+              h.napOn ? "on" : h.napOff ? "off (late wake-ups)" : "off");
+        lastNaps = h.napRuns; lastSlept = h.napSlept; lastLate = h.napLate;
+      }
+    }
     emmcra::report();
     if (native_emmc_errors)
       IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes, DMA write runs %llu (failed %llu)\n",
@@ -1146,10 +1245,21 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
   }
   uint64_t done = 0;
   IOReturn status = kIOReturnSuccess;
+  const bool seq = !write && emmcra::noteRequest(first + block, count);
   // The gate is taken per bounce-buffer run, so requests can share the card.
   while (done < count) {
     uint32_t n = count - done > kBounceBlocks ? kBounceBlocks : static_cast<uint32_t>(count - done);
     uint64_t bytes = static_cast<uint64_t>(n) * kBlock;
+    if (!write && !writable) {   // read-ahead hit: served without waiting for the card (emmcra, 06/11)
+      const int hit = emmcra::tryHit(first + block + done, n, first + blocks, buffer, done * kBlock);
+      if (hit < 0) { status = kIOReturnIOError; break; }
+      if (hit > 0) {
+        __atomic_fetch_add(&guamp_emmc_read_bytes, bytes, __ATOMIC_RELAXED);
+        if (reader >= 0) { emmcra::lock(); emmcwho::add(reader, readerName, bytes); emmcra::unlock(); }
+        done += n;
+        continue;
+      }
+    }
     uint64_t waitFrom = mach_absolute_time();
     IOLockLock(card.gate);
     const uint64_t activeBegan = mach_absolute_time();
@@ -1158,8 +1268,7 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     uint8_t *readBuffer = card.bounce;
     if (!write && card.directRead && native_emmc_dma && card.host.dmaCached && card.host.dmaData && bytes <= Host::kDmaBytes)
       readBuffer = const_cast<uint8_t *>(card.host.dmaData);
-    if (!write && !done) emmcra::note(first + block, count);
-    const int ahead = write || writable ? 0 : readAhead(first + block + done, n, first + blocks, buffer, done * kBlock);
+    const int ahead = write || writable ? 0 : readAhead(first + block + done, n, first + blocks, buffer, done * kBlock, seq);
     bool ok = ahead ? ahead > 0
               : write ? buffer->readBytes(done * kBlock, card.bounce, bytes) == bytes &&
                           card.writeBlocks(first + block + done, n, card.bounce)
@@ -1168,8 +1277,8 @@ IOReturn NativeEmmc::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, 
     guamp_emmc_active += mach_absolute_time() - activeBegan;
     if (ok) {
       if (write) guamp_emmc_write_bytes += bytes;
-      else guamp_emmc_read_bytes += bytes;
-      if (!write && reader >= 0) emmcwho::add(reader, readerName, bytes);
+      else __atomic_fetch_add(&guamp_emmc_read_bytes, bytes, __ATOMIC_RELAXED);   // tryHit adds without the gate
+      if (!write && reader >= 0) { emmcra::lock(); emmcwho::add(reader, readerName, bytes); emmcra::unlock(); }
     }
     IOLockUnlock(card.gate);
     if (!ok) { status = kIOReturnIOError; break; }
@@ -1412,6 +1521,10 @@ static void startLater(thread_call_param_t, thread_call_param_t)
     if (!ok) card.host.resetLines();
     native_emmc_dma = ok ? 1 : 0;
     IOLog("NativeEmmc: ADMA2 reads %s (%s buffer)\n", ok ? "verified, in use" : "refused, PIO", card.host.dmaCached ? "cached" : "uncached");
+    uint32_t napArg = 1;
+    PE_parse_boot_argn("guamp-emmc-nap", &napArg, sizeof(napArg));
+    card.host.napOn = ok && napArg ? 1 : 0;
+    IOLog("NativeEmmc: sleep during DMA reads %s (guamp-emmc-nap, default 1)\n", card.host.napOn ? "on" : "off");
     // Boot argument guamp-emmc-dmaw=1: CMD25 + ADMA2 writes, kept only if a write of 64 blocks to a free kpan area
     // (between the framebuffer copy and the panic copy) reads back identical through PIO, three times with different data
     uint32_t dmaw = 1;
@@ -1692,6 +1805,7 @@ extern "C" void guamp_emmc_flush(unsigned type)
   Card &card = gCard;
   if (!card.online || !card.gate) return;
   bool panic = type >= kPEPanicRestartCPU && type != kPEPagingOff;
+  if (panic) emmcra::gPanic = true;
   bool locked = panic ? IOLockTryLock(card.gate) : (IOLockLock(card.gate), true);
   // A panic may have stopped another thread in the middle of a transfer: start from clean CMD/DAT lines
   if (panic) card.host.resetLines();
