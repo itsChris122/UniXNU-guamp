@@ -80,7 +80,9 @@ extern "C" volatile uint64_t guamp_copy_latest[10];
 // Section 15: [24] undrawable layers that kept a stale source, [25] frames seeded from the screen, [26] last video luma,
 // [27] dark video draws, [28] video draws with the same samples as the previous one, [29] their hash.
 // [18] BGRA layer ticks, [19] 4:2:0 layer ticks, [20] scanout copy ticks, [21] whole redraws, [22] partial, [23] unchanged.
-extern "C" volatile uint64_t guamp_compose[30];
+// Section 16 (guamp-compose-xr10): [30] extended-range (XR10) layers taken, [31] the last one's fourcc, [32] single-layer XR10 swaps
+// composed.
+extern "C" volatile uint64_t guamp_compose[33];
 extern "C" volatile uint32_t guamp_compose_layer[4][14];
 // package/LegacyDisplayProbe.cpp: the surface of the last swap refused for its surface (reason 4): width, height, format, planes,
 // row bytes, allocation, descriptor bytes.
@@ -196,10 +198,16 @@ static char fourcc(uint32_t format, unsigned shift)
 // before the scanout copy), layers drawn and skipped; then every layer that changed since the previous report.
 static void composeLog(uint64_t f)
 {
-  static uint64_t last[30] = {};
+  static uint64_t last[33] = {};
   static uint32_t lastLayer[4][14] = {};
-  uint64_t now[30];
-  for (unsigned i = 0; i < 30; i++) now[i] = guamp_compose[i];
+  uint64_t now[33];
+  for (unsigned i = 0; i < 33; i++) now[i] = guamp_compose[i];
+  // Section 16: extended-range layers, with the fourcc of the last one.
+  if (now[30] != last[30] || now[32] != last[32]) {
+    const uint32_t xr = (uint32_t)now[31];
+    IOLog("GuampDisplay: compose xr10: layers +%llu (total %llu, last %c%c%c%c %08x), single-layer swaps composed +%llu\n",
+          now[30] - last[30], now[30], fourcc(xr, 24), fourcc(xr, 16), fourcc(xr, 8), fourcc(xr, 0), xr, now[32] - last[32]);
+  }
   if (now[0] != last[0] || now[1] != last[1] || now[12] != last[12] || now[3] != last[3]) {
     const uint64_t frames = now[2] - last[2];
     const uint32_t skipped = (uint32_t)now[9];
@@ -231,7 +239,7 @@ static void composeLog(uint64_t f)
           "(dark draws +%llu, same picture +%llu of +%llu 420 draws)\n", now[24] - last[24], now[25] - last[25], now[26],
           now[27] - last[27], now[28] - last[28], now[5] - last[5]);
   }
-  for (unsigned i = 0; i < 30; i++) last[i] = now[i];
+  for (unsigned i = 0; i < 33; i++) last[i] = now[i];
 }
 
 static void copyLog()
