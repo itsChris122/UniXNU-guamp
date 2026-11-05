@@ -41,7 +41,7 @@ archives = [
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py NativeEmmc --wifi-runtime --wifi-redwood --baseband",   # GUAMP_WIFI_RUNTIME=1 + drivers/GuampWifi (R2); GUAMP_WIFI_REDWOOD=1: mode 2 (iOS station, en0; CI compile fixed a04e8e6). Inert without guamp-wifi-start=1|2
-  # --baseband (04/11): GUAMP_BASEBAND=1 + drivers/QcomBaseband (UniXNU cellular bridge, submodule UniXNU/QcomBaseband 43d85fb): AppleBaseband
+  # --baseband (04/11): GUAMP_BASEBAND=1 + drivers/QcomBaseband (UniXNU cellular bridge, submodule UniXNU/QcomBaseband dd0199c, 05/11): AppleBaseband
   # services and ABM/CommCenter QMUX clients on the modem QRTR link. Inert without guamp-baseband=1 (needs guamp-wifi-start=1|2 for the modem).
   "build-guamp-adreno.py",          # NativeAdreno A6XX (xVanTuring/Adreno610) + GuampAdreno probe, guamp-adreno=1|2
   "build-native-adreno-accelerator.py",   # staged AGXAccelerator for guamp-adreno=2 (IOAcceleratorES ABI audited on f18b4df, slide -0x1000000)
