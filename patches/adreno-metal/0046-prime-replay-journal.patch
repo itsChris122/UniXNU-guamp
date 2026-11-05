@@ -1,0 +1,233 @@
+guamp: shader priming replays the render server's journal of pipelines once per runtime and Turnip build (precompilation)
+
+Every new image changes the bridge's runtime, which keys the shader cache, and Turnip's build, which keys its own: fin50
+(live-20261105-204852) made 155 render pipelines in 15.5 s with "V cache hit0 miss286", the slowest 832 ms, most between 90 and
+330 s while the user opened things; a boot with a warm cache makes one in about 21 ms (live-20261103-192306: 104 pipelines, 2184 ms, hit104). The library pass of
+PrimeShaders.h cannot warm them: it makes each vertex function with one BGRA8 attachment and no constants, while QuartzCore draws
+fixed_frag_lph_cpf with about 200 constant sets and their own blending (90 % of the journal's time).
+
+PrimeShaders.h now reads the tail (8 MiB) of pipelines.log, the frontend's journal of every render pipeline the render server made
+(both functions with every constant, the attachments with their blending, the vertex descriptor, samples, topology, depth and
+stencil formats), keeps the distinct descriptors (269 in the last 8 MiB of the 20261104-160143 dump, all QuartzCore's), and makes
+the most frequent first (at most 400) from QuartzCore's default.metallib, 30 s after the device opened instead of the library
+pass's 90 s, each after waitForQuiet() and at background QoS like the library pass; the library pass follows at its own delay.
+prime-replay-done lists the builds (buildId(): translator digest and Turnip's LC_UUID) already replayed, prime-current/prime-bad
+leave out a descriptor that ended the process, NMB_PRIME_REPLAY=0 turns it off. prime.log gets "replay lines=.. unique=.. tried=..
+made=.. refused=.. skipped=.. ms=.. waited=..", and each made pipeline counts in the PR row's made=. Host check: the header compiles
+with clang -fsyntax-only as Objective-C++ against stand-in Foundation/Metal headers (the CI builds it for real); the journal key
+extraction was replayed in Python on the 20261104-160143 journal. Applies after 0001-0003, 0009-0030 (none touches PrimeShaders.h).
+
+diff --git a/PrimeShaders.h b/PrimeShaders.h
+index b8d453e..969b8ea 100644
+--- a/PrimeShaders.h
++++ b/PrimeShaders.h
+@@ -21,6 +21,10 @@
+ #include <errno.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <algorithm>
++#include <ctype.h>
++#include <functional>
++#include <map>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -288,6 +292,182 @@ static std::string library(id<MTLDevice> device, const std::string &path, const
+     return path + line + firstRefusal;
+ }
+ 
++// guamp (UniXNU-guamp patches/adreno-metal/0031): the render server's own pipelines again, from its journal (pipelines.log, one R line
++// per render pipeline it made, with both functions' constants, the attachments, their blending and the vertex descriptor), once per
++// translator and Turnip build (buildId()). A new image's runtime keys the shader cache anew, so every pipeline of the earlier boots was
++// compiled again on its first draw: fin50 made 155 pipelines in 15.5 s with 0 cache hits (the slowest 832 ms, most of them while the
++// user opened apps between 90 and 330 s), where a boot with a warm cache makes one in about 20 ms. The library pass cannot stand in for
++// it: it makes each vertex function with a BGRA8 attachment and no constants, and QuartzCore's draws are fixed_frag_lph_cpf with one of
++// about 200 constant sets (90 % of the journal's time). Only QuartzCore's functions are taken (the render server's pipelines are all
++// its own). The most frequent descriptors first, at most kReplayMost; each waits for a quiet desktop like the library pass, and one
++// that ended the process is left out afterwards (prime-current, prime-bad). prime-replay-done lists the builds done; NMB_PRIME_REPLAY=0
++// turns it off. Its line in prime.log: replay lines=<R lines read> unique=<descriptors> made= refused= skipped= ms= waited=.
++static constexpr size_t kReplayMost = 400, kReplayTail = 8u << 20;
++static const char *const kQuartzCoreLibrary = "/System/Library/Frameworks/QuartzCore.framework/default.metallib";
++
++static std::vector<std::string> words(const std::string &text) {
++    std::vector<std::string> out;
++    for (size_t at = 0; at < text.size();) {
++        size_t end = text.find(' ', at);
++        if (end == std::string::npos) end = text.size();
++        if (end > at) out.push_back(text.substr(at, end - at));
++        at = end + 1;
++    }
++    return out;
++}
++static bool hexBytes(const std::string &hex, std::vector<uint8_t> &out) {
++    if (hex.empty() || hex.size() % 2 || hex.size() > 128) return false;
++    out.clear();
++    for (size_t i = 0; i < hex.size(); i += 2) {
++        char pair[3] = {hex[i], hex[i + 1], 0}, *end = nullptr;
++        out.push_back((uint8_t)strtoul(pair, &end, 16));
++        if (end != pair + 2) return false;
++    }
++    return true;
++}
++// One journal function ("name k1:type:hex k2:type:hex ..." or "-"): the library's function with those constants, nil when it has none.
++static id<MTLFunction> journalFunction(id<MTLLibrary> lib, const std::string &text, bool &missing) {
++    const std::vector<std::string> parts = words(text);
++    if (parts.empty() || parts[0] == "-") return nil;
++    NSString *name = @(parts[0].c_str());
++    if (![lib.functionNames containsObject:name]) {missing = true; return nil;}
++    if (parts.size() == 1) return [lib newFunctionWithName:name];
++    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
++    std::vector<uint8_t> bytes;
++    for (size_t i = 1; i < parts.size(); ++i) {
++        const std::string &p = parts[i];
++        const size_t second = p.rfind(':'), first = second == std::string::npos || second == 0 ? std::string::npos : p.rfind(':', second - 1);
++        if (first == std::string::npos || !hexBytes(p.substr(second + 1), bytes)) {missing = true; return nil;}
++        const MTLDataType type = (MTLDataType)strtoul(p.c_str() + first + 1, nullptr, 10);
++        const std::string key = p.substr(0, first);
++        if (!key.empty() && key[0] == '#') [values setConstantValue:bytes.data() type:type atIndex:(NSUInteger)strtoul(key.c_str() + 1, nullptr, 10)];
++        else [values setConstantValue:bytes.data() type:type withName:@(key.c_str())];
++    }
++    NSError *error = nil;
++    id<MTLFunction> function = [lib newFunctionWithName:name constantValues:values error:&error];
++    if (!function) missing = true;
++    return function;
++}
++static unsigned long field(const std::string &line, const char *key, unsigned long otherwise) {
++    const size_t at = line.find(key);
++    return at == std::string::npos ? otherwise : strtoul(line.c_str() + at + strlen(key), nullptr, 10);
++}
++// The descriptor of one journal line's key (from " label=" up to its QuartzCore callers), nil if a function is not QuartzCore's.
++static MTLRenderPipelineDescriptor *journalDescriptor(id<MTLLibrary> lib, const std::string &head, const std::string &key, bool &missing) {
++    const size_t v = key.find(" | v "), f = key.find(" | f ");
++    if (v == std::string::npos || f == std::string::npos || f < v) {missing = true; return nil;}
++    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    d.vertexFunction = journalFunction(lib, key.substr(v + 5, f - v - 5), missing);
++    if (!d.vertexFunction) {missing = true; return nil;}
++    d.fragmentFunction = journalFunction(lib, key.substr(f + 5), missing);
++    if (missing) return nil;
++    d.rasterSampleCount = field(head, " samples=", 1);
++    d.inputPrimitiveTopology = (MTLPrimitiveTopologyClass)field(head, " topo=", 0);
++    d.depthAttachmentPixelFormat = (MTLPixelFormat)field(head, " ds=", 0);
++    if (const size_t slash = head.find('/', head.find(" ds=")); slash != std::string::npos)
++        d.stencilAttachmentPixelFormat = (MTLPixelFormat)strtoul(head.c_str() + slash + 1, nullptr, 10);
++    MTLVertexDescriptor *vertex = nil;
++    for (const std::string &w : words(key.substr(0, v))) {
++        // The label as the journal wrote it, so this pipeline's own journal line has the same key.
++        if (w.compare(0, 6, "label=") == 0) {if (w.size() > 6 && w != "label=-") d.label = @(w.c_str() + 6); continue;}
++        unsigned long n[9] = {};
++        if ((w[0] != 'c' && w[0] != 'a') || w.size() < 4 || !isdigit((unsigned char)w[1])) continue;
++        char *equals = nullptr;
++        const unsigned index = (unsigned)strtoul(w.c_str() + 1, &equals, 10);
++        if (!equals || *equals != '=') continue;
++        const char *at = equals;
++        for (unsigned k = 0; at && k < 9; ++k) {n[k] = strtoul(at + 1, nullptr, 10); at = strchr(at + 1, ':');}
++        if (w[0] == 'c' && index < 8) {
++            MTLRenderPipelineColorAttachmentDescriptor *a = d.colorAttachments[index];
++            a.pixelFormat = (MTLPixelFormat)n[0]; a.writeMask = (MTLColorWriteMask)n[1]; a.blendingEnabled = n[2] != 0;
++            a.sourceRGBBlendFactor = (MTLBlendFactor)n[3]; a.destinationRGBBlendFactor = (MTLBlendFactor)n[4]; a.rgbBlendOperation = (MTLBlendOperation)n[5];
++            a.sourceAlphaBlendFactor = (MTLBlendFactor)n[6]; a.destinationAlphaBlendFactor = (MTLBlendFactor)n[7]; a.alphaBlendOperation = (MTLBlendOperation)n[8];
++        } else if (w[0] == 'a' && index < 31 && n[2] < 31) {
++            if (!vertex) vertex = [MTLVertexDescriptor vertexDescriptor];
++            vertex.attributes[index].format = (MTLVertexFormat)n[0]; vertex.attributes[index].offset = n[1]; vertex.attributes[index].bufferIndex = n[2];
++            vertex.layouts[n[2]].stride = n[3]; vertex.layouts[n[2]].stepFunction = (MTLVertexStepFunction)n[4]; vertex.layouts[n[2]].stepRate = n[5];
++        }
++    }
++    if (vertex) d.vertexDescriptor = vertex;
++    return d;
++}
++static void replay(id<MTLDevice> device, const std::string &root, const std::string &logPath, const std::string &build,
++                   const std::string &current, const std::set<std::string> &bad) {
++    if (const char *off = getenv("NMB_PRIME_REPLAY"); off && !strtoul(off, nullptr, 0)) return;
++    const std::string donePath = root + "/prime-replay-done";
++    if (readLines(donePath).count(build)) return;
++    FILE *journal = fopen((root + "/pipelines.log").c_str(), "r");
++    if (!journal) return;
++    // The journal grows with every boot (32 MB after 114 boots): its tail only.
++    if (fseeko(journal, 0, SEEK_END) == 0) {
++        const off_t size = ftello(journal);
++        fseeko(journal, size > (off_t)kReplayTail ? size - (off_t)kReplayTail : 0, SEEK_SET);
++        if (size > (off_t)kReplayTail) {int c; while ((c = fgetc(journal)) != EOF && c != '\n') {}}
++    }
++    struct Seen {unsigned count = 0; std::string head;};
++    std::map<std::string, Seen> seen;
++    unsigned lines = 0;
++    std::string line;
++    char piece[4096];
++    while (fgets(piece, sizeof piece, journal)) {
++        line += piece;
++        if (line.empty() || line.back() != '\n') {if (line.size() > (1u << 16)) line.clear(); continue;}
++        line.pop_back();
++        if (line.compare(0, 2, "R ") == 0 && line.find(" ok=1 ") != std::string::npos) {
++            const size_t label = line.find(" label="), qc = line.rfind(" | ");
++            if (label != std::string::npos && qc != std::string::npos && qc > label) {
++                ++lines;
++                // The key: from the label to the functions; the callers after the last " | " and the timings before the label differ per draw.
++                Seen &s = seen[line.substr(label, qc - label)];
++                ++s.count;
++                if (s.head.empty()) s.head = line.substr(0, label);
++            }
++        }
++        line.clear();
++    }
++    fclose(journal);
++    std::vector<std::pair<unsigned, const std::string *>> order;
++    for (const auto &entry : seen) order.push_back({entry.second.count, &entry.first});
++    std::stable_sort(order.begin(), order.end(), [](const auto &a, const auto &b) {return a.first > b.first;});
++    if (order.size() > kReplayMost) order.resize(kReplayMost);
++    unsigned made = 0, refused = 0, skipped = 0;
++    uint64_t waited = 0;
++    const uint64_t began = nowMs();
++    @autoreleasepool {
++        NSError *error = nil;
++        waited += waitForQuiet();
++        id<MTLLibrary> lib = order.empty() ? nil : [device newLibraryWithURL:[NSURL fileURLWithPath:@(kQuartzCoreLibrary)] error:&error];
++        for (const auto &entry : order) {
++            if (!lib) break;
++            @autoreleasepool {
++                const std::string &key = *entry.second;
++                const std::string id = "replay\t" + std::to_string(std::hash<std::string>()(key));
++                if (bad.count(id)) {++skipped; continue;}
++                bool missing = false;
++                native_prime_compiling = 3;
++                MTLRenderPipelineDescriptor *d = journalDescriptor(lib, seen[key].head, key, missing);
++                if (!d) {++skipped; continue;}
++                waited += waitForQuiet();
++                writeCurrent(current, id);
++                native_prime_compiling = 1;
++                bool ok = false;
++                @try {ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;} @catch (NSException *exception) {ok = false;}
++                native_prime_compiling = 0;
++                ok ? ++made : ++refused;
++                if (ok) native_prime_made = native_prime_made + 1;
++                error = nil;
++                usleep(20000);
++            }
++        }
++    }
++    unlink(current.c_str());
++    char text[200];
++    snprintf(text, sizeof text, "replay lines=%u unique=%zu tried=%zu made=%u refused=%u skipped=%u ms=%llu waited=%llu", lines, seen.size(),
++             order.size(), made, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
++    appendLine(logPath, text);
++    appendLine(donePath, build);
++}
++
+ // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
+ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath) {
+     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+@@ -297,7 +477,14 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
+     // A function was being compiled when the process ended: it is not tried again.
+     for (const std::string &line : readLines(current)) appendLine(badPath, line);
+     unlink(current.c_str());
+-    sleep(delaySeconds);
++    // guamp 0031: the journal's pipelines first, 30 s after the device opened (the boot's own pipelines are made by then), then the
++    // library pass at its own delay.
++    const unsigned early = delaySeconds < 30 ? delaySeconds : 30;
++    sleep(early);
++    const uint64_t replayBegan = nowMs();
++    replay(device, root, logPath, buildId(), current, readLines(badPath));
++    const uint64_t replayed = (nowMs() - replayBegan) / 1000;
++    if (delaySeconds > early + replayed) sleep(delaySeconds - early - (unsigned)replayed);
+     const std::set<std::string> bad = readLines(badPath);
+     std::set<std::string> done = readLines(donePath);
+     const uint64_t began = nowMs();
