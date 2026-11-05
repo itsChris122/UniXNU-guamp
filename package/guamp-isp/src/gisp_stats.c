@@ -40,7 +40,7 @@ void gisp_stats_compute(const gisp_raw *raw, const gisp_rect *crop_in, const gis
     const uint32_t nqx = (qw + step - 1) / step;
     const int lsc = p->lsc_w && p->lsc_h && p->lsc_w * p->lsc_h <= GISP_LSC_MAX;
     float *gain = lsc ? malloc(sizeof(float) * (2 * cw + 4 * GISP_LSC_MAX)) : NULL;
-    float *gprev = calloc(nqx, sizeof(float));
+    float *gprev = calloc(2 * (size_t)nqx, sizeof(float)); /* verde dei quadrati campionati: riga sopra e due righe sopra */
     uint16_t *zcol = malloc(sizeof(uint16_t) * nqx);
     if ((lsc && !gain) || !gprev || !zcol) { free(gain); free(gprev); free(zcol); return; }
     for (uint32_t i = 0; i < nqx; i++) zcol[i] = (uint16_t)(i * step * zx / qw);
@@ -53,7 +53,7 @@ void gisp_stats_compute(const gisp_raw *raw, const gisp_rect *crop_in, const gis
     const float inv = range > 0 ? 1.0f / range : 0;
     const float lr = 0.2126f * p->wb[0] * inv, lg = 0.7152f * p->wb[1] * inv, lb = 0.0722f * p->wb[2] * inv;
     double luma_sum = 0;
-    int have_prev_row = 0;
+    uint32_t rows_seen = 0;
     int32_t gtag = -1;
 
     for (uint32_t qy = 0; qy < qh; qy += step) {
@@ -67,7 +67,8 @@ void gisp_stats_compute(const gisp_raw *raw, const gisp_rect *crop_in, const gis
             gisp__lsc_row(raw, p, yc + 1, crop.x, cw, gain + cw, gain + 2 * cw);
         }
         const uint32_t zrow = (qy * zy / qh) * zx;
-        float gleft = 0;
+        float gleft = 0, gleft2 = 0;
+        float *g1 = gprev + (size_t)(rows_seen & 1) * nqx, *g2 = gprev + (size_t)((rows_seen + 1) & 1) * nqx;
         for (uint32_t i = 0; i < nqx; i++) {
             const uint32_t x = 2 * i * step;
             float v[4];
@@ -84,13 +85,16 @@ void gisp_stats_compute(const gisp_raw *raw, const gisp_rect *crop_in, const gis
             if (!mono) c[1] *= 0.5f;
             else { c[0] = c[2] = c[1] = c[1] * 0.25f; }
             const uint32_t z = zrow + zcol[i];
-            /* contrasto AF: differenze del verde con il quadrato campionato a sinistra e quello sopra */
+            /* contrasto AF: seconda differenza del verde (|g - 2 g1 + g2|) in orizzontale e in verticale tra quadrati
+             * campionati. La prima differenza |dG| sommata su un bordo vale il salto del bordo con o senza sfocatura
+             * (variazione totale): non distingue il fuoco. La seconda scende come 1 / larghezza del bordo. */
             const float g = c[1] * inv;
             float d = 0;
-            if (i) d += fabsf(g - gleft);
-            if (have_prev_row) d += fabsf(g - gprev[i]);
+            if (i >= 2) d += fabsf(g - 2.0f * gleft + gleft2);
+            if (rows_seen >= 2) d += fabsf(g - 2.0f * g1[i] + g2[i]);
+            gleft2 = gleft;
             gleft = g;
-            gprev[i] = g;
+            g2[i] = g; /* g2 diventa la riga "sopra" al prossimo giro (scambio dei due buffer) */
             st->sharp[z] += d;
             float yl = lr * c[0] + lg * c[1] + lb * c[2];
             yl = yl > 1 ? 1 : yl;
@@ -101,7 +105,7 @@ void gisp_stats_compute(const gisp_raw *raw, const gisp_rect *crop_in, const gis
             st->count[z]++;
         }
         st->total += nqx;
-        have_prev_row = 1;
+        rows_seen++;
     }
     st->mean_luma = st->total ? (float)(luma_sum / st->total) : 0;
     st->range = range;

@@ -88,7 +88,9 @@ typedef struct {
     float sum_r[GISP_ZONES_MAX], sum_g[GISP_ZONES_MAX], sum_b[GISP_ZONES_MAX];
     uint32_t count[GISP_ZONES_MAX];
     uint32_t sat[GISP_ZONES_MAX];   /* quadrati con almeno un canale saturo */
-    float sharp[GISP_ZONES_MAX];    /* contrasto per l'AF: somma |dG| orizzontale + verticale tra quadrati, per zona */
+    float sharp[GISP_ZONES_MAX];    /* contrasto per l'AF: somma della seconda differenza del verde |G - 2 G1 + G2|,
+                                     * orizzontale + verticale tra quadrati campionati, per zona, fondo scala = 1.
+                                     * (La prima differenza sommata su un bordo non cambia con la sfocatura.) */
     uint32_t hist[256];             /* istogramma della luma lineare (WB applicato), 0..bianco in 256 classi */
     uint32_t total;                 /* quadrati contati */
     float mean_luma;                /* media della luma lineare, 0..1 */
@@ -115,7 +117,7 @@ typedef struct {
     uint16_t r[GISP_WIRE_ZX * GISP_WIRE_ZY], g[GISP_WIRE_ZX * GISP_WIRE_ZY], b[GISP_WIRE_ZX * GISP_WIRE_ZY];
     uint8_t sat[GISP_WIRE_ZX * GISP_WIRE_ZY];      /* per zona: frazione di quadrati saturi, 0..255 */
     uint8_t valid[GISP_WIRE_ZX * GISP_WIRE_ZY];    /* per zona: frazione di quadrati non saturi, 0..255 */
-    uint32_t sharp[GISP_WIRE_ZX * GISP_WIRE_ZY];   /* contrasto AF per zona: media |dG| per quadrato, Q16 di 1.0 */
+    uint32_t sharp[GISP_WIRE_ZX * GISP_WIRE_ZY];   /* contrasto AF per zona: media |d2G| per quadrato, Q16 di 1.0 */
     uint32_t hist[GISP_WIRE_HIST];                 /* luma lineare 0..1 in 64 classi */
 } gisp_stats_wire;
 /* st deve essere stato calcolato con zones 16x12 (altrimenti restituisce -1). */
