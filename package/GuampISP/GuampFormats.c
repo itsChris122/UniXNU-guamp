@@ -1,6 +1,8 @@
 // GuampFormats.c - the FigCaptureStream formats the plug-in offers.
 //
-// CMCapture builds the AVCaptureDevice formats from the device plist CMCapture.framework/J120/AVCaptureSession.plist
+// CMCapture builds the AVCaptureDevice formats from the device plist CMCapture.framework/<hw.model>/AVCaptureSession.plist
+// (guamp: motorola,guamp, written by scripts/make-guamp-cmcapture-plist.py from the J120 one with exactly the stream formats
+// below; keep the two lists in step)
 // (MultiStream -> FigCaptureStreamFormats / AVCaptureDeviceFormats / AVCaptureSessionPresets) and pairs each plist stream
 // format with an entry of the plug-in's SupportedFormatsArray with the same sensor dimensions (SensorWidth x SensorHeight,
 // plus the Binned/FES flags). So the plug-in advertises the J120 sensor geometry, not the guamp one: the RAW from
@@ -25,8 +27,15 @@ static const GFormat kFront[] = {
     {"Video-FES-30",                3840, 2160,   1920, 1080,  15, 30,    kGuampModeVideo,    0, 0},
 };
 
+// OV02B10/OV02B1B (macro with GT9772 AF, depth mono): 2 MP 1600x1200, one sensor mode. The plist entry (make-guamp-cmcapture-plist.py
+// --cameras 4) describes exactly this one stream format, so preview and still come from the same stream.
+static const GFormat kOv02b[] = {
+    {"Photo",                       1600, 1200,   1600, 1200,  15, 30,    kGuampModePreview,  1, 0},
+};
+
 const GFormat *GFormatsFor(uint32_t position, size_t *count) {
   if (position == kGuampCamFront) { *count = sizeof(kFront) / sizeof(kFront[0]); return kFront; }
+  if (position == kGuampCamMacro || position == kGuampCamDepth) { *count = 1; return kOv02b; }
   *count = sizeof(kBack) / sizeof(kBack[0]);
   return kBack;
 }
@@ -96,7 +105,9 @@ static CFDictionaryRef copyFormat(const GFormat *f, uint32_t position) {
   CFDictionaryRef crop = copyRect(0, 0, f->sensorWidth, f->sensorHeight);
   CFDictionarySetValue(d, CFSTR("VideoCropRect"), crop);
   CFRelease(crop);
-  setNum(d, CFSTR("VideoFieldOfView"), position == kGuampCamFront ? 77.0 : 75.0);   // degrees, horizontal (estimate)
+  // degrees, horizontal (estimates: GM1ST 4.73 mm on 1/2", 4H7 2.58 mm, OV02B macro ~2.5 mm / depth ~1.8 mm on 1/5")
+  setNum(d, CFSTR("VideoFieldOfView"), position == kGuampCamFront ? 77.0 : position == kGuampCamMacro ? 79.0
+                                       : position == kGuampCamDepth ? 88.0 : 75.0);
   setNum(d, CFSTR("SensorHDRMode"), 0);
   CFMutableDictionaryRef outs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
   CFDictionaryRef primary = copyOutput(f, f->outWidth, f->outHeight, 16.0);

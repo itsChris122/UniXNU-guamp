@@ -33,9 +33,10 @@ typedef struct GFormat {
   uint32_t binned;
 } GFormat;
 const GFormat *GFormatsFor(uint32_t position, size_t *count);
+CFStringRef GPortTypeFor(uint32_t position);                  // kFigCapturePortType_* of a GuampCamIosPosition
 CFArrayRef GFormatsCopyArray(uint32_t position);              // kFigCaptureStreamProperty_SupportedFormatsArray
 
-// ---- processing glue (GuampFrames.c): RAW slot -> gisp -> 420f IOSurface, 3A ----------------------------------------
+// ---- processing glue (GuampFrames.c): RAW slot -> gcampipe (3A + gisp) -> 420f/420v IOSurface -------------------------------
 typedef struct GOutput {
   GPixelBufferHandler pixelHandler;     // Block_copy'd
   GEventHandler eventHandler;
@@ -70,8 +71,7 @@ typedef struct GStream {
   GuampCamIosModeInfo mode;
   const uint8_t *slot[GUAMP_CAMIOS_MAX_SLOTS];   // mapped RAW slots (kGuampCamMemRing + sensor * 16 + i)
   size_t slotSize[GUAMP_CAMIOS_MAX_SLOTS];
-  void *isp;                            // gisp context (agent 3)
-  void *aaa;                            // 3A context (agent 4)
+  void *isp;                            // gcp (package/GuampCamPipe): gisp statistics + g3a + rendering of this stream
   uint64_t frames, dropped;
   CMFormatDescriptionRef formatDescription;
 } GStream;
@@ -89,6 +89,5 @@ OSStatus GStreamCreate(GDevice *, uint32_t sensor, GBaseObjectRef *out);
 OSStatus GFramesStart(GStream *);
 void     GFramesStop(GStream *);
 void     GFramesRequestStill(GStream *, CFDictionaryRef settings);
-CFDictionaryRef GFramesCopyMetadata(GStream *, const GuampCamIosFrame *);
 
 #endif

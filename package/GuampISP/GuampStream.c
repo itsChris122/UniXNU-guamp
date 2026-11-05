@@ -1,4 +1,5 @@
-// GuampStream.c - FigCaptureStream of the guamp plug-in: one per camera (back GM1ST, front 4H7).
+// GuampStream.c - FigCaptureStream of the guamp plug-in: one per camera (back GM1ST, front 4H7, with
+// the secondary-camera kernel work also the two OV02B: macro and depth).
 //
 // The property names are the CFString values of CMCapture's kFigCaptureStreamProperty_* constants, read out of
 // H9ISP's _streamProperties table (145 entries, analisi/camera/cam5-servizio-ios.md section 4). Only the ones the
@@ -103,6 +104,19 @@ static const char *const kIgnoredSets[] = {
     "RawImageProcessEnd", "ReloadNVM", "SphereMode",
 };
 
+// kFigCapturePortType_* values (CFStrings of CMCapture). CMCapture binds them to the uniqueName of the device entries of
+// CMCapture.framework/<hw.model>/AVCaptureSession.plist (FigCaptureSourcePreprocessVideoDeviceDict 0x1a6ac7488): Back Camera,
+// Front Camera, Back Ultra Wide Camera, Back Telephoto Camera (scripts/make-guamp-cmcapture-plist.py writes those entries).
+// The OV02B macro stands in as the ultra wide (the role iOS gives macro shots), the OV02B depth module as the telephoto.
+CFStringRef GPortTypeFor(uint32_t position) {
+  switch (position) {
+    case kGuampCamFront: return CFSTR("PortTypeFront");
+    case kGuampCamMacro: return CFSTR("PortTypeBackSuperWide");
+    case kGuampCamDepth: return CFSTR("PortTypeBackTelephoto");
+    default: return CFSTR("PortTypeBack");
+  }
+}
+
 static const GuampCamIosSensorInfo *sensorOf(GStream *s) { return &s->device->kernel.info.sensor[s->sensor]; }
 
 static CFTypeRef copyOutputsEnabled(GStream *s) {
@@ -125,9 +139,7 @@ static OSStatus streamCopyProperty(GBaseObjectRef o, CFStringRef key, CFAllocato
   *out = NULL;
   pthread_mutex_lock(&s->lock);
   if (keyIs(key, "SupportedPropertiesDictionary")) *out = copyStreamSupported();
-  else if (keyIs(key, "PortType"))
-    // kFigCapturePortType_BackFacingCamera / _FrontFacingCamera (CFString values to confirm, doc section 9 item 3).
-    *out = CFRetain(s->position == kGuampCamFront ? CFSTR("PortTypeFront") : CFSTR("PortTypeBack"));
+  else if (keyIs(key, "PortType")) *out = CFRetain(GPortTypeFor(s->position));
   else if (keyIs(key, "SupportedFormatsArray")) *out = GFormatsCopyArray(s->position);
   else if (keyIs(key, "FormatIndex")) *out = num32((int32_t)s->formatIndex);
   else if (keyIs(key, "FormatDescription")) { if (s->formatDescription) *out = CFRetain(s->formatDescription); }

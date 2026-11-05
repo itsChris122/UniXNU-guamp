@@ -158,8 +158,11 @@ __attribute__((visibility("default"))) OSStatus H6ISPCaptureDeviceCreate(CFAlloc
     CFRelease(obj);
     return kGErrUnsupported;
   }
-  // One FigCaptureStream per present back/front sensor, back first (AVCaptureDevice order of the J120 plist).
-  for (uint32_t pos = kGuampCamBack; pos <= kGuampCamFront; ++pos) {
+  // One FigCaptureStream per present sensor: back, front (AVCaptureDevice order of the plist), then macro and depth when
+  // the kernel offers them (agent 7) and the plist describes them (make-guamp-cmcapture-plist.py --cameras 4).
+  static const uint32_t order[] = {kGuampCamBack, kGuampCamFront, kGuampCamMacro, kGuampCamDepth};
+  for (size_t o = 0; o < sizeof(order) / sizeof(order[0]); ++o) {
+    const uint32_t pos = order[o];
     for (uint32_t i = 0; i < d->kernel.info.sensorCount && i < GUAMP_CAMIOS_MAX_SENSORS; ++i) {
       const GuampCamIosSensorInfo *s = &d->kernel.info.sensor[i];
       if (!s->present || s->position != pos) continue;

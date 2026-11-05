@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 8689284..ca581a3 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -9369,6 +9369,32 @@ native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
+@@ -9369,6 +9369,45 @@ native_guamp_baseband_mount(proc_t p, user_addr_t scratch)
  	    native_guamp_baseband_preboot_stage, native_guamp_baseband_preboot_status, native_guamp_baseband_folder_stage,
  	    native_guamp_baseband_folder_status, logging_error, hash_source);
  }
@@ -16,6 +16,8 @@ index 8689284..ca581a3 100644
 + * trust cache. Never panics: stage 5 = mounted, the sealed directory and our plug-in both visible. */
 +volatile int native_guamp_camera_plugin_stage = 0;
 +volatile int native_guamp_camera_plugin_status = -1;
++volatile int native_guamp_camera_cmcapture_stage = 0;
++volatile int native_guamp_camera_cmcapture_status = -1;
 +static int
 +native_guamp_camera_plugin_enabled(void)
 +{
@@ -26,16 +28,27 @@ index 8689284..ca581a3 100644
 +native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
 +{
 +	static const char source[] = "/private/var/ngpu/mediacapture", point[] = "/System/Library/MediaCapture";
++	static const char cmc_source[] = "/private/var/ngpu/cmcapture", cmc_point[] = "/System/Library/PrivateFrameworks/CMCapture.framework";
 +	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point,
 +	    "/System/Library/MediaCapture/H6ISP.mediacapture", &native_guamp_camera_plugin_stage, &native_guamp_camera_plugin_status);
 +	printf("guamp-camera-plugin: addon files %d, written %d, same %d, failed %d (last error %d); %s stage %d status %d\n",
 +	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
 +	    point, native_guamp_camera_plugin_stage, native_guamp_camera_plugin_status);
++	/* CMCapture names its camera description after hw.model (FigCaptureGetModelSpecificName: "motorola,guamp" here) and
++	 * falls back to CMCapture.framework/iOS, which has no AVCaptureDevices: without CMCapture.framework/motorola,guamp no
++	 * stream of the plug-in becomes an AVCaptureDevice. The addon's cmcapture/motorola,guamp (scripts/make-guamp-cmcapture-plist.py,
++	 * derived from J120 at build time) is shown inside the framework with the same union view; stage 5 = J120 and ours visible. */
++	native_gpu_addon_mount(p, scratch, 0x400, cmc_source, sizeof(cmc_source), cmc_point, sizeof(cmc_point),
++	    "/System/Library/PrivateFrameworks/CMCapture.framework/J120/AVCaptureSession.plist",
++	    "/System/Library/PrivateFrameworks/CMCapture.framework/motorola,guamp/AVCaptureSession.plist",
++	    &native_guamp_camera_cmcapture_stage, &native_guamp_camera_cmcapture_status);
++	printf("guamp-camera-plugin: %s stage %d status %d\n", cmc_point, native_guamp_camera_cmcapture_stage,
++	    native_guamp_camera_cmcapture_status);
 +}
  static void
  native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  {
-@@ -9378,10 +9404,12 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -9378,10 +9417,12 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  	int iphone_res = native_guamp_iphone_res_enabled();
  	/* guamp-audio-plugin=1 likewise installs the addon (it carries GuampAudio.driver) and mounts the HAL view after it. */
  	int audio_plugin = native_guamp_audio_plugin_enabled();
@@ -50,7 +63,7 @@ index 8689284..ca581a3 100644
  		native_guamp_iphone_res_ngpu(p, scratch);
  	}
  	native_gpu_addon_install(p, scratch);
-@@ -9399,6 +9427,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+@@ -9399,6 +9440,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
  		native_guamp_audio_plugin_mount(p, scratch);
  	}
  	native_guamp_baseband_mount(p, scratch);	/* guamp-baseband=1|2: Mav16 firmware views for ABM (04/11) */

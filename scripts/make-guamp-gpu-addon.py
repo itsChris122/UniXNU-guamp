@@ -20,6 +20,10 @@ guamp-audio-plugin=1 (patches/xnu/zzzzz-guamp-audio-plugin.patch), and audiomxd 
 and trust.json) as mediacapture/H6ISP.mediacapture; the kernel shows that directory over /System/Library/MediaCapture only with
 guamp-camera-ios=1|2 (patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-camera-plugin.patch), and mediaserverd loads it only
 with its CDHash in the trust cache.
+--cmcapture DIR (required with --camera) adds CMCapture's camera description for the guamp hw.model (DIR = the OUTDIR of
+scripts/make-guamp-cmcapture-plist.py: <model>/AVCaptureSession.plist and CameraSetup.plist) as cmcapture/<model>/*; the same
+patch shows it inside /System/Library/PrivateFrameworks/CMCapture.framework. Without it CMCapture turns no plug-in stream into an
+AVCaptureDevice (it looks for CMCapture.framework/motorola,guamp, see that script).
 --no-gpu leaves the GPU files out (audio-only addon on top of BASE).
 
 The output also carries ".guamp-keep" (every name of the output plus baseband/, see compose-guamp-delta-addon.py and
@@ -118,6 +122,16 @@ def camera_files(directory):
     return [('mediacapture/H6ISP.mediacapture', 0o755, dylib.read_bytes())]
 
 
+def cmcapture_files(directory):
+    plists = sorted(directory.glob('*/AVCaptureSession.plist'))
+    if len(plists) != 1 or not (plists[0].parent / 'CameraSetup.plist').is_file():
+        sys.exit(f'{directory}: one <model>/ with AVCaptureSession.plist and CameraSetup.plist expected '
+                 '(scripts/make-guamp-cmcapture-plist.py --j120 ... {directory})')
+    model = plists[0].parent
+    return [(f'cmcapture/{model.name}/{name}', 0o644, (model / name).read_bytes())
+            for name in ('AVCaptureSession.plist', 'CameraSetup.plist')]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--base', type=Path, required=True, help='the existing guamp addon (iphone-res)')
@@ -127,6 +141,7 @@ def main():
     parser.add_argument('--prime-list', type=Path, help='absolute .metallib paths the render server compiles ahead')
     parser.add_argument('--audio', type=Path, help='OUTDIR of build-guamp-audio-plugin.sh (GuampAudio.driver + trust.json)')
     parser.add_argument('--camera', type=Path, help='OUTDIR of build-guamp-isp-plugin.sh (H6ISP.mediacapture + trust.json)')
+    parser.add_argument('--cmcapture', type=Path, help='OUTDIR of make-guamp-cmcapture-plist.py (needed with --camera)')
     parser.add_argument('--no-gpu', action='store_true', help='leave the GPU plugin files out (with --audio: audio-only addon)')
     parser.add_argument('--no-keep', action='store_true', help='no .guamp-keep entry (the kernel prunes nothing)')
     parser.add_argument('output', type=Path)
@@ -142,8 +157,12 @@ def main():
     added = [] if args.no_gpu else plugin_files(args.plugin, args.publish, clients, args.prime_list)
     if args.audio:
         added += audio_files(args.audio)
+    if args.camera and not args.cmcapture:
+        sys.exit('--camera needs --cmcapture (CMCapture.framework/motorola,guamp, else no AVCaptureDevice appears)')
     if args.camera:
         added += camera_files(args.camera)
+    if args.cmcapture:
+        added += cmcapture_files(args.cmcapture)
     if not added:
         sys.exit('nothing to add (--no-gpu without --audio or --camera)')
     names = {name for name, _, _ in base}
