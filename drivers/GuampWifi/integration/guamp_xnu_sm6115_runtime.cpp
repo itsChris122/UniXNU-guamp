@@ -124,6 +124,12 @@ struct Sm6115Runtime {
     ops.baseband=basebandRequested();
     e=control.prepare(&owner.arena,owner.allocator,ops,true);
     if(e)return fail(e,"APPS SMP2P/GLINK prepare");
+    // guamp 06/11: guamp-wifi-beat=<5..3600 s> (default 5): transport heartbeat once running (perfmode 60)
+    unsigned beatS=WifiControl::BeatMs/1000;
+    if(PE_parse_boot_argn("guamp-wifi-beat",&beatS,sizeof(beatS))&&beatS>=5&&beatS<=3600) {
+      control.runningBeatMs=beatS*1000;
+      IOLog("GuampWiFi: transport heartbeat every %u s once running\n",beatS);
+    }
     transition(Prepared);return Ok;
   }
 

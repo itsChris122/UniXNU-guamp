@@ -59,6 +59,9 @@ struct WifiControl {
   Stage stage=Off; int error=0;
   uint32_t descriptor=0,outboundFifo=0,outboundBytes=0; uint16_t channel=0;
   uint64_t deadline=0,now=0,started=0,beat=0;
+  // guamp 06/11: heartbeat period once Running (14 lines each time; guamp-wifi-beat=<s> in the runtime, perfmode 60 s).
+  // Before Running, and on failure, it stays BeatMs: that is where it tells which gate stalled.
+  uint32_t runningBeatMs=BeatMs;
   bool routerStarted=false,wlanStarted=false;
   // Diagnostics: the gate being waited for or the step that failed, and transitions already reported.
   const char *gate="idle";
@@ -151,7 +154,7 @@ struct WifiControl {
     if(stage==Failed) return error;
     if(stage==Off||stage==Prepared) return NotReady;
     if(error) return fail(error);
-    if(now>=beat+BeatMs) { beat=now; heartbeat(); }
+    if(now>=beat+(stage==Running?runningBeatMs:BeatMs)) { beat=now; heartbeat(); }
     int e=smp.poll();
     if(smp.inPresent&&!sawInbound) {
       sawInbound=true; trace("smp2p 435 inbound present: size/valid/features",0,smp.inSize,smp.inValid,smp.inFeatures);

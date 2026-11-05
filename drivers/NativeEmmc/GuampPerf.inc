@@ -472,6 +472,7 @@ extern "C" volatile int native_gpu_addon_files, native_gpu_addon_written, native
     native_gpu_addon_error, native_gpu_addon_stage, native_gpu_addon_status, native_gpu_addon2_stage, native_gpu_addon2_status,
     native_gpu_addon3_stage, native_gpu_addon3_status;
 
+static uint32_t guampPerfQuiet;   // cores without timer/IPI progress in the last sample (heartbeat block below)
 static void guampPerfSample() {
   static bool checked = false, enabled = false, previousValid = false;
   static uint32_t previous[CPU_STATE_MAX] = {};
@@ -530,6 +531,7 @@ static void guampPerfSample() {
         lastBeat[cpu] = beat;
       }
       const uint64_t silent = guamp_stuck_cpu_mask();
+      guampPerfQuiet = quiet;
       if (quiet || silent) {
         reports = reports + 1;
         if (reports <= 3 || reports % 6 == 0)
@@ -537,6 +539,20 @@ static void guampPerfSample() {
                 quiet, static_cast<unsigned long long>(silent), guamp_mmio_tag[0] ? static_cast<char>(guamp_mmio_tag[0]) : '-',
                 guamp_mmio_tag[1], guamp_mmio_tag[2]);
       }
+    }
+    // 06/11 (fin50: 10 of the ~50 lines every 10 s, all but the counters constant): guamp-perf-static-every=<n> (default 1 =
+    // every sample) prints the cache policy, the GIC/IPI line, the per-core SMP lines and the timer/GIC/IRQ snapshots on the
+    // first 3 samples and then every n-th (perfmode 6 = once a minute). A quiet or debugger-silent core prints them at once.
+    static unsigned staticEvery = 0, staticRound = 0;
+    if (!staticEvery) {
+      staticEvery = 1;
+      PE_parse_boot_argn("guamp-perf-static-every", &staticEvery, sizeof(staticEvery));
+      if (staticEvery < 1 || staticEvery > 360) staticEvery = 1;
+    }
+    staticRound = staticRound + 1;
+    if (staticRound > 3 && staticRound % staticEvery && !guamp_stuck_cpu_mask() && !guampPerfQuiet) {
+      previousValid = true;
+      return;
     }
     IOLog("GuampRamCache: managed IO RAM to Normal NC %u; MMIO/native WB policy retained\n", guamp_ram_nc_enabled);
     IOLog("GuampSmp: IPI pending-mode %u sent %llu received %llu; GIC group %x enabled %x ctl %x typer %x\n",

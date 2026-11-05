@@ -884,13 +884,20 @@ void transport() {
   if (!gUartLock) { IOLog("GuampBt: transport: no lock\n"); return; }
   unsigned rs = 1;
   if (PE_parse_boot_argn("guamp-bt-shim-reset", &rs, sizeof(rs))) gResetEnabled = rs != 0;
+  // 06/11 (fin50: guamp-bt 0.5 % of a core at rest, 500 UART reads/s): guamp-bt-idle-ms=<2..20> (default 2 = as before) is the
+  // pause between reads while the controller said it sleeps (IBS SLEEP_IND) or is powered off; a sleeping controller sends
+  // WAKE_IND first, so only that byte waits longer. Awake, or without IBS, the pause stays 2 ms. guamp-perfmode=1 sets 10.
+  unsigned idleMs = 2;
+  PE_parse_boot_argn("guamp-bt-idle-ms", &idleMs, sizeof(idleMs));
+  if (idleMs < 2) idleMs = 2;
+  if (idleMs > 20) idleMs = 20;
   bts_link link = {};
   link.tx = linkTx;
   link.reset = linkReset;
   link.power = linkPower;
   btshim::attach(&link);
-  IOLog("GuampBt: transport on at %u baud (IBS %u), reset re-download %u\n", gBaudRate, gIbs ? 1u : 0u,
-        gResetEnabled ? 1u : 0u);
+  IOLog("GuampBt: transport on at %u baud (IBS %u), reset re-download %u, asleep poll %u ms\n", gBaudRate,
+        gIbs ? 1u : 0u, gResetEnabled ? 1u : 0u, idleMs);
   static uint8_t buf[2048];
   uint64_t lastLog = 0;
   for (;;) {
@@ -933,7 +940,7 @@ void transport() {
       IOLockUnlock(gUartLock);
     }
     if (n) btshim::controllerBytes(buf, n);
-    else IOSleep(2);
+    else IOSleep(gOff || (gIbs && gAsleep) ? idleMs : 2);
     uint64_t now = 0;
     absolutetime_to_nanoseconds(mach_absolute_time(), &now);
     if (now - lastLog > 60000000000ULL) {

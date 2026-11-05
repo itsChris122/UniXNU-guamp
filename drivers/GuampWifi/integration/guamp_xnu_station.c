@@ -573,11 +573,20 @@ static void wifi_worker(void *arg, wait_result_t result)
    * every 1 ms, about 1000 wake-ups a second also with nothing to do. guamp-wifi-poll-max=<ms> (1..8, default 1 = as before):
    * after 64 idle steps in a row (~64 ms without work) the pause doubles up to <ms>; any work brings it back to 1 ms at once,
    * so traffic keeps the 1 ms polling and only an idle link waits longer (at most <ms> for its first frame).
+   * 06/11 (fin50: still 8-10 % at rest): connected, every beacon (~100 ms) is copy engine work and brings the pause back to 1 ms;
+   * with 64 idle steps per doubling the next beacon came before 2 ms was even reached, so poll-max changed almost nothing.
+   * guamp-wifi-poll-idle=<steps> (1..64, default 64 = as before): idle steps before each doubling. With 4 and poll-max 8
+   * (guamp-perfmode=1) the pause is 8 ms 28 ms after the last work: ~20 wake-ups per beacon interval instead of ~85.
    */
-  uint32_t poll_max = 1, idle = 0, pause = 1;
+  uint32_t poll_max = 1, poll_idle = 64, idle = 0, pause = 1;
   PE_parse_boot_argn("guamp-wifi-poll-max", &poll_max, sizeof(poll_max));
+  PE_parse_boot_argn("guamp-wifi-poll-idle", &poll_idle, sizeof(poll_idle));
   if (poll_max < 1) poll_max = 1;
   if (poll_max > 8) poll_max = 8;
+  if (poll_idle < 1) poll_idle = 1;
+  if (poll_idle > 64) poll_idle = 64;
+  if (poll_max > 1 || poll_idle != 64)
+    printf("GuampWiFi: worker polling 1 ms, idle back-off to %u ms after %u idle steps per doubling\n", poll_max, poll_idle);
   while (1) {
     int work = nw_wifi_step();
     if (work < 0) {
@@ -586,7 +595,7 @@ static void wifi_worker(void *arg, wait_result_t result)
       break;
     }
     if (work == 0) {
-      if (++idle >= 64 && pause < poll_max) {
+      if (++idle >= poll_idle && pause < poll_max) {
         pause = pause * 2 > poll_max ? poll_max : pause * 2;
         idle = 0;
       }

@@ -474,12 +474,24 @@ void thread(void *, wait_result_t)
   // once the legacy display has copied frames, a period in which it copied none (native_legacy_copy_n unchanged) leaves the
   // frame buffer as it was, so the scan is skipped; a whole frame still goes out every 20 skipped periods (~10 s) for a viewer
   // opened later. Before the first display copy (boot logo, progress bar) nothing changes. guamp-usb-fps=<1..10> (default 2).
+  // 06/11 (fin50: 1-10 % of a core, 889 MB sent in 690 s): guamp-usb-poll-ms=<1..50> (default 5) is the pause between passes
+  // while a viewer is connected (events, new log text, touches from the viewer; 20 = 50 wake-ups/s instead of 200, the log
+  // still reaches the PC within 20 ms); guamp-usb-full-every=<1..120> (default 6) sends a whole frame every n frames instead of
+  // the changed rows only (a 4.6 MB copy from the uncached frame buffer each time). guamp-perfmode=1 sets 20 and 30, fps 1.
   thread_set_thread_name(current_thread(), "guamp-usb-mirror");
-  uint32_t skip = 1, fps = 2;
+  uint32_t skip = 1, fps = 2, pollMs = 5, fullEvery = 6;
   PE_parse_boot_argn("guamp-usb-frame-skip", &skip, sizeof(skip));
   PE_parse_boot_argn("guamp-usb-fps", &fps, sizeof(fps));
+  PE_parse_boot_argn("guamp-usb-poll-ms", &pollMs, sizeof(pollMs));
+  PE_parse_boot_argn("guamp-usb-full-every", &fullEvery, sizeof(fullEvery));
   if (fps < 1) fps = 1;
   if (fps > 10) fps = 10;
+  if (pollMs < 1) pollMs = 1;
+  if (pollMs > 50) pollMs = 50;
+  if (fullEvery < 1) fullEvery = 1;
+  if (fullEvery > 120) fullEvery = 120;
+  if (fps != 2 || pollMs != 5 || fullEvery != 6)
+    IOLog("NativeEmmc USB mirror: %u frames/s, pass every %u ms, whole frame every %u frames\n", fps, pollMs, fullEvery);
   uint64_t lastCopies = 0, interval = 0;
   uint32_t idlePeriods = 0;
   nanoseconds_to_absolutetime(1000 * 1000 * 1000ULL / fps, &interval);   // the frame buffer is uncached
@@ -494,9 +506,9 @@ void thread(void *, wait_result_t)
         if (skip && copies && copies == lastCopies && ++idlePeriods < 20) {
           native_usb_frames_skipped++;
         } else {
-          // A whole frame every 6 frames (~3 s), and after 20 skipped periods: a viewer opened later, or after a lost transfer,
+          // A whole frame every guamp-usb-full-every frames (6: ~3 s), and after 20 skipped periods: a viewer opened later, or after a lost transfer,
           // catches up
-          if ((m.frame % 6 == 0 || idlePeriods >= 20) && m.shadow) memset(m.shadow, 0xA5, kFbBytes);
+          if ((m.frame % fullEvery == 0 || idlePeriods >= 20) && m.shadow) memset(m.shadow, 0xA5, kFbBytes);
           idlePeriods = 0;
           lastCopies = copies;
           m.sendFrame(gCard.fb);
@@ -504,7 +516,7 @@ void thread(void *, wait_result_t)
         lastFrame = now;
       }
     }
-    IOSleep(native_usb_configured ? 5 : 20);   // leave the CPU to iOS
+    IOSleep(native_usb_configured ? pollMs : 20);   // leave the CPU to iOS
   }
 }
 
