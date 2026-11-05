@@ -88,6 +88,9 @@ extern volatile uint32_t native_adreno_wide_request, native_adreno_wide_active;
 extern volatile uint32_t native_adreno_gpu_all, native_adreno_gpu_all_cfg[7];
 // patch 0006: processes that never get a connection with gpu-all (their open is refused: nil device, software paths as before).
 extern char native_adreno_gpu_all_deny[192];
+// patch 0015: the words that give a process the small window, and its size in MiB (0: everyone gets the full window).
+extern char native_adreno_gpu_all_small[96];
+extern volatile uint32_t native_adreno_gpu_all_small_mib;
 // ArmCpu's SPI attach (also used by the touch service).
 int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // The staged AGXAccelerator (build-native-adreno-accelerator.py adds it to the archive); absent unless that builder ran.
@@ -543,7 +546,17 @@ int naPublish(Session &s) {
   // fin44: Maps ran out of its 192 MiB window ("texture: OutOfMemory(Device)" from metal2vulkan, with the kernel refusing nothing:
   // others BO 260 -> 388 MiB while it ran, metal2vulkan's 64 MiB pool blocks). Without the argument a client window is now 256 MiB;
   // the 2 GiB of client windows hold eight such, and the smallest window (64 MiB) still serves a ninth.
-  if (!native_adreno_gpu_all_cfg[0]) native_adreno_gpu_all_cfg[0] = 256;
+  // fin48: Maps failed again at ~180 MiB of BOs in 256 MiB ("VectorKit received null buffer") while the widget extensions held full
+  // windows: patch 0015 gives "Widget"/"Extension" processes 128 MiB (guamp-gpu-all-small=<words>, guamp-gpu-all-smallwin=<MiB>, 0 =
+  // off) and an app now gets 384 MiB by default.
+  if (!native_adreno_gpu_all_cfg[0]) native_adreno_gpu_all_cfg[0] = 384;
+  {
+    char small[sizeof native_adreno_gpu_all_small] = {};
+    if (PE_parse_boot_argn("guamp-gpu-all-small", small, sizeof small)) strlcpy(native_adreno_gpu_all_small, small, sizeof small);
+    unsigned smallMib = 128;
+    PE_parse_boot_argn("guamp-gpu-all-smallwin", &smallMib, sizeof smallMib);
+    native_adreno_gpu_all_small_mib = smallMib;
+  }
   {
     char deny[sizeof native_adreno_gpu_all_deny] = {};
     if (!PE_parse_boot_argn("guamp-gpu-all-deny", deny, sizeof deny)) strlcpy(deny, "SpringBoard,mediaserverd", sizeof deny);

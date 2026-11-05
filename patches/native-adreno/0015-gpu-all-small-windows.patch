@@ -1,0 +1,44 @@
+guamp: smaller gpu-all windows for widget and extension processes, so an app gets room (Maps buffer allocations, fin48)
+
+diff -ru a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp	2026-11-05 15:17:48.068545469 +0100
++++ b/NativeAdrenoPublish.cpp	2026-11-05 15:19:07.172549300 +0100
+@@ -159,6 +159,16 @@
+ char native_adreno_gpu_all_deny[192];
+ }
+ #include "NativeAdrenoGpuAll.h"
++extern "C" {char native_adreno_gpu_all_small[96]="Widget,Extension";volatile uint32_t native_adreno_gpu_all_small_mib=128;}
++static bool nameHolds(const char *name,size_t bytes,const char *word)
++{
++    for(size_t i=0;i<bytes && name[i];++i) {
++        size_t j=0;
++        while(word[j] && i+j<bytes && name[i+j]==word[j])++j;
++        if(!word[j])return true;
++    }
++    return false;
++}
+ static uint64_t gpuAllConfig(unsigned index,uint64_t fallback)
+ {
+     const uint32_t value=index<sizeof native_adreno_gpu_all_cfg/sizeof *native_adreno_gpu_all_cfg?native_adreno_gpu_all_cfg[index]:0;
+@@ -314,7 +324,20 @@
+             for(unsigned i=0;i<NativeAdrenoAllClients;++i)if(g.slots[i] && g.slot_pid[i]==pid_)++same_pid;
+             const bool limited=!render_server && (g.others_live>=gpuAllConfig(5,16) || same_pid>=gpuAllConfig(6,2));
+             for(unsigned i=1;!limited && slot==NativeAdrenoAllClients && i<NativeAdrenoAllClients;++i)if(!g.slots[i])slot=i;
+-            if(slot<NativeAdrenoAllClients && !g.windows.take(gpuAllConfig(0,192)<<20,gpuAllConfig(1,64)<<20,&win_start,&win_bytes))
++            /* guamp (UniXNU-guamp patches/native-adreno/0015): processes whose name holds one of native_adreno_gpu_all_small's
++             * comma-separated words (the board: guamp-gpu-all-small, default "Widget,Extension") get native_adreno_gpu_all_small_mib (board:
++             * guamp-gpu-all-smallwin, default 128) instead of the full window, so the 2 GiB of windows leave an app room to grow (fin48: Maps
++             * at ~180 MiB of BOs in a 256 MiB window failed its allocations while three widget extensions held 256 MiB windows each). */
++            uint64_t want=gpuAllConfig(0,192);
++            if(native_adreno_gpu_all_small_mib && native_adreno_gpu_all_small[0]) {
++                char list[sizeof native_adreno_gpu_all_small];
++                strlcpy(list,native_adreno_gpu_all_small,sizeof list);
++                for(char *word=list,*next;word && *word;word=next) {
++                    next=word;while(*next && *next!=',')++next;if(*next)*next++=0;else next=nullptr;
++                    if(*word && nameHolds(name_,sizeof name_,word)) {want=native_adreno_gpu_all_small_mib;break;}
++                }
++            }
++            if(slot<NativeAdrenoAllClients && !g.windows.take(want<<20,gpuAllConfig(1,64)<<20,&win_start,&win_bytes))
+                 slot=NativeAdrenoAllClients;
+             dynamic=slot<NativeAdrenoAllClients;
+         }
