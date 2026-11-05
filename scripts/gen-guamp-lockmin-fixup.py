@@ -12,8 +12,12 @@ Instead the place that applies it is gated on the time since boot:
       ldr x0,[x21,#8]; bl minimumLockscreenIdleTime; fcmp d8,d0; fcsel d0,d0,d8,mi; mov x0,x19; bl setTotalInterval:;
       then the audit reason string (SBIdleTimerIntervalToNSString, addAuditReason:, retain/release)
   replacement (same 16 instructions, 64 bytes, 0x1cfa2f3d8..0x1cfa2f417):
-      d0 = CACurrentMediaTime(); if (d0 >= LIMIT) goto end;            // after LIMIT s of uptime: no floor
-      ldr x0,[x21,#8]; bl minimumLockscreenIdleTime; fcmp; fcsel; mov x0,x19; bl setTotalInterval:; b end; nop; nop
+      d0 = CACurrentMediaTime(); if (d0 >= BOOT + LIMIT) goto end;     // LIMIT s after this boot: no floor
+      ldr x0,[x21,#8]; bl minimumLockscreenIdleTime; fcmp; fcsel; mov x0,x19; bl setTotalInterval:; b end
+  BOOT: the timebase keeps counting across warm resets and fastboot boot (fin48 in RAM: ~570 s at the first log line),
+  so the limit is "movz x9,#LIMIT; movk x9,#0xb007,lsl #16" and the kernel rewrites that pair to the timebase seconds
+  at its start + LIMIT (patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-text-fixup-uptime.patch). A kernel
+  without it leaves 0xb007xxxx s (~93 years): the floor then stays for the whole boot, as with 4b12eb7 alone.
   Only the audit-reason line of the descriptor goes; x19-x21/d8 are callee-saved, so CACurrentMediaTime keeps them.
 
 Every entry is <file>,<offset>,<original>,<replacement> (16 bytes, cs_text_fixup of patches/xnu/native-text-fixup.patch):
@@ -62,6 +66,8 @@ def add_imm(rd, rn, imm):
     assert 0 <= imm < 4096
     return 0x91000000 | (imm << 10) | (rn << 5) | rd
 
+MARK = 0xb007                         # movk x9, #0xb007, lsl #16: "boot-relative" (zzzz...-guamp-text-fixup-uptime.patch)
+
 def build(limit):
     assert 1 <= limit <= 0xffff
     min_stub = bl_target(word(ORIGINAL, 1), VM + 4)      # _objc_msgSend$minimumLockscreenIdleTime
@@ -70,7 +76,9 @@ def build(limit):
         adrp(VM, CA_CURRENT_MEDIA_TIME, 16),
         add_imm(16, 16, CA_CURRENT_MEDIA_TIME & 0xfff),
         0xd63f0200,                                      # blr x16
-        0xd2800000 | (limit << 5) | 9,                   # mov x9, #limit
+        0xd503201f,                                      # nop (the pair below stays inside one 16-byte entry)
+        0xd2800000 | (limit << 5) | 9,                   # movz x9, #limit
+        0xf2a00000 | (MARK << 5) | 9,                    # movk x9, #0xb007, lsl #16 (the kernel adds the boot time)
         0x9e620121,                                      # scvtf d1, x9
         0x1e612000,                                      # fcmp d0, d1
         None,                                            # b.ge end
@@ -81,12 +89,11 @@ def build(limit):
         word(ORIGINAL, 4),                               # mov x0, x19
         None,                                            # bl setTotalInterval:
         None,                                            # b end
-        0xd503201f, 0xd503201f,                          # nop, nop
     ]
-    code[6] = b_ge(VM + 24, END)
-    code[8] = bl(VM + 32, min_stub)
-    code[12] = bl(VM + 48, set_stub)
-    code[13] = b(VM + 52, END)
+    code[8] = b_ge(VM + 32, END)
+    code[10] = bl(VM + 40, min_stub)
+    code[14] = bl(VM + 56, set_stub)
+    code[15] = b(VM + 60, END)
     assert len(code) == 16 and VM + 64 == END
     return struct.pack('<16I', *code)
 
@@ -122,22 +129,22 @@ def main():
         text = disassemble(new)
         assert text, 'aarch64-linux-gnu-objdump needed for --check'
         lines = [l.split('\t', 2)[-1].strip() for l in text.splitlines() if l.strip().startswith('1cfa2f')]
-        want = ['adrp\tx16, 0x18946a000', 'add\tx16, x16, #0xee0', 'blr\tx16', 'mov\tx9, #0x%x' % a.limit, 'scvtf\td1, x9',
-                'fcmp\td0, d1', 'b.ge\t0x1cfa2f418', 'ldr\tx0, [x21, #8]', 'bl\t0x%x' % bl_target(word(ORIGINAL, 1), VM + 4),
-                'fcmp\td8, d0', 'fcsel\td0, d0, d8, mi', 'mov\tx0, x19', 'bl\t0x%x' % bl_target(word(ORIGINAL, 5), VM + 20),
-                'b\t0x1cfa2f418', 'nop', 'nop']
+        want = ['adrp	x16, 0x18946a000', 'add	x16, x16, #0xee0', 'blr	x16', 'nop', 'mov	x9, #0x%x' % a.limit,
+                'movk	x9, #0xb007, lsl #16', 'scvtf	d1, x9', 'fcmp	d0, d1', 'b.ge	0x1cfa2f418', 'ldr	x0, [x21, #8]',
+                'bl	0x%x' % bl_target(word(ORIGINAL, 1), VM + 4), 'fcmp	d8, d0', 'fcsel	d0, d0, d8, mi', 'mov	x0, x19',
+                'bl	0x%x' % bl_target(word(ORIGINAL, 5), VM + 20), 'b	0x1cfa2f418']
         assert len(lines) == 16, lines
         for got, exp in zip(lines, want):
             g = ' '.join(got.split('//')[0].split()); e = ' '.join(exp.split())
             assert g.startswith(e), (g, e)
         # the two message stubs are the ones the original called (decoded from the original bl, re-encoded from the new pc)
-        assert bl_target(word(new, 8), VM + 32) == bl_target(word(ORIGINAL, 1), VM + 4)
-        assert bl_target(word(new, 12), VM + 48) == bl_target(word(ORIGINAL, 5), VM + 20)
+        assert bl_target(word(new, 10), VM + 40) == bl_target(word(ORIGINAL, 1), VM + 4)
+        assert bl_target(word(new, 14), VM + 56) == bl_target(word(ORIGINAL, 5), VM + 20)
         for l in lines: print('  ' + l)
     if a.check:
         for limit in (1, 60, 180, 600, 0xffff):   # every limit encodes, the rest of the code does not move
             other = build(limit)
-            assert other[:12] == new[:12] and other[16:] == new[16:] and word(other, 3) == 0xd2800000 | (limit << 5) | 9
+            assert other[:16] == new[:16] and other[20:] == new[20:] and word(other, 4) == 0xd2800000 | (limit << 5) | 9
         assert all(len(e.split(',')[2]) == 32 == len(e.split(',')[3]) and len(e) < 160 for e in entries(new))
         print('lockmin fixup: PASS')
     for e in entries(new): print(e)
