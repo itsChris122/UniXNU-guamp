@@ -1,0 +1,132 @@
+guamp: metal2vulkan bridge patch 0045, Turnip on an Adreno 6xx takes assumed color-write and half facts (shader cost)
+
+Turnip is in none of metal2vulkan's measured driver tables, so on the A610 every translation took Metal's exact routes: each opaque
+color write rounded in the shader to the code Metal stores (about 20 instructions a channel of BGRA8, about 70 and a 4 KiB table read
+a channel of an sRGB attachment; the render server's messages.log says so on every boot: "shader-color-conversion ... about 35 more
+instructions per normalized or half-float channel"), and every `half` operation ran in `f32` followed by a rounding back to `half`.
+QuartzCore's fixed_frag_lph_cpf is 90 % of the render server's pipeline time (pipelines.log of 20261104-160143: 10233 of 11924
+makings); translated on the host for an A610-like profile, its 199 variants of that journal hold 40964 ALU instructions, 23452 with
+the color facts (-43 %, SPIR-V words -30 %); on the most frequent variant 350 instructions become 215.
+
+bridge/patches/0045 adds, in driver_facts::deviations, for Turnip (driverID MESA_TURNIP, vendor 0x5143, deviceID 0x06xxxxxx: a6xx)
+the facts MetalColorWrites, MetalFloatDenormals, MetalHalfArithmetic, MetalHalfConversion, MetalHalfQuantize and MetalHalfFma. They
+are ASSUMED from what Turnip declares on a6xx (RTE for f32 and f16, f32 denormals flushed as Metal does, f16 denormals flushed where
+Metal keeps them), not measured: a color may differ from Metal's by one code at an exact tie, a `half` result below 2^-14 is flushed.
+With the half facts a `half` sum, difference or product is the device's 16-bit instruction (Turnip lowers it to native fp16, twice
+the rate and half the registers on a6xx, where the A610 has only 48 vec4 registers a fiber), not f32 plus two conversions.
+METAL2VULKAN_GUAMP_ADRENO_FACTS (boot line through guamp-m2v-env, 0019): unset or "all" every fact, "colors" the color writes only,
+"0" none (as before). The facts are in the profile fingerprint, so each choice keys its own shader cache entries. Unit test in the
+patch (cargo test -p metal2vulkan --lib driver_facts: 9 passed, with the pre-existing fast_paths.rs AliasWrites test fix applied
+locally only). Applies after every earlier bridge patch (driver_facts.rs is touched by none of them).
+
+diff --git a/bridge/patches/0045-guamp-adreno-a6xx-assumed-facts.patch b/bridge/patches/0045-guamp-adreno-a6xx-assumed-facts.patch
+new file mode 100644
+index 0000000..c694236
+--- /dev/null
++++ b/bridge/patches/0045-guamp-adreno-a6xx-assumed-facts.patch
+@@ -0,0 +1,105 @@
++diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
++index 7ab0511..89f6825 100644
++--- a/crates/metal2vulkan/src/device/driver_facts.rs
+++++ b/crates/metal2vulkan/src/device/driver_facts.rs
++@@ -925,12 +925,56 @@ pub(crate) fn defects(description: &DeviceDescription) -> BTreeSet<DriverWorkaro
++ 
++ /// The deviations of the driver `description` names, on its GPU's vendor, at its release.
++ pub(crate) fn deviations(description: &DeviceDescription) -> BTreeMap<DriverDeviation, Standing> {
++-    among(
+++    let mut facts = among(
++         DEVIATIONS,
++         description.driver_id,
++         (description.vendor_id, description.device_id),
++         description.driver_version,
++-    )
+++    );
+++    for fact in guamp_adreno_facts(description) {
+++        facts.entry(*fact).or_insert(Standing::Measured);
+++    }
+++    facts
+++}
+++
+++/// guamp (UniXNU-guamp, AdrenoMetal bridge patch 0025): Turnip on an Adreno 6xx (the Moto G9
+++/// Play's A610) is in no table above, so every opaque color write was rounded to Metal's code in
+++/// the shader and every `half` operation ran in `f32` with a rounding after it. On QuartzCore's
+++/// `fixed_frag_lph_cpf` (its 199 variants of one render server) the color rounding alone was 43 %
+++/// of the fragment ALU instructions: about 20 a channel of an opaque BGRA8 write, about 70 and a
+++/// table read a channel of an sRGB one. These facts are ASSUMED from what Turnip declares on
+++/// a6xx, not measured as the rows above are: `f32` and `f16` arithmetic rounding to nearest even,
+++/// `f32` denormals flushed (as Metal flushes them), `f16` denormals flushed where Metal keeps them
+++/// (a difference below 2^-14 only), and the render backend's unorm and sRGB conversion, at most one
+++/// code from Metal's at an exact tie. `METAL2VULKAN_GUAMP_ADRENO_FACTS`: unset or `all` takes every
+++/// one, `colors` the color writes only, `0` none (Metal's exact routes, as before). The facts are
+++/// part of the profile and its fingerprint, so the shader cache keeps each choice's entries apart.
+++pub(crate) const GUAMP_ADRENO_A6XX: &[DriverDeviation] = &[
+++    DriverDeviation::MetalColorWrites,
+++    DriverDeviation::MetalFloatDenormals,
+++    DriverDeviation::MetalHalfArithmetic,
+++    DriverDeviation::MetalHalfConversion,
+++    DriverDeviation::MetalHalfQuantize,
+++    DriverDeviation::MetalHalfFma,
+++];
+++
+++/// Qualcomm's vendor id, as Turnip reports it.
+++const QUALCOMM_VENDOR_ID: u32 = 0x5143;
+++
+++/// The guamp facts `description` takes (`GUAMP_ADRENO_A6XX`): Turnip on a Qualcomm GPU whose
+++/// `deviceID` (Turnip's chip id) is of the 6xx generation, `0x06xxxxxx` (the A610: `0x06010000`).
+++pub(crate) fn guamp_adreno_facts(description: &DeviceDescription) -> &'static [DriverDeviation] {
+++    if description.driver_id != Some(DriverId::MESA_TURNIP)
+++        || description.vendor_id != QUALCOMM_VENDOR_ID
+++        || description.device_id >> 24 != 6
+++    {
+++        return &[];
+++    }
+++    match std::env::var("METAL2VULKAN_GUAMP_ADRENO_FACTS").as_deref() {
+++        Ok("0") | Ok("none") => &[],
+++        Ok("colors") => &GUAMP_ADRENO_A6XX[..1],
+++        _ => GUAMP_ADRENO_A6XX,
+++    }
++ }
++ 
++ /// A driver's measured answer where Vulkan leaves the result undefined, or its measured cost of
++@@ -2236,3 +2280,41 @@ pub(crate) const fn nvidia(major: u32, minor: u32, patch: u32) -> u32 {
++ pub(crate) const fn moltenvk(major: u32, minor: u32, patch: u32) -> u32 {
++     major * 10000 + minor * 100 + patch
++ }
+++
+++
+++#[cfg(test)]
+++mod guamp_adreno_tests {
+++    use super::*;
+++    use crate::device::requirements::ApiVersion;
+++
+++    fn turnip(device_id: u32) -> DeviceDescription {
+++        let mut d = DeviceDescription::new(ApiVersion::V1_3);
+++        d.driver_id = Some(DriverId::MESA_TURNIP);
+++        d.vendor_id = QUALCOMM_VENDOR_ID;
+++        d.device_id = device_id;
+++        d.driver_version = mesa(26, 2, 0);
+++        d
+++    }
+++
+++    // One test for the identities and the switch, which is the process environment.
+++    #[test]
+++    fn a6xx_takes_the_assumed_facts_and_the_switch_holds() {
+++        std::env::remove_var("METAL2VULKAN_GUAMP_ADRENO_FACTS");
+++        let facts = deviations(&turnip(0x0601_0000));
+++        for f in GUAMP_ADRENO_A6XX {
+++            assert_eq!(facts.get(f), Some(&Standing::Measured), "{f:?}");
+++        }
+++        assert!(deviations(&turnip(0x0730_0000)).is_empty(), "an a7xx is not assumed");
+++        let mut other = turnip(0x0601_0000);
+++        other.driver_id = Some(DriverId::MESA_RADV);
+++        assert!(guamp_adreno_facts(&other).is_empty());
+++        std::env::set_var("METAL2VULKAN_GUAMP_ADRENO_FACTS", "colors");
+++        assert_eq!(
+++            deviations(&turnip(0x0601_0000)).into_keys().collect::<Vec<_>>(),
+++            vec![DriverDeviation::MetalColorWrites]
+++        );
+++        std::env::set_var("METAL2VULKAN_GUAMP_ADRENO_FACTS", "0");
+++        assert!(deviations(&turnip(0x0601_0000)).is_empty());
+++        std::env::remove_var("METAL2VULKAN_GUAMP_ADRENO_FACTS");
+++    }
+++}
