@@ -457,6 +457,26 @@ static void testGcamSynthetic() {
   CHECK(pickMode(g, kExp[1], kResFull, -1, &m, ov, &nov) && !m.derived && m.width == 3264 && nov == 0);
   const Mipi mi = mipiOf(kBoard[1], m);
   CHECK(mi.csiphy == 2 && mi.lanes == 4 && mi.laneMbps == 732 && mi.dt == 0x2b && mi.strideBytes == 4080 && mi.laneAssign == 0x3210);
+  CHECK(mi.bayer == camssBayer(m.cfa));
+  // MCLK 19.2 MHz: lane rate and fps 0.8x, line time 1.25x
+  Mode slow = m;
+  const uint64_t lp = m.linePs();
+  modeScaleMclk(&slow, false);
+  CHECK(slow.laneMbps() >= 584 && slow.laneMbps() <= 586 && slow.fpsMilli == m.fpsMilli * 4 / 5);
+  CHECK(slow.linePs() > lp * 124 / 100 && slow.linePs() < lp * 126 / 100);
+  Mode same = m;
+  modeScaleMclk(&same, true);
+  CHECK(same.opPixClk == m.opPixClk && same.fpsMilli == m.fpsMilli);
+}
+
+// CamX colorFilterArrangement -> GuampCamssApi.h bayer (TFE pixel pattern): the blob CFAs of the four sensors.
+static void testBayer() {
+  CHECK(camssBayer(0) == 2);   // BGGR (ov02b10)
+  CHECK(camssBayer(1) == 3);   // GBRG (s5kgm1st)
+  CHECK(camssBayer(2) == 1);   // GRBG (s5k4h7)
+  CHECK(camssBayer(3) == 0);   // RGGB
+  CHECK(camssBayer(4) == 4);   // Y (ov02b1b)
+  CHECK(camssBayer(9) == 0);
 }
 
 // Session over the simulator: open, configure, exposure, stream on/off with a moving frame counter, close.
@@ -556,6 +576,7 @@ static void testGcamFile(const char *path) {
 
 int main(int argc, char **argv) {
   testEncoding();
+  testBayer();
   testLdo();
   testProbe();
   testWriteList();

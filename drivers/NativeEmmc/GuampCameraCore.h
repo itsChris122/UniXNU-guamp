@@ -17,8 +17,8 @@
 namespace gcam {
 
 // ---- errors (negative errno style, like the other cores) ------------------------------------------------------------
-enum : int { kOk = 0, kErrIo = -5, kErrNack = -6, kErrNoMem = -12, kErrInval = -22, kErrRange = -34,
-             kErrTimeout = -110, kErrMismatch = -1000 };
+enum : int { kOk = 0, kErrIo = -5, kErrNack = -6, kErrNoMem = -12, kErrBusy = -16, kErrInval = -22, kErrRange = -34,
+             kErrTimeout = -110, kErrMismatch = -1000, kErrNoTable = -1001 };   // busy: session in use
 
 // ---- PM8008 (camera PMIC, QUP0 SE1 I2C) -----------------------------------------------------------------------------
 constexpr uint8_t kPmChip = 0x08;           // qcom,pm8008@8: MISC, revid, GPIOs

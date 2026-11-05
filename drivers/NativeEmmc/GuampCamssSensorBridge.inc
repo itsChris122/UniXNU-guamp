@@ -4,7 +4,7 @@
 // when GUAMP_CAMSS_SENSOR_BRIDGE is 1, i.e. in a kernel that has that session code; otherwise the weak stand-ins
 // answer GUAMP_CAMSS_SENSOR_ABSENT.
 // mode: 0 = low (GM1ST 1280x720, S5K4H7 1632x1224 binned, OV02B 1600x1200), 1 = full, 16 + n = vendor mode n.
-// The sensor session answers "busy" while the guamp-camera=2 session test of GuampCamera.inc runs: retried 120 s.
+// The sensor session answers kErrBusy while the guamp-camera=2 session test of GuampCamera.inc runs: retried 120 s.
 #ifndef GUAMP_CAMSS_SENSOR_BRIDGE_INC
 #define GUAMP_CAMSS_SENSOR_BRIDGE_INC
 #include "GuampCamssApi.h"
@@ -16,7 +16,7 @@ extern "C" int guamp_camss_sensor_prepare(uint32_t cell, uint32_t mode, struct g
   int r = -1;
   for (unsigned t = 0; t < 60; ++t) {
     r = camera::sensorOpen(cell, res, idx, 10000, 256, &m);
-    if (r != gcam::kErrInval || t == 59) break;   // kErrInval also means "session in use": wait for it
+    if (r != gcam::kErrBusy || t == 59) break;   // session in use (guamp-camera=2 test): wait for it
     IOSleep(2000);
   }
   if (r) return r;
@@ -31,7 +31,7 @@ extern "C" int guamp_camss_sensor_prepare(uint32_t cell, uint32_t mode, struct g
   link->dt = m.dt;
   link->width = m.width;
   link->height = m.height;
-  link->bayer = m.cfa;   // sensor driver CFA code, passed through to the TFE pixel pattern field
+  link->bayer = m.bayer;   // guamp_camss_bayer (Mipi::cfa is the CamX numbering, not the TFE one)
   link->combo = m.combo;
   IOLog("GuampCamss: sensor cell %u mode %u: csiphy %u, %u lanes (%x), %u Mbit/s, settle %u, vc %u dt %x, %ux%u, extra %ux%u dt %x\n",
         cell, mode, m.csiphy, m.lanes, m.laneAssign, m.laneMbps, m.settle, m.vc, m.dt, m.width, m.height, m.extraW, m.extraH,

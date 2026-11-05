@@ -163,6 +163,15 @@ inline bool deriveBinned(const ExpModel &e, const Mode &full, Mode *out, Reg *ov
   return true;
 }
 
+// MCLK 19.2 MHz instead of 24 (GPLL9 not locked): the sensor PLLs are programmed for 24 MHz, so every PLL output
+// (pixel clock, lane rate, fps, line time) is 0.8x. Applied to the chosen mode so the lane rate given to CSIPHY, the
+// fps and the exposure arithmetic (linePs) describe what the sensor really sends.
+inline void modeScaleMclk(Mode *m, bool mclk24) {
+  if (mclk24) return;
+  m->opPixClk = static_cast<uint32_t>(static_cast<uint64_t>(m->opPixClk) * 4u / 5u);
+  m->fpsMilli = m->fpsMilli * 4u / 5u;
+}
+
 // Low: the smallest vendor mode (GM1ST 1280x720 at 364 Mbit/s per lane, the easiest for a first CSIPHY lock); when
 // the only vendor mode is wider than 2000 pixels, its SMIA 2x2 binned form. Full: the largest vendor mode.
 // index < nModes forces that vendor mode. Returns false only when the table has no mode.
@@ -181,13 +190,18 @@ inline bool pickMode(const Gcam &g, const ExpModel &e, Res res, int index, Mode 
   return true;
 }
 
+// CamX colorFilterArrangement (blob, Mode::cfa: 0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB, 4 Y) -> TFE pixel pattern order of
+// GuampCamssApi.h (0 RGGB, 1 GRBG, 2 BGGR, 3 GBRG, 4 mono). The two numberings differ: never pass cfa through.
+constexpr uint8_t kCfaToCamss[5] = {2, 3, 1, 0, 4};
+constexpr uint8_t camssBayer(uint8_t cfa) { return cfa < 5 ? kCfaToCamss[cfa] : 0; }
+
 // What the CAMSS side (CSIPHY/CSID/TFE RDI) needs for one stream.
 struct Mipi {
-  uint8_t cell, csiphy, lanes, combo, dt, vc, settle, cfa;
+  uint8_t cell, csiphy, lanes, combo, dt, vc, settle, cfa;   // cfa: CamX numbering (see camssBayer)
   uint16_t laneAssign, width, height;
   uint32_t laneMbps, strideBytes, fpsMilli;   // strideBytes: packed RAW10 line (width x 10 / 8)
   uint16_t extraW, extraH;
-  uint8_t extraDt, pad;
+  uint8_t extraDt, bayer;                     // bayer: GuampCamssApi.h guamp_camss_bayer of cfa
 };
 inline Mipi mipiOf(const Sensor &s, const Mode &m) {
   const Phy &p = kPhy[s.cell];
@@ -195,7 +209,7 @@ inline Mipi mipiOf(const Sensor &s, const Mode &m) {
   x.cell = s.cell; x.csiphy = p.csiphy; x.lanes = m.lanes; x.combo = p.combo; x.dt = m.dt; x.vc = m.vc; x.settle = m.settle;
   x.cfa = m.cfa; x.laneAssign = p.laneAssign; x.width = m.width; x.height = m.height; x.laneMbps = m.laneMbps();
   x.strideBytes = static_cast<uint32_t>(m.width) * 10u / 8u; x.fpsMilli = m.fpsMilli;
-  x.extraW = m.extraW; x.extraH = m.extraH; x.extraDt = m.extraDt;
+  x.extraW = m.extraW; x.extraH = m.extraH; x.extraDt = m.extraDt; x.bayer = camssBayer(m.cfa);
   return x;
 }
 
@@ -280,6 +294,7 @@ struct Session {
   unsigned nOverlay = 0;
   ExposureApplied exp = {};
   uint8_t state = kOff;
+  bool mclk24 = true;                          // false: MCLK is 19.2 MHz, mode timing scaled by 0.8 (modeScaleMclk)
   unsigned written = 0;                        // registers written by the last list (for the logs)
 
   const ExpModel &model() const { return kExp[s->cell]; }
@@ -320,6 +335,7 @@ struct Session {
     if (state < kPowered || !g) return kErrInval;
     if (g->slave7 != s->slave7 || g->id != s->id || g->addrBytes != s->addrBytes) return kErrMismatch;
     if (!pickMode(*g, model(), res, index, &mode, overlay, &nOverlay)) return kErrRange;
+    modeScaleMclk(&mode, mclk24);
     int r = list(g->init, g->nInit);
     if (r) { note(*o, "sensor: init list failed (written, total)", r, written, g->nInit); return r; }
     r = list(mode.regs, mode.nRegs);

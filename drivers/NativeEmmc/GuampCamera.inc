@@ -27,6 +27,7 @@
 //   guamp-camera-modeidx=<n> force vendor mode n of the table (default: from guamp-camera-res)
 //   guamp-camera-stream=0|1  1: stream on for guamp-camera-stream-ms (default 1000, at most 10000), frame counter
 //                         read before and after (SMIA sensors), then stream off. Default 0: never streams
+//   guamp-camera-s6=0        do not vote pm6125_s6 (RPM smpa6, parent of PM8008 L1P/L2P) on; default 1
 //   guamp-camera-exp-us=<us> first exposure (default 10000), guamp-camera-gain=<Q8> first gain (default 256 = 1x)
 #include "GuampCameraCore.h"
 #include "GuampCameraSensor.h"
@@ -115,9 +116,24 @@ bool rcgUpdate(uint32_t rcg) {
   return false;
 }
 
-// GPLL9 (576 MHz main output) for the 24 MHz MCLK: configured like gpll9_config only when L is still 0, then voted.
+// GPLL9 (576 MHz main output) for the 24 MHz MCLK: configured like gpll9_config only when L is still 0. Like
+// clk_alpha_pll_enable (clk-alpha-pll.c, PLL_MODE bits): with PLL_VOTE_FSM_ENA set the PLL follows the GCC vote
+// (0x79000 bit 9) and reports PLL_ACTIVE_FLAG; without it (gcc-bengal gpll9 has no SUPPORTS_FSM_MODE, so unless the
+// boot chain switched it to FSM the vote alone never starts it) the manual sequence: BYPASSNL, 5 us, RESET_N, wait
+// LOCK_DET, OUTCTRL. What we turned on is turned off again by gpll9Off() (GPLL9 has no other user on this board).
+constexpr uint32_t kPllOutctrl = 1u << 0, kPllBypassnl = 1u << 1, kPllResetN = 1u << 2, kPllFsmEna = 1u << 20,
+                   kPllActive = 1u << 30, kPllLock = 1u << 31;
+constexpr uint32_t kGpll9Vote = 1u << 9;
+uint8_t gGpll9By;                   // 0 not ours, 1 voted by us, 2 enabled by hand
+const char *gGpll9How = "-";
+bool gpll9Running(uint32_t m) { return (m & kPllLock) && ((m & kPllOutctrl) || ((m & kPllFsmEna) && (m & kPllActive))); }
+bool gpll9WaitFor(uint32_t bits) {
+  for (unsigned i = 0; i < 1000; ++i) { if ((rd(gGcc, kGpll9) & bits) == bits) return true; IODelay(2); }
+  return false;
+}
 bool gpll9() {
-  if (rd(gGcc, kGpll9) & (1u << 31)) return true;
+  uint32_t m = rd(gGcc, kGpll9);
+  if (gpll9Running(m)) { gGpll9How = "already running"; return true; }
   if (!rd(gGcc, kGpll9 + 4)) {
     wr(gGcc, kGpll9 + 4, 0x3c);                                       // L: 60 x 19.2 = 1152 MHz
     wr(gGcc, kGpll9 + 8, 0);
@@ -126,9 +142,30 @@ bool gpll9() {
     wr(gGcc, kGpll9 + 0x18, 0x00004289);
     wr(gGcc, kGpll9 + 0x1c, 0x08000000);
   }
-  wr(gGcc, kGccGpll0Vote, rd(gGcc, kGccGpll0Vote) | (1u << 9));
-  for (unsigned i = 0; i < 1000; ++i) { if (rd(gGcc, kGpll9) & (1u << 31)) return true; IODelay(2); }
-  return false;
+  if (m & kPllFsmEna) {
+    if (!(rd(gGcc, kGccGpll0Vote) & kGpll9Vote)) { wr(gGcc, kGccGpll0Vote, rd(gGcc, kGccGpll0Vote) | kGpll9Vote); gGpll9By = 1; }
+    gGpll9How = "fsm vote";
+    return gpll9WaitFor(kPllActive | kPllLock);
+  }
+  gGpll9How = "manual enable";
+  if (m & kPllOutctrl) wr(gGcc, kGpll9, m &= ~kPllOutctrl);           // output off while (re)locking
+  wr(gGcc, kGpll9, m |= kPllBypassnl);
+  IODelay(5);
+  wr(gGcc, kGpll9, m |= kPllResetN);
+  if (!gpll9WaitFor(kPllLock)) { wr(gGcc, kGpll9, m & ~(kPllResetN | kPllBypassnl)); return false; }
+  wr(gGcc, kGpll9, m | kPllOutctrl);
+  gGpll9By = 2;
+  return true;
+}
+void gpll9Off() {
+  if (gGpll9By == 2) {
+    const uint32_t m = rd(gGcc, kGpll9) & ~kPllOutctrl;
+    wr(gGcc, kGpll9, m);
+    wr(gGcc, kGpll9, m & ~(kPllResetN | kPllBypassnl));
+  } else if (gGpll9By == 1) {
+    wr(gGcc, kGccGpll0Vote, rd(gGcc, kGccGpll0Vote) & ~kGpll9Vote);
+  }
+  gGpll9By = 0;
 }
 
 int mclk(void *, unsigned idx, unsigned g, int on) {
@@ -157,25 +194,48 @@ int mclk(void *, unsigned idx, unsigned g, int on) {
 
 const gcam::Ops gOps = {nullptr, pmRead, pmWrite, cciRd, cciWr, gpio, mclk, delayUs, sleepMs, note};
 
-// GDSC + AHB + CCI clock; CCI registers are touched only when all of them report on.
+// GDSC + AHB + CCI clock; CCI registers are touched only when all of them report on. What was already on (GuampCamss.inc
+// open with the TPG, another session) is neither reprogrammed nor turned off by camssDown().
+bool gGdscWasOn, gTopAhbWasOn;
 bool camssUp() {
+  gGdscWasOn = rd(gGcc, kGdscCamssTop) & (1u << 31);
   wr(gGcc, kGdscCamssTop, rd(gGcc, kGdscCamssTop) & ~1u);
   bool gdsc = false;
   for (unsigned i = 0; i < 1000 && !gdsc; ++i) { gdsc = rd(gGcc, kGdscCamssTop) & (1u << 31); if (!gdsc) IODelay(2); }
   const bool cam = branch(kCbcrCameraAhb, true);
-  wr(gGcc, kRcgTopAhb + 4, 0);                                        // TCXO
-  const bool top = rcgUpdate(kRcgTopAhb) && branch(kCbcrTopAhb, true);
+  gTopAhbWasOn = !(rd(gGcc, kCbcrTopAhb) & kCbcrOff);
+  if (!gTopAhbWasOn) wr(gGcc, kRcgTopAhb + 4, 0);                     // TCXO (CAMSS may already run it faster)
+  const bool top = (gTopAhbWasOn || rcgUpdate(kRcgTopAhb)) && branch(kCbcrTopAhb, true);
   wr(gGcc, kRcgCci + 4, 0);                                           // TCXO 19.2 MHz (37.5 MHz needs GPLL0 aux2)
   const bool cci = rcgUpdate(kRcgCci) && branch(kCbcrCci, true);
-  IOLog("GuampCamera: camss: gdsc %s (0x%x), camera_ahb %d, top_ahb %d, cci_0_clk %d\n", gdsc ? "on" : "OFF",
-        rd(gGcc, kGdscCamssTop), cam, top, cci);
+  IOLog("GuampCamera: camss: gdsc %s (0x%x, was %s), camera_ahb %d, top_ahb %d%s, cci_0_clk %d\n", gdsc ? "on" : "OFF",
+        rd(gGcc, kGdscCamssTop), gGdscWasOn ? "on" : "off", cam, top, gTopAhbWasOn ? " (was on)" : "", cci);
   return gdsc && top && cci;
 }
 void camssDown() {
   branch(kCbcrCci, false);
-  branch(kCbcrTopAhb, false);
-  wr(gGcc, kGdscCamssTop, rd(gGcc, kGdscCamssTop) | 1u);
-  IOLog("GuampCamera: camss: cci clock, top ahb off, gdsc collapse requested (0x%x)\n", rd(gGcc, kGdscCamssTop));
+  if (!gTopAhbWasOn) branch(kCbcrTopAhb, false);
+  if (!gGdscWasOn) wr(gGcc, kGdscCamssTop, rd(gGcc, kGdscCamssTop) | 1u);
+  IOLog("GuampCamera: camss: cci clock off, top ahb %s, gdsc %s (0x%x)\n", gTopAhbWasOn ? "left on" : "off",
+        gGdscWasOn ? "left on (was on)" : "collapse requested", rd(gGcc, kGdscCamssTop));
+}
+
+// pm6125_s6 (RPM "smpa" 6, qcom,set 3) is vdd_l1_l2, the parent of PM8008 L1P (s5k4h7 vdig 1.2 V) and L2P (s5kgm1st
+// vdig 1.056 V). pm8008-regulator enables the parent and asks it for vout + qcom,min-dropout-voltage (100 mV) before
+// the LDO: 1.3 V covers both (S6 range 0.304..1.456 V, init 0.304 V: without the vote L1P/L2P have no input and
+// never report VREG_READY). Same request form as the BT LDO votes (swen + uv, active and sleep set).
+// guamp-camera-s6=0 skips it (to see whether the boot chain already left S6 up).
+constexpr uint32_t kS6Uv = 1300000;
+unsigned gS6 = 1;
+bool gS6Voted;
+void s6Vote(bool on) {
+  if (!gS6 || on == gS6Voted) return;
+  const rpm_kvp kv[2] = {{RPM_KEY_SWEN, 4, on ? 1u : 0u}, {RPM_KEY_UV, 4, kS6Uv}};
+  const int a = rpm::request(RPM_SET_ACTIVE, RPM_RES_SMPA, 6, kv, on ? 2 : 1, 500);
+  const int s = rpm::request(RPM_SET_SLEEP, RPM_RES_SMPA, 6, kv, on ? 2 : 1, 500);
+  gS6Voted = on && !a;
+  IOLog("GuampCamera: rpm smpa6 (pm6125_s6, vdd_l1_l2) swen %u%s: active %s, sleep %s\n", on ? 1u : 0u, on ? " 1300000 uV" : "",
+        rpm_err_name(a), rpm_err_name(s));
 }
 
 void cciPins(bool active) {
@@ -207,7 +267,7 @@ gcam::Cci gCciDev = {nullptr};
 const gcam::CciTiming *gTiming = &gcam::kCciFast;
 
 void hwDown() {
-  if (gCamss) { cciPins(false); camssDown(); gCamss = false; }
+  if (gCamss) { cciPins(false); camssDown(); gpll9Off(); gCamss = false; }
   if (gPmUp) {
     for (unsigned n = 1; n <= gcam::kLdos; ++n)
       while (gLdo.users[n - 1]) gcam::ldoOff(gOps, gLdo, n);       // nothing should be left; force it anyway
@@ -215,6 +275,7 @@ void hwDown() {
     IOLog("GuampCamera: off: ldo users %u, pm8008 chip-en %s, mclk off, camss off\n", gcam::ldoUsers(gLdo),
           gChipWasOn ? "left on (was on)" : "cleared");
   }
+  s6Vote(false);                                                     // after the LDOs, like the regulator core
   gPmUp = false;
   gHwUp = false;
 }
@@ -237,10 +298,12 @@ int hwUp() {
   if (!r) { pmGpio1(); r = gcam::pmChip(gOps, true); }
   gPmUp = !r;
   if (!gPmUp) { IOLog("GuampCamera: RESULT FAILED: pm8008 not reachable (rc %d)\n", r); return r ? r : gcam::kErrIo; }
+  s6Vote(true);                                                      // parent of L1P/L2P before any LDO is enabled
   gCamss = camssUp();
   if (!gCamss) { IOLog("GuampCamera: RESULT FAILED: camss clocks/gdsc, CCI not touched\n"); hwDown(); return gcam::kErrTimeout; }
   gMclk24 = gMclkMhz == 24 && gpll9();
-  IOLog("GuampCamera: mclk %s\n", gMclk24 ? "24 MHz (GPLL9 576 MHz / 24)" : "19.2 MHz (TCXO): sensor lane rates and fps x0.8");
+  IOLog("GuampCamera: mclk %s; gpll9 mode 0x%x (%s)\n", gMclk24 ? "24 MHz (GPLL9 576 MHz / 24)" : "19.2 MHz (TCXO): sensor lane rates and fps x0.8",
+        rd(gGcc, kGpll9), gMclkMhz == 24 ? gGpll9How : "not used");
   gTiming = gCciKhz == 100 ? &gcam::kCciStandard : gCciKhz == 1000 ? &gcam::kCciFastPlus : &gcam::kCciFast;
   cciPins(true);
   gCciDev = {&gOps};
@@ -300,9 +363,9 @@ void logStatus(const char *when) {
 
 void logMipi(const gcam::Mipi &m) {
   IOLog("GuampCamera: mipi: cell %u csiphy %u, %u lane (assign 0x%04x, combo %u), %u Mbit/s per lane, dt 0x%02x vc %u, %ux%u RAW10 "
-        "(stride %u), settle %u, %u.%03u fps, cfa %u, extra %ux%u dt 0x%02x%s\n", m.cell, m.csiphy, m.lanes, m.laneAssign, m.combo,
-        gMclk24 ? m.laneMbps : m.laneMbps * 4 / 5, m.dt, m.vc, m.width, m.height, m.strideBytes, m.settle, m.fpsMilli / 1000,
-        m.fpsMilli % 1000, m.cfa, m.extraW, m.extraH, m.extraDt, gMclk24 ? "" : " (MCLK 19.2: x0.8)");
+        "(stride %u), settle %u, %u.%03u fps, cfa %u (camss bayer %u), extra %ux%u dt 0x%02x%s\n", m.cell, m.csiphy, m.lanes, m.laneAssign, m.combo,
+        m.laneMbps, m.dt, m.vc, m.width, m.height, m.strideBytes, m.settle, m.fpsMilli / 1000,
+        m.fpsMilli % 1000, m.cfa, m.bayer, m.extraW, m.extraH, m.extraDt, gMclk24 ? "" : " (MCLK 19.2: rate and fps already x0.8)");
 }
 
 // Powers and configures one sensor, left in standby (not streaming). res 0 low / 1 full, modeIdx forces a vendor mode
@@ -312,8 +375,8 @@ int sensorOpen(unsigned cell, unsigned res, unsigned modeIdx, uint32_t expUs, ui
   if (!gSessionLock) return gcam::kErrNoMem;
   IOLockLock(gSessionLock);
   const gcam::Sensor &s = gcam::kBoard[cell];
-  int r = gSess.state != gcam::kOff ? gcam::kErrInval : 0;
-  if (!r && !gcamLoad()) r = gcam::kErrInval;
+  int r = gSess.state != gcam::kOff ? gcam::kErrBusy : 0;   // one session at a time (callers may retry on busy)
+  if (!r && !gcamLoad()) r = gcam::kErrNoTable;
   if (!r) {
     r = gcam::gcamFind(gGcamData, gGcamLen, s.name, &gTable);
     if (r) IOLog("GuampCamera: %s not in the gcam table (version 2 expected): rc %d\n", s.name, r);
@@ -330,6 +393,8 @@ int sensorOpen(unsigned cell, unsigned res, unsigned modeIdx, uint32_t expUs, ui
     gcam::Reg ov[gcam::kBinRegs];
     unsigned nov = 0;
     gcam::pickMode(gTable, gcam::kExp[cell], rs, idx, &m, ov, &nov);
+    gcam::modeScaleMclk(&m, gMclk24);
+    gSess.mclk24 = gMclk24;
     const gcam::ExposureRequest q = {gcam::linesForNs(m, static_cast<uint64_t>(expUs) * 1000u), gainQ8 ? gainQ8 : 256u, 0};
     r = gSess.configure(rs, idx, q);
     IOLog("GuampCamera: %s configure mode %u%s %ux%u: init %u + mode %u + overlay %u writes, exposure %u lines (%u us) fll %u gain code 0x%x: %s rc %d\n",
@@ -409,7 +474,7 @@ void sessionTest() {
       absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
       counted = !rb && smia;
       frames = static_cast<uint8_t>(b.frameCount - a.frameCount);
-      expected = static_cast<unsigned>(static_cast<uint64_t>(gSess.mode.fpsMilli) * (gMclk24 ? 5u : 4u) / 5u * (ns / 1000000u) / 1000000u);
+      expected = static_cast<unsigned>(static_cast<uint64_t>(gSess.mode.fpsMilli) * (ns / 1000000u) / 1000000u);
       logStatus("streaming");
       IOLog("GuampCamera: %s streamed %u ms: frame counter %u -> %u (%s; mod 256, expected about %u)\n", s.name,
             static_cast<unsigned>(ns / 1000000u), a.frameCount, b.frameCount, counted ? "SMIA 0x0005" : "not available", expected & 0xff);
@@ -451,6 +516,7 @@ void start() {
   PE_parse_boot_argn("guamp-camera-stream-ms", &gStreamMs, sizeof(gStreamMs));
   PE_parse_boot_argn("guamp-camera-exp-us", &gExpUs, sizeof(gExpUs));
   PE_parse_boot_argn("guamp-camera-gain", &gGainQ8, sizeof(gGainQ8));
+  PE_parse_boot_argn("guamp-camera-s6", &gS6, sizeof(gS6));
   af::start();
   if (gMode > 2) gMode = 1;
   if (gDelay > 600) gDelay = 600;
