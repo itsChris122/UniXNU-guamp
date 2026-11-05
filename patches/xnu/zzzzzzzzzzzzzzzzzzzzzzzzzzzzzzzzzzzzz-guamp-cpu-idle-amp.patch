@@ -1,0 +1,251 @@
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index b5b3ba9..22b3ca0 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -333,12 +333,38 @@ platform_cache_disable(void)
+ {
+ }
+ 
++/*
++ * guamp 06/11 (ag-perf-cpu): cpu_idle() calls this before every WFI on non-Apple cores. FlushPoU_Dcache passes
++ * CLIDR_EL1.LoUIS (1 on Cortex-A53/A73) to DCACHE_SET_WAY, whose level argument is 0-based and inclusive: every idle
++ * entry of any core cleaned and invalidated by set/way its L1 and the L2 it shares with the other three cores of the
++ * cluster (SM6115: 16384 lines of the 1 MB Gold L2). With ~1500 idle entries per second per core both L2s were wiped
++ * thousands of times per second and every core ran from DRAM, and the flush itself (tens of us) was counted as idle.
++ * The cores are cache coherent and plain WFI keeps L1 and L2 powered (no PSCI CPU_SUSPEND here: cpu offline and sleep
++ * clean the caches on their own paths), so nothing has to be written back before WFI.
++ *
++ * guamp-idle-flush=0 (default): no cache maintenance before WFI. =1: the original FlushPoU_Dcache (for A/B tests).
++ * guamp_idle_wfi[] counts the idle entries per core and guamp_idle_flush_mach[] the time spent flushing (GuampCore).
++ */
++#define GUAMP_IDLE_CPUS 8
++TUNABLE(uint32_t, guamp_idle_flush, "guamp-idle-flush", 0);
++uint64_t guamp_idle_wfi[GUAMP_IDLE_CPUS];
++uint64_t guamp_idle_flush_mach[GUAMP_IDLE_CPUS];
++
+ void
+ platform_cache_idle_enter(
+ 	void)
+ {
+ 	platform_cache_disable();
+ 
++	unsigned int cpu = (unsigned int)getCpuDatap()->cpu_number;
++	if (cpu < GUAMP_IDLE_CPUS) {
++		guamp_idle_wfi[cpu]++;
++	}
++	if (!guamp_idle_flush) {
++		return;
++	}
++	uint64_t start = mach_absolute_time();
++
+ 	/*
+ 	 * If we're only using a single CPU, just write back any
+ 	 * dirty cachelines.  We can avoid doing housekeeping
+@@ -350,6 +376,9 @@ platform_cache_idle_enter(
+ 	} else {
+ 		FlushPoU_Dcache();
+ 	}
++	if (cpu < GUAMP_IDLE_CPUS) {
++		guamp_idle_flush_mach[cpu] += mach_absolute_time() - start;
++	}
+ }
+ 
+ boolean_t
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index a6568b0..7d44de5 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2375,6 +2375,42 @@ pset_commit_processor_to_new_thread(processor_set_t pset, processor_t processor,
+ }
+ 
+ static processor_t choose_processor_for_realtime_thread(processor_set_t pset, processor_t skip_processor, bool consider_secondaries, bool skip_spills);
++
++/*
++ * guamp 06/11 (ag-perf-cpu): placement by priority inside the single pset (definitions at the end of the file, after
++ * guamp-sched-big). pset->perfcontrol_cpu_preferred_bitmask holds the Gold cores (guamp-sched-big, default 0xf0).
++ * guamp-sched-amp=<base priority> (default 31 = BASEPRI_DEFAULT; 0 = off): an idle core is chosen in the Gold cluster
++ * first for threads at or above it (UI 47, user initiated 37, default 31, kernel threads, realtime), in the Silver
++ * cluster first for those below (utility 20, background 4, maintenance), so background work no longer takes the idle
++ * Gold cores that the next frame needs. Both stay work conserving: with no idle core of the preferred cluster the
++ * other cluster's idle cores are used. guamp-sched-rt-big=1 (default; 0 = off): realtime threads (render server,
++ * audio, display link), which the original code put on the lowest numbered idle core = always a Silver one, take an
++ * idle Gold core first.
++ */
++static uint32_t guamp_sched_amp_pri = BASEPRI_DEFAULT;
++static uint32_t guamp_sched_rt_big = 1;
++static uint64_t guamp_sched_amp_placed[2];   /* idle core chosen: [0] Silver, [1] Gold (GuampCore line) */
++static uint64_t guamp_sched_rt_placed[2];
++
++static inline uint64_t
++guamp_sched_amp_preferred(processor_set_t pset, thread_t thread)
++{
++	uint64_t big = pset->perfcontrol_cpu_preferred_bitmask;
++	if (big == 0 || guamp_sched_amp_pri == 0 || thread->base_pri >= (int)guamp_sched_amp_pri) {
++		return big;
++	}
++	return pset->cpu_bitmask & ~big;
++}
++
++static inline uint64_t
++guamp_sched_amp_avoided(processor_set_t pset, thread_t thread)
++{
++	uint64_t big = pset->perfcontrol_cpu_preferred_bitmask;
++	if (big == 0 || guamp_sched_amp_pri == 0 || thread->base_pri >= (int)guamp_sched_amp_pri) {
++		return pset->perfcontrol_cpu_migration_bitmask;
++	}
++	return big;
++}
+ static processor_t choose_furthest_deadline_processor_for_realtime_thread(processor_set_t pset, int max_pri, uint64_t minimum_deadline,
+     processor_t skip_processor, bool skip_spills, bool include_ast_urgent_pending_cpus);
+ static processor_t choose_next_processor_for_realtime_thread(processor_set_t pset, int max_pri, uint64_t minimum_deadline, processor_t skip_processor, bool consider_secondaries);
+@@ -5170,12 +5206,13 @@ choose_processor(
+ 				 */
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					uint64_t idle_primary_map = (pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask);
+-					uint64_t non_avoided_idle_primary_map = idle_primary_map & ~pset->perfcontrol_cpu_migration_bitmask;
++					uint64_t guamp_avoided = guamp_sched_amp_avoided(pset, thread);   /* guamp-sched-amp */
++					uint64_t non_avoided_idle_primary_map = idle_primary_map & ~guamp_avoided;
+ 					/*
+ 					 * If the rotation bitmask to force a migration is set for this core and there's an idle core that
+ 					 * that needn't be avoided, don't continue running on the same core.
+ 					 */
+-					if (!(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
++					if (!(bit_test(guamp_avoided, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
+ 						return processor;
+ 					}
+ 				}
+@@ -5189,7 +5226,12 @@ choose_processor(
+ 				 * to regain their previous executing processor.
+ 				 */
+ 				if (thread->sched_pri >= BASEPRI_RTQUEUES) {
+-					if (processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
++					/* guamp-sched-rt-big: not back to a busy Silver core while a Gold one is idle. */
++					uint64_t guamp_idle_big = pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map &
++					    pset->recommended_bitmask & pset->perfcontrol_cpu_preferred_bitmask;
++					bool guamp_skip = guamp_sched_rt_big && guamp_idle_big != 0 &&
++					    !bit_test(pset->perfcontrol_cpu_preferred_bitmask, processor->cpu_id);
++					if (!guamp_skip && processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 						return processor;
+ 					}
+ 					processor = PROCESSOR_NULL;
+@@ -5332,7 +5374,9 @@ no_available_cpus:
+ 		 * Choose an idle processor, in pset traversal order
+ 		 */
+ 		uint64_t idle_primary_map = (pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask);
+-		uint64_t preferred_idle_primary_map = idle_primary_map & pset->perfcontrol_cpu_preferred_bitmask;
++		uint64_t guamp_preferred = guamp_sched_amp_preferred(pset, thread);   /* guamp-sched-amp */
++		uint64_t guamp_avoided = guamp_sched_amp_avoided(pset, thread);
++		uint64_t preferred_idle_primary_map = idle_primary_map & guamp_preferred;
+ 
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+@@ -5347,14 +5391,17 @@ no_available_cpus:
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			pset->cpu_preferred_last_chosen = cpuid;
++			if (pset->perfcontrol_cpu_preferred_bitmask) {
++				guamp_sched_amp_placed[bit_test(pset->perfcontrol_cpu_preferred_bitmask, cpuid) ? 1 : 0]++;
++			}
+ 			return processor;
+ 		}
+ 
+ 		/*
+ 		 * Look at the cores that don't need to be avoided next.
+ 		 */
+-		if (pset->perfcontrol_cpu_migration_bitmask != 0) {
+-			uint64_t non_avoided_idle_primary_map = idle_primary_map & ~pset->perfcontrol_cpu_migration_bitmask;
++		if (guamp_avoided != 0) {
++			uint64_t non_avoided_idle_primary_map = idle_primary_map & ~guamp_avoided;
+ 			cpuid = lsb_next(non_avoided_idle_primary_map, pset->cpu_preferred_last_chosen);
+ 			if (cpuid < 0) {
+ 				cpuid = lsb_first(non_avoided_idle_primary_map);
+@@ -8571,6 +8618,18 @@ try_again:
+ 	}
+ 
+ 	cpumap_t primary_map = cpu_map & pset->primary_map;
++
++	/* guamp-sched-rt-big: an available Gold core first (see guamp_sched_amp_preferred). */
++	cpumap_t guamp_big_map = primary_map & pset->perfcontrol_cpu_preferred_bitmask;
++	if (guamp_sched_rt_big && guamp_big_map != 0) {
++		int guamp_cpu = lsb_first(guamp_big_map);
++		guamp_sched_rt_placed[1]++;
++		return processor_array[guamp_cpu];
++	}
++	if (guamp_sched_rt_big && primary_map != 0 && pset->perfcontrol_cpu_preferred_bitmask) {
++		guamp_sched_rt_placed[0]++;
++	}
++
+ 	if (avoid_cpu0) {
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
+@@ -9329,6 +9388,46 @@ struct guamp_sys_top {
+ 	char name[24];
+ };
+ 
++/*
++ * guamp 06/11 (ag-perf-cpu): idle entries (WFI) per second of every core, the time spent in the pre-WFI cache flush when
++ * guamp-idle-flush=1 (osfmk/arm/caches.c), and where guamp-sched-amp / guamp-sched-rt-big put the threads.
++ */
++extern uint64_t guamp_idle_wfi[8];
++extern uint64_t guamp_idle_flush_mach[8];
++static uint64_t guamp_cpu_idle_last_wfi[8];
++static uint64_t guamp_cpu_idle_last_flush[8];
++static uint64_t guamp_cpu_idle_last_placed[4];
++
++static void
++guamp_cpu_idle_report(uint64_t span)
++{
++	char line[400];
++	uint64_t span_ns = 0;
++	absolutetime_to_nanoseconds(span, &span_ns);
++	if (span_ns < NSEC_PER_MSEC) {
++		return;
++	}
++	int len = scnprintf(line, sizeof(line), "GuampIdle: wfi/s, flush us/s per core:");
++	for (int cpu = 0; cpu < 8; cpu++) {
++		uint64_t w = guamp_idle_wfi[cpu], f = guamp_idle_flush_mach[cpu];
++		uint64_t dw = w - guamp_cpu_idle_last_wfi[cpu], df = f - guamp_cpu_idle_last_flush[cpu];
++		guamp_cpu_idle_last_wfi[cpu] = w;
++		guamp_cpu_idle_last_flush[cpu] = f;
++		uint64_t df_ns = 0;
++		absolutetime_to_nanoseconds(df, &df_ns);
++		len += scnprintf(line + len, sizeof(line) - (size_t)len, " c%d %llu/%llu", cpu,
++		    (unsigned long long)(dw * NSEC_PER_SEC / span_ns), (unsigned long long)(df_ns * 1000 / span_ns));
++	}
++	uint64_t placed[4] = { guamp_sched_amp_placed[0], guamp_sched_amp_placed[1], guamp_sched_rt_placed[0], guamp_sched_rt_placed[1] };
++	uint64_t d[4];
++	for (int i = 0; i < 4; i++) {
++		d[i] = placed[i] - guamp_cpu_idle_last_placed[i];
++		guamp_cpu_idle_last_placed[i] = placed[i];
++	}
++	printf("%s; idle picks silver/gold %llu/%llu, realtime silver/gold %llu/%llu\n", line,
++	    (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3]);
++}
++
+ static void
+ guamp_sys_kthr_report(void)
+ {
+@@ -9361,6 +9460,7 @@ guamp_sys_kthr_report(void)
+ 	}
+ 	if (span) {
+ 		printf("%s (guamp-sched-big %llx)\n", line, (unsigned long long)pset0.perfcontrol_cpu_preferred_bitmask);
++		guamp_cpu_idle_report(span);
+ 	}
+ 
+ 	/* kernel_task threads by CPU time used since the previous report. */
+@@ -9464,6 +9564,15 @@ guamp_sys_init(void)
+ 	printf("guamp-sched-big: preferred cores %llx, avoided when a preferred one is idle %llx\n",
+ 	    (unsigned long long)pset0.perfcontrol_cpu_preferred_bitmask, (unsigned long long)pset0.perfcontrol_cpu_migration_bitmask);
+ 
++	if (PE_parse_boot_argn("guamp-sched-amp", &value, sizeof(value))) {
++		guamp_sched_amp_pri = value > MAXPRI ? MAXPRI : value;
++	}
++	if (PE_parse_boot_argn("guamp-sched-rt-big", &value, sizeof(value))) {
++		guamp_sched_rt_big = value ? 1 : 0;
++	}
++	printf("guamp-sched-amp: base priority %u and above on Gold first, below on Silver first (0 = off); realtime on Gold first %u\n",
++	    guamp_sched_amp_pri, guamp_sched_rt_big);
++
+ 	if (PE_parse_boot_argn("guamp-kthr", &value, sizeof(value))) {
+ 		guamp_sys_kthr = value ? 1 : 0;
+ 	}

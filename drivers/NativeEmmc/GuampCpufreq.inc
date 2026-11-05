@@ -24,12 +24,15 @@ static const char *const kNames[2] = {"silver cpu0-3", "gold cpu4-7"};
 
 // Live check (03/11, guamp-cpufreq-live=1 default, =0 off): every minute one line per domain with the PERF_STATE request
 // read back, the LMh limit register (DT qcom,limits-dcvs: msm_lmh_dcvs.c reads domain + 0x704, frequency = bits 9:0 x XO) and
-// the domain cycle counter (REG_CYCLE_CNTR 0x9c0; bengal has qcom,no-accumulative-counter = one counter per domain) as average
-// MHz since the previous line. Only reads: whether the cores really run at the state we asked for, or the hardware limits them.
+// the domain cycle counter (REG_CYCLE_CNTR 0x9c0; bengal has qcom,no-accumulative-counter = one counter per domain).
+// Only reads: whether the cores really run at the state we asked for, or the hardware limits them.
+// 06/11 (ag-perf-cpu): the counter is 32 bits and wraps every ~2.1 s at 2016 MHz, so the old average over one minute
+// (fin50: 13-21 MHz) was the wrapped remainder, not a frequency. Now two short windows, both well under one wrap:
+// "sleep" = 20 ms of IOSleep (the domain's cores may be in WFI) and "spin" = 2 ms of IODelay on this thread's core
+// (cluster shown from MPIDR_EL1 Aff1: 0 Silver, 1 Gold), whose domain then has at least one running core.
 constexpr uint32_t kLmhReq = 0x704, kCycles = 0x9c0;
 static volatile uint8_t *gBase[2];
-static uint32_t gKhz[2][kMaxRows], gRows[2], gLastCycles[2];
-static uint64_t gLastNs[2];
+static uint32_t gKhz[2][kMaxRows], gRows[2];
 static uint32_t rd(volatile uint8_t *b, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(b + off); }
 static void wr(volatile uint8_t *b, uint32_t off, uint32_t v) {
   *reinterpret_cast<volatile uint32_t *>(b + off) = v;
@@ -101,6 +104,12 @@ void start() {
 }
 }  // namespace cpufreq
 
+static uint64_t nowNs() {
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns;
+}
+
 void guamp_cpufreq_live() {
   using namespace cpufreq;
   static int enabled = -1;
@@ -110,18 +119,31 @@ void guamp_cpufreq_live() {
     enabled = v ? 1 : 0;
   }
   if (!enabled) return;
+  uint32_t c0[2] = {}, c1[2] = {}, c2[2] = {};
+  const uint64_t t0 = nowNs();
+  for (unsigned d = 0; d < 2; ++d)
+    if (gBase[d]) c0[d] = rd(gBase[d], kCycles);
+  IOSleep(20);
+  const uint64_t t1 = nowNs();
+  for (unsigned d = 0; d < 2; ++d)
+    if (gBase[d]) c1[d] = rd(gBase[d], kCycles);
+  uint64_t mpidr = 0;
+  __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+  IODelay(2000);
+  const uint64_t t2 = nowNs();
+  for (unsigned d = 0; d < 2; ++d)
+    if (gBase[d]) c2[d] = rd(gBase[d], kCycles);
+  const uint64_t sleepUs = t1 > t0 ? (t1 - t0) / 1000 : 0, spinUs = t2 > t1 ? (t2 - t1) / 1000 : 0;
   for (unsigned d = 0; d < 2; ++d) {
     volatile uint8_t *b = gBase[d];
     if (!b) continue;
-    const uint32_t state = rd(b, kPerfState), lmh = rd(b, kLmhReq), cycles = rd(b, kCycles);
-    uint64_t now = 0;
-    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
-    const uint64_t span = gLastNs[d] && now > gLastNs[d] ? now - gLastNs[d] : 0;
-    const uint32_t delta = cycles - gLastCycles[d];   // 32-bit counter, wraps
-    gLastNs[d] = now;
-    gLastCycles[d] = cycles;
-    IOLog("GuampCpufreq: %s live: state %u (%u MHz), LMh limit reg %08x (%u MHz), cycle counter %08x avg %llu MHz over %llu ms\n",
-          kNames[d], state, state < gRows[d] ? gKhz[d][state] / 1000 : 0, lmh, (lmh & 0x3ffu) * kXoKhz / 1000, cycles,
-          span ? static_cast<unsigned long long>(delta) * 1000ULL / span : 0ULL, static_cast<unsigned long long>(span / 1000000ULL));
+    const uint32_t state = rd(b, kPerfState), lmh = rd(b, kLmhReq);
+    const uint32_t sleepCycles = c1[d] - c0[d], spinCycles = c2[d] - c1[d];   // 32 bits: no wrap within 20 ms
+    IOLog("GuampCpufreq: %s live: state %u (%u MHz), LMh limit reg %08x (%u MHz), counter MHz sleep %llu over %llu us, "
+          "spin %llu over %llu us (spinning on cluster %llu)\n",
+          kNames[d], state, state < gRows[d] ? gKhz[d][state] / 1000 : 0, lmh, (lmh & 0x3ffu) * kXoKhz / 1000,
+          sleepUs ? static_cast<unsigned long long>(sleepCycles) / sleepUs : 0ULL, static_cast<unsigned long long>(sleepUs),
+          spinUs ? static_cast<unsigned long long>(spinCycles) / spinUs : 0ULL, static_cast<unsigned long long>(spinUs),
+          static_cast<unsigned long long>((mpidr >> 8) & 0xff));
   }
 }
