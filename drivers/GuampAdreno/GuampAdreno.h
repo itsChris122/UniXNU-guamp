@@ -41,11 +41,12 @@ enum {
 };
 int guamp_adreno_start(const struct GuampAdrenoStart *start);
 
-// guamp-copy-gpu-wait: waits (sleeping, thread context) until the CP timestamp reaches the newest fence handed out at the call, at
+// guamp-copy-gpu-wait: waits (sleeping, thread context) until the CP timestamp reaches the render server's last fence at the call
+// (guamp-copy-wait-compositor=1, default, patch 0017; the newest fence handed out with 0 or before its first submission), at
 // most timeout_us. 0 done (also when nothing was ever submitted), 1 timed out, -1 no ring (not started, poisoned or parked).
 // *waited_us: the time spent. NativeLegacyDisplay (scripts/guamp-canvas-variant.py) holds a weak stand-in that answers -1.
 int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited_us);
-// The same ring, read only: *submitted the newest fence handed out, *retired the CP timestamp of the fence page. 0, or -1 without a
+// The same ring, read only: *submitted the fence the wait above would wait for, *retired the CP timestamp of the fence page. 0, or -1 without a
 // ring (as above). NativeLegacyDisplay's latest-frame copy compares *submitted before and after a copy (more GPU work since: the
 // surface may have changed) and holds a weak stand-in that answers -1.
 int guamp_adreno_ring_marks(uint32_t *submitted, uint32_t *retired);

@@ -64,6 +64,13 @@ extern volatile uint32_t native_adreno_client_cleans, native_adreno_reassert_mod
 // patches/native-adreno/0013: imports the GPU only reads cleaned when mapped and every N-th submission (guamp-adreno-ro-imports-owned,
 // default 1; 0 = at every submission) (guamp-adreno-ro-imports-sweep, default 32; 0 = never).
 extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_imports_sweep;
+// patches/native-adreno/0017 (NativeAdrenoProcFence.h): the render server's last fence, the reader of the CP timestamp the soft
+// priority uses, and its switches (guamp-gpu-other-depth, default 2, 0 off, max 4; guamp-gpu-other-wait-us, default 50000).
+extern volatile uint32_t native_adreno_compositor_fence, native_adreno_other_depth, native_adreno_other_wait_us;
+extern uint32_t (*native_adreno_retired_fence)(void);
+// guamp-copy-wait-compositor (default 1): the display copy (guamp_adreno_wait_submitted, guamp_adreno_ring_marks) follows the render
+// server's last fence instead of the ring's newest; 0, or before the render server's first submission: the ring's newest, as before.
+volatile uint32_t gCopyWaitCompositor = 1;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 // patches/native-adreno/0014: the process that last submitted from the window holding an address, and the ban of a process.
@@ -775,12 +782,27 @@ int naAccelerator() {
 // only the ring object's newest fence number and the CP-written timestamp of the fence page (+4, write-combined kernel memory, no
 // GPU register); never retires or accounts a fence and never runs the hang detector, so it needs no GPU lock. Sleeps until the GPU
 // interrupt or 200 us per round; with interrupts off or preemption disabled it spins 20 us per round.
+// The fence the display copy waits for: the render server's last one (patch 0017), else the ring's newest. The CP runs the ring in
+// order, so the render server's fence covers every job queued before it (the app frames it composites); app jobs queued after it no
+// longer keep the screen waiting (05/11 Maps: 43 copy waits timed out at 500 ms behind the app's own work).
+static uint32_t copyTarget(NativeAdrenoRing *ring) {
+  const uint32_t newest = ring->lastSubmitted();
+  const uint32_t own = gCopyWaitCompositor ? __atomic_load_n(&native_adreno_compositor_fence, __ATOMIC_ACQUIRE) : 0u;
+  return own && int32_t(newest - own) >= 0 ? own : newest;
+}
+// patch 0017: the CP timestamp of the fence page (the newest fence the GPU retired), for the soft priority; 0 without a ring.
+static uint32_t retiredFence(void) {
+  const volatile uint8_t *page = gSession.ncpu[2];
+  if (!page || gSession.nb[2].bytes < 8) return 0;
+  __asm__ volatile("dsb sy" ::: "memory");
+  return *reinterpret_cast<const volatile uint32_t *>(page + 4);
+}
 extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited_us) {
   if (waited_us) *waited_us = 0;
   NativeAdrenoRing *ring = gRing;
   const volatile uint8_t *page = gSession.ncpu[2];
   if (!ring || !page || gSession.nb[2].bytes < 8 || ring->poisoned() || gGpuParked) return -1;
-  const uint32_t target = ring->lastSubmitted();
+  const uint32_t target = copyTarget(ring);
   if (!target) return 0;
   const uint64_t start = naNow(nullptr);
   for (;;) {
@@ -806,7 +828,7 @@ extern "C" int guamp_adreno_ring_marks(uint32_t *submitted, uint32_t *retired) {
   NativeAdrenoRing *ring = gRing;
   const volatile uint8_t *page = gSession.ncpu[2];
   if (!ring || !page || gSession.nb[2].bytes < 8 || ring->poisoned() || gGpuParked) return -1;
-  if (submitted) *submitted = ring->lastSubmitted();
+  if (submitted) *submitted = copyTarget(ring);
   __asm__ volatile("dsb sy" ::: "memory");
   if (retired) *retired = *reinterpret_cast<const volatile uint32_t *>(page + 4);
   return 0;
@@ -832,6 +854,15 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   }
   native_adreno_reassert_check = bootArg("guamp-adreno-reassert-check", 64);
   native_adreno_wc_quiet_us = bootArg("guamp-adreno-reassert-quiet-us", 100000);
+  gCopyWaitCompositor = bootArg("guamp-copy-wait-compositor", 1) ? 1 : 0;
+  {
+    const uint32_t depth = bootArg("guamp-gpu-other-depth", 2);
+    native_adreno_other_depth = depth > 4 ? 4 : depth;
+  }
+  native_adreno_other_wait_us = bootArg("guamp-gpu-other-wait-us", 50000);
+  native_adreno_retired_fence = &retiredFence;
+  IOLog("GuampAdreno: display copy waits for the render server's fence %u; other processes at most %u submissions in flight "
+        "(wait up to %u us)\n", gCopyWaitCompositor, native_adreno_other_depth, native_adreno_other_wait_us);
   native_adreno_ro_imports_owned = bootArg("guamp-adreno-ro-imports-owned", 1) ? 1 : 0;
   native_adreno_ro_imports_sweep = bootArg("guamp-adreno-ro-imports-sweep", 32);
   IOLog("GuampAdreno: read-only imports cleaned at map only %u, swept every %u submissions\n", native_adreno_ro_imports_owned,

@@ -58,6 +58,13 @@ if [ -e "$WORK/na/NativeAdrenoReassertPlan.h" ]; then
 else
   echo "NativeAdrenoReassertPlan.h missing (patch 0012 not applied)"; rc=1
 fi
+echo "== render server fence and soft priority (patch 0017, NativeAdrenoProcFence.h): clang (ASan/UBSan) and gcc"
+if [ -e "$WORK/na/NativeAdrenoProcFence.h" ]; then
+  clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/proc_fence_host.cpp" -o "$WORK/proc_fence" && "$WORK/proc_fence" || rc=1
+  g++ $FLAGS -Wvolatile -I "$WORK/na" "$HERE/proc_fence_host.cpp" -o "$WORK/proc_fence_gcc" && "$WORK/proc_fence_gcc" >/dev/null || rc=1
+else
+  echo "NativeAdrenoProcFence.h missing (patch 0017 not applied)"; rc=1
+fi
 extract() {   # source output: the statements of dropViews between "if(!view)return;" and "view->release();"
   python3 -I - "$1" "$2" <<'PY' || return 1
 import sys

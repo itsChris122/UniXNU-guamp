@@ -1,0 +1,170 @@
+guamp: per-process fences on the single ring: the display copy waits for the render server (backboardd) last fence instead of the ring newest, and soft priority: other processes keep at most guamp-gpu-other-depth submissions in flight (their next submit waits outside the GPU lock, at most guamp-gpu-other-wait-us)
+
+diff --git a/NativeAdrenoProcFence.h b/NativeAdrenoProcFence.h
+new file mode 100644
+index 0000000..37c9813
+--- /dev/null
++++ b/NativeAdrenoProcFence.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_PROC_FENCE_H
++#define NATIVE_ADRENO_PROC_FENCE_H
++#include <stdint.h>
++/* guamp (UniXNU-guamp patches/native-adreno/0017): the fences of each process's last submissions, on the single ring of this GPU
++ * (no preemption: the CP runs the ring in order, so a job waits for every job queued before it).
++ *  - The display copy waits for the render server's last fence (native_adreno_compositor_fence), not the ring's newest: the
++ *    swapped surface is the render server's work, and an app's jobs queued after it no longer hold the screen (05/11 Maps: 43
++ *    copy waits timed out at 500 ms, 0.3-2.6 fps).
++ *  - Soft priority: a process other than the render server may have at most `depth` submissions in flight; its next submission
++ *    waits (outside the GPU lock, at most a time limit) until the one `depth` back retired, so a render server job queues behind at
++ *    most `depth` jobs of each app instead of a whole backlog. */
++enum {NativeAdrenoProcFenceSlots=16,NativeAdrenoProcFenceHistory=4};
++struct NativeAdrenoProcFence {
++    int32_t pid;          /* 0: free */
++    uint32_t count;       /* submissions recorded */
++    uint32_t last[NativeAdrenoProcFenceHistory];   /* fence of submission i at last[i % History] */
++    bool compositor;      /* the render server (backboardd) */
++    char name[20];
++};
++/* Fence a process must see retired before its next submission, with at most `depth` in flight (0: none to wait for). */
++static inline uint32_t nativeAdrenoThrottleTarget(const NativeAdrenoProcFence &p,uint32_t depth)
++{
++    if(!depth || depth>NativeAdrenoProcFenceHistory || p.count<depth)return 0;
++    return p.last[(p.count-depth)%NativeAdrenoProcFenceHistory];
++}
++static inline bool nativeAdrenoFenceRetired(uint32_t retired,uint32_t fence) {return !fence || (int32_t)(retired-fence)>=0;}
++static inline void nativeAdrenoNoteFence(NativeAdrenoProcFence &p,uint32_t fence)
++{
++    p.last[p.count%NativeAdrenoProcFenceHistory]=fence;p.count=p.count+1;
++}
++/* The slot of pid, or the one to take for it: a free one, else the one whose last fence is oldest. */
++static inline unsigned nativeAdrenoProcSlot(const NativeAdrenoProcFence *table,int32_t pid,bool *found)
++{
++    *found=false;
++    if(pid<=0)return NativeAdrenoProcFenceSlots;   /* the kernel's own submissions are nobody's */
++    for(unsigned i=0;i<NativeAdrenoProcFenceSlots;++i)if(table[i].pid==pid) {*found=true;return i;}
++    for(unsigned i=0;i<NativeAdrenoProcFenceSlots;++i)if(!table[i].pid)return i;
++    unsigned take=0;
++    for(unsigned i=1;i<NativeAdrenoProcFenceSlots;++i) {
++        const NativeAdrenoProcFence &a=table[i],&b=table[take];
++        const uint32_t na=a.count?a.last[(a.count-1)%NativeAdrenoProcFenceHistory]:0,nb=b.count?b.last[(b.count-1)%NativeAdrenoProcFenceHistory]:0;
++        if((int32_t)(na-nb)<0)take=i;
++    }
++    return take;
++}
++static inline bool nativeAdrenoIsCompositor(const char *name)
++{
++    static const char want[]="backboardd";
++    for(unsigned i=0;i<sizeof want;++i)if(name[i]!=want[i])return false;
++    return true;
++}
++#endif
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 154c08f..6785417 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -19,6 +19,10 @@
+ #include <string.h>
+ #include <kern/thread.h>
+ #include "NativeAdrenoUserClient.h"
++#include "NativeAdrenoProcFence.h"
++/* guamp 0017 (NativeAdrenoSubmit.cpp) */
++extern "C" {extern uint32_t (*native_adreno_retired_fence)(void);extern volatile uint32_t native_adreno_other_wait_us;
++    extern volatile uint64_t native_adreno_throttle_stats[4];uint32_t native_adreno_throttle_target(void);}
+ 
+ extern "C" void proc_selfname(char *, int);
+ /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
+@@ -659,6 +663,27 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
+         native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
+         if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+     } else {
++        /* guamp (patches/native-adreno/0017, NativeAdrenoProcFence.h): soft priority on the single ring. A process other than the render
++         * server keeps at most guamp-gpu-other-depth submissions in flight: its next one first waits, outside the lock (the render
++         * server's own submissions go on meanwhile), for the one that many back, at most guamp-gpu-other-wait-us. */
++        if(method==NativeAdrenoMethodSubmit && connection->other_ && connection->live_ && g.clock.now_us && native_adreno_retired_fence) {
++            const uint32_t target=native_adreno_throttle_target();
++            if(target && !nativeAdrenoFenceRetired(native_adreno_retired_fence(),target)) {
++                const uint64_t began=g.clock.now_us(g.clock.cookie),limit=native_adreno_other_wait_us;
++                uint64_t waited=0;bool done=false;
++                for(;;) {
++                    if((done=nativeAdrenoFenceRetired(native_adreno_retired_fence(),target)))break;
++                    waited=g.clock.now_us(g.clock.cookie)-began;
++                    if(waited>=limit)break;
++                    if(!g.clock.idle || g.clock.idle(g.clock.cookie))IODelay(50);
++                }
++                waited=g.clock.now_us(g.clock.cookie)-began;
++                native_adreno_throttle_stats[0]=native_adreno_throttle_stats[0]+1;
++                if(!done)native_adreno_throttle_stats[1]=native_adreno_throttle_stats[1]+1;
++                native_adreno_throttle_stats[2]=native_adreno_throttle_stats[2]+waited;
++                if(waited>native_adreno_throttle_stats[3])native_adreno_throttle_stats[3]=waited;
++            }
++        }
+         IOLockLock(g.lock);
+         /* guamp-gpu-all: the limits of a process other than the render server, checked and counted under the same lock as the call. */
+         const bool limited=native_adreno_gpu_all && connection->other_ && connection->live_;
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index 7a9e83e..769eeb1 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -2,6 +2,7 @@
+ #include "NativeAdrenoSubmit.h"
+ #include "AdrenoPM4.h"
+ #include "NativeAdrenoReassertPlan.h"
++#include "NativeAdrenoProcFence.h"
+ extern "C" {extern volatile uint32_t native_adreno_ro_imports_sweep;}   /* guamp 0013: NativeAdrenoVm.cpp */
+ #include <IOKit/IOLib.h>
+ #include <kern/clock.h>
+@@ -144,6 +145,45 @@ static void noteWindowOwner(uint64_t start,uint64_t bytes)
+     NativeAdrenoWindowOwner &o=native_adreno_window_owners[free_slot];
+     o.start=start;o.bytes=bytes;o.pid=pid;proc_selfname(o.name,sizeof o.name);
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0017, NativeAdrenoProcFence.h): each process's last fences, written under the GPU lock by
++ * submit(), read without it (fences only grow: a stale read waits a little more or less). native_adreno_compositor_fence: the render
++ * server's last fence (0 none yet). native_adreno_retired_fence: the board's reader of the CP timestamp (null: no soft priority).
++ * native_adreno_other_depth (guamp-gpu-other-depth, default 2, 0 off, max 4) and native_adreno_other_wait_us (guamp-gpu-other-wait-us,
++ * default 50000). native_adreno_throttle_stats: [0] submissions that waited, [1] of them up to the limit, [2] us waited, [3] longest. */
++extern "C" {
++NativeAdrenoProcFence native_adreno_proc_fences[NativeAdrenoProcFenceSlots];
++volatile uint32_t native_adreno_compositor_fence,native_adreno_other_depth=2,native_adreno_other_wait_us=50000;
++uint32_t (*native_adreno_retired_fence)(void);
++volatile uint64_t native_adreno_throttle_stats[4];
++}
++static void noteProcessFence(uint32_t fence)
++{
++    const int32_t pid=proc_selfpid();
++    bool found=false;
++    const unsigned slot=nativeAdrenoProcSlot(native_adreno_proc_fences,pid,&found);
++    if(slot>=NativeAdrenoProcFenceSlots)return;
++    NativeAdrenoProcFence &p=native_adreno_proc_fences[slot];
++    if(!found) {
++        p=NativeAdrenoProcFence{};
++        proc_selfname(p.name,sizeof p.name);p.name[sizeof p.name-1]=0;
++        p.compositor=nativeAdrenoIsCompositor(p.name);
++        __atomic_store_n(&p.pid,pid,__ATOMIC_RELEASE);
++    }
++    nativeAdrenoNoteFence(p,fence);
++    if(p.compositor)__atomic_store_n(&native_adreno_compositor_fence,fence,__ATOMIC_RELEASE);
++}
++/* The fence the calling process must see retired before it submits again (0: none, or the render server, or the switch off). */
++extern "C" uint32_t native_adreno_throttle_target(void)
++{
++    const uint32_t depth=native_adreno_other_depth;
++    if(!depth || !native_adreno_retired_fence)return 0;
++    const int32_t pid=proc_selfpid();
++    for(unsigned i=0;i<NativeAdrenoProcFenceSlots;++i) {
++        const NativeAdrenoProcFence &p=native_adreno_proc_fences[i];
++        if(__atomic_load_n(&p.pid,__ATOMIC_ACQUIRE)==pid && pid)return p.compositor?0:nativeAdrenoThrottleTarget(p,depth);
++    }
++    return 0;
++}
+ static bool bannedCaller()
+ {
+     const int32_t pid=proc_selfpid();
+@@ -364,6 +404,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+     ++stats_.submissions;
+     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
+     *fence=value;
++    noteProcessFence(value);   /* guamp 0017 (the kernel's own submissions, pid 0, are not recorded) */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingClock *clock,
