@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,157 @@
+@@ -650,6 +650,222 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -53,6 +53,15 @@
 + *   guamp-oslog-procs=a,b,c       own list instead of the default (process names; p_comm keeps 16 characters)
 + *   guamp-oslog-lines=<n>         lines at most in the whole boot (default 3000)
 + *   guamp-oslog-level=1|2         also OS_ACTIVITY_MODE=info (1) or debug (2): more lines, more noise
++ *   guamp-oslog-skip=a,b          05/11: lines containing any of these substrings are dropped (not counted)
++ *   guamp-oslog-only=a,b          05/11: only lines containing one of these substrings are kept (not counted otherwise)
++ *   guamp-oslog-dedup=0           05/11: keep repeated lines; by default a line identical to one of the last 16
++ *                                 kept is dropped and counted ("repeated N times" at 10, 100, 1000, ...)
++ * 05/11 (fin49, wifid): libsystem_trace honours OS_ACTIVITY_DT_MODE/OS_ACTIVITY_MODE only when
++ * amfi_check_dyld_policy_self() (mac_syscall "AMFI", 90) answers with bit 8 (allow development environment
++ * variables, _os_trace_allow_development_env_vars); on a release build platform daemons never get it, so wifid wrote
++ * nothing but AssertMacros lines (those go to stderr directly). For the listed processes __mac_syscall (mac_base.c)
++ * now adds that bit (guamp_oslog_amfi_policy); guamp-oslog-amfi=0 turns this off.
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
 + */
@@ -62,6 +71,10 @@
 +static int guamp_oslog_level;
 +static SInt32 guamp_oslog_left;
 +static int guamp_oslog_state = -1;	/* -1 not read yet, 0 off, 1 on */
++static char guamp_oslog_skip[256];
++static char guamp_oslog_only[256];
++static int guamp_oslog_dedup = 1;
++static int guamp_oslog_amfi = 1;
 +
 +static int
 +guamp_oslog_enabled(void)
@@ -81,6 +94,14 @@
 +	}
 +	PE_parse_boot_argn("guamp-oslog-lines", &lines, sizeof(lines));
 +	PE_parse_boot_argn("guamp-oslog-level", &level, sizeof(level));
++	if (!PE_parse_boot_arg_str("guamp-oslog-skip", guamp_oslog_skip, sizeof(guamp_oslog_skip))) {
++		guamp_oslog_skip[0] = '\0';
++	}
++	if (!PE_parse_boot_arg_str("guamp-oslog-only", guamp_oslog_only, sizeof(guamp_oslog_only))) {
++		guamp_oslog_only[0] = '\0';
++	}
++	PE_parse_boot_argn("guamp-oslog-dedup", &guamp_oslog_dedup, sizeof(guamp_oslog_dedup));
++	PE_parse_boot_argn("guamp-oslog-amfi", &guamp_oslog_amfi, sizeof(guamp_oslog_amfi));
 +	guamp_oslog_left = lines > 0 ? lines : 0;
 +	guamp_oslog_level = level;
 +	os_atomic_store(&guamp_oslog_state, 1, release);
@@ -143,6 +164,34 @@
 +	return n;
 +}
 +
++#include "guamp_oslog_filter.h"
++
++/* 05/11: the AMFI dyld policy answer with "development environment variables allowed" (see the comment at the top). */
++int guamp_oslog_amfi_policy(struct proc *p, int call, user_addr_t arg, int error);
++int
++guamp_oslog_amfi_policy(struct proc *p, int call, user_addr_t arg, int error)
++{
++	uint64_t req[2], flags = 0;	/* { pid or 0, user address of the 64-bit flags } (libsystem_trace, arm64) */
++
++	if (call != 90 || arg == USER_ADDR_NULL || !guamp_oslog_enabled() || !guamp_oslog_amfi ||
++	    !proc_is64bit(p) || !guamp_oslog_match(p->p_comm)) {
++		return error;
++	}
++	if (copyin(arg, req, sizeof(req)) != 0 || req[1] == 0) {
++		return error;
++	}
++	if (error == 0 && copyin((user_addr_t)req[1], &flags, sizeof(flags)) != 0) {
++		return error;
++	}
++	flags |= GUAMP_AMFI_DEV_ENV_VARS;
++	if (copyout(&flags, (user_addr_t)req[1], sizeof(flags)) != 0) {
++		return error;
++	}
++	return 0;
++}
++
++static struct guamp_oslog_ring guamp_oslog_recent;
++
 +static void
 +guamp_oslog_tee(struct proc *p, int fd, uio_t uio)
 +{
@@ -174,6 +223,22 @@
 +			char saved = *nl;
 +			*nl = '\0';
 +			if (nl != line) {
++				unsigned repeats = 0;
++				int keep = guamp_oslog_keep(line, guamp_oslog_skip, guamp_oslog_only);
++				if (keep && guamp_oslog_dedup) {
++					keep = guamp_oslog_ring_note(&guamp_oslog_recent, (uint32_t)proc_getpid(p), line, &repeats);
++				}
++				if (!keep) {
++					if (repeats != 0 && guamp_oslog_left > 0) {
++						printf("guamp oslog: %s[%d] (a line seen before, repeated %u times)\n", p->p_comm,
++						    proc_getpid(p), repeats);
++					}
++					if (saved == '\0') {
++						break;
++					}
++					line = nl + 1;
++					continue;
++				}
 +				SInt32 left = OSAddAtomic(-1, &guamp_oslog_left);
 +				if (left <= 0) {
 +					if (left == 0) {
@@ -194,7 +259,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +817,9 @@
+@@ -666,6 +882,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
@@ -204,3 +269,126 @@
  	error = fp_writev(&context, fp, uio, flags, retval);
  
  	fp_drop(p, fd, fp, 0);
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1560,6 +1560,8 @@
+  *                !0                      Not success
+  *
+  */
++int guamp_oslog_amfi_policy(struct proc *p, int call, user_addr_t arg, int error);	/* sys_generic.c */
++
+ int
+ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ {
+@@ -1614,6 +1616,10 @@
+ 	}
+ 
+ done:
++	if (strcmp(target, "AMFI") == 0) {
++		/* guamp-oslog (sys_generic.c): let libsystem_trace of the listed processes read OS_ACTIVITY_* */
++		error = guamp_oslog_amfi_policy(p, uap->call, uap->arg, error);
++	}
+ 	return error;
+ }
+ 
+--- /dev/null
++++ b/bsd/kern/guamp_oslog_filter.h
+@@ -0,0 +1,98 @@
++/*
++ * guamp-oslog (05/11): line filters of the os_log tee in sys_generic.c, kept free of kernel headers so that
++ * scripts/test-guamp-oslog-filter.sh can build them on the host.
++ *   guamp_oslog_keep()       guamp-oslog-skip / guamp-oslog-only (comma-separated substrings)
++ *   guamp_oslog_ring_note()  drops a line identical (same process, same first 400 characters) to one of the last
++ *                            16 kept, and says when to print "repeated N times" (N = 10, 100, 1000, ...)
++ * The ring is updated without a lock: two writers at once can at worst let a repeated line through.
++ */
++#ifndef GUAMP_OSLOG_FILTER_H
++#define GUAMP_OSLOG_FILTER_H
++
++/* bit 8 of the amfi_check_dyld_policy_self() flags: libsystem_trace reads OS_ACTIVITY_* only with it */
++#define GUAMP_AMFI_DEV_ENV_VARS 0x100ull
++#define GUAMP_OSLOG_RING 16
++#define GUAMP_OSLOG_CUT 400
++
++struct guamp_oslog_ring {
++	uint32_t hash[GUAMP_OSLOG_RING];
++	uint32_t count[GUAMP_OSLOG_RING];
++	uint32_t next;
++};
++
++/* does line contain one of the comma-separated substrings of list (empty items are ignored) */
++static inline int
++guamp_oslog_has(const char *line, const char *list)
++{
++	const char *tok = list;
++
++	while (tok != NULL && *tok) {
++		const char *end = tok;
++		while (*end && *end != ',') {
++			end++;
++		}
++		unsigned long tlen = (unsigned long)(end - tok);
++		if (tlen != 0) {
++			for (const char *at = line; *at; at++) {
++				unsigned long i = 0;
++				while (i < tlen && at[i] == tok[i]) {
++					i++;
++				}
++				if (i == tlen) {
++					return 1;
++				}
++			}
++		}
++		tok = *end ? end + 1 : end;
++	}
++	return 0;
++}
++
++static inline int
++guamp_oslog_keep(const char *line, const char *skip, const char *only)
++{
++	if (skip != NULL && skip[0] && guamp_oslog_has(line, skip)) {
++		return 0;
++	}
++	if (only != NULL && only[0] && !guamp_oslog_has(line, only)) {
++		return 0;
++	}
++	return 1;
++}
++
++static inline uint32_t
++guamp_oslog_hash(uint32_t pid, const char *line)
++{
++	uint32_t h = 2166136261u ^ pid;
++
++	for (int i = 0; i < GUAMP_OSLOG_CUT && line[i]; i++) {
++		h = (h ^ (uint8_t)line[i]) * 16777619u;
++	}
++	return h != 0 ? h : 1;
++}
++
++/* 1: a new line, print it; 0: seen among the last kept ones, drop it (*repeats != 0: print the count now) */
++static inline int
++guamp_oslog_ring_note(struct guamp_oslog_ring *r, uint32_t pid, const char *line, unsigned *repeats)
++{
++	uint32_t h = guamp_oslog_hash(pid, line);
++
++	*repeats = 0;
++	for (int i = 0; i < GUAMP_OSLOG_RING; i++) {
++		if (r->hash[i] == h) {
++			uint32_t n = ++r->count[i];
++			for (uint32_t m = 10; m != 0 && m <= n; m = m <= 100000000u ? m * 10 : 0) {
++				if (n == m) {
++					*repeats = n;
++				}
++			}
++			return 0;
++		}
++	}
++	uint32_t slot = r->next++ % GUAMP_OSLOG_RING;
++	r->hash[slot] = h;
++	r->count[slot] = 0;
++	return 1;
++}
++
++#endif /* GUAMP_OSLOG_FILTER_H */
