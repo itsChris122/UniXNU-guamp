@@ -22,10 +22,17 @@
 // the 70 % rule kept the GPU at 320 MHz for most frames; 950 MHz verified with 0 failed switches in 106):
 //   guamp-gpu-boost=1  wait boost: a CPU thread blocked on a GPU fence (NativeAdreno's fence waits, the display's guamp-copy-gpu-wait:
 //                      GuampAdrenoProbe.cpp sets guamp_gpu_dcvs_boost) ends the window at once and sends the GPU to the top; the steps
-//                      down are the usual ones (500 ms of near idle per level). Default 0 (off).
-//   guamp-gpu-up=<%>   busy share of a window that sends the GPU to the top (default 70).
+//                      down are the usual ones (500 ms of near idle per level). Default 1 since 06/11 (every test since fin38 passed
+//                      guamp-gpu-boost=1, 0 failed switches); guamp-gpu-boost=0 turns it off.
+//   guamp-gpu-up=<%>   busy share of a window that sends the GPU to the top (default 25 since 06/11, what fin38..fin50 passed;
+//                      it was 70: guamp-gpu-up=70 gives the old rule back).
 //   guamp-gpu-min=<MHz> the slowest level the governor goes down to (default 0: 320 MHz).
 //   One line "GuampGpu: dcvs tuning ..." at start; the 10 s line gains "boosts N".
+// What it sees (06/11, GuampGpuPower.h gp_gov_kind / gp_meas): every 10 s one more line "GuampGpu: dcvs real ..." with the core
+// clock measured at each level (CP perfcounter 0 against CP_ALWAYS_ON_COUNTER over fully busy windows; 0 = no such window yet)
+// and the samples of the last 10 s split into work (a pipe or memory unit busy), cp-only (only the CP bits: a CP that waits
+// on a fence or for idle counts as busy for the governor) and idle. A level whose measured clock is more than 5 % off logs
+// "GuampGpu: dcvs level N MHz measures M MHz" once.
 
 extern "C" {
 volatile uint32_t guamp_gpu_dcvs_hold;
@@ -73,8 +80,10 @@ volatile uint8_t *gCc, *gGpu;
 gp_state gS;
 gp_gov gG;
 uint32_t gCxMin = GP_RPM_LOW_SVS, gMxMin = GP_RPM_MIN_SVS;
-unsigned gBoostOn = 0, gBoosts = 0, gWakeMs = 1500, gWakes = 0;
+unsigned gBoostOn = 1, gBoosts = 0, gWakeMs = 1500, gWakes = 0;
 unsigned gWakeWindows = 0;   // governor windows the top is still held for after a display wake
+gp_meas gM;                  // measured core clock per level
+uint32_t gOffLogged = 0;     // levels already reported as off
 
 uint32_t rd(void *, unsigned block, uint32_t off) {
   return *reinterpret_cast<volatile uint32_t *>((block == GG2_GPUCC ? gCc : gGpu) + off);
@@ -101,6 +110,20 @@ void logState(unsigned busy, unsigned switches, unsigned fails, const uint32_t *
   IOLog("GuampGpu: dcvs now %u MHz top %u | sw %u fail %u | busy %u%% | ms 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u "
         "465:%u 320:%u xo:%u | boosts %u wakes %u\n", kGpLevels[gS.level].mhz, kGpLevels[gS.top].mhz, switches, fails,
         busy * 100u / GP_GOV_WINDOW, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], gBoosts, gWakes);
+}
+
+// The measured clock per level (0 when no fully busy window ran there) and the sample split since the previous line.
+void logReal(const uint32_t *kinds) {
+  uint32_t m[GP_NLEVELS];
+  for (unsigned i = 0; i < GP_NLEVELS; ++i) m[i] = gp_meas_mhz(&gM, i);
+  IOLog("GuampGpu: dcvs real MHz 980:%u 950:%u 900:%u 820:%u 745:%u 600:%u 465:%u 320:%u | samples work %u cp-only %u idle %u\n",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], kinds[GP_SAMPLE_WORK], kinds[GP_SAMPLE_CP], kinds[GP_SAMPLE_IDLE]);
+}
+
+// CP perfcounter 0 on PERF_CP_ALWAYS_COUNT (NativeAdreno start sets it; a GPU recovery may have reset it).
+void measSelect() {
+  gg2_gw(&kIo, GG2_RBBM_PERFCTR_CNTL, 1);
+  gg2_gw(&kIo, GG2_CP_PERFCTR_CP_SEL_0, 0);
 }
 
 // Every 10 s with the level line: the GPU submissions since the previous line, their mean time in the kernel and in its cache
@@ -178,10 +201,17 @@ void thread(void *, wait_result_t) {
   thread_set_thread_name(current_thread(), "guamp-gpu-dcvs");
   uint32_t ms[GP_NLEVELS] = {};
   unsigned switches = 0, fails = 0, run = 0, busy = 0;
+  uint32_t kinds[3] = {};
+  measSelect();
   for (unsigned window = 1;; ++window) {
     busy = 0;
     bool held = false, boosted = false;
     unsigned sampled = 0;
+    const unsigned ran = gS.level;
+    if (!guamp_gpu_dcvs_hold)   // no GPU read while a recovery holds the governor (the loop below checks it the same way)
+      gp_meas_begin(&gM, gg2_gr(&kIo, GG2_RBBM_PERFCTR_CP_0_LO), gg2_gr(&kIo, GG2_CP_ALWAYS_ON_COUNTER_LO));
+    else
+      gM.primed = false;
     for (unsigned i = 0; i < GP_GOV_WINDOW; ++i) {
       if (guamp_gpu_dcvs_hold) {
         held = true;
@@ -204,17 +234,30 @@ void thread(void *, wait_result_t) {
         }
         gG.quiet = 0;   // already at the top: waits on the GPU keep it there (no step down while they go on)
       }
-      if (gp_gov_busy(gg2_gr(&kIo, GP_RBBM_STATUS))) ++busy;
+      const gp_sample_kind k = gp_gov_kind(gg2_gr(&kIo, GP_RBBM_STATUS));
+      if (k != GP_SAMPLE_IDLE) ++busy;
+      kinds[k] = kinds[k] + 1;
       ++sampled;
       IOSleep(1);
     }
     if (held) {
       IOSleep(GP_GOV_WINDOW);
+      if (!guamp_gpu_dcvs_hold) measSelect();   // after a recovery: the counter may be back to its reset select
       continue;
     }
     guamp_gpu_dcvs_busy[0] = guamp_gpu_dcvs_busy[0] + busy;
     guamp_gpu_dcvs_busy[1] = guamp_gpu_dcvs_busy[1] + sampled;
     guamp_gpu_dcvs_busy[2] = guamp_gpu_dcvs_busy[2] + uint64_t(kGpLevels[gS.level].mhz) * sampled;
+    {
+      const bool allBusy = sampled >= GP_GOV_WINDOW / 5 && busy == sampled;
+      const uint32_t mhz = gp_meas_end(&gM, ran, allBusy, gg2_gr(&kIo, GG2_RBBM_PERFCTR_CP_0_LO),
+                                       gg2_gr(&kIo, GG2_CP_ALWAYS_ON_COUNTER_LO));
+      if (allBusy && !mhz) measSelect();
+      if (ran < GP_NLEVELS && !(gOffLogged & (1u << ran)) && gM.aon[ran] >= GG2_XO_HZ && gp_meas_off(&gM, ran)) {
+        gOffLogged |= 1u << ran;
+        IOLog("GuampGpu: dcvs level %u MHz measures %u MHz\n", kGpLevels[ran].mhz, gp_meas_mhz(&gM, ran));
+      }
+    }
     if (boosted) ++gBoosts;
     const bool waking = gWakeWindows != 0;
     if (waking) gWakeWindows = gWakeWindows - 1;
@@ -248,6 +291,8 @@ void thread(void *, wait_result_t) {
     guamp_gpu_mhz_now = kGpLevels[gS.level].mhz;
     if (window % 200 == 0) {
       logState(busy, switches, fails, ms);
+      logReal(kinds);
+      kinds[0] = kinds[1] = kinds[2] = 0;
       logSubmits();
     }
   }
@@ -289,7 +334,7 @@ void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
   gS.level = level;
   gS.pllOn = GP_PLL1;
   gS.top = gp_gov_top(bin, cap);
-  unsigned up = 0, minMhz = 0;
+  unsigned up = 25, minMhz = 0;
   PE_parse_boot_argn("guamp-gpu-boost", &gBoostOn, sizeof(gBoostOn));
   PE_parse_boot_argn("guamp-gpu-wake-ms", &gWakeMs, sizeof(gWakeMs));
   PE_parse_boot_argn("guamp-gpu-up", &up, sizeof(up));

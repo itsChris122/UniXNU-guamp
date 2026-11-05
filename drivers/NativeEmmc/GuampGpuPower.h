@@ -444,6 +444,61 @@ static inline unsigned gp_gov_failed(gp_state *s, unsigned target, unsigned prev
   return prev > s->bottom ? s->bottom : prev;
 }
 
+// --- what the governor sees (06/11) ---------------------------------------------------------------------------------
+// fin50: long runs of "busy 100%" at 950 MHz while Maps scrolled at a few fps. RBBM_STATUS busy (GP_GOV_BUSY_MASK) also
+// counts a CP that only waits (CP_WAIT_REG_MEM on a fence, WAIT_FOR_IDLE) or fetches: a6xx.xml RBBM_STATUS bits 1-2
+// (CP_AHB_BUSY_CP_MASTER, CP_BUSY) and 22-23 (the GPU_BUSY_IGN_AHB* summaries). A sample is "work" when a unit of the
+// pipe or the memory path is busy (bits 3..21: GFX_DBGC, VBIF, TSE .. HLSQ), "cp-only" when only the CP bits are.
+#define GP_GOV_WORK_MASK 0x003ffff8u
+enum gp_sample_kind : unsigned { GP_SAMPLE_IDLE = 0, GP_SAMPLE_WORK = 1, GP_SAMPLE_CP = 2 };
+static inline gp_sample_kind gp_gov_kind(uint32_t rbbmStatus) {
+  if (!gp_gov_busy(rbbmStatus)) return GP_SAMPLE_IDLE;
+  return (rbbmStatus & GP_GOV_WORK_MASK) ? GP_SAMPLE_WORK : GP_SAMPLE_CP;
+}
+// The real core clock per level: GPU cycles (CP perfcounter 0, PERF_CP_ALWAYS_COUNT, set by NativeAdreno's start and
+// gg2_measure_hz) against the 19.2 MHz CP_ALWAYS_ON_COUNTER over whole governor windows. Only windows whose every sample
+// was busy count: with hardware clock gating on (guamp-adreno-hwcg, default 1) an idle CP may stop its clock and the
+// counter with it, so a mixed window gives the duty, not the rate. 32-bit deltas: CP 0 wraps after 4.4 s at 980 MHz,
+// the window is 50 ms.
+struct gp_meas {
+  uint64_t cyc[GP_NLEVELS] = {}, aon[GP_NLEVELS] = {};
+  uint32_t lastCyc = 0, lastAon = 0;
+  bool primed = false;
+};
+// Starts a window: the counters as read now.
+static inline void gp_meas_begin(gp_meas *m, uint32_t cyc, uint32_t aon) {
+  m->lastCyc = cyc;
+  m->lastAon = aon;
+  m->primed = true;
+}
+// Ends a window that ran at level, all busy or not; returns the window's MHz (0 when nothing usable). A delta that
+// makes no sense (the counter reset by a GPU recovery or deselected: no cycles, or over 2x the fastest level) is dropped.
+static inline uint32_t gp_meas_end(gp_meas *m, unsigned level, bool allBusy, uint32_t cyc, uint32_t aon) {
+  const bool primed = m->primed;
+  const uint32_t dc = cyc - m->lastCyc, da = aon - m->lastAon;
+  gp_meas_begin(m, cyc, aon);
+  if (!primed || level >= GP_NLEVELS || !da || !dc) return 0;
+  const uint64_t mhz = static_cast<uint64_t>(dc) * (GG2_XO_HZ / 1000ull) / da / 1000ull;
+  if (mhz > 2ull * kGpLevels[0].mhz) return 0;
+  if (allBusy) {
+    m->cyc[level] += dc;
+    m->aon[level] += da;
+  }
+  return static_cast<uint32_t>(mhz);
+}
+// Mean MHz measured at a level so far, 0 when no fully busy window ran there.
+static inline uint32_t gp_meas_mhz(const gp_meas *m, unsigned level) {
+  if (level >= GP_NLEVELS || !m->aon[level]) return 0;
+  return static_cast<uint32_t>(m->cyc[level] * (GG2_XO_HZ / 1000ull) / m->aon[level] / 1000ull);
+}
+// A level whose measured clock is off by more than 5 % (the PLL / RCG programmed, but not running what kGpLevels says).
+static inline bool gp_meas_off(const gp_meas *m, unsigned level) {
+  const uint32_t got = gp_meas_mhz(m, level);
+  if (!got || level >= GP_NLEVELS) return false;
+  const uint32_t want = kGpLevels[level].mhz;
+  return got * 100u < want * 95u || got * 100u > want * 105u;
+}
+
 // --- idle states ----------------------------------------------------------------------------------------------------
 // SLUMBER (kgsl_pwrctrl_disable without GMU): GPU idle required; clock dropped to XO (lowest), PLLs off, bus vote 0,
 // GX GDSC off then CX GDSC off (collapseCx), corners released. Everything the GPU held is lost: wake runs the full

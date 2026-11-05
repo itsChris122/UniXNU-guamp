@@ -381,7 +381,51 @@ static void testGovernor() {
   f.refuseCorner = -1;
 }
 
+// gp_gov_kind / gp_meas (06/11): the sample split and the measured clock per level.
+static void testMeasure() {
+  CHECK(gp_gov_kind(0) == GP_SAMPLE_IDLE && gp_gov_kind(1) == GP_SAMPLE_IDLE);            // CX AHB master only
+  CHECK(gp_gov_kind(0xff000000u) == GP_SAMPLE_IDLE);                                     // bits 24+ ignored
+  CHECK(gp_gov_kind(1u << 2) == GP_SAMPLE_CP && gp_gov_kind((1u << 2) | (1u << 22) | (1u << 23)) == GP_SAMPLE_CP);
+  CHECK(gp_gov_kind(1u << 1) == GP_SAMPLE_CP);
+  CHECK(gp_gov_kind((1u << 2) | (1u << 18)) == GP_SAMPLE_WORK && gp_gov_kind(1u << 4) == GP_SAMPLE_WORK);   // SP, VBIF
+  CHECK(gp_gov_kind(1u << 21) == GP_SAMPLE_WORK && gp_gov_kind(1u << 3) == GP_SAMPLE_WORK);
+  gp_meas m;
+  // not primed: nothing counted
+  CHECK(gp_meas_end(&m, 1, true, 1000, 1000) == 0 && gp_meas_mhz(&m, 1) == 0 && m.primed);
+  // 50 ms at 950 MHz: 47.5 M cycles against 960000 always-on ticks
+  gp_meas_begin(&m, 0xfff00000u, 0xffff0000u);   // both wrap inside the window
+  CHECK(gp_meas_end(&m, 1, true, 0xfff00000u + 47500000u, 0xffff0000u + 960000u) == 950);
+  CHECK(gp_meas_mhz(&m, 1) == 950 && !gp_meas_off(&m, 1));
+  // a mixed window reports its duty but does not enter the mean
+  gp_meas_begin(&m, 0, 0);
+  CHECK(gp_meas_end(&m, 1, false, 20000000u, 960000u) == 400 && gp_meas_mhz(&m, 1) == 950);
+  // a counter that did not move or ran too fast (reset / deselected) is dropped
+  gp_meas_begin(&m, 5, 0);
+  CHECK(gp_meas_end(&m, 1, true, 5, 960000u) == 0 && gp_meas_mhz(&m, 1) == 950);
+  gp_meas_begin(&m, 0, 0);
+  CHECK(gp_meas_end(&m, 1, true, 0xf0000000u, 960000u) == 0 && gp_meas_mhz(&m, 1) == 950);
+  gp_meas_begin(&m, 0, 0);
+  CHECK(gp_meas_end(&m, 1, true, 100, 0) == 0);
+  CHECK(gp_meas_end(&m, GP_NLEVELS, true, 1000, 1000) == 0 && gp_meas_mhz(&m, GP_NLEVELS) == 0);
+  // a level that runs at half its rate (a PLL post divider of 2) is flagged; 320 within 5 % is not
+  gp_meas_begin(&m, 0, 0);
+  CHECK(gp_meas_end(&m, 2, true, 22500000u, 960000u) == 450 && gp_meas_off(&m, 2));
+  gp_meas_begin(&m, 0, 0);
+  CHECK(gp_meas_end(&m, GP_LEVEL_320, true, 15500000u, 960000u) == 310 && !gp_meas_off(&m, GP_LEVEL_320));
+  CHECK(!gp_meas_off(&m, 3));   // no data: never flagged
+  // means over several windows weigh by time
+  gp_meas n;
+  gp_meas_begin(&n, 0, 0);
+  gp_meas_end(&n, 4, true, 745000u, 19200u);   // 1 ms at 745 MHz
+  gp_meas_begin(&n, 0, 0);
+  gp_meas_end(&n, 4, true, 745000u * 3u, 19200u * 3u);
+  CHECK(gp_meas_mhz(&n, 4) == 745);
+  // the default the governor glue passes: 25 % -> 13 samples of a 50 ms window
+  CHECK(gp_gov_up_samples(25) == 13);
+}
+
 int main() {
+  testMeasure();
   testHwcgProtect();
   testLalpha();
   testLevels();
