@@ -126,7 +126,6 @@ public:
 #define OSDefineMetaClassAndStructors(name, super) name::name() {} name *name::alloc() { return new name; }
 #define OSTypeAlloc(type) type::alloc()
 #define OSSafeReleaseNULL(p) do { if (p) (p)->release(); (p) = nullptr; } while (0)
-extern "C" void guamp_torch_request(uint32_t permille);
 
 #include "../GuampCamIos.inc"
 
@@ -164,7 +163,7 @@ bool thread_call_enter_delayed(thread_call_t, uint64_t) { return true; }
 void proc_selfname(char *buf, int size) { snprintf(buf, size, "%s", gProcName); }
 void nanoseconds_to_absolutetime(uint64_t ns, uint64_t *abs) { *abs = ns; }
 task_t current_task(void) { return nullptr; }
-void guamp_torch_request(uint32_t permille) { gTorch = permille; }
+void guamp_torch_request_owner(uint32_t owner, uint32_t permille) { if (owner == 1) gTorch = permille; else gTorch = 7777; }
 }
 void IOSleep(unsigned ms) { usleep(ms * 1000); }
 struct IOLock { pthread_mutex_t m; pthread_cond_t c; };

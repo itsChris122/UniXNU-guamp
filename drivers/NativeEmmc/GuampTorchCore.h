@@ -36,6 +36,32 @@ constexpr bool expired(uint64_t onMs, uint64_t nowMs, unsigned timeoutS) {
 static_assert(codeForMa(100) == 7 && maForCode(7) == 100, "100 mA");
 static_assert(codeForMa(10000) == codeForMa(kCapMa) && maForCode(codeForMa(kCapMa)) <= kDtMaxMa / 2, "cap");
 
+// ---- torch owners (06/11) --------------------------------------------------------------------------------------------
+// Two clients drive the same LED as a torch: the Control Center flashlight (GuampTorch service, SpringBoard / AVFlashlight
+// fixup) and the camera (AVCaptureDevice TorchLevel through AppleH6CamIn). Each one only sets or clears its own level and
+// the LED shows the brighter of the two, so the camera switching its torch off on close no longer kills a flashlight
+// turned on from the Control Center, and the other way round.
+// The PMIC thread evaluates torchAction() on every poll, not only on a new request: after a photo flash (which takes the
+// LED) the torch comes back by itself. After an automatic switch off (auto-off timer, LED fault, failed switch on) the
+// torch is held off until the next request of any owner, so a fault never turns into a retry loop.
+enum TorchOwner : uint8_t { kOwnerSystem = 0, kOwnerCamera = 1, kOwners = 2 };
+constexpr unsigned clampPermille(unsigned p) { return p > 1000u ? 1000u : p; }
+constexpr unsigned ownersPermille(unsigned system, unsigned camera) {
+  return clampPermille(system) > clampPermille(camera) ? clampPermille(system) : clampPermille(camera);
+}
+enum TorchAction : uint8_t { kTorchKeep = 0, kTorchOn = 1, kTorchOff = 2 };
+// wantMa = maForPermille(owners), 0 = off; held = automatic switch off since the last request; flashLit = a photo flash
+// owns the LED now; on / onMa = the torch state.
+constexpr TorchAction torchAction(unsigned wantMa, bool held, bool flashLit, bool on, unsigned onMa) {
+  return flashLit ? kTorchKeep
+         : (wantMa && !held) ? (on && onMa == maForCode(codeForMa(wantMa)) ? kTorchKeep : kTorchOn)
+         : on ? kTorchOff : kTorchKeep;
+}
+static_assert(torchAction(100, false, false, false, 0) == kTorchOn && torchAction(100, false, true, false, 0) == kTorchKeep &&
+              torchAction(100, true, false, false, 0) == kTorchKeep && torchAction(0, false, false, true, 100) == kTorchOff &&
+              torchAction(100, false, false, true, 100) == kTorchKeep && torchAction(50, false, false, true, 100) == kTorchOn,
+              "torch action table");
+
 // ---- photo flash (same LED, same TGR_CURRENT register, hardware safety timer ON) ------------------------------------
 // guamp DT flash_0: max-current 1500 mA, current-ma 1000, duration-ms 1280, thermal-derate-current 200/500/1000 mA;
 // Linux (qpnp_flash_led_calc_bharger_max_current) allows at most 1500 mA and less from battery OCV/ESR, which this port

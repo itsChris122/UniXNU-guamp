@@ -17,7 +17,10 @@
 #include "GuampCamssApi.h"
 #include "GuampCameraSecondary.h"   // gcam::iosFacts: lens, geometry and gain limits of every cell (agent 7)
 
-extern "C" void guamp_torch_request(uint32_t permille);   // PmicService.inc (GuampTorch, PMI632 flash LED)
+// PmicService.inc (GuampTorch, PMI632 flash LED). The camera is torch owner 1 (GuampTorchCore.h): its TorchLevel and its
+// switch off never touch a flashlight turned on from the Control Center (owner 0), and the other way round.
+extern "C" void guamp_torch_request_owner(uint32_t owner, uint32_t permille);
+constexpr uint32_t kCamTorchOwner = 1;
 
 // CAMSS (agent 2, codex/cam-camss-20261105) and the hardware hooks of the sensor/lens side are resolved weakly: this
 // file builds and the test pattern works on a kernel without them. The integration branch (agent 6) defines the hooks:
@@ -456,13 +459,17 @@ const GuampCamIosBackend kBackend = {"CAMSS", probe, setMode, slotMemory, start,
 
 // ---- flash: GuampTorch LED (torch level, or the photo flash API when the integration provides it) -----------------
 thread_call_t gFlashOff;
-void flashOff(thread_call_param_t, thread_call_param_t) { guamp_torch_request(0); }
+void flashOff(thread_call_param_t, thread_call_param_t) { guamp_torch_request_owner(kCamTorchOwner, 0); }
 int flash(uint32_t mode, uint32_t level, uint32_t ms) {
-  if (mode == kGuampFlashOff) { guamp_torch_request(0); return 0; }
-  if (mode == kGuampFlashTorch) { guamp_torch_request(level > 1000 ? 1000 : level); return 0; }
+  if (mode == kGuampFlashOff) {                           // camera torch off, and a pre-flash / flash still lit ends now
+    guamp_torch_request_owner(kCamTorchOwner, 0);
+    if (guamp_camios_hw_flash) guamp_camios_hw_flash(0, 0, 0);
+    return 0;
+  }
+  if (mode == kGuampFlashTorch) { guamp_torch_request_owner(kCamTorchOwner, level > 1000 ? 1000 : level); return 0; }
   // kGuampFlashPulse (main) / kGuampFlashPre: level = current in mA here
   if (guamp_camios_hw_flash) return guamp_camios_hw_flash(mode == kGuampFlashPre ? 1 : 2, level, ms ? ms : 200);
-  guamp_torch_request(1000);                               // fallback: torch at its maximum for `ms`
+  guamp_torch_request_owner(kCamTorchOwner, 1000);         // fallback: torch at its maximum for `ms`
   if (gFlashOff) {
     uint64_t deadline;
     clock_interval_to_deadline(ms ? (ms > 1000 ? 1000 : ms) : 200, kMillisecondScale, &deadline);
@@ -610,6 +617,7 @@ IOReturn AppleH9CamInUserClient::clientClose() {
   using namespace camios;
   for (uint32_t i = 0; i < gSensors; ++i)
     if (gSensor[i].owner == this) closeSensor(gSensor[i]);
+  flash(kGuampFlashOff, 0, 0);   // mediaserverd gone (or closed): the camera torch and any flash in progress end with it
   if (!isInactive()) terminate();
   return kIOReturnSuccess;
 }

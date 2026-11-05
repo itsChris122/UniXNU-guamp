@@ -522,7 +522,10 @@ extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *co
 // Torch request from any thread (in-kernel callers; user space uses the GuampTorch service): level in permille of
 // guamp-torch-ma, 0 = off. The PMIC thread applies the newest one within 25 ms; ignored with guamp-torch=0 or unless the
 // flash peripheral checked out.
-extern "C" void guamp_torch_request(uint32_t permille) { pmic::torch::request(permille); }
+extern "C" void guamp_torch_request(uint32_t permille) { pmic::torch::request(pmic::guamp_torch::kOwnerSystem, permille); }
+// The same for one owner (GuampTorchCore.h: 0 = Control Center flashlight / system, 1 = camera): each owner only clears
+// its own level, the LED shows the brighter one.
+extern "C" void guamp_torch_request_owner(uint32_t owner, uint32_t permille) { pmic::torch::request(owner, permille); }
 // Current torch state in mA (0 = off), for property readback.
 extern "C" uint32_t guamp_torch_current_ma() { return pmic::torch::gMa; }
 extern "C" int guamp_torch_available() { return pmic::torch::gReady ? 1 : 0; }

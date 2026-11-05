@@ -71,7 +71,8 @@ constexpr unsigned kPmi632 = 2;   // PmicService.inc board constant
 }  // namespace pmic
 void use(unsigned tick) {
   if (pmic::torch::init()) pmic::torch::poll(tick);
-  pmic::torch::request(500);
+  pmic::torch::request(pmic::guamp_torch::kOwnerSystem, 500);
+  pmic::torch::request(pmic::guamp_torch::kOwnerCamera, 0);
   pmic::torch::flashRequest(2, 500, 200);
   pmic::torch::nap(25);
   pmic::torch::shutdown(true);

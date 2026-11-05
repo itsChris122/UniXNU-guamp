@@ -36,6 +36,52 @@ int main() {
   check(!expired(1000, 1000 + 599999, 600), "not yet at 599.999 s", 0, 0);
   check(expired(1000, 1000 + 600000, 600), "off at 600 s", 0, 0);
   check(!expired(5000, 1000, 600), "clock before on time: no expiry", 0, 0);
+  // Owners (Control Center flashlight + camera) and the per-poll action, against a model of the PMIC poll of GuampTorch.inc
+  check(ownersPermille(0, 0) == 0 && ownersPermille(1000, 0) == 1000 && ownersPermille(300, 600) == 600 &&
+        ownersPermille(5000, 0) == 1000, "owners: the brighter one", ownersPermille(300, 600), 600);
+  {
+    struct Led { bool on = false; unsigned ma = 0; bool held = false; bool flash = false; unsigned switches = 0; bool failNext = false; };
+    Led led;
+    unsigned lv[kOwners] = {};
+    auto poll = [&](bool request) {
+      if (request) led.held = false;
+      const unsigned want = maForPermille(ownersPermille(lv[kOwnerSystem], lv[kOwnerCamera]), 100);
+      switch (torchAction(want, led.held, led.flash, led.on, led.ma)) {
+        case kTorchOn:
+          if (led.failNext) { led.failNext = false; led.on = false; led.ma = 0; led.held = true; break; }
+          if (!led.on) led.switches++;
+          led.on = true; led.ma = maForCode(codeForMa(want)); break;
+        case kTorchOff: led.on = false; led.ma = 0; break;
+        default: break;
+      }
+    };
+    lv[kOwnerSystem] = 1000; poll(true);
+    check(led.on && led.ma == 100, "Control Center on", led.ma, 100);
+    lv[kOwnerCamera] = 500; poll(true);
+    check(led.on && led.ma == 100, "camera dimmer: Control Center level stays", led.ma, 100);
+    lv[kOwnerCamera] = 0; poll(true);
+    check(led.on && led.ma == 100, "camera torch off keeps the flashlight", led.ma, 100);
+    led.flash = true; led.on = false; led.ma = 0;          // flashFire: off("flash")
+    for (int k = 0; k < 8; ++k) poll(false);
+    check(!led.on, "flash owns the LED", led.on, 0);
+    led.flash = false; poll(false);
+    check(led.on && led.ma == 100, "torch back after the flash", led.ma, 100);
+    led.on = false; led.ma = 0; led.held = true;           // auto-off timer
+    for (int k = 0; k < 8; ++k) poll(false);
+    check(!led.on, "auto-off holds until the next request", led.on, 0);
+    poll(true);
+    check(led.on, "new request after auto-off", led.on, 1);
+    lv[kOwnerSystem] = 0; poll(true);
+    check(!led.on, "Control Center off", led.on, 0);
+    lv[kOwnerCamera] = 1000; led.failNext = true; poll(true);
+    const unsigned sw = led.switches;
+    for (int k = 0; k < 40; ++k) poll(false);
+    check(!led.on && led.switches == sw, "failed switch on: no retry loop", led.switches, sw);
+    poll(true);
+    check(led.on && led.ma == 100, "retry on the next request", led.ma, 100);
+    lv[kOwnerCamera] = 0; poll(true);
+    check(!led.on, "camera off, nobody else: off", led.on, 0);
+  }
   printf("torch core: %s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }

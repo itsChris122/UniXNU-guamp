@@ -3,6 +3,9 @@
 // thread). Default on since 28/10: guamp-torch=0 turns it off; guamp-torch-ma = current at level 1.0 (default 100, 25..200),
 // guamp-torch-sec = auto-off (default 600, max 1800). No button drives it: requests come through guamp_torch_request()
 // (level in permille, 0 = off) from any thread and are applied by the PMIC thread within one 25 ms poll.
+// Two owners (06/11, GuampTorchCore.h): the Control Center flashlight (this service, guamp_torch_request) and the
+// camera (AppleH6CamIn TorchLevel, guamp_torch_request_owner(1, ...)); the LED shows the brighter one, a photo flash
+// takes it for its length and the torch comes back afterwards.
 // IOKit endpoint: service GuampTorch (class GuampTorchService, child of the platform expert). A root process sets
 // "TorchLevel" (integer permille, 0 = off) or "TorchOn" (boolean) with IORegistryEntrySetCFProperty; the service shows
 // "TorchCurrentMA", "TorchMaxMA" and "TorchAutoOffSeconds". iOS itself does not use it: its flashlight goes through
@@ -41,8 +44,10 @@ enum : uint8_t {
 };
 constexpr uint8_t kSubtypePmi632 = 5, kSafetyTmrDisabled = 0x13, kHdrm = 0xb4;
 
-volatile uint32_t gReady, gOn, gMa, gRequest, gRequestSeq, gSwitches, gFaults;
-uint32_t gSeenSeq;
+volatile uint32_t gReady, gOn, gMa, gRequestSeq, gSwitches, gFaults;
+volatile uint32_t gLevel[guamp_torch::kOwners];   // permille per owner (GuampTorchCore.h torch owners)
+uint32_t gHold;                                   // PMIC thread: automatic switch off, held until the next request
+uint32_t gSeenSeq, gTorchSeenAtOn;
 unsigned gMaxMa = guamp_torch::kDefaultMa, gTimeoutS = guamp_torch::kDefaultTimeoutS;
 uint64_t gOnMs;
 unsigned gBoost = 1;   // guamp-torch-boost: 1 = with the cable in, the torch takes power from the battery boost (0 = leave the register)
@@ -113,7 +118,7 @@ void on(unsigned ma, const char *why) {
   if (gOn) {
     if (real == gMa) return;
     const int e = update(kTgrCurrent, 0x7f, code);
-    if (e) { off("level change failed"); return; }
+    if (e) { gHold = 1; off("level change failed"); return; }
     IOLog("GuampTorch: on, level %u -> %u mA (code %u, %s)\n", gMa, real, code, why);
     gMa = real;
     publishState();
@@ -139,6 +144,7 @@ void on(unsigned ma, const char *why) {
   if (ok) e = update(kEnLedCtrl, 0x03, 0x01);
   if (!ok || e) {
     switchOff();
+    gHold = 1;                                     // no retry every poll: wait for the next request
     IOLog("GuampTorch: on failed (%s): error %d, VREG_OK %s after %u ms, schgm status2 %02x status3 %02x\n", why, e,
           ok ? "yes" : "no", (waited + 1) * 5, vreg, state);
     publishState();
@@ -156,9 +162,10 @@ void on(unsigned ma, const char *why) {
   publishState();
 }
 
-// Any thread: the newest request wins; the PMIC thread applies it.
-void request(uint32_t permille) {
-  gRequest = permille;
+// Any thread: sets the level of one owner (0 = that owner lets go); the PMIC thread applies the brighter owner.
+void request(unsigned owner, uint32_t permille) {
+  if (owner >= guamp_torch::kOwners) return;
+  gLevel[owner] = guamp_torch::clampPermille(permille);
   __asm__ volatile("dmb ish" ::: "memory");
   gRequestSeq = gRequestSeq + 1;
 }
@@ -291,17 +298,23 @@ void poll(unsigned tick) {
   if (seq != gSeenSeq) {
     gSeenSeq = seq;
     __asm__ volatile("dmb ish" ::: "memory");
-    const unsigned ma = guamp_torch::maForPermille(gRequest, gMaxMa);
-    if (ma && flashLit()) flashOff("torch request");
-    if (ma) on(ma, "request");
-    else off("request");
+    gHold = 0;
+  }
+  // Every poll (not only on a request): the torch comes back after a photo flash; a flash in progress keeps the LED.
+  const unsigned want = guamp_torch::maForPermille(guamp_torch::ownersPermille(gLevel[guamp_torch::kOwnerSystem],
+                                                                               gLevel[guamp_torch::kOwnerCamera]), gMaxMa);
+  const bool fresh = seq != gTorchSeenAtOn;
+  switch (guamp_torch::torchAction(want, gHold != 0, flashLit(), gOn != 0, gMa)) {
+    case guamp_torch::kTorchOn: gTorchSeenAtOn = seq; on(want, fresh ? "request" : "after flash"); break;
+    case guamp_torch::kTorchOff: off("request"); break;
+    default: break;
   }
   if (!gOn) return;
-  if (guamp_torch::expired(gOnMs, nowMs(), gTimeoutS)) { off("auto-off timer"); return; }
+  if (guamp_torch::expired(gOnMs, nowMs(), gTimeoutS)) { gHold = 1; off("auto-off timer"); return; }
   if (tick % 40 == 0) {
     uint8_t rt = 0, s3 = 0;
-    if (!rd(kRtSts, &rt) && (rt & 1u)) { gFaults = gFaults + 1; off("LED fault"); return; }
-    if (!read8(kPmi632, kSchgmStatus3, &s3) && (s3 & 7u) == 7u) { gFaults = gFaults + 1; off("flash regulator error"); }
+    if (!rd(kRtSts, &rt) && (rt & 1u)) { gFaults = gFaults + 1; gHold = 1; off("LED fault"); return; }
+    if (!read8(kPmi632, kSchgmStatus3, &s3) && (s3 & 7u) == 7u) { gFaults = gFaults + 1; gHold = 1; off("flash regulator error"); }
   }
 }
 
@@ -344,7 +357,7 @@ public:
     //   if (proc_getuid(current_proc()) != 501 &&
     //       IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
     //     return kIOReturnNotPrivileged;
-    torch::request(level ? level->unsigned32BitValue() : onOff->isTrue() ? 1000u : 0u);
+    torch::request(guamp_torch::kOwnerSystem, level ? level->unsigned32BitValue() : onOff->isTrue() ? 1000u : 0u);
     return kIOReturnSuccess;
   }
 };
@@ -358,6 +371,8 @@ void publishState() {
   if (GuampTorchService *service = gService) {
     service->number("TorchCurrentMA", gMa);
     service->setProperty("TorchOn", gOn ? kOSBooleanTrue : kOSBooleanFalse);
+    service->number("TorchLevelSystem", gLevel[guamp_torch::kOwnerSystem]);   // Control Center flashlight, permille
+    service->number("TorchLevelCamera", gLevel[guamp_torch::kOwnerCamera]);   // camera TorchLevel, permille
     service->number("FlashState", gFlashState);      // 0 idle, 1 pre-flash on, 2 main flash on, 3 last request refused
     service->number("FlashCount", gFlashCount);
     service->number("FlashRefused", gFlashRefused);
