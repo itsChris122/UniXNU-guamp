@@ -65,6 +65,13 @@ if [ -e "$WORK/na/NativeAdrenoReassertPlan.h" ]; then
 else
   echo "NativeAdrenoReassertPlan.h missing (patch 0012 not applied)"; rc=1
 fi
+echo "== submission kernel cost: page attribute table scan and mailbox pause (patch 0019, NativeAdrenoWcScan.h): clang (ASan/UBSan) and gcc"
+if [ -e "$WORK/na/NativeAdrenoWcScan.h" ]; then
+  clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/kcost_host.cpp" -o "$WORK/kcost" && "$WORK/kcost" || rc=1
+  g++ $FLAGS -Wvolatile -I "$WORK/na" "$HERE/kcost_host.cpp" -o "$WORK/kcost_gcc" && "$WORK/kcost_gcc" >/dev/null || rc=1
+else
+  echo "NativeAdrenoWcScan.h missing (patch 0019 not applied)"; rc=1
+fi
 echo "== render server fence and soft priority (patch 0017, NativeAdrenoProcFence.h): clang (ASan/UBSan) and gcc"
 if [ -e "$WORK/na/NativeAdrenoProcFence.h" ]; then
   clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/proc_fence_host.cpp" -o "$WORK/proc_fence" && "$WORK/proc_fence" || rc=1

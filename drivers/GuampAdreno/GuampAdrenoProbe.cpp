@@ -63,6 +63,8 @@ extern volatile uint32_t native_adreno_publish_ro_clean;
 // (guamp-adreno-reassert-check, default 64; 0 = never) after a quiet time (guamp-adreno-reassert-quiet-us, default 100000).
 extern volatile uint32_t native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check,
     native_adreno_wc_quiet_us;
+// patches/native-adreno/0019: guamp-adreno-reassert-table (default 1), guamp-adreno-mailbox-idle-ms (default 8).
+extern volatile uint32_t native_adreno_reassert_table, native_adreno_mailbox_idle_ms;
 // patches/native-adreno/0013: imports the GPU only reads cleaned when mapped and every N-th submission (guamp-adreno-ro-imports-owned,
 // default 1; 0 = at every submission) (guamp-adreno-ro-imports-sweep, default 32; 0 = never).
 extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_imports_sweep;
@@ -887,6 +889,12 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   }
   native_adreno_reassert_check = bootArg("guamp-adreno-reassert-check", 64);
   native_adreno_wc_quiet_us = bootArg("guamp-adreno-reassert-quiet-us", 100000);
+  // patch 0019: the re-assertion's page check from the pmap's attribute table (0 = a pmap_cache_attributes call per page), and the
+  // mailbox poller's pause while nobody uses the mailbox (1 = 1 ms always, as before).
+  native_adreno_reassert_table = bootArg("guamp-adreno-reassert-table", 1) ? 1 : 0;
+  native_adreno_mailbox_idle_ms = bootArg("guamp-adreno-mailbox-idle-ms", 8);
+  IOLog("GuampAdreno: re-assert page table reads %u, mailbox idle poll %u ms\n", native_adreno_reassert_table,
+        native_adreno_mailbox_idle_ms);
   gCopyWaitCompositor = bootArg("guamp-copy-wait-compositor", 1) ? 1 : 0;
   {
     const uint32_t depth = bootArg("guamp-gpu-other-depth", 2);

@@ -1,0 +1,298 @@
+guamp: submission kernel cost: the walks over every mapping test window and kind on the mapping's own fields (no BO object load per mapping), the write-combine re-assertion reads the pmap's page attribute table instead of a call per page (guamp-adreno-reassert-table=1, default) and counts pages checked/reset, the mailbox poller polls 1 ms only while used (guamp-adreno-mailbox-idle-ms, default 8)
+
+diff --git a/NativeAdrenoCpu.cpp b/NativeAdrenoCpu.cpp
+index f699cd4..0365330 100644
+--- a/NativeAdrenoCpu.cpp
++++ b/NativeAdrenoCpu.cpp
+@@ -150,21 +150,42 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,siz
+     else __atomic_fetch_sub(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     return kIOReturnSuccess;
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0019): the pages' attribute is read straight from the pmap's physical page attribute table
++ * (osfmk/arm/pmap/pmap_data.h: pp_attr_table, one pp_attr_t per page from vm_first_phys, the WIMG in the low 6 bits, 0 = default), as
++ * pmap_cache_attributes() reads it, without a call per page: a re-assertion that finds nothing to change only reads 2 bytes a page.
++ * A span outside [vm_first_phys, vm_last_phys) or a kernel page size other than 4 KiB keeps the call. native_adreno_reassert_table
++ * (board: guamp-adreno-reassert-table, default 1; 0 = a call per page as before). native_adreno_reassert_pages: [0] pages checked,
++ * [1] pages found reset and written back to write-combined, [2] BO passes. */
++extern "C" {extern volatile uint16_t *pp_attr_table;extern uint64_t vm_first_phys,vm_last_phys;}
++extern "C" {volatile uint32_t native_adreno_reassert_table=1;volatile uint64_t native_adreno_reassert_pages[3];}
++#include "NativeAdrenoWcScan.h"
+ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans,size_t count,uint32_t *reset)
+ {
+     if(!spans || !count || !reset)return kIOReturnBadArgument;
+     const uint64_t began=mach_absolute_time();
++    const bool table=native_adreno_reassert_table && PAGE_SIZE==4096 && pp_attr_table && vm_last_phys>vm_first_phys;
++    uint64_t checked=0;uint32_t found=0;
+     for(size_t i=0;i<count;++i) {
+         const NativeAdrenoPhysicalSpan &span=spans[i];
+         if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
+-            span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
++            span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize) {*reset+=found;return kIOReturnBadArgument;}
++        checked+=span.bytes>>12;
++        /* From the default attribute the pmap also cleans and invalidates the page (pmap_sync_wimg), so lines a cacheable view
++         * dirtied reach DRAM before the GPU reads it. */
++        if(table && nativeAdrenoWcScanInTable(span.physical,span.bytes,vm_first_phys,vm_last_phys)) {
++            found+=nativeAdrenoWcScan(pp_attr_table,vm_first_phys,span.physical,span.bytes,VM_WIMG_WCOMB,
++                [](uint64_t physical) {pmap_set_cache_attributes((ppnum_t)(physical>>12),VM_WIMG_WCOMB);});
++            continue;
++        }
+         for(uint64_t offset=0;offset<span.bytes;offset+=4096) {
+             const ppnum_t pn=(ppnum_t)((span.physical+offset)>>12);
+-            /* From the default attribute the pmap also cleans and invalidates the page (pmap_sync_wimg), so lines a cacheable view
+-             * dirtied reach DRAM before the GPU reads it. */
+-            if((pmap_cache_attributes(pn)&VM_WIMG_MASK)!=VM_WIMG_WCOMB) {pmap_set_cache_attributes(pn,VM_WIMG_WCOMB);++*reset;}
++            if((pmap_cache_attributes(pn)&VM_WIMG_MASK)!=VM_WIMG_WCOMB) {pmap_set_cache_attributes(pn,VM_WIMG_WCOMB);++found;}
+         }
+     }
++    *reset+=found;
+     __atomic_fetch_add(&native_adreno_reassert_ticks,mach_absolute_time()-began,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&native_adreno_reassert_pages[0],checked,__ATOMIC_RELAXED);
++    if(found)__atomic_fetch_add(&native_adreno_reassert_pages[1],found,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&native_adreno_reassert_pages[2],1,__ATOMIC_RELAXED);
+     return kIOReturnSuccess;
+ }
+diff --git a/NativeAdrenoPollPlan.h b/NativeAdrenoPollPlan.h
+new file mode 100644
+index 0000000..e5be203
+--- /dev/null
++++ b/NativeAdrenoPollPlan.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_POLL_PLAN_H
++#define NATIVE_ADRENO_POLL_PLAN_H
++#include <stdint.h>
++/* guamp (UniXNU-guamp patches/native-adreno/0019): the mailbox poller's pause. 1 ms while the page is served (owner and words set), has
++ * been mapped at least once and saw a request within the last 1000 polls; idle_ms otherwise. A first request after an idle stretch
++ * waits at most idle_ms, every one after it 1 ms. */
++enum : uint32_t {NativeAdrenoMailboxBusyPolls=1000};
++static inline uint32_t nativeAdrenoMailboxSleepMs(bool served,uint32_t maps,uint32_t idle_polls,uint32_t idle_ms)
++{
++    if(!idle_ms)idle_ms=1;
++    if(!served || !maps)return idle_ms;
++    return idle_polls<NativeAdrenoMailboxBusyPolls?1:idle_ms;
++}
++#endif
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index dc1cb0b..1d76a73 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -75,6 +75,8 @@ IOBufferMemoryDescriptor *gMailbox=nullptr;
+ volatile uint32_t *gMailboxWords=nullptr;
+ volatile bool gPollerStarted=false;
+ }
++#include "NativeAdrenoPollPlan.h"
++extern "C" {volatile uint32_t native_adreno_mailbox_idle_ms=8;}   /* guamp 0019 (board: guamp-adreno-mailbox-idle-ms) */
+ class AGXDeviceUserClient;
+ /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
+ static AGXDeviceUserClient *gMailboxOwner=nullptr;
+@@ -269,12 +271,17 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
+ {
+     thread_set_thread_name(current_thread(),"sheng-gpu-mailbox");
+     uint32_t last=0;
++    /* guamp (UniXNU-guamp patches/native-adreno/0019): 1 ms polls only while the page is mapped and was used in the last second; a page
++     * nobody mapped or that sat unused polls every native_adreno_mailbox_idle_ms (default 8; 1 = always 1 ms as before). The thread woke
++     * 1000 times a second for good (0.7-1.4 % of a core of kernel_task in fin50, with no mailbox caller). */
++    uint32_t idle_polls=0;
+     for(;;) {
+-        IOSleep(1);
++        const uint32_t idle_ms=native_adreno_mailbox_idle_ms?native_adreno_mailbox_idle_ms:1;
++        IOSleep(nativeAdrenoMailboxSleepMs(gMailboxOwner && gMailboxWords,native_adreno_metal_diag.mb_maps,idle_polls,idle_ms));
+         if(!gMailboxOwner || !gMailboxWords)continue;
+         const uint32_t request=gMailboxWords[1];
+-        if(request==last || request==gMailboxWords[2])continue;
+-        last=request;
++        if(request==last || request==gMailboxWords[2]) {if(idle_polls<UINT32_MAX)++idle_polls;continue;}
++        last=request;idle_polls=0;
+         const uint32_t method=gMailboxWords[3],in_size=gMailboxWords[5],out_size=gMailboxWords[6];
+         IOReturn status=kIOReturnBadArgument;
+         if(in_size<=0x700 && out_size<=0x700) {
+diff --git a/NativeAdrenoVm.cpp b/NativeAdrenoVm.cpp
+index 622919b..cf557ec 100644
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -21,9 +21,9 @@ static bool coherentMapping(unsigned writeback) {return writeback && native_adre
+  * the board says so (native_adreno_written_imports_owned): map cleans and invalidates them, and nothing after that until unmap. The
+  * read-only imports there, which their owners keep drawing into with the CPU, are still cleaned on every submission (the A610:
+  * about 89 MB a submission, 12 ms, all imports together). */
+-static bool importedUntouched(const NativeAdrenoMemory *memory,unsigned permissions)
++static bool importedUntouched(bool imported,unsigned permissions)
+ {
+-    return memory->imported() &&
++    return imported &&
+         (native_adreno_io_coherent || (native_adreno_written_imports_owned && (permissions&ArmSmmu4KWrite)));
+ }
+ static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
+@@ -315,7 +315,8 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t
+         record=&mappings_[i];free_hint_=i+1;if(high_<i+1)high_=i+1;break;
+     }
+     if(!record) {memory->quarantine();return fail(ArmSmmu4KStateMismatch);}
+-    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,client_cleans && memory->imported(),0,0};++objects_;
++    *record={memory,0,iova,memory->spanCount(),0,permissions,writeback,shareability,0,client_cleans && memory->imported(),0,0,
++        memory->bytes(),memory->imported(),memory->writeCombined() && !memory->pooled()};++objects_;
+     if(coherentMapping(writeback))native_adreno_coherent_skips[0]=native_adreno_coherent_skips[0]+1;
+     else {
+         checked=memory->publishForDevice(0,memory->bytes(),permissions&ArmSmmu4KWrite,distrust_write_combined_);
+@@ -448,15 +449,21 @@ IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_byt
+ {
+     if(sweep_read_only)native_adreno_publish_ro_owned[2]=native_adreno_publish_ro_owned[2]+1;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    /* guamp 0019: the skip counters are summed here and added once (two volatile read-modify-writes per skipped mapping before). */
++    uint64_t skipped=0,skipped_bytes=0,skipped_coherent=0;
++    struct Flush {
++        uint64_t &n,&b,&c;
++        ~Flush() {
++            if(n) {native_adreno_publish_skipped[0]=native_adreno_publish_skipped[0]+n;native_adreno_publish_skipped[1]=native_adreno_publish_skipped[1]+b;}
++            if(c)native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+(uint32_t)c;
++        }
++    } flush{skipped,skipped_bytes,skipped_coherent};
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory,m.permissions)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+-        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes)) {
+-            native_adreno_publish_skipped[0]=native_adreno_publish_skipped[0]+1;
+-            native_adreno_publish_skipped[1]=native_adreno_publish_skipped[1]+m.memory->bytes();
+-            continue;
+-        }
++        /* guamp 0019: the tests up to the window are on the mapping's own fields (no load of the BO object); the counters stay exact. */
++        if(coherentMapping(m.writeback) || importedUntouched(m.imported,m.permissions)) {++skipped_coherent;continue;}
++        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes)) {++skipped;skipped_bytes+=m.bytes;continue;}
+         if(m.client_cleans) {   /* guamp 0012: its client cleaned what the CPU wrote (cleaned once when it was mapped) */
+             native_adreno_publish_client[0]=native_adreno_publish_client[0]+1;
+             native_adreno_publish_client[1]=native_adreno_publish_client[1]+m.memory->bytes();
+@@ -481,8 +488,8 @@ IOReturn NativeAdrenoVm::acquireImported()
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
+-        if(coherentMapping(m.writeback) || importedUntouched(m.memory,m.permissions)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
++        if(!m.memory || !m.imported || !(m.permissions&ArmSmmu4KWrite))continue;   /* guamp 0019: the mapping's own fields */
++        if(coherentMapping(m.writeback) || importedUntouched(m.imported,m.permissions)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+@@ -495,7 +502,7 @@ IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dra
+     if(iova&3)return kIOReturnBadArgument;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.bytes)continue;
+         const size_t offset=(size_t)(iova-m.iova);
+         if(m.memory->mapping())*cached=static_cast<const volatile uint32_t *>(m.memory->mapping())[offset/4];
+         for(size_t j=0;j<m.memory->spanCount();++j) {
+@@ -530,7 +537,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombinedIn(uint64_t window_start,uint64_t
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory)continue;
++        if(!m.memory || !m.wc_walk)continue;   /* guamp 0019: reassertWriteCombined has nothing to do for the others */
+         if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
+         const IOReturn status=m.memory->reassertWriteCombined(reset);
+         if(status)return status;
+@@ -544,7 +551,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombinedChanged(uint64_t window_start,uint
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<high_;++i) {
+         Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->writeCombined() || m.memory->pooled())continue;   /* reassertWriteCombined has nothing to do for these */
++        if(!m.memory || !m.wc_walk)continue;   /* reassertWriteCombined has nothing to do for these (guamp 0019: the mapping's copy) */
+         if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
+         const bool current=m.wc_epoch==epoch;
+         if(!nativeAdrenoReassertWalks(m.wc_epoch,epoch,all))continue;
+@@ -563,7 +570,7 @@ IOReturn NativeAdrenoVm::reassertWriteCombinedDirty(uint64_t window_start,uint64
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<high_;++i) {
+         Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->writeCombined() || m.memory->pooled())continue;   /* reassertWriteCombined has nothing to do for these */
++        if(!m.memory || !m.wc_walk)continue;   /* reassertWriteCombined has nothing to do for these (guamp 0019: the mapping's copy) */
+         if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
+         /* The generation is read before the walk: an event during it moves the generation again and the next submission walks it. */
+         const uint32_t gen=m.memory->wcGeneration();
+@@ -587,7 +594,7 @@ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,u
+     if(!bytes || iova>UINT64_MAX-bytes)return kIOReturnBadArgument;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.bytes)continue;
+         if(!m.memory->writeCombined())return kIOReturnSuccess;   /* maintained before every submission anyway */
+         /* Whole lines; the range is clipped to its BO. */
+         size_t at=(size_t)(iova-m.iova)&~(size_t)63;
+@@ -616,7 +623,7 @@ IOReturn NativeAdrenoVm::peekWords(uint64_t iova,uint32_t *out,size_t count) con
+     for(size_t k=0;k<count;++k)out[k]=0;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.bytes || !m.memory->mapping())continue;   /* guamp 0019: range first */
+         const size_t offset=(size_t)(iova-m.iova);
+         for(size_t k=0;k<count && offset+4*k+4<=m.memory->bytes();++k)out[k]=static_cast<const volatile uint32_t *>(m.memory->mapping())[offset/4+k];
+         return kIOReturnSuccess;
+@@ -628,7 +635,7 @@ IOReturn NativeAdrenoVm::peekWordsUncached(uint64_t iova,uint32_t *out,size_t co
+     if(!out || !attached_ || poisoned_ || !count)return kIOReturnBadArgument;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.bytes || !m.memory->mapping())continue;   /* guamp 0019: range first */
+         const size_t offset=(size_t)(iova-m.iova),first=offset&~(size_t)4095;
+         const size_t end=offset+4*count<m.memory->bytes()?offset+4*count:m.memory->bytes();
+         const size_t bytes=((end+4095)&~(size_t)4095)-first;
+@@ -643,7 +650,7 @@ uint64_t NativeAdrenoVm::handleAt(uint64_t iova) const
+     if(!attached_ || !mappings_)return 0;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+-        if(m.memory && iova>=m.iova && iova-m.iova<m.memory->bytes())return m.handle;
++        if(m.memory && iova>=m.iova && iova-m.iova<m.bytes)return m.handle;
+     }
+     return 0;
+ }
+diff --git a/NativeAdrenoVm.h b/NativeAdrenoVm.h
+index 0defbf9..a8db48c 100644
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -48,6 +48,12 @@ class NativeAdrenoVm final {
+         bool client_cleans=false;   /* guamp 0012: an import whose client cleans its CPU caches itself (NativeAdrenoMapClientCleans) */
+         uint32_t wc_epoch=0;        /* guamp 0012: native_adreno_wc_epoch when its write-combined pages were last re-asserted (0 never) */
+         uint32_t wc_gen=0;          /* guamp 0016: its BO's wcGeneration() when last settled (0 never) */
++        /* guamp 0019: the BO's size and kind, fixed while it is mapped, copied here at map so the walks over every mapping (several per
++         * submission and per completed job, over ~1300 mappings of every process) test the window and the kind without loading the
++         * NativeAdrenoMemory object of each one (a cache miss per mapping, most of them outside the submitter's window). */
++        size_t bytes=0;
++        bool imported=false;
++        bool wc_walk=false;         /* write-combined and not from the BO pool: reassertWriteCombined has work for it */
+     };
+     Mapping *mappings_=nullptr;
+     NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+diff --git a/NativeAdrenoWcScan.h b/NativeAdrenoWcScan.h
+new file mode 100644
+index 0000000..dad20b7
+--- /dev/null
++++ b/NativeAdrenoWcScan.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_WC_SCAN_H
++#define NATIVE_ADRENO_WC_SCAN_H
++#include <stdint.h>
++#include <stddef.h>
++/* guamp (UniXNU-guamp patches/native-adreno/0019): the write-combine re-assertion's page check over the pmap's physical page attribute
++ * table (XNU osfmk/arm/pmap/pmap_data.h: pp_attr_table[atop(pa - vm_first_phys)], WIMG in PP_ATTR_WIMG_MASK, 0 = VM_WIMG_DEFAULT), the
++ * value pmap_cache_attributes() returns for a page inside [vm_first_phys, vm_last_phys). 4 KiB pages. */
++enum : uint16_t {NativeAdrenoPpAttrWimgMask=0x003f};
++/* The span lies wholly inside the table. */
++static inline bool nativeAdrenoWcScanInTable(uint64_t physical,uint64_t bytes,uint64_t first_phys,uint64_t last_phys)
++{
++    return bytes && physical>=first_phys && physical<last_phys && bytes<=last_phys-physical;
++}
++/* Calls reassert(physical) for each page whose attribute is not wcomb; returns how many. The entry is read again right before the
++ * call is skipped or made, as pmap_cache_attributes() would read it (no lock: the pmap reads it the same way). */
++template<typename Reassert>
++static inline uint32_t nativeAdrenoWcScan(const volatile uint16_t *table,uint64_t first_phys,uint64_t physical,uint64_t bytes,
++    unsigned wcomb,Reassert reassert)
++{
++    uint32_t found=0;
++    const volatile uint16_t *attr=table+((physical-first_phys)>>12);
++    const uint64_t pages=bytes>>12;
++    for(uint64_t i=0;i<pages;++i) {
++        const unsigned wimg=attr[i]&NativeAdrenoPpAttrWimgMask;
++        if(wimg!=wcomb) {reassert(physical+(i<<12));++found;}
++    }
++    return found;
++}
++#endif

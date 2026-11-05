@@ -59,6 +59,10 @@ __attribute__((weak)) volatile uint64_t native_adreno_throttle_stats[4];
 __attribute__((weak)) volatile uint32_t native_adreno_compositor_fence;
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
+// patches/native-adreno/0019: the re-assertion's pages ([0] checked, [1] found reset and written back, [2] BO passes) and its time
+// (mach_absolute_time ticks, NativeAdrenoCpu.cpp), to tell the page checks from the pmap's resets.
+__attribute__((weak)) volatile uint64_t native_adreno_reassert_pages[3];
+__attribute__((weak)) volatile uint64_t native_adreno_reassert_ticks;
 }
 
 namespace gpudcvs {
@@ -127,6 +131,18 @@ void logSubmits() {
           rw - prev[2], rn - prev[3], rc - prev[4], rb - prev[5], native_adreno_reassert_stats[3], native_adreno_reassert_stats[5],
           native_adreno_wc_epoch, native_adreno_wc_bo_events);
   prev[0] = cm; prev[1] = cb; prev[2] = rw; prev[3] = rn; prev[4] = rc; prev[5] = rb;
+  // patch 0019: per submission, the pages the re-assertion checked and reset, and the us of its page passes alone (the rest of
+  // "re-assert us each" is the walk over the mappings).
+  static uint64_t rp[4];
+  const uint64_t pc = native_adreno_reassert_pages[0], pr = native_adreno_reassert_pages[1], pp = native_adreno_reassert_pages[2],
+                 pt = native_adreno_reassert_ticks;
+  if (dn) {
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(pt - rp[3], &ns);
+    IOLog("GuampGpu: re-assert pages each: checked %llu, reset %llu; BO passes %llu, page passes %llu us each\n", (pc - rp[0]) / dn,
+          (pr - rp[1]) / dn, pp - rp[2], ns / 1000 / dn);
+  }
+  rp[0] = pc; rp[1] = pr; rp[2] = pp; rp[3] = pt;
   // patch 0017: app submissions held back so the render server's jobs do not queue behind their backlog.
   static uint64_t th[3];
   const uint64_t tw = native_adreno_throttle_stats[0], tl = native_adreno_throttle_stats[1], tu = native_adreno_throttle_stats[2];
