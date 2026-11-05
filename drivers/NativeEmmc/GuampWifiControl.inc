@@ -15,7 +15,7 @@
 #include "GuampSnocCe.inc"
 #include "GuampWifiRpm.inc"
 #if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
-// guamp 04/11: the cellular bridge of UniXNU (drivers/QcomBaseband, UniXNU/QcomBaseband 43d85fb, by HoshinoYumeka): publishes
+// guamp 04/11: the cellular bridge of UniXNU (drivers/QcomBaseband, UniXNU/QcomBaseband dd0199c, by HoshinoYumeka): publishes
 // AppleBaseband/AppleBasebandPCI* to iOS and carries ABM/CommCenter's QMUX clients over this QRTR link (local ports
 // 0x4100..0x413f). Built with scripts/build-arm-driver.py NativeEmmc --wifi-runtime --baseband; on at boot only with guamp-baseband=1.
 #include "QcomBaseband.h"
