@@ -1,0 +1,581 @@
+guamp: lean metal2vulkan memory pools (bridge 0040), the MB row (the runtime's memory per process) and a purgeable census
+
+fin50 (live-20261105-204852): Maps grew to a 307 MiB footprint with about 5 MiB of the system's memory left; the GPU's wired objects
+went 487 -> 554 -> 620 -> 684 MiB in 64 MiB steps, and nothing came back when Maps' footprint fell to 267 MiB. Every block of the
+runtime's pools is a BO the kernel wires as it is made, and the system has no swap and no memory compressor, so a block's free bytes
+are memory no process gets back. The pools, as of bridge 0022 (adreno-metal 0016):
+- grew to 64 MiB blocks, so one pool's slack could be 64 MiB;
+- kept one empty block of any size (64 MiB too) in each pool when it emptied;
+- kept room for half of the next block ahead in each of the encodings' four pools (keep_room): a pool whose 64 MiB block was half
+  placed got a second 64 MiB block before any placement needed it;
+- started every pool at 4 MiB, so keep_room took 16 MiB in every Metal process at its first creation call, widgets and extensions too.
+
+Bridge patch 0040 (crates/metal2vulkan-runtime, memory.rs PoolPolicy), each limit set by the board's NativeMetalEnv (guamp-m2v-env)
+without a new addon:
+- NMB_POOL_BLOCK_MIB (4-64, default 16): the largest pooled block; a placement over half of it (8 MiB) takes a dedicated block of
+  its own size, so a pool's slack is at most 16 MiB;
+- NMB_POOL_KEEP_MIB (0-64, default 4): the largest empty block a pool keeps; a larger one is freed as it empties;
+- NMB_POOL_ROOM_KIB (0-65536, default 2048): the most room keep_room keeps ahead, not half of the next block;
+- NMB_POOL_FIRST_KIB (256-16384, default 1024): a pool's first block (4 MiB before), then doubling as before.
+The upstream behaviour is NMB_POOL_BLOCK_MIB=64,NMB_POOL_KEEP_MIB=64,NMB_POOL_ROOM_KIB=65536,NMB_POOL_FIRST_KIB=4096.
+Device::memory_census (bytes of pooled blocks in use, placed in them, empty, dedicated, imported; their block counts; all allocated)
+and purgeable_census (setPurgeableState volatile and empty requests with their bytes, process-wide: the runtime keeps the state and
+purges nothing, so this says what a purging runtime could give back). Host tests: tests::memory (41 pass, two new).
+
+Here: nmb_device_memory_census (NativeMetalObjects.rs/.h, fourteen words) and the telemetry row
+"MB <process> p<pooled>/<placed> e<empty> d<dedicated> i<imported> n<blocks by kind> al<allocated> v<n>/<MiB> x<n>/<MiB>" (MiB),
+after the L row. Pooled minus placed is the pools' slack; v/x tell whether honouring purgeability would pay.
+Applies after 0001-0003, 0009-0022 and 0030; the Objective-C++ is not compiled outside the CI (the bridge crate was type-checked on
+the host with the patched runtime).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f0f7ed8..9efefc6 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -3351,6 +3351,16 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+   if(nmb_device_texture_counts(gDevice,tc))
+    row("L lin %llu/%llu/%llu sh %llu cp %llu bk %llu pass %llu/%llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
+     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
++  // guamp (UniXNU-guamp patches/adreno-metal/0040): the runtime's memory in this process, in MiB: pooled blocks in use / placed in them,
++  // empty pooled (e), dedicated (d), imported host memory (i); the blocks of those four kinds (n); all ever allocated (al); and the
++  // setPurgeableState requests (v volatile, x empty: count/MiB), which the runtime never purges. Pooled minus placed is the pools' slack.
++  uint64_t mc[14]={};
++  if(nmb_device_memory_census(gDevice,mc))
++   row("MB %.10s p%llu/%llu e%llu d%llu i%llu n%llu/%llu/%llu/%llu al%llu v%llu/%llu x%llu/%llu",getprogname(),
++    (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
++    (unsigned long long)(mc[4]>>20),(unsigned long long)mc[5],(unsigned long long)mc[6],(unsigned long long)mc[7],(unsigned long long)mc[8],
++    (unsigned long long)(mc[9]>>20),(unsigned long long)mc[10],(unsigned long long)(mc[11]>>20),(unsigned long long)mc[12],
++    (unsigned long long)(mc[13]>>20));
+   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
+   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
+  }
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index b38da69..36ed07a 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -45,6 +45,9 @@ bool nmb_copy_census(uint64_t out[12]);
+ /* The runtime's encoder phases in nanoseconds (a draw's four steps, a close's three, a commit's four) and their counts: fourteen words,
+  * diagnostic. */
+ bool nmb_phase_timings(uint64_t out[14]);
++/* guamp 0040: the device's memory (bytes of pooled blocks in use, placed in them, empty pooled, dedicated, imported; those four kinds'
++ * block counts; bytes allocated so far) and the process's setPurgeableState requests (volatile, bytes, empty, bytes): fourteen words. */
++bool nmb_device_memory_census(const NmbDevice *, uint64_t out[14]);
+ /* The translator source the runtime was built from, which keys the shader cache (build-native-metal-bridge.py). */
+ const char *nmb_runtime_build(void);
+ // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index dd75502..acecba0 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -328,6 +328,24 @@ pub extern "C" fn nmb_phase_timings(out: *mut u64) -> bool {
+     })
+ }
+ 
++/// guamp (UniXNU-guamp patches/adreno-metal/0040): the device's memory into the caller's fourteen words: the bytes of its pooled blocks
++/// with a placement, placed in them, of its empty pooled blocks, of its dedicated blocks and of the host memory imported; the blocks of
++/// those four kinds; the bytes allocated so far; then the process's setPurgeableState requests (volatile, their bytes, empty, their bytes).
++/// Diagnostic only.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_memory_census(device: *const NmbDevice, out: *mut u64) -> bool {
++    guard(false, || {
++        if out.is_null() {
++            return Err("null census".into());
++        }
++        // SAFETY: the header's fourteen words.
++        let out = unsafe { std::slice::from_raw_parts_mut(out, 14) };
++        out[..10].copy_from_slice(&get(device)?.0.memory_census());
++        out[10..].copy_from_slice(&metal2vulkan_runtime::purgeable_census());
++        Ok(true)
++    })
++}
++
+ /// The device's texture copy counts into the caller's eight words: linear images at Metal's row pitch made, refused by the driver and
+ /// refused again from memory, textures given a shadow image, shadow copies in and texels copied back, and passes over linear images
+ /// rendered in place and through copies.
+diff --git a/bridge/patches/0040-lean-memory-pools.patch b/bridge/patches/0040-lean-memory-pools.patch
+new file mode 100644
+index 0000000..34db50e
+--- /dev/null
++++ b/bridge/patches/0040-lean-memory-pools.patch
+@@ -0,0 +1,481 @@
++diff --git a/crates/metal2vulkan-runtime/src/attributes.rs b/crates/metal2vulkan-runtime/src/attributes.rs
++index 5f055d5..c8d82be 100644
++--- a/crates/metal2vulkan-runtime/src/attributes.rs
+++++ b/crates/metal2vulkan-runtime/src/attributes.rs
++@@ -16,6 +16,7 @@ use super::buffer::Buffer;
++ use super::device::lock;
++ use super::error::{invalid, Error, Problem};
++ use super::values::StorageMode;
+++use std::sync::atomic::{AtomicU64, Ordering};
++ use std::sync::Mutex;
++ 
++ /// The least `allocatedSize` of a Metal resource whose purgeable state Metal keeps. A smaller
++@@ -113,6 +114,35 @@ pub(super) fn set_purgeable(
++     }
++ }
++ 
+++/// guamp (UniXNU-guamp patches/adreno-metal/0040): the `setPurgeableState:` requests of resources
+++/// whose state the runtime keeps, since the process began: volatile requests and their bytes,
+++/// empty requests and theirs. The runtime purges nothing (its memory stays wired either way), so
+++/// these say how much a purging runtime could give back.
+++static PURGEABLE_ASKS: [AtomicU64; 4] = [
+++    AtomicU64::new(0),
+++    AtomicU64::new(0),
+++    AtomicU64::new(0),
+++    AtomicU64::new(0),
+++];
+++
+++/// Count a `setPurgeableState:` of `state` on a resource of `bytes` ([`purgeable_census`]).
+++pub(super) fn note_purgeable(state: PurgeableState, bytes: u64) {
+++    let at = match state {
+++        PurgeableState::Volatile => 0,
+++        PurgeableState::Empty => 2,
+++        PurgeableState::KeepCurrent | PurgeableState::NonVolatile => return,
+++    };
+++    PURGEABLE_ASKS[at].fetch_add(1, Ordering::Relaxed);
+++    PURGEABLE_ASKS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+++}
+++
+++/// The `setPurgeableState:` requests counted so far: volatile requests, their bytes, empty
+++/// requests, their bytes. Diagnostic only; no Metal counterpart.
+++#[doc(hidden)]
+++pub fn purgeable_census() -> [u64; 4] {
+++    PURGEABLE_ASKS.each_ref().map(|count| count.load(Ordering::Relaxed))
+++}
+++
++ /// A resource's label and purgeable state. A new resource has no label and is non-volatile.
++ #[derive(Debug)]
++ pub(super) struct ResourceAttributes {
++@@ -182,6 +212,7 @@ impl Buffer {
++         if self.caller_memory().is_some() || self.length() < PURGEABLE_ALLOCATION {
++             return Ok(PurgeableState::NonVolatile);
++         }
+++        note_purgeable(state, self.length());
++         let answer = self.attributes().set_purgeable_state(state);
++         if state == PurgeableState::Empty && self.storage_mode() != StorageMode::Private {
++             self.clear()?;
++diff --git a/crates/metal2vulkan-runtime/src/heap.rs b/crates/metal2vulkan-runtime/src/heap.rs
++index 751024d..7664c7e 100644
++--- a/crates/metal2vulkan-runtime/src/heap.rs
+++++ b/crates/metal2vulkan-runtime/src/heap.rs
++@@ -870,6 +870,7 @@ impl Heap {
++         {
++             return Ok(PurgeableState::NonVolatile);
++         }
+++        super::attributes::note_purgeable(state, self.size());
++         let answer = self.attributes().set_purgeable_state(state);
++         if let (PurgeableState::Empty, Some(bytes)) = (state, self.bytes()) {
++             if self.storage_mode() == StorageMode::Shared && !self.0.used.load(Ordering::Relaxed) {
++diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
++index 4047633..9a7b12f 100644
++--- a/crates/metal2vulkan-runtime/src/lib.rs
+++++ b/crates/metal2vulkan-runtime/src/lib.rs
++@@ -202,7 +202,7 @@ pub use address_pool::AddressPool;
++ pub use amplification::VertexAmplificationViewMapping;
++ pub use apple_only::{AppleOnly, AppleOnlyCall, AppleOnlyGap, DEFAULT_PROTECTION_OPTIONS};
++ pub use argument_encoder::{ArgumentEncoder, ArgumentEncoderProblem};
++-pub use attributes::PurgeableState;
+++pub use attributes::{purgeable_census, PurgeableState};
++ pub use binary_archive::{BinaryArchive, BinaryArchiveDescriptor};
++ pub use blit::BlitCommandEncoder;
++ pub use blit_texture::copy_census;
++diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
++index a09c1ee..f214d08 100644
++--- a/crates/metal2vulkan-runtime/src/memory.rs
+++++ b/crates/metal2vulkan-runtime/src/memory.rs
++@@ -51,12 +51,53 @@ use std::sync::Mutex;
++ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
++ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
++ 
++-/// The first pooled block of a pool: later ones grow with the pool ([`Memory::next_block_bytes`]),
++-/// doubling it up to [`BLOCK_BYTES`]. Where device memory is the system's own and every block is
++-/// wired as it is made (a guest whose GPU imports its pages), a process with a few small resources
++-/// otherwise held a 64 MiB block in each of its pools: 256-640 MiB each, 2 GiB in all at an iPadOS
++-/// guest's home screen.
++-pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
+++// The first pooled block of a pool ([`PoolPolicy::first_block_bytes`], 4 MiB before guamp 0040):
+++// later ones grow with the pool ([`Memory::next_block_bytes`]), doubling it up to the largest
+++// pooled block. Where device memory is the system's own and every block is wired as it is made (a
+++// guest whose GPU imports its pages), a process with a few small resources otherwise held a 64 MiB
+++// block in each of its pools: 256-640 MiB each, 2 GiB in all at an iPadOS guest's home screen.
+++
+++/// How lean the pools are (guamp, UniXNU-guamp patches/adreno-metal/0040): where every block is
+++/// wired as it is made and the system has neither swap nor a memory compressor (an Adreno 610
+++/// guest with 4 GiB), a block's free bytes are memory no other process gets back. fin50: Maps
+++/// grew in 64 MiB steps (the GPU's wired objects 487, 554, 620, 684 MiB) to a 307 MiB footprint
+++/// with about 5 MiB of the system's memory left, and gave nothing back when its footprint fell
+++/// (one empty block, of any size, kept in each pool; room for half of a 64 MiB block kept ahead in
+++/// each of the encodings' pools).
+++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+++pub(super) struct PoolPolicy {
+++    /// The largest pooled block (`NMB_POOL_BLOCK_MIB`, 4 to 64, default 16): a placement over
+++    /// half of it takes a dedicated block of its own size, so a pool's slack is at most one block.
+++    pub(super) block_bytes: u64,
+++    /// The largest empty pooled block a pool keeps for its next placement (`NMB_POOL_KEEP_MIB`,
+++    /// 0 to 64, default 4): a larger one is freed as it empties.
+++    pub(super) keep_empty_bytes: u64,
+++    /// The most room [`keep_room`] keeps ahead in an encodings' pool (`NMB_POOL_ROOM_KIB`, 0 to
+++    /// 65536, default 2048), rather than half of the pool's next block.
+++    pub(super) room_bytes: u64,
+++    /// A pool's first block (`NMB_POOL_FIRST_KIB`, 256 to 16384, default 1024), rather than
+++    /// 4 MiB: [`keep_room`] makes one in each of the encodings' four pools at the
+++    /// device's first creation call, 16 MiB in every Metal process at 4 MiB, a widget's or an
+++    /// extension's included.
+++    pub(super) first_block_bytes: u64,
+++}
+++
+++impl PoolPolicy {
+++    /// The runtime's policy before guamp's was `NMB_POOL_BLOCK_MIB=64`, any empty block kept (a
+++    /// limit past 64 MiB) and room for half of the next block (past 65536 KiB). The defaults, each replaced by its variable where that is set to a number in its range.
+++    pub(super) fn from_env() -> PoolPolicy {
+++        let var = |name: &str, low: u64, high: u64| -> Option<u64> {
+++            let value: u64 = std::env::var(name).ok()?.trim().parse().ok()?;
+++            (low..=high).contains(&value).then_some(value)
+++        };
+++        PoolPolicy {
+++            block_bytes: var("NMB_POOL_BLOCK_MIB", 4, 64).unwrap_or(16) << 20,
+++            keep_empty_bytes: var("NMB_POOL_KEEP_MIB", 0, 64).unwrap_or(4) << 20,
+++            room_bytes: var("NMB_POOL_ROOM_KIB", 0, 65536).unwrap_or(2048) << 10,
+++            first_block_bytes: var("NMB_POOL_FIRST_KIB", 256, 16384).unwrap_or(1024) << 10,
+++        }
+++    }
+++}
++ 
++ /// What memory a resource needs.
++ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++@@ -275,6 +316,8 @@ pub(super) struct Pool<T> {
++     blocks: Vec<Option<PoolBlock<T>>>,
++     /// The largest alignment a pooled placement asked of it so far ([`Pool::has_room`]).
++     align: u64,
+++    /// The largest empty pooled block it keeps ([`PoolPolicy::keep_empty_bytes`]).
+++    keep_empty: u64,
++ }
++ 
++ #[derive(Debug)]
++@@ -289,11 +332,20 @@ impl<T> Default for Pool<T> {
++         Pool {
++             blocks: Vec::new(),
++             align: 1,
+++            keep_empty: u64::MAX,
++         }
++     }
++ }
++ 
++ impl<T> Pool<T> {
+++    /// An empty pool that keeps an empty pooled block of at most `keep_empty` bytes.
+++    pub(super) fn keeping(keep_empty: u64) -> Pool<T> {
+++        Pool {
+++            keep_empty,
+++            ..Pool::default()
+++        }
+++    }
+++
++     /// A place for `size` bytes aligned to `align` in a pooled block that has room: (block,
++     /// offset).
++     pub(super) fn place(&mut self, size: u64, align: u64) -> Option<(usize, u64)> {
++@@ -365,7 +417,7 @@ impl<T> Pool<T> {
++ 
++     /// Return `[offset, offset + size)` of block `index`. The block's payload when the block
++     /// must now be freed: a dedicated block, or a pooled block that emptied while another empty
++-    /// pooled block is kept.
+++    /// pooled block is kept, or one larger than the pool keeps empty.
++     pub(super) fn release(&mut self, index: usize, offset: u64, size: u64) -> Option<T> {
++         let block = self.blocks.get_mut(index)?.as_mut()?;
++         block.ranges.free(offset, size);
++@@ -373,6 +425,7 @@ impl<T> Pool<T> {
++             return None;
++         }
++         let keep = !block.dedicated
+++            && block.ranges.len() <= self.keep_empty
++             && !self.blocks.iter().enumerate().any(|(other, block)| {
++                 other != index
++                     && block
++@@ -400,17 +453,39 @@ impl<T> Pool<T> {
++     /// imports, whatever else they are.
++     fn count_into(&self, census: &mut Census, imported: impl Fn(&T) -> bool) {
++         for block in self.blocks.iter().flatten() {
++-            let count = match (imported(&block.payload), block.dedicated) {
++-                (true, _) => &mut census.imported,
++-                (false, true) => &mut census.dedicated,
++-                (false, false) if block.ranges.is_empty() => &mut census.empty,
++-                (false, false) => &mut census.pooled,
+++            let bytes = block.ranges.len();
+++            let (count, total) = match (imported(&block.payload), block.dedicated) {
+++                (true, _) => (&mut census.imported, &mut census.bytes.imported),
+++                (false, true) => (&mut census.dedicated, &mut census.bytes.dedicated),
+++                (false, false) if block.ranges.is_empty() => {
+++                    (&mut census.empty, &mut census.bytes.empty)
+++                }
+++                (false, false) => {
+++                    census.bytes.pooled_used += block.ranges.used();
+++                    (&mut census.pooled, &mut census.bytes.pooled)
+++                }
++             };
++             *count += 1;
+++            *total += bytes;
++         }
++     }
++ }
++ 
+++/// The bytes of a device's live blocks, by kind ([`Census::bytes`]; guamp 0040).
+++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+++pub(super) struct CensusBytes {
+++    /// Of pooled blocks with a placement in them.
+++    pub(super) pooled: u64,
+++    /// Placed in those.
+++    pub(super) pooled_used: u64,
+++    /// Of empty pooled blocks.
+++    pub(super) empty: u64,
+++    /// Of dedicated blocks.
+++    pub(super) dedicated: u64,
+++    /// Of imported host memory.
+++    pub(super) imported: u64,
+++}
+++
++ /// A device's live `VkDeviceMemory` blocks, by kind ([`Memory::census`]): each one buffer
++ /// object the driver lists in every submission where it lists every allocation (ANV on i915).
++ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++@@ -423,6 +498,8 @@ pub(super) struct Census {
++     pub(super) dedicated: u64,
++     /// The caller's host memory imported ([`Memory::import_host`]), a block each.
++     pub(super) imported: u64,
+++    /// Their bytes, by the same kinds.
+++    pub(super) bytes: CensusBytes,
++ }
++ 
++ /// A host pointer the runtime may send between threads: the mapping of a block it owns.
++@@ -684,6 +761,10 @@ pub(super) struct Memory {
++     families: Vec<u32>,
++     /// The bytes of the blocks allocated so far ([`Memory::allocated`]).
++     allocated: u64,
+++    /// The most room [`keep_room`] keeps ahead ([`PoolPolicy::room_bytes`]).
+++    room_bytes: u64,
+++    /// A pool's first block ([`PoolPolicy::first_block_bytes`]).
+++    first_block_bytes: u64,
++ }
++ 
++ impl Memory {
++@@ -699,12 +780,15 @@ impl Memory {
++     ) -> Memory {
++         let count = properties.memory_type_count as usize;
++         let types = properties.memory_types[..count.min(vk::MAX_MEMORY_TYPES)].to_vec();
+++        let policy = PoolPolicy::from_env();
++         Memory {
++             pools: (types.iter().chain(&types))
++-                .map(|_| Pool::default())
+++                .map(|_| Pool::keeping(policy.keep_empty_bytes))
++                 .collect(),
++             types,
++-            block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
+++            block_bytes: policy.block_bytes.min(max_allocation.max(1)),
+++            room_bytes: policy.room_bytes,
+++            first_block_bytes: policy.first_block_bytes,
++             device_address,
++             address_types: None,
++             kept: None,
++@@ -837,12 +921,12 @@ impl Memory {
++     }
++ 
++     /// The size of the next pooled block of `pool` for a placement of `size` bytes: as many bytes
++-    /// as its pooled blocks have (the pool doubles), at least [`FIRST_BLOCK_BYTES`] and the
++-    /// placement's next power of two, at most [`BLOCK_BYTES`] (or the device's largest
++-    /// allocation).
+++    /// as its pooled blocks have (the pool doubles), at least the first block's size
+++    /// ([`PoolPolicy::first_block_bytes`]) and the placement's next power of two, at most the
+++    /// largest pooled block ([`PoolPolicy::block_bytes`], or the device's largest allocation).
++     fn next_block_bytes(&self, pool: (Holds, u32), size: u64) -> u64 {
++         let have = self.pool_ref(pool.0, pool.1).pooled_bytes();
++-        (have.max(FIRST_BLOCK_BYTES).max(size.next_power_of_two()))
+++        (have.max(self.first_block_bytes).max(size.next_power_of_two()))
++             .min(self.block_bytes)
++             .max(size)
++     }
++@@ -1432,18 +1516,23 @@ fn place(
++ /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
++ /// is left to the placement that needs it.
++ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
++-    let (lacking, maker) = {
+++    let (lacking, maker, room_bytes) = {
++         let mut memory = lock(memory);
++         let Ok(kept) = memory.kept(device) else {
++             return;
++         };
++         // Room for half of the pool's next block: a growing pool keeps room for what its blocks
++-        // have held, rather than half of the largest block from its first encoding on.
+++        // have held, rather than half of the largest block from its first encoding on. guamp
+++        // 0040: at most `room_bytes` of it, so that a pool whose blocks are mostly placed does not
+++        // get a whole new block ahead of any placement that needs it.
+++        let room_bytes = memory.room_bytes;
++         let lacking: Vec<((Holds, u32), u64)> = (kept.into_iter())
++             .map(|pool| (pool, memory.next_block_bytes(pool, 1)))
++-            .filter(|&((holds, type_index), bytes)| !memory.pool_ref(holds, type_index).has_room(bytes / 2))
+++            .filter(|&((holds, type_index), bytes)| {
+++                !memory.pool_ref(holds, type_index).has_room((bytes / 2).min(room_bytes))
+++            })
++             .collect();
++-        (lacking, memory.maker())
+++        (lacking, memory.maker(), room_bytes)
++     };
++     for (pool, bytes) in lacking {
++         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
++@@ -1451,7 +1540,7 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
++             continue;
++         };
++         let mut memory = lock(memory);
++-        if memory.pool_ref(pool.0, pool.1).has_room(bytes / 2) {
+++        if memory.pool_ref(pool.0, pool.1).has_room((bytes / 2).min(room_bytes)) {
++             drop(memory);
++             // SAFETY: nothing is placed in the block, which no command reads.
++             unsafe { block.release(device) };
++diff --git a/crates/metal2vulkan-runtime/src/tests/memory.rs b/crates/metal2vulkan-runtime/src/tests/memory.rs
++index 53a1a65..6ec7bb5 100644
++--- a/crates/metal2vulkan-runtime/src/tests/memory.rs
+++++ b/crates/metal2vulkan-runtime/src/tests/memory.rs
++@@ -261,6 +261,52 @@ fn pooled_blocks_place_until_full_and_one_empty_block_is_kept() {
++     assert_eq!(pool.blocks(), 0);
++ }
++ 
+++/// guamp 0040: a pool keeps an empty pooled block only up to its size limit; a larger one is
+++/// freed as it empties, and a kept one still serves the next placement.
+++#[test]
+++fn an_empty_block_past_the_keep_limit_is_freed() {
+++    let mut pool: Pool<&str> = Pool::keeping(256);
+++    let big = pool.add(1024, false, "big", 100);
+++    let small = pool.add(256, false, "small", 100);
+++    assert_eq!(pool.release(big, 0, 100), Some("big"), "past the limit");
+++    assert_eq!(pool.release(small, 0, 100), None, "within the limit, kept");
+++    assert_eq!(pool.blocks(), 1);
+++    assert_eq!(pool.place(200, 1), Some((small, 0)));
+++    let mut none: Pool<u8> = Pool::keeping(0);
+++    let only = none.add(64, false, 1, 8);
+++    assert_eq!(none.release(only, 0, 8), Some(1), "a limit of 0 keeps none");
+++}
+++
+++/// guamp 0040: the policy's variables replace its defaults only within their ranges.
+++#[test]
+++fn the_pool_policy_takes_its_variables_within_their_ranges() {
+++    use crate::memory::PoolPolicy;
+++    // One test sets and reads the variables, so no other test races them.
+++    std::env::remove_var("NMB_POOL_BLOCK_MIB");
+++    std::env::remove_var("NMB_POOL_KEEP_MIB");
+++    std::env::remove_var("NMB_POOL_ROOM_KIB");
+++    let defaults = PoolPolicy::from_env();
+++    assert_eq!(defaults.block_bytes, 16 << 20);
+++    assert_eq!(defaults.keep_empty_bytes, 4 << 20);
+++    assert_eq!(defaults.room_bytes, 2048 << 10);
+++    assert_eq!(defaults.first_block_bytes, 1 << 20);
+++    std::env::set_var("NMB_POOL_FIRST_KIB", "4096");
+++    assert_eq!(PoolPolicy::from_env().first_block_bytes, 4 << 20);
+++    std::env::remove_var("NMB_POOL_FIRST_KIB");
+++    std::env::set_var("NMB_POOL_BLOCK_MIB", "64");
+++    std::env::set_var("NMB_POOL_KEEP_MIB", "0");
+++    std::env::set_var("NMB_POOL_ROOM_KIB", "99999999");
+++    let set = PoolPolicy::from_env();
+++    assert_eq!(set.block_bytes, 64 << 20);
+++    assert_eq!(set.keep_empty_bytes, 0);
+++    assert_eq!(set.room_bytes, defaults.room_bytes, "out of range: the default");
+++    std::env::set_var("NMB_POOL_BLOCK_MIB", "2");
+++    assert_eq!(PoolPolicy::from_env().block_bytes, defaults.block_bytes);
+++    std::env::remove_var("NMB_POOL_BLOCK_MIB");
+++    std::env::remove_var("NMB_POOL_KEEP_MIB");
+++    std::env::remove_var("NMB_POOL_ROOM_KIB");
+++}
+++
++ #[test]
++ fn dedicated_blocks_take_no_other_placement_and_free_with_their_resource() {
++     let mut pool: Pool<u32> = Pool::default();
++diff --git a/crates/metal2vulkan-runtime/src/texture/attributes.rs b/crates/metal2vulkan-runtime/src/texture/attributes.rs
++index 3c607cc..97c2038 100644
++--- a/crates/metal2vulkan-runtime/src/texture/attributes.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/attributes.rs
++@@ -25,7 +25,9 @@
++ //!   validation stops each ("Setting purgeability state directly on heap sub-allocated resources
++ //!   is not allowed"), as a buffer in a heap does.
++ 
++-use super::super::attributes::{set_purgeable, texture_allocation, PURGEABLE_ALLOCATION};
+++use super::super::attributes::{
+++    note_purgeable, set_purgeable, texture_allocation, PURGEABLE_ALLOCATION,
+++};
++ use super::super::buffer::Buffer;
++ use super::super::buffer_texture::TexelsHome;
++ use super::super::copy_plan::block_extent;
++@@ -72,12 +74,18 @@ impl Texture {
++         }
++         Ok(match self.kept() {
++             Some(Kept::Image(cell)) => {
+++                if let Storage::Image(image) = &self.0.storage {
+++                    note_purgeable(state, allocation_bytes(image));
+++                }
++                 let mut current = lock(cell);
++                 let (answer, next) = set_purgeable(*current, state);
++                 *current = next;
++                 answer
++             }
++-            Some(Kept::Texels(buffer)) => buffer.attributes().set_purgeable_state(state),
+++            Some(Kept::Texels(buffer)) => {
+++                note_purgeable(state, buffer.length());
+++                buffer.attributes().set_purgeable_state(state)
+++            }
++             None => PurgeableState::NonVolatile,
++         })
++     }
++@@ -111,9 +119,14 @@ fn own_allocation(image: &Image) -> bool {
++     if matches!(image.options.storage_mode(), Ok(StorageMode::Memoryless)) {
++         return false;
++     }
+++    allocation_bytes(image) >= PURGEABLE_ALLOCATION
+++}
+++
+++/// The `allocatedSize` Metal gives the texture of `image` (`texture_allocation`).
+++fn allocation_bytes(image: &Image) -> u64 {
++     let plan = image.plan();
++     let block_bytes = plan.format.block().map_or(0, |block| u64::from(block.size));
++-    let bytes = texture_allocation(
+++    texture_allocation(
++         block_extent(plan.pixel_format).unwrap_or([1, 1]),
++         block_bytes,
++         plan.extent,
++@@ -121,6 +134,5 @@ fn own_allocation(image: &Image) -> bool {
++         plan.levels,
++         plan.layers,
++         plan.samples.as_raw(),
++-    );
++-    bytes >= PURGEABLE_ALLOCATION
+++    )
++ }
++diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
++index 7fda01b..cdc5125 100644
++--- a/crates/metal2vulkan-runtime/src/work_counts.rs
+++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
++@@ -979,6 +979,31 @@ pub struct WorkCounts {
++ }
++ 
++ impl Device {
+++    /// guamp (UniXNU-guamp patches/adreno-metal/0040): its memory now: the bytes of the pooled
+++    /// blocks with a placement, of what is placed in them, of the empty pooled blocks, of the
+++    /// dedicated blocks and of the host memory imported; the blocks of each of those four kinds;
+++    /// the bytes allocated so far. No Metal counterpart; not part of the API.
+++    #[doc(hidden)]
+++    pub fn memory_census(&self) -> [u64; 10] {
+++        let (allocated, census) = {
+++            let memory = lock(&self.shared().memory);
+++            (memory.allocated(), memory.census())
+++        };
+++        let bytes = census.bytes;
+++        [
+++            bytes.pooled,
+++            bytes.pooled_used,
+++            bytes.empty,
+++            bytes.dedicated,
+++            bytes.imported,
+++            census.pooled,
+++            census.empty,
+++            census.dedicated,
+++            census.imported,
+++            allocated,
+++        ]
+++    }
+++
++     /// What its commit path did so far (`work_counts.rs`): counts the lanes hold to bounds. No
++     /// Metal counterpart; not part of the API.
++     #[doc(hidden)]
