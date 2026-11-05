@@ -1,0 +1,55 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index bd608c7..4f1fa5f 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -6239,6 +6239,50 @@ cs_text_fixup_init(void)
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, cs_text_fixup_init);
+ 
++/*
++ * guamp 05/11: boot-relative immediates. The timebase keeps counting across warm resets and fastboot boot (see
++ * zzzz-guamp-log-time-zero.patch), so user-space uptime (mach_absolute_time, CACurrentMediaTime) does not start at
++ * this boot (fin48 in RAM after fastboot: ~570 s at the first log line). Inside one replacement, the adjacent pair
++ * "movz xN, #S ; movk xN, #0xb007, lsl #16" means "S seconds after this kernel started": once the table is parsed
++ * the pair becomes movz/movk of (seconds of the timebase now + S), capped at 0xffffffff. Without this patch the value
++ * reads 0xb007xxxx s (~93 years), i.e. a gate that never closes. Used by scripts/gen-guamp-lockmin-fixup.py.
++ */
++#include <kern/clock.h>
++uint32_t cs_text_fixup_rebased;
++uint64_t cs_text_fixup_rebase_seconds;
++#define CS_TEXT_FIXUP_MOVZ_X(w)   (((w) & 0xffe00000u) == 0xd2800000u)    /* movz xN, #imm16 (lsl 0) */
++#define CS_TEXT_FIXUP_MARK(rd)    (0xf2a00000u | (0xb007u << 5) | (rd))   /* movk xN, #0xb007, lsl #16 */
++static void
++cs_text_fixup_boot_rebase(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	cs_text_fixup_rebase_seconds = ns / NSEC_PER_SEC;
++	for (uint32_t i = 0; i < cs_text_fixup_count; i++) {
++		struct cs_text_fixup *f = &cs_text_fixups[i];
++		for (uint32_t at = 0; at + 8 <= f->length; at += 4) {
++			uint32_t w0, w1;
++			memcpy(&w0, f->replacement + at, 4);
++			memcpy(&w1, f->replacement + at + 4, 4);
++			if (!CS_TEXT_FIXUP_MOVZ_X(w0) || w1 != CS_TEXT_FIXUP_MARK(w0 & 31u)) {
++				continue;
++			}
++			uint64_t v = cs_text_fixup_rebase_seconds + ((w0 >> 5) & 0xffffu);
++			if (v > 0xffffffffull) {
++				v = 0xffffffffull;
++			}
++			w0 = 0xd2800000u | ((uint32_t)(v & 0xffffu) << 5) | (w0 & 31u);
++			w1 = 0xf2a00000u | ((uint32_t)(v >> 16) << 5) | (w1 & 31u);
++			memcpy(f->replacement + at, &w0, 4);
++			memcpy(f->replacement + at + 4, &w1, 4);
++			cs_text_fixup_rebased++;
++			printf("text-fixup: %s+0x%llx boot-relative immediate -> %llu s (timebase at %llu s)\n", f->name,
++			    f->offset + at, v, cs_text_fixup_rebase_seconds);
++		}
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, cs_text_fixup_boot_rebase);
++
+ /*
+  * Applies the fixups that fall in this validated page of vp. kva is a writable kernel address of the page. Returns the
+  * number of fixups written, so the caller makes the instruction cache coherent.
