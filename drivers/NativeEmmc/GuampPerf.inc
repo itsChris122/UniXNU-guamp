@@ -13,6 +13,7 @@ extern "C" {   // these headers declare C functions without C linkage for C++
 extern "C" {   // these headers declare C functions without C linkage for C++
 #include <vm/vm_shared_region.h>
 }
+#include "GuampMemQueuesCore.h"
 extern "C" kern_return_t host_statistics(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" kern_return_t host_info(host_t, host_flavor_t, host_info_t, mach_msg_type_number_t *);
 extern "C" volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8], armcpu_smp_step[8], armcpu_smp_fail[8];
@@ -138,6 +139,40 @@ static int guampMemTopVisit(struct proc *p, void *arg) {
 
 static void guampMemTopCall(thread_call_param_t, thread_call_param_t);
 
+// GuampMemQueuesCore.h: the pageout queues and the jetsam view the host statistics leave out. Read without locks (counters of
+// the VM and of memorystatus, a torn value only skews one report). Asm labels: the kernel headers declare some of these with
+// other types per configuration (memorystatus_available_pages is 64-bit without CONFIG_JETSAM; little-endian, the low word
+// read here is the value); all are defined unconditionally in vm_resident.c, vm_compressor.c and kern_memorystatus.c.
+extern "C" unsigned int guamp_vm_throttled __asm("_vm_page_throttled_count");
+extern "C" unsigned int guamp_vm_cleaned __asm("_vm_page_cleaned_count");
+extern "C" unsigned int guamp_vm_free_target __asm("_vm_page_free_target");
+extern "C" unsigned int guamp_vm_free_min __asm("_vm_page_free_min");
+extern "C" unsigned int guamp_vm_throttle_limit __asm("_vm_page_throttle_limit");
+extern "C" int guamp_vm_compressor_mode __asm("_vm_compressor_mode");
+extern "C" unsigned int guamp_ms_available __asm("_memorystatus_available_pages");
+extern "C" unsigned int guamp_ms_pressure __asm("_memorystatus_available_pages_pressure");
+extern "C" unsigned int guamp_ms_critical __asm("_memorystatus_available_pages_critical");
+
+static void guampMemQueuesSample() {
+  static GuampMemQueues last = {};
+  static bool printed = false;
+  GuampMemQueues now = {{guamp_vm_throttled, guamp_vm_cleaned, guamp_vm_free_target, guamp_vm_free_min, guamp_vm_throttle_limit,
+                         guamp_ms_available, guamp_ms_pressure, guamp_ms_critical,
+                         static_cast<uint32_t>(guamp_vm_compressor_mode)}};
+  if (!guampMemQueuesMoved(now, last, !printed, kGuampMemQueuesStepPages)) return;
+  const uint32_t pb = PAGE_SIZE;
+  char avail[96] = "unknown";
+  if (guampMemQueuesAvailableKnown(now.v[5]))
+    snprintf(avail, sizeof(avail), "%u MiB (pressure %u, critical %u)", guampMemQueuesMiB(now.v[5], pb),
+             guampMemQueuesMiB(now.v[6], pb), guampMemQueuesMiB(now.v[7], pb));
+  IOLog("GuampMem: queues MiB throttled %u cleaned %u; free target %u min %u throttle %u MiB; jetsam available %s; "
+        "compressor mode %u (2 = in-core, 8 = none: vm_compressor=2 turns it on)\n",
+        guampMemQueuesMiB(now.v[0], pb), guampMemQueuesMiB(now.v[1], pb), guampMemQueuesMiB(now.v[2], pb),
+        guampMemQueuesMiB(now.v[3], pb), guampMemQueuesMiB(now.v[4], pb), avail, now.v[8]);
+  last = now;
+  printed = true;
+}
+
 static void guampMemSample() {
   static unsigned round = 0;
   vm_statistics64_data_t vm = {};
@@ -155,6 +190,7 @@ static void guampMemSample() {
   } else {
     IOLog("GuampMem: VM statistics unavailable, status %d count %u\n", result, count);
   }
+  guampMemQueuesSample();
   round = round + 1;
   if (round % 3) return;
   // The caller is the eMMC service path: walking the process list there could wait on a proc lock held by a task
