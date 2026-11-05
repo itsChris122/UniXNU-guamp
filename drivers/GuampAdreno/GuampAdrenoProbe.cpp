@@ -820,6 +820,10 @@ int naAccelerator() {
 // fin49 (glitches): also the ring's newest fence when the display last accepted a swap (guamp_adreno_note_swap), whichever is later
 // (GuampCopyTarget.h): everything handed out before the swap has run when the copy reads the surface.
 static volatile uint32_t gSwapFence;
+// guamp-copy-gpu-wait-max in us (0: the caller's bound alone), and native_copy_wait_extended: [0] waits that went past the caller's
+// bound, [1] of them that then saw their fence (a finished frame copied instead of an unfinished one), [2] that gave up anyway.
+static volatile uint32_t gCopyWaitMaxUs = 2000000;
+extern "C" {volatile uint64_t native_copy_wait_extended[3];}
 extern "C" void guamp_adreno_note_swap(void) {
   NativeAdrenoRing *ring = gRing;
   if (!ring || ring->poisoned() || gGpuParked) return;
@@ -844,13 +848,26 @@ extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited
   const uint32_t target = copyTarget(ring);
   if (!target) return 0;
   const uint64_t start = naNow(nullptr);
+  // guamp-copy-gpu-wait-max (GuampCopyTarget.h guampCopyWaitGiveUp): past timeout_us the wait goes on while fences still retire.
+  uint64_t progressAt = start;
+  uint32_t lastDone = 0;
+  bool haveDone = false, extended = false;
   for (;;) {
     __asm__ volatile("dsb sy" ::: "memory");
     const uint32_t done = *reinterpret_cast<const volatile uint32_t *>(page + 4);
-    const uint64_t spent = naNow(nullptr) - start;
+    const uint64_t now = naNow(nullptr), spent = now - start;
+    if (!haveDone || done != lastDone) {lastDone = done; haveDone = true; progressAt = now;}
     if (waited_us) *waited_us = spent > 0xffffffffull ? 0xffffffffu : uint32_t(spent);
-    if (int32_t(done - target) >= 0) return 0;
-    if (spent >= timeout_us || ring->poisoned() || gGpuParked) return 1;
+    if (int32_t(done - target) >= 0) {
+      if (extended) native_copy_wait_extended[1] = native_copy_wait_extended[1] + 1;
+      return 0;
+    }
+    if (ring->poisoned() || gGpuParked) return 1;
+    if (spent >= timeout_us && !extended) {extended = true; native_copy_wait_extended[0] = native_copy_wait_extended[0] + 1;}
+    if (guampCopyWaitGiveUp(spent, now - progressAt, timeout_us, gCopyWaitMaxUs)) {
+      if (extended) native_copy_wait_extended[2] = native_copy_wait_extended[2] + 1;
+      return 1;
+    }
     guamp_gpu_dcvs_boost = 1;
     if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
       assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 200, NSEC_PER_USEC);
@@ -901,6 +918,10 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
         native_adreno_mailbox_idle_ms);
   gCopyWaitCompositor = bootArg("guamp-copy-wait-compositor", 1) ? 1 : 0;
   {
+    const uint32_t ms = bootArg("guamp-copy-gpu-wait-max", 2000);
+    gCopyWaitMaxUs = (ms > 10000 ? 10000 : ms) * 1000;
+  }
+  {
     const uint32_t depth = bootArg("guamp-gpu-other-depth", 2);
     native_adreno_other_depth = depth > 4 ? 4 : depth;
   }
@@ -915,7 +936,8 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   IOLog("GuampAdreno: job slots kept for the render server %u of 8 (apps wait up to %u us, the render server up to %u us)\n",
         native_adreno_rs_slots, native_adreno_slot_wait_us, native_adreno_rs_slot_wait_us);
   IOLog("GuampAdreno: display copy waits for the render server's fence %u; other processes at most %u submissions in flight "
-        "(wait up to %u us)\n", gCopyWaitCompositor, native_adreno_other_depth, native_adreno_other_wait_us);
+        "(wait up to %u us); past its bound the copy waits while fences retire, up to %u ms\n", gCopyWaitCompositor,
+        native_adreno_other_depth, native_adreno_other_wait_us, gCopyWaitMaxUs / 1000);
   native_adreno_ro_imports_owned = bootArg("guamp-adreno-ro-imports-owned", 1) ? 1 : 0;
   native_adreno_ro_imports_sweep = bootArg("guamp-adreno-ro-imports-sweep", 32);
   IOLog("GuampAdreno: read-only imports cleaned at map only %u, swept every %u submissions\n", native_adreno_ro_imports_owned,

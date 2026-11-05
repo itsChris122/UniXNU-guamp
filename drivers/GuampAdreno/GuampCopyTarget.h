@@ -17,4 +17,18 @@ static inline uint32_t guampCopyTarget(uint32_t newest, uint32_t compositor, uin
   if (swap && (!target || int32_t(swap - target) > 0)) target = swap;
   return target && int32_t(newest - target) >= 0 ? target : newest;
 }
+
+// guamp-copy-gpu-wait-max (ms, default 2000; 0 = the caller's bound alone, as before). fin50 Maps (live-20261105-204852): from 331 s
+// to 502 s more than 100 copy waits timed out at 500 ms, the GPU 100% busy behind the app's frames, and the copy then read the render
+// server's surface before its frame was written: an older frame (the map jumping back while moved fast) or a frame half drawn (the
+// cleared damage rectangle read before the map layer was drawn: the black horizontal bar, or the whole map black). Past the caller's
+// bound the wait goes on while the GPU still retires fences, so the copy reads a finished frame, later (the swap queued behind it waits,
+// which slows the render server down instead of showing torn frames); it gives up only when no fence retired for a whole bound (a
+// stalled GPU: the hang detector's case) or at the hard bound. True: stop waiting, timed out.
+static inline bool guampCopyWaitGiveUp(uint64_t spent_us, uint64_t stalled_us, uint32_t timeout_us, uint32_t max_us) {
+  if (spent_us < timeout_us) return false;
+  if (max_us <= timeout_us) return true;
+  if (spent_us >= max_us) return true;
+  return stalled_us >= timeout_us;
+}
 #endif

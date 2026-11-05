@@ -48,6 +48,31 @@ int main() {
     if (!retired(target, renderJob) || !retired(target, appJob)) early++;
     if (int32_t(target - swapMark) > 0) stalls++;    // waited for work queued after the swap
   }
+  // guamp-copy-gpu-wait-max (guampCopyWaitGiveUp): within the caller's bound never; past it only at the hard bound or after a whole
+  // bound without a retired fence; a hard bound at or under the caller's one keeps the old answer.
+  CHECK(!guampCopyWaitGiveUp(100, 100, 500000, 2000000));
+  CHECK(guampCopyWaitGiveUp(500000, 0, 500000, 0));            // off: as before
+  CHECK(guampCopyWaitGiveUp(500000, 0, 500000, 500000));
+  CHECK(!guampCopyWaitGiveUp(700000, 120000, 500000, 2000000)); // fences still retiring: wait on
+  CHECK(guampCopyWaitGiveUp(700000, 500000, 500000, 2000000));  // stalled a whole bound
+  CHECK(guampCopyWaitGiveUp(2000000, 0, 500000, 2000000));      // hard bound
+  // fin50's case: the frame's fence 1200 ms away, a fence retiring every 150 ms. The old bound copies an unfinished frame at 500 ms;
+  // the new one waits until 1200 ms. A GPU that stops at 300 ms is given up at 800 ms.
+  {
+    uint64_t t = 0, progress = 0; bool gave = false, done = false;
+    for (; t <= 3000000; t += 1000) {
+      if (t % 150000 == 0) progress = t;
+      if (t >= 1200000) {done = true; break;}
+      if (guampCopyWaitGiveUp(t, t - progress, 500000, 2000000)) {gave = true; break;}
+    }
+    CHECK(done && !gave);
+    t = 0; progress = 0; gave = false;
+    for (; t <= 3000000; t += 1000) {
+      if (t % 150000 == 0 && t <= 300000) progress = t;
+      if (guampCopyWaitGiveUp(t, t - progress, 500000, 2000000)) {gave = true; break;}
+    }
+    CHECK(gave && t == 800000);
+  }
   CHECK(early == 0);
   CHECK(stalls == 0);
   CHECK(earlyAlone > 0);   // the model does show 0017's failure
