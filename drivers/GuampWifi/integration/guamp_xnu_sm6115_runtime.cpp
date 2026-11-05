@@ -555,9 +555,11 @@ struct Sm6115Runtime {
   // guamp-baseband=1 (04/11): the UniXNU cellular bridge (drivers/QcomBaseband) on this QRTR link. The bridge itself reads
   // /chosen/coachz-baseband (the ADT of scripts/make-guamp-baseband-adt.py has it); the boot argument sets it here too, before the
   // bridge's first look, so one switch is enough. Without a --baseband build the argument is reported and ignored.
+  // guamp-baseband=2 is the same bridge plus the personalized Mav16 path the XNU patch mounts in /private/preboot (05/11: =2 was
+  // refused here, so it mounted the firmware views with the bridge off).
   static bool basebandRequested() {
     unsigned on=0;PE_parse_boot_argn("guamp-baseband",&on,sizeof(on));
-    if(on!=1)return false;
+    if(on!=1&&on!=2)return false;
 #if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
     bool adt=false,set=false;
     if(IORegistryEntry *chosen=IORegistryEntry::fromPath("IODeviceTree:/chosen")) {
@@ -571,12 +573,12 @@ struct Sm6115Runtime {
       }
       chosen->release();
     }
-    IOLog("GuampBaseband: guamp-baseband=1: cellular bridge on (/chosen/coachz-baseband %s), enabled %d; QMUX clients on QRTR "
-          "ports 0x4100..0x413f, no cellular data (no SM6115 IPA)\n",adt?"from the ADT":set?"set by the kernel":"NOT SET",
+    IOLog("GuampBaseband: guamp-baseband=%u: cellular bridge on (/chosen/coachz-baseband %s), enabled %d; QMUX clients on QRTR "
+          "ports 0x4100..0x413f, no cellular data (SM6115 IPA v4.2 not wired yet)\n",on,adt?"from the ADT":set?"set by the kernel":"NOT SET",
           coachz_baseband_enabled());
     return coachz_baseband_enabled()!=0;
 #else
-    IOLog("GuampBaseband: guamp-baseband=1 ignored: kernel built without the bridge (build-arm-driver.py --baseband)\n");
+    IOLog("GuampBaseband: guamp-baseband=%u ignored: kernel built without the bridge (build-arm-driver.py --baseband)\n",on);
     return false;
 #endif
   }

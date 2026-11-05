@@ -8,7 +8,12 @@ the entry baseband/standalone/Baseband/Mav16/<path>, which native_gpu_addon_inst
 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-baseband.patch shows over /usr/standalone/firmware (Baseband/Mav16). The addon is persistent
 (zzzzzzzzzzzzzzzzz-guamp-addon-manifest.patch): after one boot with it the files stay in Data and later addons need not carry them.
 
-  make-guamp-baseband-addon.py (--bbfw FILE.bbfw | --ipsw URL_OR_FILE) [--base ADDON] --out OUT.gpuaddon
+  make-guamp-baseband-addon.py (--bbfw FILE.bbfw | --ipsw URL_OR_FILE) [--base ADDON] [--stub qdsp6sw.mbn] [--kernel KERNEL.macho]
+                               --out OUT.gpuaddon
+
+Size (05/11): the Mav16 files take 33.8 MB compressed, 30.7 MB of it qdsp6sw.mbn; next to the 54.4 MB kernel the 80 MiB ramdisk
+leaves about 28 MB for the whole addon. --stub qdsp6sw.mbn (see elf_skeleton) brings the firmware to about 3.2 MB; --kernel prints
+the room left.
 
 --base merges the entries of an existing addon (for example the delta of the current image) into the output, so one boot payload
 carries both; an entry name present in both is refused. Apple firmware: it only goes into the boot payload, never into a repository.
@@ -32,10 +37,39 @@ PREFIX = 'baseband/standalone/Baseband/Mav16/'
 BBFW_NAME = 'Firmware/vinyl_02_Mav16-11.00.01.Release.bbfw'
 BBFW_SHA256 = 'f0066dd01c4407f3104cff4fde86172ca5c14cec355e6b25f4777a2c61bee1d2'
 LIMIT = 64 * 1024 * 1024
+RAMDISK = 80 * 1024 * 1024   # GuampBoot FAT ramdisk (boot image at most 96 MiB)
 
 
 def pad(blob):
     return blob + bytes(-len(blob) % 8)
+
+
+def elf_skeleton(data):
+    """Same size, same ELF header, program headers and MBN hash/signature segment; the bytes of every PT_LOAD segment zeroed.
+
+    Why (05/11): qdsp6sw.mbn alone is 30.7 MB compressed and does not fit the 80 MiB ramdisk next to the 54.4 MB kernel, even in an
+    addon of its own. The bridge never asks BBUpdater for it: its SAHARA end requests only image 0x15 (sbl1.mbn, coachz_baseband.cpp
+    bb_sahara_images) and throws the bytes away, and the Qualcomm modem runs its own firmware from modem_<slot>. ABM/BBUpdater still
+    find the file, its size and its ELF layout. If BBUpdater ever digests the whole image, rebuild without --stub (and with a smaller
+    kernel or a bigger ramdisk)."""
+    assert data[:4] == b'\x7fELF' and data[4] in (1, 2), 'not an ELF image'
+    out = bytearray(data)
+    if data[4] == 1:
+        phoff, = struct.unpack_from('<I', data, 0x1c)
+        phent, phnum = struct.unpack_from('<HH', data, 0x2a)
+        segments = [struct.unpack_from('<8I', data, phoff + phent * i) for i in range(phnum)]
+        loads = [(off, size) for kind, off, _, _, size, _, flags, _ in segments if kind == 1]
+    else:
+        phoff, = struct.unpack_from('<Q', data, 0x20)
+        phent, phnum = struct.unpack_from('<HH', data, 0x36)
+        segments = [struct.unpack_from('<IIQQQQQQ', data, phoff + phent * i) for i in range(phnum)]
+        loads = [(off, size) for kind, flags, off, _, _, size, _, _ in segments if kind == 1]
+    for off, size in loads:
+        if not size:
+            continue   # empty segments may point past the end of the file (qdsp6sw.mbn segment 28)
+        assert off + size <= len(data) and off >= phoff + phent * phnum, 'segment past the end or over the headers'
+        out[off:off + size] = bytes(size)
+    return bytes(out)
 
 
 class Remote(io.RawIOBase):
@@ -100,6 +134,9 @@ def main():
     source.add_argument('--bbfw', type=Path, help='the Mav16 .bbfw already extracted from the IPSW')
     source.add_argument('--ipsw', help='the 21H461 IPSW (file or URL, board.toml [ipsw] url): only the bbfw is read')
     parser.add_argument('--base', type=Path, help='an existing addon whose entries are kept in the output')
+    parser.add_argument('--stub', action='append', default=[], metavar='NAME',
+                        help='firmware file (path inside Mav16, e.g. qdsp6sw.mbn) carried as an ELF skeleton: see elf_skeleton()')
+    parser.add_argument('--kernel', type=Path, help='kernel.macho of the image: prints the GBPK estimate against the 80 MiB ramdisk')
     parser.add_argument('--out', required=True, type=Path)
     options = parser.parse_args()
     assert not options.out.exists(), 'exists: %s' % options.out
@@ -116,6 +153,7 @@ def main():
     entries = [entry for entry in entries if entry[0] != '.guamp-keep']
     names = {name for name, *_ in entries}
     added = 0
+    stubs, stubbed = list(options.stub), []
     with zipfile.ZipFile(io.BytesIO(bbfw)) as archive:
         for info in archive.infolist():
             if info.is_dir():
@@ -125,9 +163,14 @@ def main():
             assert len(encoded) <= 160 and '..' not in info.filename.split('/') and not info.filename.startswith('/'), name
             assert name not in names, 'entry already in --base: %s' % name
             data = archive.read(info)
+            if info.filename in stubs:
+                data = elf_skeleton(data)
+                stubbed.append(info.filename)
             entries.append((name, 0o644, len(data), zlib.compress(data, 9)))
             names.add(name)
             added += 1
+    if set(stubs) - set(stubbed):
+        raise SystemExit(f'--stub names not in the bbfw: {sorted(set(stubs) - set(stubbed))}')
     if had_keep:
         lines = sorted((set(keep) - {p for p in keep if p.endswith('/')}) | names | {'.guamp-keep'})
         lines += sorted({p for p in keep if p.endswith('/')} | {'baseband/'})
@@ -141,9 +184,17 @@ def main():
     addon = MAGIC + struct.pack('<IIQ', len(entries), 0, 24 + len(body)) + body
     if len(addon) > LIMIT:
         raise SystemExit(f'addon of {len(addon)} bytes is over the {LIMIT}-byte limit: build it without --base and boot it once')
+    report = dict(bbfw_sha256=digest, firmware_files=added, stubs=stubbed, base_entries=len(entries) - added, entries=len(entries),
+                  bytes=len(addon), sha256=hashlib.sha256(addon).hexdigest())
+    if options.kernel:
+        # GBPK = kernel + ADT + trust cache + addon (+ ~12 KiB of headers, fin48); the FAT ramdisk is 80 MiB, its tables take a few
+        # hundred KiB: 512 KiB of margin and 256 KiB for ADT and trust cache.
+        room = RAMDISK - 512 * 1024 - 256 * 1024 - options.kernel.stat().st_size
+        report.update(kernel_bytes=options.kernel.stat().st_size, addon_room=room, fits_ramdisk=len(addon) <= room)
     options.out.write_bytes(addon)
-    print(json.dumps(dict(bbfw_sha256=digest, firmware_files=added, base_entries=len(entries) - added, entries=len(entries),
-                          bytes=len(addon), sha256=hashlib.sha256(addon).hexdigest()), indent=2))
+    print(json.dumps(report, indent=2))
+    if options.kernel and len(addon) > report['addon_room']:
+        print(f'WARNING: {len(addon)} bytes of addon do not fit the 80 MiB ramdisk next to this kernel ({report["addon_room"]} bytes left)')
 
 
 if __name__ == '__main__':
