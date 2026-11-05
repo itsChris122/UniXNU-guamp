@@ -24,7 +24,7 @@ extern "C" int guamp_camss_sensor_prepare(uint32_t cell, uint32_t mode, struct g
   link->phy = m.csiphy;
   link->lanes = m.lanes;
   link->lane_assign = m.laneAssign;
-  link->lane_mask = 0;
+  link->lane_mask = gcam::laneMaskOfCell(cell);   // OV02B1B: DL2 + DL3 (combo clock), not CLK + DL2
   link->settle_count = m.settle ? m.settle : 14;
   link->data_rate_mbps = m.laneMbps;
   link->vc = m.vc;

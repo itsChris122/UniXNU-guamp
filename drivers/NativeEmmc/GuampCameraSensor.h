@@ -16,6 +16,7 @@
 #ifndef GUAMP_CAMERA_SENSOR_H
 #define GUAMP_CAMERA_SENSOR_H
 #include "GuampCameraCore.h"
+#include "GuampCameraSecondary.h"   // roles, lane masks and post-mode fixes of the secondary cameras
 
 namespace gcam {
 
@@ -290,6 +291,7 @@ struct Session {
   const Gcam *g = nullptr;
   Power pw = {};
   Mode mode = {};
+  uint8_t post = kPostDefault;                 // PostFlags (GuampCameraSecondary.h): macro mirror + flip
   Reg overlay[kBinRegs] = {};
   unsigned nOverlay = 0;
   ExposureApplied exp = {};
@@ -344,6 +346,12 @@ struct Session {
       r = cci->writeRegs(s->cci, s->slave7, overlay, nOverlay, &written);
       if (r) { note(*o, "sensor: binning overlay failed (written)", r, written, nOverlay); return r; }
     }
+    Reg fix[kPostRegsMax];
+    const unsigned nFix = postModeRegs(s->cell, post, fix, &mode.cfa);   // mode.cfa: what the sensor sends after it
+    if (nFix) {
+      r = cci->writeRegs(s->cci, s->slave7, fix, nFix, &written);
+      if (r) { note(*o, "sensor: post-mode fix failed (written)", r, written, nFix); return r; }
+    }
     if (model().longExp) {
       const Reg pg = {0x6028, model().page, 2, 2, 0};
       if (model().page) r = cci->writeRegs(s->cci, s->slave7, &pg, 1);
@@ -383,7 +391,9 @@ struct Session {
     st->height = mode.height;
     if (state < kPowered) return kOk;
     uint8_t b[4] = {};
-    int r = read(s->idReg, b, s->idBytes);
+    // OV02B: the chip id is on page 0, stream on/off and the exposure writes leave page 3 / page 1 selected
+    int r = model().kind == kExpOv02b ? write8(0xfd, 0x00) : kOk;
+    if (!r) r = read(s->idReg, b, s->idBytes);
     if (!r) st->id = s->idBytes == 2 ? static_cast<uint16_t>(b[0] << 8 | b[1]) : b[0];
     if (model().kind == kExpSmia) {
       if (!r && model().page) { const Reg pg = {0x6028, model().page, 2, 2, 0}; r = cci->writeRegs(s->cci, s->slave7, &pg, 1); }

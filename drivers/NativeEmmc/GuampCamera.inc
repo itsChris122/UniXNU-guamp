@@ -20,6 +20,8 @@
 //                         (sensor PLLs are set for 24 MHz: at 19.2 every lane rate and fps is 0.8x)
 //   guamp-camera-cci=100|400|1000  CCI timing set (default 400; the CCI clock is the 19.2 MHz TCXO, so the bus
 //                         runs at about half the nominal rate)
+//   guamp-camera-macro-flip=0|1|2  macro (ov02b10) mirror + flip after its mode list, so it sends frames in the main
+//                         camera orientation: 1 default (CFA BGGR -> RGGB), 2 flip but CFA kept, 0 vendor orientation
 //   guamp-camera-af=1|3      after the sensors: lens driver + EEPROM AF probe (GuampCamera3A.inc), 3 = also macro
 //   guamp-camera-pmgpio=1    also program PM8008 GPIO1 as the DT does (func1 output); default: only log it
 //   guamp-camera-sensor=<cell>  session sensor for mode 2 (default 0 = s5kgm1st; 1 s5k4h7, 2 ov02b1b, 3 ov02b10)
@@ -50,6 +52,7 @@ constexpr unsigned kGpioPm8008Reset = 26;        // pm8008_active: output high, 
 constexpr unsigned kCciPins[2][2] = {{22, 23}, {29, 30}};   // cci0/cci1 sda, scl: function cci_i2c (slot 1), pull-up
 
 unsigned gMode, gDelay = 15, gMask = 0xf, gMclkMhz = 24, gCciKhz = 400, gPmGpio;
+unsigned gMacroFlip = 1;           // guamp-camera-macro-flip (GuampCameraSecondary.h postFlagsFromArg)
 unsigned gSensor, gRes, gModeIdx = 0xff, gStream, gStreamMs = 1000, gExpUs = 10000, gGainQ8 = 256;
 IOLock *gOwnLock, *gSessionLock;
 IOLock *busLock() { return audiohw::gLock ? audiohw::gLock : gOwnLock; }
@@ -508,6 +511,8 @@ void start() {
   PE_parse_boot_argn("guamp-camera-mask", &gMask, sizeof(gMask));
   PE_parse_boot_argn("guamp-camera-mclk", &gMclkMhz, sizeof(gMclkMhz));
   PE_parse_boot_argn("guamp-camera-cci", &gCciKhz, sizeof(gCciKhz));
+  PE_parse_boot_argn("guamp-camera-macro-flip", &gMacroFlip, sizeof(gMacroFlip));
+  gSess.post = gcam::postFlagsFromArg(gMacroFlip);
   PE_parse_boot_argn("guamp-camera-pmgpio", &gPmGpio, sizeof(gPmGpio));
   PE_parse_boot_argn("guamp-camera-sensor", &gSensor, sizeof(gSensor));
   PE_parse_boot_argn("guamp-camera-res", &gRes, sizeof(gRes));

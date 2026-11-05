@@ -82,7 +82,7 @@ static uint8_t sensorRead(const Sensor &s, uint32_t a) {
   const uint16_t id = S->sensorId[s.cell];
   if (s.idBytes == 2 && a == s.idReg) return id >> 8;
   if (s.idBytes == 2 && a == s.idReg + 1u) return id & 0xff;
-  if (s.idBytes == 1 && a == s.idReg) return id & 0xff;
+  if (s.idBytes == 1 && a == s.idReg && (!ovSensor(s) || !S->regs[s.cell][0xfd])) return id & 0xff;   // OV02B: page 0 only
   if (!ovSensor(s) && a == 0x0005) return streaming(s) ? (S->frame[s.cell] = static_cast<uint8_t>(S->frame[s.cell] + 7)) : S->frame[s.cell];
   return S->regs[s.cell][regKey(s, a)];
 }
