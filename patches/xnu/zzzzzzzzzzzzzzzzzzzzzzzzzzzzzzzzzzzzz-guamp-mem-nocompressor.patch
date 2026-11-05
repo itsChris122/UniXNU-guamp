@@ -1,0 +1,363 @@
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 63b25bb..f1b6bcd 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -1446,6 +1446,35 @@ memorystatus_init(void)
+ 		memorystatus_delta = (unsigned int)MEMSTAT_PERCENT_TOTAL_PAGES(MEMORYSTATUS_DELTA_PERCENTAGE_LARGE);
+ 	}
+ 
++	/*
++	 * guamp (zzz...-guamp-mem-nocompressor.patch, 06/11): "available" counts every pageable file page, also the hot working set,
++	 * and without the compressor nothing else can be reclaimed. With the stock ratios (critical 5 %, idle 10 %, pressure 15 %
++	 * of 3066 MiB) fin50 thrashed with 669 MiB available and no pressure level, no idle kill, no memory warning to any app.
++	 * Without an active compressor and without kern.memstat_* values from the ADT or the boot line, guamp-jetsam-idle-mb
++	 * (default 640) and guamp-jetsam-pressure-mb (default 800) set the idle-band and pressure thresholds; =0 keeps the stock ones.
++	 * The critical base (no idle process left) stays stock, so "no victim" can never come earlier than before.
++	 */
++	uint32_t guamp_idle_mb = memorystatus_idle_threshold_mb, guamp_pressure_mb = memorystatus_pressure_threshold_mb;
++	if (!VM_CONFIG_COMPRESSOR_IS_ACTIVE) {
++		uint32_t value = 640;
++		if (guamp_idle_mb == 0) {
++			PE_parse_boot_argn("guamp-jetsam-idle-mb", &value, sizeof(value));
++			guamp_idle_mb = value;
++		}
++		value = 800;
++		if (guamp_pressure_mb == 0) {
++			PE_parse_boot_argn("guamp-jetsam-pressure-mb", &value, sizeof(value));
++			guamp_pressure_mb = value;
++		}
++		/* never above half of memory; the asserts below want every threshold under max_mem */
++		if ((uint64_t)guamp_idle_mb << 20 > max_mem / 2) {
++			guamp_idle_mb = 0;
++		}
++		if ((uint64_t)guamp_pressure_mb << 20 > max_mem / 2) {
++			guamp_pressure_mb = 0;
++		}
++	}
++
+ 	if (memorystatus_critical_threshold_mb != 0) {
+ 		memorystatus_available_pages_critical_base = (unsigned int)atop_64((uint64_t)memorystatus_critical_threshold_mb << 20);
+ 	} else if (max_mem <= MEMORYSTATUS_SMALL_MEMORY_THRESHOLD) {
+@@ -1458,8 +1487,8 @@ memorystatus_init(void)
+ 	/*
+ 	 * For historical reasons, devices with "medium"-sized memory configs have a different critical:idle:pressure ratio
+ 	 */
+-	if ((memorystatus_idle_threshold_mb != 0)) {
+-		memorystatus_available_pages_critical_idle = (unsigned int)atop_64((uint64_t)memorystatus_idle_threshold_mb << 20);
++	if ((guamp_idle_mb != 0)) {
++		memorystatus_available_pages_critical_idle = (unsigned int)atop_64((uint64_t)guamp_idle_mb << 20);
+ 	} else {
+ 		if ((max_mem > MEMORYSTATUS_SMALL_MEMORY_THRESHOLD) &&
+ 		    (max_mem <= MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD)) {
+@@ -1472,8 +1501,8 @@ memorystatus_init(void)
+ 	}
+ 	assert(memorystatus_available_pages_critical_idle < (unsigned int)atop_64(max_mem));
+ 
+-	if (memorystatus_pressure_threshold_mb != 0) {
+-		memorystatus_available_pages_pressure = (unsigned int)atop_64((uint64_t)memorystatus_pressure_threshold_mb << 20);
++	if (guamp_pressure_mb != 0) {
++		memorystatus_available_pages_pressure = (unsigned int)atop_64((uint64_t)guamp_pressure_mb << 20);
+ 	} else {
+ 		if ((max_mem > MEMORYSTATUS_SMALL_MEMORY_THRESHOLD) &&
+ 		    (max_mem <= MEMORYSTATUS_MEDIUM_MEMORY_THRESHOLD)) {
+@@ -1485,6 +1514,11 @@ memorystatus_init(void)
+ 		}
+ 	}
+ 	assert(memorystatus_available_pages_pressure < (unsigned int)atop_64(max_mem));
++	printf("guamp jetsam: critical %u idle %u pressure %u MiB (compressor %s, guamp-jetsam-idle-mb %u, guamp-jetsam-pressure-mb %u)\n",
++	    (unsigned int)(ptoa_64(memorystatus_available_pages_critical_base) >> 20),
++	    (unsigned int)(ptoa_64(memorystatus_available_pages_critical_idle) >> 20),
++	    (unsigned int)(ptoa_64(memorystatus_available_pages_pressure) >> 20),
++	    VM_CONFIG_COMPRESSOR_IS_ACTIVE ? "active" : "off", guamp_idle_mb, guamp_pressure_mb);
+ 
+ 	if (memorystatus_more_free_offset_mb != 0) {
+ 		memorystatus_policy_more_free_offset_pages = (unsigned int)atop_64((uint64_t)memorystatus_more_free_offset_mb);
+@@ -3638,6 +3672,57 @@ memorystatus_thread_pool_default()
+ 
+ extern void vm_pressure_response(void);
+ 
++/*
++ * guamp (06/11): one line for GuampMem (NativeEmmc GuampPerf.inc, every 30 s): processes and footprint per jetsam band, so a
++ * log shows whether launchd applied its jetsam properties (daemons in band 0/idle and 3..) or left them all at 180 (default).
++ * Up to 12 non-empty bands, lowest first.
++ */
++extern int filecache_thrashing_induced_jetsam;
++void guamp_memstat_band_report(char *buf, size_t len);
++
++void
++guamp_memstat_band_report(char *buf, size_t len)
++{
++	size_t used = 0;
++	unsigned int shown = 0, idle = 0, total = 0;
++	if (!buf || len == 0) {
++		return;
++	}
++	buf[0] = '\0';
++	proc_list_lock();
++	for (unsigned int band = 0; band < MEMSTAT_BUCKET_COUNT; band++) {
++		memstat_bucket_t *bucket = &memstat_bucket[band];
++		if (bucket->count == 0) {
++			continue;
++		}
++		total += bucket->count;
++		if (band == JETSAM_PRIORITY_IDLE) {
++			idle = bucket->count;
++		}
++		if (shown >= 12) {
++			continue;
++		}
++		uint64_t bytes = 0;
++		proc_t p;
++		TAILQ_FOREACH(p, &bucket->list, p_memstat_list) {
++			if (proc_task(p) != TASK_NULL) {
++				bytes += get_task_phys_footprint(proc_task(p));
++			}
++		}
++		int n = snprintf(buf + used, len - used, "%s%u:%u/%lluM", shown ? " " : "", band, bucket->count, bytes >> 20);
++		if (n < 0 || (size_t)n >= len - used) {
++			break;
++		}
++		used += (size_t)n;
++		shown++;
++	}
++	proc_list_unlock();
++	if (used < len) {
++		snprintf(buf + used, len - used, " (band:procs/footprint; %u procs, %u idle; fc-thrash kills %d)", total, idle,
++		    filecache_thrashing_induced_jetsam);
++	}
++}
++
+ bool
+ memorystatus_avail_pages_below_pressure(void)
+ {
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+index 1a776fd..da8eae1 100644
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -1372,6 +1372,15 @@ SYSCTL_PROC(_kern, OID_AUTO, shutdownreason,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED,
+     NULL, 0, sysctl_shutdownreason, "A", "shutdownreason");
+ 
++/*
++ * guamp (zzz...-guamp-mem-nocompressor.patch, 06/11): launchd reads hw.targettype only to open
++ * /System/Library/LaunchDaemons/com.apple.jetsamproperties.<targettype>.plist. The ADT says D22 (iPhone X identity) and the
++ * iPadOS 21H461 root has only J120/J121/J207/J208, so launchd ran with no jetsam properties: no per-daemon limits (565 overrides),
++ * no priorities, no pressured exit. guamp-jetsam-target (default J120 = J121, iPad Pro 12.9" 2nd gen, 4 GB) is what launchd
++ * (pid 1, and only it) reads; every other reader still gets the ADT value. guamp-jetsam-target=0 gives launchd the ADT value.
++ */
++extern "C" int proc_selfpid(void);
++
+ static int
+ sysctl_targettype SYSCTL_HANDLER_ARGS
+ {
+@@ -1381,6 +1390,14 @@ sysctl_targettype SYSCTL_HANDLER_ARGS
+ 	char        tt[32];
+ 
+ 	tt[0] = '\0';
++	if (proc_selfpid() == 1) {
++		char guamp_tt[16] = "J120";
++		PE_parse_boot_arg_str("guamp-jetsam-target", guamp_tt, sizeof(guamp_tt));
++		if (guamp_tt[0] && strcmp(guamp_tt, "0")) {
++			strlcpy(tt, guamp_tt, sizeof(tt));
++			return sysctl_io_string(req, tt, 0, 0, NULL);
++		}
++	}
+ 	root = IOService::getServiceRoot();
+ 	if (root && (obj = root->copyProperty(gIODTTargetTypeKey))) {
+ 		if ((data = OSDynamicCast(OSData, obj.get()))) {
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 5dcf00e..cb88828 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -1022,6 +1022,19 @@ task_is_halting(task_t task)
+ void
+ task_init(void)
+ {
++	/*
++	 * guamp (zzz...-guamp-mem-nocompressor.patch, 06/11): the ADT has no kern.max_task_pmem, so apps and every daemon without
++	 * its own limit ran unlimited, and os_proc_available_memory() told Maps/WebKit ~2 GiB were free on a 3 GiB window with
++	 * 1.2 GiB wired. guamp-task-pmem (MiB, default 1024) is the default limit when neither the ADT nor max_task_pmem= set one;
++	 * =0 keeps no limit.
++	 */
++	if (max_task_footprint_mb == 0) {
++		int guamp_task_pmem = 1024;
++		PE_parse_boot_argn("guamp-task-pmem", &guamp_task_pmem, sizeof(guamp_task_pmem));
++		if (guamp_task_pmem > 0 && (uint64_t)guamp_task_pmem << 20 < max_mem) {
++			max_task_footprint_mb = guamp_task_pmem;
++		}
++	}
+ 	if (max_task_footprint_mb != 0) {
+ #if CONFIG_MEMORYSTATUS
+ 		if (max_task_footprint_mb < 50) {
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 7dc5bff..4e3a98e 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -2710,6 +2710,43 @@ check_if_low_space:
+  * has potentially changed significantly, and we don't want to detect on old
+  * data from before the jetsam.
+  */
++/*
++ * guamp (zzz...-guamp-mem-nocompressor.patch, 06/11): without an active compressor (vm_compressor_mode 8 = freezer only, the
++ * owner's choice on guamp) the phantom cache was never allocated and compressor_needs_to_swap() never ran, so file cache
++ * thrashing was invisible to jetsam: fin50 kept 1.1 GiB of anonymous memory on the throttled queue, ~650 MiB of file cache that
++ * eMMC re-read 19k times per second, 308 processes and not one kill (available 669 MiB > pressure 459). Here vm_pageout_scan
++ * (one thread, no compressor thread racing it) evaluates the phantom cache and wakes the memorystatus thread, which kills in
++ * band order (idle daemons first) with cause fc-thrashing until the file cache stops thrashing. guamp-fc-thrash=0 turns it off.
++ */
++static int guamp_fc_thrash_enabled = -1;
++
++int
++guamp_filecache_thrash_enabled(void)
++{
++	if (guamp_fc_thrash_enabled < 0) {
++		unsigned int value = 1;
++		PE_parse_boot_argn("guamp-fc-thrash", &value, sizeof(value));
++		guamp_fc_thrash_enabled = value ? 1 : 0;
++	}
++	return guamp_fc_thrash_enabled;
++}
++
++void
++guamp_filecache_thrash_check(void)
++{
++	if (VM_CONFIG_COMPRESSOR_IS_ACTIVE || !guamp_filecache_thrash_enabled()) {
++		return;
++	}
++	if (vm_phantom_cache_check_pressure()) {
++		os_atomic_store(&memorystatus_phantom_cache_pressure, true, release);
++		if (vm_compressor_thrashing_detected == FALSE) {
++			vm_compressor_thrashing_detected = TRUE;
++			filecache_thrashing_induced_jetsam++;
++			memorystatus_thread_wake();
++		}
++	}
++}
++
+ void
+ vm_thrashing_jetsam_done(void)
+ {
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+index 9055592..b636658 100644
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -3015,6 +3015,11 @@ vm_pageout_scan(void)
+ 	/* Ask the pmap layer to return any pages it no longer needs. */
+ 	pmap_release_pages_fast();
+ 
++#if CONFIG_PHANTOM_CACHE && CONFIG_JETSAM
++	/* guamp (06/11): file cache thrashing check without the compressor, see guamp_filecache_thrash_check() */
++	guamp_filecache_thrash_check();
++#endif
++
+ 	vm_page_lock_queues();
+ 
+ 	delayed_unlock = 1;
+@@ -3824,21 +3829,45 @@ throttle_inactive:
+ }
+ 
+ 
++/*
++ * guamp (zzz...-guamp-mem-nocompressor.patch, 06/11): the three limits below are page counts tuned for 16 KiB pages. This kernel
++ * runs 4 KiB pages, so the free target was 2000 pages = 7.8 MiB, min 5.9 MiB and the privileged reserve 400 KiB (fin50: free 5 MiB
++ * for minutes, 1317 free pages, bursts of 8 MiB contiguous GPU requests). guamp-vm-free-scale=N multiplies the limits (default
++ * 16384 / PAGE_SIZE = 4: target 31 MiB, min 23 MiB, reserve 2 MiB (128 pages x 4, freezer compressor present), the same bytes as an
++ * iPhone); =1 gives back the stock values.
++ */
++static unsigned int guamp_vm_free_scale_value = 0;
++
++static unsigned int
++guamp_vm_free_scale(void)
++{
++	if (guamp_vm_free_scale_value == 0) {
++		unsigned int scale = PAGE_SIZE < 16384 ? (unsigned int)(16384 / PAGE_SIZE) : 1;
++		if (PE_parse_boot_argn("guamp-vm-free-scale", &scale, sizeof(scale)) && (scale == 0 || scale > 16)) {
++			scale = 1;
++		}
++		guamp_vm_free_scale_value = scale;
++		printf("guamp-vm-free-scale=%u (page %u bytes)\n", scale, (unsigned int)PAGE_SIZE);
++	}
++	return guamp_vm_free_scale_value;
++}
++
+ void
+ vm_page_free_reserve(
+ 	int pages)
+ {
+ 	int             free_after_reserve;
++	const int       guamp_scale = (int)guamp_vm_free_scale();
+ 
+ 	if (VM_CONFIG_COMPRESSOR_IS_PRESENT) {
+-		if ((vm_page_free_reserved + pages + COMPRESSOR_FREE_RESERVED_LIMIT) >= (VM_PAGE_FREE_RESERVED_LIMIT + COMPRESSOR_FREE_RESERVED_LIMIT)) {
+-			vm_page_free_reserved = VM_PAGE_FREE_RESERVED_LIMIT + COMPRESSOR_FREE_RESERVED_LIMIT;
++		if ((vm_page_free_reserved + pages + COMPRESSOR_FREE_RESERVED_LIMIT) >= (VM_PAGE_FREE_RESERVED_LIMIT + COMPRESSOR_FREE_RESERVED_LIMIT) * guamp_scale) {
++			vm_page_free_reserved = (VM_PAGE_FREE_RESERVED_LIMIT + COMPRESSOR_FREE_RESERVED_LIMIT) * guamp_scale;
+ 		} else {
+ 			vm_page_free_reserved += (pages + COMPRESSOR_FREE_RESERVED_LIMIT);
+ 		}
+ 	} else {
+-		if ((vm_page_free_reserved + pages) >= VM_PAGE_FREE_RESERVED_LIMIT) {
+-			vm_page_free_reserved = VM_PAGE_FREE_RESERVED_LIMIT;
++		if ((vm_page_free_reserved + pages) >= VM_PAGE_FREE_RESERVED_LIMIT * guamp_scale) {
++			vm_page_free_reserved = VM_PAGE_FREE_RESERVED_LIMIT * guamp_scale;
+ 		} else {
+ 			vm_page_free_reserved += pages;
+ 		}
+@@ -3848,15 +3877,15 @@ vm_page_free_reserve(
+ 	vm_page_free_min = vm_page_free_reserved +
+ 	    VM_PAGE_FREE_MIN(free_after_reserve);
+ 
+-	if (vm_page_free_min > VM_PAGE_FREE_MIN_LIMIT) {
+-		vm_page_free_min = VM_PAGE_FREE_MIN_LIMIT;
++	if (vm_page_free_min > VM_PAGE_FREE_MIN_LIMIT * guamp_scale) {
++		vm_page_free_min = VM_PAGE_FREE_MIN_LIMIT * guamp_scale;
+ 	}
+ 
+ 	vm_page_free_target = vm_page_free_reserved +
+ 	    VM_PAGE_FREE_TARGET(free_after_reserve);
+ 
+-	if (vm_page_free_target > VM_PAGE_FREE_TARGET_LIMIT) {
+-		vm_page_free_target = VM_PAGE_FREE_TARGET_LIMIT;
++	if (vm_page_free_target > VM_PAGE_FREE_TARGET_LIMIT * guamp_scale) {
++		vm_page_free_target = VM_PAGE_FREE_TARGET_LIMIT * guamp_scale;
+ 	}
+ 
+ 	if (vm_page_free_target < vm_page_free_min + 5) {
+diff --git a/osfmk/vm/vm_phantom_cache.c b/osfmk/vm/vm_phantom_cache.c
+index 71993a9..4579ab7 100644
+--- a/osfmk/vm/vm_phantom_cache.c
++++ b/osfmk/vm/vm_phantom_cache.c
+@@ -110,7 +110,7 @@ vm_phantom_cache_init(void)
+ 	unsigned int    log1;
+ 	unsigned int    size;
+ 
+-	if (!VM_CONFIG_COMPRESSOR_IS_ACTIVE) {
++	if (!VM_CONFIG_COMPRESSOR_IS_ACTIVE && !guamp_filecache_thrash_enabled()) {
+ 		return;
+ 	}
+ #if !XNU_TARGET_OS_OSX
+@@ -486,7 +486,11 @@ vm_phantom_cache_check_pressure()
+ 		pressure_detected = TRUE;
+ 	}
+ 
+-	if (vm_page_external_count > ((AVAILABLE_MEMORY) * 50) / 100) {
++	/*
++	 * guamp (06/11): without the compressor the anonymous pages sit on the throttled queue, outside AVAILABLE_MEMORY, so the file
++	 * cache is always "more than half" of it and this guard hid every thrashing period (fin50: 650 of 753 MiB). Count them.
++	 */
++	if (vm_page_external_count > ((AVAILABLE_MEMORY + (VM_CONFIG_COMPRESSOR_IS_ACTIVE ? 0 : vm_page_throttled_count)) * 50) / 100) {
+ 		pressure_detected = FALSE;
+ 	}
+ 
+diff --git a/osfmk/vm/vm_phantom_cache.h b/osfmk/vm/vm_phantom_cache.h
+index 24d73ac..a7fad28 100644
+--- a/osfmk/vm/vm_phantom_cache.h
++++ b/osfmk/vm/vm_phantom_cache.h
+@@ -50,4 +50,7 @@ extern  void            vm_phantom_cache_add_ghost(vm_page_t);
+ extern  vm_ghost_t      vm_phantom_cache_lookup_ghost(vm_page_t, uint32_t);
+ extern  void            vm_phantom_cache_update(vm_page_t);
+ extern  boolean_t       vm_phantom_cache_check_pressure(void);
++/* guamp (06/11): file cache thrashing detection without the compressor (vm_compressor.c) */
++extern  void            guamp_filecache_thrash_check(void);
++extern  int             guamp_filecache_thrash_enabled(void);
+ extern  void            vm_phantom_cache_restart_sample(void);

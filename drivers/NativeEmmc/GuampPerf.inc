@@ -434,6 +434,10 @@ static void setTargets(const int *pids, const char (*names)[20], unsigned n) {
 }
 }  // namespace guampprof
 
+// guamp_memstat_band_report (xnu zzz...-guamp-mem-nocompressor.patch, kern_memorystatus.c, 06/11): processes and footprint per
+// jetsam band, to see whether launchd applied its jetsam properties (daemons in bands 0..) or left them at 180.
+extern "C" void guamp_memstat_band_report(char *buf, size_t len);
+
 static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
   GuampMemTop top = {};
   proc_iterate(1u /* PROC_ALLPROCLIST */, guampMemTopVisit, &top, nullptr, nullptr);
@@ -441,6 +445,9 @@ static void guampMemTopCall(thread_call_param_t, thread_call_param_t) {
         top.procs, top.total >> 20, top.name[0], top.pid[0], top.bytes[0] >> 20, top.name[1], top.pid[1], top.bytes[1] >> 20,
         top.name[2], top.pid[2], top.bytes[2] >> 20, top.name[3], top.pid[3], top.bytes[3] >> 20,
         top.name[4], top.pid[4], top.bytes[4] >> 20, top.name[5], top.pid[5], top.bytes[5] >> 20);
+  static char bands[320];
+  guamp_memstat_band_report(bands, sizeof(bands));
+  IOLog("GuampJetsam: %s\n", bands);
   // Per-process CPU since the previous walk, in permille of one core over the walk interval.
   static uint64_t lastWalk = 0;
   const uint64_t now = mach_absolute_time();
