@@ -18,6 +18,9 @@ open(sys.argv[2], 'w').write(text[a:b])
 PY
 clang++ $FLAGS -fsanitize=address,undefined "-DVARIANT_TAPS=\"$WORK/taps.h\"" "$HERE/scanout_host.cpp" -o "$WORK/host" && "$WORK/host" || rc=1
 g++ $FLAGS "-DVARIANT_TAPS=\"$WORK/taps.h\"" "$HERE/scanout_host.cpp" -o "$WORK/host_gcc" && "$WORK/host_gcc" >/dev/null || rc=1
+# guamp-scanout-hwscale: the VIG0 / QSEED3LITE register values (GuampScanoutHw.h).
+clang++ $FLAGS -fsanitize=address,undefined "$HERE/scanout_hw_host.cpp" -o "$WORK/hw" && "$WORK/hw" || rc=1
+g++ $FLAGS "$HERE/scanout_hw_host.cpp" -o "$WORK/hw_gcc" && "$WORK/hw_gcc" >/dev/null || rc=1
 # The kernel side must compile for arm64 as a kext would (no FP/SIMD registers for the compiler, NEON only in inline asm).
 clang++ -target arm64-apple-ios17 -mkernel -mgeneral-regs-only -std=gnu++20 -O2 -Wall -Wextra -Werror -fsyntax-only \
   -x c++ - <<EOF || rc=1
@@ -27,6 +30,6 @@ void f(gscan::State &s, volatile unsigned char *d, const unsigned char *p) { gsc
 EOF
 echo "== kernel glue: GuampScanout.inc on arm64-apple-ios, -Werror, integer registers only"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/scanout_glue_check.cpp" -o "$WORK/glue.o" && echo "glue: compiled" || rc=1
-(cd "$HERE/.." && python3 -I tests/check_literals.py GuampScanout.inc GuampScanoutCore.h) || rc=1
+(cd "$HERE/.." && python3 -I tests/check_literals.py GuampScanout.inc GuampScanoutCore.h GuampScanoutHw.h) || rc=1
 [ $rc = 0 ] && echo "== result: PASS" || echo "== result: FAIL"
 exit $rc
