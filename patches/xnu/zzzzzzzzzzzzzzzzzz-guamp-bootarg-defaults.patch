@@ -1,6 +1,6 @@
---- a/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
-+++ b/pexpert/gen/bootargs.c	2026-10-30 02:25:11.666500084 +0100
-@@ -187,13 +187,43 @@
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -187,13 +187,68 @@
  	return arg_found;
  }
  
@@ -18,12 +18,37 @@
 +    "guamp-audio-mic=1 guamp-audio-mic-gain=30 guamp-sensors=2 guamp-slim=1 guamp-wifi-start=2 guamp-wifi-ui=1 guamp-biokit=1 "
 +    "guamp-emmc-ra=64 guamp-emmc-ra-slots=128 guamp-emmc-ra-adapt=1 guamp-ls-auto=3";
 +
++/*
++ * guamp-perfmode=1 (06/11, idle cost; only read from the boot line): a second table, looked up before the one above, that keeps
++ * every log line that says something (GuampPerf/GuampCpu/GuampKthr/GuampMem, errors, state changes, the USB live log and the kpan
++ * log) but takes away what costs CPU at rest. fin50 at rest: kernel_task 13-25 % of a core, of which guamp-wifi 8-10 (copy
++ * engines polled every 1 ms, ~1000 wake-ups/s; a beacon every ~100 ms reset the back-off before it got anywhere), the USB mirror
++ * 1-10 (events polled every 5 ms, a whole 4.6 MB frame every 6th frame), guamp-bt 0.5 (UART every 2 ms also while the controller
++ * sleeps); the log itself is ~5 lines/s, of which 14 Wi-Fi transport lines every 5 s and 10 constant GuampSmp/RamCache lines every
++ * 10 s. A key on the boot line still wins over both tables; guamp-perfmode=0 or absent: nothing changes.
++ *   guamp-wifi-poll-max=8 guamp-wifi-poll-idle=4  idle link: 1 ms polling backs off to 8 ms after 4 idle steps per doubling
++ *   guamp-wifi-beat=60                            Wi-Fi transport heartbeat (14 lines) every 60 s instead of 5 s once running
++ *   guamp-usb-fps=1 guamp-usb-poll-ms=20 guamp-usb-full-every=30  mirror: 1 frame/s, events every 20 ms, whole frame every 30
++ *   guamp-bt-idle-ms=10                           UART read every 10 ms while the controller says it sleeps (IBS)
++ *   guamp-perf-static-every=6                     constant per-core lines once a minute (first 3 samples always)
++ *   guamp-emmc-log-ms=10000                       periodic kpan log write every 10 s instead of 5 (panic flush unchanged)
++ * Not here on purpose: guamp-slim-fast (the owner keeps the services on, 29/10), guamp-oslog (a diagnostic chosen on the line).
++ */
++static char guamp_perfmode_defaults[] =
++    "guamp-wifi-poll-max=8 guamp-wifi-poll-idle=4 guamp-wifi-beat=60 guamp-usb-fps=1 guamp-usb-poll-ms=20 guamp-usb-full-every=30 "
++    "guamp-bt-idle-ms=10 guamp-perf-static-every=6 guamp-emmc-log-ms=10000";
++
 +static boolean_t
 +guamp_bootarg_default(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
 +{
 +	uint32_t enabled = 1;
-+	if (strncmp(arg_string, "guamp-", 6) || !strcmp(arg_string, "guamp-defaults")) {
++	uint32_t perfmode = 0;
++	if (strncmp(arg_string, "guamp-", 6) || !strcmp(arg_string, "guamp-defaults") || !strcmp(arg_string, "guamp-perfmode")) {
 +		return FALSE;
++	}
++	if (PE_parse_boot_argn_internal(PE_boot_args(), "guamp-perfmode", &perfmode, sizeof(perfmode), FALSE) && perfmode == 1 &&
++	    PE_parse_boot_argn_internal(guamp_perfmode_defaults, arg_string, arg_ptr, max_len, force_string)) {
++		return TRUE;
 +	}
 +	if (PE_parse_boot_argn_internal(PE_boot_args(), "guamp-defaults", &enabled, sizeof(enabled), FALSE) && !enabled) {
 +		return FALSE;
@@ -45,7 +70,7 @@
  }
  
  boolean_t
-@@ -213,7 +243,10 @@
+@@ -213,7 +268,10 @@
  	char            *arg_ptr,
  	int                     strlen)
  {
