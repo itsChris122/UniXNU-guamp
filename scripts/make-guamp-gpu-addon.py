@@ -24,6 +24,10 @@ with its CDHash in the trust cache.
 scripts/make-guamp-cmcapture-plist.py: <model>/AVCaptureSession.plist and CameraSetup.plist) as cmcapture/<model>/*; the same
 patch shows it inside /System/Library/PrivateFrameworks/CMCapture.framework. Without it CMCapture turns no plug-in stream into an
 AVCaptureDevice (it looks for CMCapture.framework/motorola,guamp, see that script).
+--videoencoder DIR adds the software H.264 encoder (DIR = the OUTDIR of package/GuampVideoEncoder/build-guamp-videoencoder.sh:
+H264H7.videoencoder and trust.json) as videoencoders/H264H7.videoencoder; the kernel shows that directory over
+/System/Library/VideoEncoders with guamp-venc=1, or with guamp-camera-ios=1|2 when guamp-venc is unset
+(patches/xnu/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-guamp-camera-venc.patch); it loads only with its CDHash in the trust cache.
 --no-gpu leaves the GPU files out (audio-only addon on top of BASE).
 
 The output also carries ".guamp-keep" (every name of the output plus baseband/, see compose-guamp-delta-addon.py and
@@ -130,6 +134,11 @@ def cmcapture_files(directory):
     model = plists[0].parent
     return [(f'cmcapture/{model.name}/{name}', 0o644, (model / name).read_bytes())
             for name in ('AVCaptureSession.plist', 'CameraSetup.plist')]
+def videoencoder_files(directory):
+    dylib = directory / 'H264H7.videoencoder'
+    if not dylib.is_file() or not (directory / 'trust.json').is_file():
+        sys.exit(f'{directory}: build it first (package/GuampVideoEncoder/build-guamp-videoencoder.sh {directory})')
+    return [('videoencoders/H264H7.videoencoder', 0o755, dylib.read_bytes())]
 
 
 def main():
@@ -142,6 +151,8 @@ def main():
     parser.add_argument('--audio', type=Path, help='OUTDIR of build-guamp-audio-plugin.sh (GuampAudio.driver + trust.json)')
     parser.add_argument('--camera', type=Path, help='OUTDIR of build-guamp-isp-plugin.sh (H6ISP.mediacapture + trust.json)')
     parser.add_argument('--cmcapture', type=Path, help='OUTDIR of make-guamp-cmcapture-plist.py (needed with --camera)')
+    parser.add_argument('--videoencoder', type=Path,
+                        help='OUTDIR of build-guamp-videoencoder.sh (H264H7.videoencoder + trust.json)')
     parser.add_argument('--no-gpu', action='store_true', help='leave the GPU plugin files out (with --audio: audio-only addon)')
     parser.add_argument('--no-keep', action='store_true', help='no .guamp-keep entry (the kernel prunes nothing)')
     parser.add_argument('output', type=Path)
@@ -163,8 +174,10 @@ def main():
         added += camera_files(args.camera)
     if args.cmcapture:
         added += cmcapture_files(args.cmcapture)
+    if args.videoencoder:
+        added += videoencoder_files(args.videoencoder)
     if not added:
-        sys.exit('nothing to add (--no-gpu without --audio or --camera)')
+        sys.exit('nothing to add (--no-gpu without --audio, --camera or --videoencoder)')
     names = {name for name, _, _ in base}
     clash = sorted(name for name, _, _ in added if name in names)
     if clash:

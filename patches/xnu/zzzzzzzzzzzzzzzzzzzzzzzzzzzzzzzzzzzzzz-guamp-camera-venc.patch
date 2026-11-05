@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ec58603..ee23cbf 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9425,6 +9425,34 @@ native_guamp_camera_plugin_mount(proc_t p, user_addr_t scratch)
+ 	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error,
+ 	    point, native_guamp_camera_plugin_stage, native_guamp_camera_plugin_status);
+ }
++/* guamp: the software H.264 encoder H264H7.videoencoder (package/GuampVideoEncoder of the device repository) shown inside
++ * /System/Library/VideoEncoders, the sealed directory (empty on the 21H461 OS volume: the Apple encoders live in the dyld cache)
++ * from which VideoToolbox's VTLoadVideoEncoders dlopen()s a fixed list of plug-ins. H264H7 (the A7 encoder) is in that list but
++ * not in the cache, so our file fills it: it registers Apple's own software encoder (VideoProcessing
++ * H264VideoEncoder_CreateInstance) as a visible 'avc1' encoder, which the camera's movie recording needs without the AVE.
++ * Boot-arg guamp-venc=1 mounts it, guamp-venc=0 never does; unset, it follows guamp-camera-ios=1|2. Same read-only union bindfs
++ * view as the audio and camera plug-ins (addon folder videoencoders/), AMFI through the owner trust cache. Never panics:
++ * stage 5 = mounted, the sealed directory and our plug-in both visible. */
++volatile int native_guamp_venc_stage = 0;
++volatile int native_guamp_venc_status = -1;
++static int
++native_guamp_venc_enabled(int camera_plugin)
++{
++	uint32_t mode = 0;
++	if (PE_parse_boot_argn("guamp-venc", &mode, sizeof(mode))) {
++		return mode == 1;
++	}
++	return camera_plugin;
++}
++static void
++native_guamp_venc_mount(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/ngpu/videoencoders", point[] = "/System/Library/VideoEncoders";
++	native_gpu_addon_mount(p, scratch, 0x400, source, sizeof(source), point, sizeof(point), point,
++	    "/System/Library/VideoEncoders/H264H7.videoencoder", &native_guamp_venc_stage, &native_guamp_venc_status);
++	printf("guamp-venc: %s stage %d status %d
++", point, native_guamp_venc_stage, native_guamp_venc_status);
++}
+ static void
+ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -9460,6 +9488,9 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	if (camera_plugin) {
+ 		native_guamp_camera_plugin_mount(p, scratch);	/* guamp-camera-ios=1|2: H6ISP.mediacapture (05/11) */
+ 	}
++	if (native_guamp_venc_enabled(camera_plugin)) {
++		native_guamp_venc_mount(p, scratch);	/* guamp-venc: software H.264 encoder H264H7.videoencoder (06/11) */
++	}
+ 	if (enabled != 1) {
+ 		return;
+ 	}
