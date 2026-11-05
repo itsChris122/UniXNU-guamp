@@ -134,7 +134,9 @@ extern "C" void guamp_torch_request(uint32_t permille);
 // ---- stand-in implementations on pthreads --------------------------------------------------------------------------
 task_t kernel_task;
 unsigned long page_size = 4096;
-#ifdef CAMIOS_FAKE_CAMSS
+#if defined(CAMIOS_ARG_MODE)
+static uint32_t gArgMode = CAMIOS_ARG_MODE;   // campipe_host.cpp (integration skeleton) sets it
+#elif defined(CAMIOS_FAKE_CAMSS)
 static uint32_t gArgMode = 1;
 #else
 static uint32_t gArgMode = 2;
@@ -220,7 +222,7 @@ static IOService gPlatform;
 IOService *IOService::getPlatform() { return &gPlatform; }
 IOReturn IOUserClient::clientHasPrivilege(void *, const char *) { return kIOReturnNotPrivileged; }
 
-static int failures;
+[[maybe_unused]] static int failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
 
 static IOReturn call(IOUserClient *uc, uint32_t sel, std::initializer_list<uint64_t> in, void *out = nullptr, uint32_t outSize = 0) {
@@ -238,7 +240,9 @@ static IOReturn call(IOUserClient *uc, uint32_t sel, std::initializer_list<uint6
   return sum / n;
 }
 
-#ifndef CAMIOS_FAKE_CAMSS
+#if defined(CAMIOS_NO_MAIN)
+// included by campipe_host.cpp: stand-ins only
+#elif !defined(CAMIOS_FAKE_CAMSS)
 int main() {
   camios::start();
   CHECK(camios::gService != nullptr);

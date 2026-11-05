@@ -2,7 +2,11 @@
 // /System/Library/MediaCapture/H6ISP.mediacapture). Boot argument guamp-camera-ios (default 0):
 //   1  publish AppleH6CamIn; frames from CAMSS (GuampCamssApi.h ABI 2, agent 2) and the sensor session (agent 1)
 //   2  publish AppleH6CamIn with the built-in test pattern only (no CAMSS), to bring up the iOS path alone
+//   3  publish AppleH6CamIn with CAMSS fed by its TPG (colour bars, RAW10 MIPI through CSID/TFE/SMMU into the TFE buffers):
+//      the whole chain TPG -> RAW -> user client -> gisp -> CVPixelBuffer without a sensor (integration skeleton, agent 6)
 // guamp-camera-ios-slots = RAW slots per sensor (2..4, default 4; CAMSS has GUAMP_CAMSS_MAX_BUFFERS = 4).
+// guamp-camera-ios-latency = frames between SetExposure and the first frame exposed with it (CAMSS default 2).
+// ABI: GuampCamIosAbi.h version 2 (session life cycle, exposure latency, frame flags: cam6-integrazione.md section 1).
 //
 // The service only has to exist under that class name for CMCapture to load our plug-in (GuampCamIosAbi.h). As agreed
 // with the ISP (cam3-isp.md section 2) the kernel processes no pixel: it hands the RAW buffers to user space (one
@@ -25,6 +29,7 @@ int guamp_camss_start(uint32_t) __attribute__((weak));
 int guamp_camss_wait_frame(uint32_t, uint32_t, struct guamp_camss_frame *) __attribute__((weak));
 void guamp_camss_release(uint32_t) __attribute__((weak));
 int guamp_camss_stop(void) __attribute__((weak));
+int guamp_camss_counters(struct guamp_camss_counters *) __attribute__((weak));
 void guamp_camss_close(void) __attribute__((weak));
 void *guamp_camss_buffer_memory(uint32_t) __attribute__((weak));
 int guamp_camios_hw_exposure(uint32_t cell, uint32_t exposureUs, uint32_t gainQ8, uint32_t *appliedUs, uint32_t *appliedQ8)
@@ -45,8 +50,12 @@ struct GuampCamIosBackend {
   void (*stop)(void *ctx, uint32_t sensor);
   void (*close)(void *ctx, uint32_t sensor);
   void (*release)(void *ctx, uint32_t sensor, uint32_t slot);
-  int (*setExposure)(void *ctx, uint32_t sensor, uint32_t exposureUs, uint32_t againQ8, uint32_t dgainQ8);
+  // Request already clamped to the mode limits; the backend writes it and reports what the sensor will use.
+  int (*setExposure)(void *ctx, uint32_t sensor, uint32_t exposureUs, uint32_t againQ8, uint32_t dgainQ8, uint32_t *appliedUs,
+                     uint32_t *appliedAgainQ8, uint32_t *appliedDgainQ8);
   int (*setFocus)(void *ctx, uint32_t sensor, uint32_t dac);
+  // ABI 2, optional: frames started so far (SOF count), the base of the exposure latency; nullptr = last published.
+  uint64_t (*framesStarted)(void *ctx, uint32_t sensor);
 };
 
 namespace camios {
@@ -65,13 +74,19 @@ struct Sensor {
   bool open, streaming;
   void *owner;                                 // the user client that opened it
   uint64_t sequence, delivered, dropped;
-  uint32_t exposureUs, againQ8, dgainQ8, focusDac;
+  uint32_t exposureUs, againQ8, dgainQ8, focusDac;   // applied (what the frames being published were exposed with)
+  // ABI 2: exposure latency. A request becomes the applied value at frame `from` (= last published + latency).
+  struct { bool valid; uint64_t from; uint32_t us, again, dgain; } pend;
+  uint32_t latency;
+  uint32_t modeIndex;
+  uint64_t lastSeq, lastDelivered, errorFrames;
 };
 
 IOLock *gLock;
 Sensor gSensor[GUAMP_CAMIOS_MAX_SENSORS];
 uint32_t gSensors;
-uint32_t gMode, gSlots = 4;
+uint32_t gMode, gSlots = 4, gLatency = 2;
+uint32_t gBackendKind;                         // GuampCamIosStatus.backend: 0 pattern, 1 CAMSS sensor, 2 CAMSS TPG
 const GuampCamIosBackend *gBackend;
 void *gBackendCtx;
 IOService *gService;
@@ -87,12 +102,31 @@ int recycleOldest(Sensor &s) {
   return slot;
 }
 
+// Lock held. Exposure values of frame `seq`: commits a pending request once its first frame comes, fills `f`.
+void applied(Sensor &s, uint64_t seq, GuampCamIosFrame &f) {
+  if (s.pend.valid && seq >= s.pend.from) {
+    s.exposureUs = s.pend.us;
+    s.againQ8 = s.pend.again;
+    s.dgainQ8 = s.pend.dgain;
+    s.pend.valid = false;
+  }
+  f.exposureUs = s.exposureUs;
+  f.analogGainQ8 = s.againQ8;
+  f.digitalGainQ8 = s.dgainQ8;
+  f.focusDac = s.focusDac;
+  if (s.pend.valid) f.flags |= kGuampFrameSettingsPending;
+}
+
 // Lock held. Queue a filled slot and wake WaitFrame.
 void publish(Sensor &s, uint32_t slot, const GuampCamIosFrame &frame) {
   GuampCamIosFrame &f = s.frame[slot];
   f = frame;
   f.slot = slot;
   if (!f.sequence) f.sequence = ++s.sequence;
+  if (f.sequence > s.sequence) s.sequence = f.sequence;
+  s.lastSeq = f.sequence;
+  f.sensorMode = s.modeIndex;
+  if (f.errors) f.flags |= kGuampFrameCorrupt;
   if (!f.timestamp) f.timestamp = mach_absolute_time();
   if (!f.width) { f.width = s.mode.width; f.height = s.mode.height; f.strideBytes = s.mode.strideBytes; f.rawFormat = s.mode.rawFormat; }
   s.state[slot] = kReady;
@@ -120,6 +154,7 @@ int probe(void *, uint32_t index, GuampCamIosSensorInfo *info) {
   info->fNumberQ8 = index == 0 ? 461 : 563;                // f/1.8, f/2.2
   info->pixelSizeNm = index == 0 ? 800 : 1120;
   info->testPattern = 1;
+  info->cell = index == 0 ? kGuampCellGm1st : kGuampCell4h7;
   return 0;
 }
 
@@ -172,17 +207,18 @@ void thread(void *arg, wait_result_t) {
     for (uint32_t i = 0; i < s.mode.slotCount && slot < 0; ++i)
       if (s.state[i] == kFree) slot = static_cast<int>(i);
     if (slot < 0) slot = recycleOldest(s);
-    if (slot >= 0) s.state[slot] = kFilling;
+    GuampCamIosFrame f = {};
+    if (slot >= 0) {
+      s.state[slot] = kFilling;
+      f.flags = kGuampFrameTestPattern;
+      f.sequence = s.sequence + 1;
+      applied(s, f.sequence, f);                           // the generator exposes with the applied values
+    }
     IOLockUnlock(gLock);
     if (slot >= 0) {
-      GuampCamIosFrame f = {};
-      f.exposureUs = s.exposureUs;
-      f.analogGainQ8 = s.againQ8;
-      f.digitalGainQ8 = s.dgainQ8;
-      f.focusDac = s.focusDac;
-      f.flags = 4u;
       f.temperatureMilliC = 30000;
-      fill(static_cast<uint16_t *>(s.mem[slot]->getBytesNoCopy()), s.mode, s.sequence, f.exposureUs, f.analogGainQ8);
+      fill(static_cast<uint16_t *>(s.mem[slot]->getBytesNoCopy()), s.mode, f.sequence, f.exposureUs,
+           (f.analogGainQ8 * (f.digitalGainQ8 ? f.digitalGainQ8 : 256)) >> 8);
       IOLockLock(gLock);
       if (s.streaming && s.state[slot] == kFilling) publish(s, static_cast<uint32_t>(slot), f);
       IOLockUnlock(gLock);
@@ -210,10 +246,14 @@ void stop(void *, uint32_t sensor) {
   for (int i = 0; i < 100 && r.alive; ++i) IOSleep(10);
 }
 
-int setExposure(void *, uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }   // the generator reads the Sensor values
+int setExposure(void *, uint32_t, uint32_t us, uint32_t ag, uint32_t dg, uint32_t *aus, uint32_t *aag, uint32_t *adg) {
+  *aus = us; *aag = ag; *adg = dg;                         // the generator reads the applied Sensor values
+  return 0;
+}
 int setFocus(void *, uint32_t, uint32_t) { return 0; }
 
-const GuampCamIosBackend kBackend = {"test pattern", probe, setMode, nullptr, start, stop, nullptr, nullptr, setExposure, setFocus};
+const GuampCamIosBackend kBackend = {"test pattern", probe, setMode, nullptr, start, stop, nullptr, nullptr, setExposure, setFocus,
+                                     nullptr};
 }  // namespace pattern
 
 // ---- CAMSS backend: one RDI stream at a time (guamp_camss_* is a single global session), zero copy ------------------
@@ -225,6 +265,7 @@ namespace camss {
 struct Pump { volatile bool run, alive; uint32_t sensor; };
 Pump gPump;
 uint32_t gOpenSensor = UINT32_MAX;
+bool gTpg;                                                 // guamp-camera-ios=3: CAMSS TPG instead of the sensor
 
 bool available() {
   return guamp_camss_open && guamp_camss_start && guamp_camss_wait_frame && guamp_camss_release && guamp_camss_stop &&
@@ -233,11 +274,14 @@ bool available() {
 
 int probe(void *, uint32_t index, GuampCamIosSensorInfo *info) {
   // Cell 0 S5KGM1ST (back, DW9767 AF, PMI632 flash), cell 1 S5K4H7 (front). Depth/macro OV02B are not offered to iOS.
+  // Agent 7 (secondary cameras) adds index 2 = OV02B1B depth (cell 2, mono) and 3 = OV02B10 macro (cell 3, GT9772 AF).
   if (index > 1) return -1;
   *info = {};
   info->present = 1;
   info->position = index == 0 ? kGuampCamBack : kGuampCamFront;
-  info->chipId = index == 0 ? 0x08d1 : 0x487b;
+  info->cell = index == 0 ? kGuampCellGm1st : kGuampCell4h7;
+  info->chipId = gTpg ? 0 : index == 0 ? 0x08d1 : 0x487b;
+  info->testPattern = gTpg ? 2 : 0;
   info->fullWidth = index == 0 ? 4000 : 3264;              // GM1ST 2x2-binned (quad Bayer remosaic not used) / 4H7 full
   info->fullHeight = index == 0 ? 3000 : 2448;
   info->bayer = kGuampBayerGRBG;                           // replaced by the first frame's bayer (frame metadata wins)
@@ -255,6 +299,7 @@ uint32_t bayerOf(uint32_t camssBayer) {
     case GUAMP_CAMSS_GRBG: return kGuampBayerGRBG;
     case GUAMP_CAMSS_BGGR: return kGuampBayerBGGR;
     case GUAMP_CAMSS_GBRG: return kGuampBayerGBRG;
+    case GUAMP_CAMSS_MONO: return kGuampBayerMono;
     default: return kGuampBayerRGGB;
   }
 }
@@ -263,9 +308,15 @@ int setMode(void *, uint32_t sensor, uint32_t modeIndex, uint32_t maxFpsQ8, uint
   if (gOpenSensor != UINT32_MAX) { guamp_camss_close(); gOpenSensor = UINT32_MAX; }
   guamp_camss_config c = {};
   c.abi = GUAMP_CAMSS_ABI;
-  c.source = GUAMP_CAMSS_SRC_SENSOR;
-  c.cell = sensor == 0 ? 0 : 1;
+  c.source = gTpg ? GUAMP_CAMSS_SRC_TPG : GUAMP_CAMSS_SRC_SENSOR;
+  c.cell = gSensor[sensor].info.cell;
   c.mode = modeIndex == kGuampModePhoto ? 1 : 0;           // sensor driver resolution: 0 low (binned), 1 full (agent 1)
+  if (gTpg) {                                              // TPG: split colour bars, 4 lanes, small frames
+    c.tpg_pattern = 9;
+    c.tpg_lanes = 4;
+    c.width = modeIndex == kGuampModeVideo ? 1920 : 1600;
+    c.height = modeIndex == kGuampModeVideo ? 1080 : 1200;
+  }
   c.buffers = gSlots;
   c.csid = 0;
   c.rdi = 0;
@@ -274,9 +325,9 @@ int setMode(void *, uint32_t sensor, uint32_t modeIndex, uint32_t maxFpsQ8, uint
   if (r) { IOLog("GuampCamIos: guamp_camss_open cell %u mode %u: %d\n", c.cell, c.mode, r); return -1; }
   gOpenSensor = sensor;
   // Geometry the sensor driver programs; the authoritative values travel with every frame (GuampCamIosFrame).
-  const bool back = sensor == 0, full = c.mode == 1;
-  m->width = back ? (full ? 4000 : 2000) : (full ? 3264 : 1632);
-  m->height = back ? (full ? 3000 : 1500) : (full ? 2448 : 1224);
+  const bool back = c.cell == kGuampCellGm1st, full = c.mode == 1;
+  m->width = gTpg ? c.width : back ? (full ? 4000 : 2000) : (full ? 3264 : 1632);
+  m->height = gTpg ? c.height : back ? (full ? 3000 : 1500) : (full ? 2448 : 1224);
   m->rawFormat = kGuampRawMipi10;
   m->bayer = gSensor[sensor].info.bayer;
   m->strideBytes = m->width * 10 / 8;
@@ -287,9 +338,10 @@ int setMode(void *, uint32_t sensor, uint32_t modeIndex, uint32_t maxFpsQ8, uint
   m->maxAnalogGainQ8 = 16u << 8;                           // g3a gain_max main/front
   m->maxDigitalGainQ8 = 256;
   m->blackLevel = 64;
-  m->binning = back && !full ? 2 : 1;
+  m->binning = back && !full && !gTpg ? 2 : 1;
   uint32_t lo = 0, hi = 1023;
-  if (back && guamp_camios_hw_focus) guamp_camios_hw_focus(0, UINT32_MAX, &lo, &hi);   // EEPROM-calibrated range
+  if (gSensor[sensor].info.hasAutoFocus && !gTpg && guamp_camios_hw_focus)
+    guamp_camios_hw_focus(c.cell, UINT32_MAX, &lo, &hi);   // EEPROM-calibrated range
   m->lensMin = lo;
   m->lensMax = hi;
   return 0;
@@ -308,15 +360,13 @@ void pump(void *arg, wait_result_t) {
     if (guamp_camss_wait_frame(after, 200, &cf) != GUAMP_CAMSS_OK) continue;
     after = cf.seq;
     GuampCamIosFrame f = {};
-    f.flags = cf.errors ? 1u : 0u;
+    f.flags = gTpg ? static_cast<uint32_t>(kGuampFrameTestPattern) : 0u;
+    f.errors = cf.errors;
     f.sequence = cf.seq;
     uint64_t abs = 0;
     nanoseconds_to_absolutetime(cf.sof_ns ? cf.sof_ns : cf.done_ns, &abs);   // CAMSS reports ns, the plug-in mach units
     f.timestamp = abs;
-    f.exposureUs = s.exposureUs;
-    f.analogGainQ8 = s.againQ8;
-    f.digitalGainQ8 = s.dgainQ8;
-    f.focusDac = s.focusDac;
+    f.readoutUs = cf.sof_ns && cf.eof_ns > cf.sof_ns ? static_cast<uint32_t>((cf.eof_ns - cf.sof_ns) / 1000u) : 0;
     f.width = cf.width;
     f.height = cf.height;
     f.strideBytes = cf.line_bytes;
@@ -325,6 +375,7 @@ void pump(void *arg, wait_result_t) {
     f.temperatureMilliC = INT32_MIN;
     int recycled = -1;
     IOLockLock(gLock);
+    applied(s, cf.seq, f);
     if (!s.streaming || cf.buffer >= s.mode.slotCount) {
       IOLockUnlock(gLock);
       guamp_camss_release(cf.buffer);
@@ -366,20 +417,34 @@ void close(void *, uint32_t sensor) {
 
 void release(void *, uint32_t, uint32_t slot) { guamp_camss_release(slot); }
 
-int setExposure(void *, uint32_t sensor, uint32_t us, uint32_t againQ8, uint32_t dgainQ8) {
-  if (!guamp_camios_hw_exposure) return 0;                 // no register path in this kernel: frames keep coming
+int setExposure(void *, uint32_t sensor, uint32_t us, uint32_t againQ8, uint32_t dgainQ8, uint32_t *aus, uint32_t *aag,
+                uint32_t *adg) {
+  const GuampCamIosSensorInfo &info = gSensor[sensor].info;
+  if (gTpg || !guamp_camios_hw_exposure) {                 // TPG / no register path in this kernel: frames keep coming
+    *aus = us; *aag = againQ8; *adg = dgainQ8;
+    return 0;
+  }
+  // The sensors have no digital gain stage the 3A can use (cam1 section 4): the product goes to the analog gain.
   uint32_t appliedUs = us, appliedQ8 = againQ8;
-  const int r = guamp_camios_hw_exposure(sensor == 0 ? 0 : 1, us, (againQ8 * (dgainQ8 ? dgainQ8 : 256)) >> 8, &appliedUs, &appliedQ8);
-  if (!r) { gSensor[sensor].exposureUs = appliedUs; gSensor[sensor].againQ8 = appliedQ8; gSensor[sensor].dgainQ8 = 256; }
+  const int r = guamp_camios_hw_exposure(info.cell, us, (againQ8 * (dgainQ8 ? dgainQ8 : 256)) >> 8, &appliedUs, &appliedQ8);
+  if (!r) { *aus = appliedUs; *aag = appliedQ8; *adg = 256; }
   return r;
 }
 
 int setFocus(void *, uint32_t sensor, uint32_t dac) {
-  if (sensor != 0 || !guamp_camios_hw_focus) return 0;
-  return guamp_camios_hw_focus(0, dac, nullptr, nullptr);
+  if (gTpg || !gSensor[sensor].info.hasAutoFocus || !guamp_camios_hw_focus) return 0;
+  return guamp_camios_hw_focus(gSensor[sensor].info.cell, dac, nullptr, nullptr);
 }
 
-const GuampCamIosBackend kBackend = {"CAMSS", probe, setMode, slotMemory, start, stop, close, release, setExposure, setFocus};
+// TFE RDI SOF count: the frame being exposed now is the base of the latency (more exact than the last published one).
+uint64_t framesStarted(void *, uint32_t) {
+  struct guamp_camss_counters c = {};
+  if (!guamp_camss_counters || guamp_camss_counters(&c) != GUAMP_CAMSS_OK || c.abi != GUAMP_CAMSS_ABI) return 0;
+  return c.sof;
+}
+
+const GuampCamIosBackend kBackend = {"CAMSS", probe, setMode, slotMemory, start, stop, close, release, setExposure, setFocus,
+                                     framesStarted};
 }  // namespace camss
 
 // ---- flash: GuampTorch LED (torch level, or the photo flash API when the integration provides it) -----------------
@@ -480,9 +545,12 @@ IOReturn setMode(Sensor &s, uint32_t idx, uint32_t mode, uint32_t maxQ8, uint32_
     if (!s.mem[i]) { freeSlots(s); return kIOReturnNoMemory; }
   }
   s.mode = m;
+  s.modeIndex = mode;
   s.exposureUs = 10000;
   s.againQ8 = 256;
   s.dgainQ8 = 256;
+  s.pend.valid = false;
+  s.latency = gBackend == &pattern::kBackend ? 1 : gLatency;
   IOLog("GuampCamIos: sensor %u mode %u: %ux%u fmt %u stride %u, %u slots (%s)\n", idx, mode, m.width, m.height, m.rawFormat,
         m.strideBytes, m.slotCount, s.ownMem ? "own" : gBackend->name);
   return kIOReturnSuccess;
@@ -501,6 +569,9 @@ IOReturn waitFrame(Sensor &s, uint32_t timeoutMs, GuampCamIosFrame *out) {
     memmove(s.queue, s.queue + 1, --s.queued);
     s.state[slot] = kClient;
     *out = s.frame[slot];
+    if (s.lastDelivered && out->sequence != s.lastDelivered + 1) out->flags |= kGuampFrameGap;
+    s.lastDelivered = out->sequence;
+    if (out->flags & kGuampFrameCorrupt) s.errorFrames++;
     s.delivered++;
     r = kIOReturnSuccess;
   } else if (!s.streaming) {
@@ -571,6 +642,27 @@ IOReturn AppleH9CamInUserClient::externalMethod(uint32_t selector, IOExternalMet
   if (n < 1 || in[0] >= gSensors) return kIOReturnBadArgument;
   const uint32_t idx = static_cast<uint32_t>(in[0]);
   Sensor &s = gSensor[idx];
+  if (selector == kGuampCamSelGetStatus) {
+    if (!a->structureOutput || a->structureOutputSize < sizeof(GuampCamIosStatus)) return kIOReturnBadArgument;
+    GuampCamIosStatus st = {};
+    IOLockLock(gLock);
+    st.abiVersion = GUAMP_CAMIOS_ABI_VERSION;
+    st.sensor = idx;
+    st.state = !s.open ? kGuampStateClosed : s.streaming ? kGuampStateStreaming : s.mem[0] ? kGuampStateConfigured : kGuampStateOpen;
+    st.mode = s.modeIndex;
+    st.sequence = s.lastSeq;
+    st.delivered = s.delivered;
+    st.dropped = s.dropped;
+    st.queued = s.queued;
+    for (uint32_t i = 0; i < s.mode.slotCount && i < GUAMP_CAMIOS_MAX_SLOTS; ++i) st.held += s.state[i] == kClient;
+    st.exposureLatency = s.latency;
+    st.errorFrames = static_cast<uint32_t>(s.errorFrames);
+    st.backend = gBackendKind;
+    IOLockUnlock(gLock);
+    memcpy(a->structureOutput, &st, sizeof(st));
+    a->structureOutputSize = sizeof(st);
+    return kIOReturnSuccess;
+  }
   if (selector == kGuampCamSelOpen) {
     IOLockLock(gLock);
     bool free = !s.open;
@@ -595,6 +687,7 @@ IOReturn AppleH9CamInUserClient::externalMethod(uint32_t selector, IOExternalMet
       IOLockLock(gLock);
       memset(s.state, 0, sizeof(s.state));
       s.queued = 0;
+      s.lastDelivered = 0;
       s.streaming = true;
       IOLockUnlock(gLock);
       if (gBackend->start(gBackendCtx, idx)) { s.streaming = false; return kIOReturnError; }
@@ -621,12 +714,31 @@ IOReturn AppleH9CamInUserClient::externalMethod(uint32_t selector, IOExternalMet
       if (mine && gBackend->release) gBackend->release(gBackendCtx, idx, static_cast<uint32_t>(in[1]));
       return kIOReturnSuccess;
     }
-    case kGuampCamSelSetExposure:
-      if (n < 4) return kIOReturnBadArgument;
-      s.exposureUs = static_cast<uint32_t>(in[1]);
-      s.againQ8 = static_cast<uint32_t>(in[2]);
-      s.dgainQ8 = static_cast<uint32_t>(in[3]);
-      return gBackend->setExposure(gBackendCtx, idx, s.exposureUs, s.againQ8, s.dgainQ8) ? kIOReturnError : kIOReturnSuccess;
+    case kGuampCamSelSetExposure: {
+      if (n < 4 || !s.mem[0]) return n < 4 ? kIOReturnBadArgument : kIOReturnNotReady;
+      // Clamp to the mode, let the backend write it, then the values apply from frame lastSeq + latency.
+      const GuampCamIosModeInfo &m = s.mode;
+      uint32_t us = static_cast<uint32_t>(in[1] > 0xffffffffull ? 0xffffffffull : in[1]);
+      uint32_t ag = static_cast<uint32_t>(in[2] > 0xffffull ? 0xffffull : in[2]);
+      uint32_t dg = static_cast<uint32_t>(in[3] > 0xffffull ? 0xffffull : in[3]);
+      if (m.minExposureUs && us < m.minExposureUs) us = m.minExposureUs;
+      if (m.maxExposureUs && us > m.maxExposureUs) us = m.maxExposureUs;
+      if (ag < 256) ag = 256;
+      if (m.maxAnalogGainQ8 && ag > m.maxAnalogGainQ8) ag = m.maxAnalogGainQ8;
+      if (dg < 256) dg = 256;
+      if (m.maxDigitalGainQ8 && dg > m.maxDigitalGainQ8) dg = m.maxDigitalGainQ8;
+      uint32_t aus = us, aag = ag, adg = dg;
+      if (gBackend->setExposure(gBackendCtx, idx, us, ag, dg, &aus, &aag, &adg)) return kIOReturnError;
+      const uint64_t started = gBackend->framesStarted ? gBackend->framesStarted(gBackendCtx, idx) : 0;
+      IOLockLock(gLock);
+      s.pend.valid = true;
+      s.pend.from = (started > s.lastSeq ? started : s.lastSeq) + (s.latency ? s.latency : 1);
+      s.pend.us = aus;
+      s.pend.again = aag;
+      s.pend.dgain = adg;
+      IOLockUnlock(gLock);
+      return kIOReturnSuccess;
+    }
     case kGuampCamSelSetFocus:
       if (n < 2) return kIOReturnBadArgument;
       s.focusDac = static_cast<uint32_t>(in[1] > 1023 ? 1023 : in[1]);
@@ -638,7 +750,9 @@ IOReturn AppleH9CamInUserClient::externalMethod(uint32_t selector, IOExternalMet
 namespace camios {
 void start() {
   PE_parse_boot_argn("guamp-camera-ios", &gMode, sizeof(gMode));
-  if (gMode != 1 && gMode != 2) return;
+  if (gMode < 1 || gMode > 3) return;
+  PE_parse_boot_argn("guamp-camera-ios-latency", &gLatency, sizeof(gLatency));
+  if (gLatency > 4) gLatency = 4;
   PE_parse_boot_argn("guamp-camera-ios-slots", &gSlots, sizeof(gSlots));
   if (gSlots < 2) gSlots = 2;
   if (gSlots > GUAMP_CAMSS_MAX_BUFFERS) gSlots = GUAMP_CAMSS_MAX_BUFFERS;
@@ -646,9 +760,15 @@ void start() {
   gFlashOff = thread_call_allocate(flashOff, nullptr);
   if (!gLock) return;
   gBackend = &pattern::kBackend;
-  if (gMode == 1) {
-    if (camss::available()) gBackend = &camss::kBackend;
-    else IOLog("GuampCamIos: CAMSS API not in this kernel, test pattern instead\n");
+  gBackendKind = 0;
+  if (gMode == 1 || gMode == 3) {
+    if (camss::available()) {
+      gBackend = &camss::kBackend;
+      camss::gTpg = gMode == 3;
+      gBackendKind = camss::gTpg ? 2 : 1;
+    } else {
+      IOLog("GuampCamIos: CAMSS API not in this kernel, test pattern instead\n");
+    }
   }
   probeSensors();
   IOService *platform = IOService::getPlatform();
@@ -660,7 +780,8 @@ void start() {
   if (!svc->attach(platform) || !svc->start(platform)) { svc->detach(platform); svc->release(); IOLog("GuampCamIos: service not started\n"); return; }
   svc->registerService();
   gService = svc;
-  IOLog("GuampCamIos: AppleH6CamIn published (mode %u, backend %s, %u slots), plug-in /System/Library/MediaCapture/H6ISP.mediacapture\n",
-        gMode, gBackend->name, gSlots);
+  IOLog("GuampCamIos: AppleH6CamIn published (ABI %u, mode %u, backend %s%s, %u slots, latency %u), plug-in "
+        "/System/Library/MediaCapture/H6ISP.mediacapture\n", GUAMP_CAMIOS_ABI_VERSION, gMode, gBackend->name,
+        gBackendKind == 2 ? " TPG" : "", gSlots, gLatency);
 }
 }  // namespace camios
