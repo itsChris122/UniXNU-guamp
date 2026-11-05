@@ -211,7 +211,7 @@ void g3a_af_default(g3a_af_config *c, uint16_t dac_lo, uint16_t dac_hi) {
 float g3a_af_measure(const g3a_stats *s, const g3a_af_config *c, float *luma) {
     uint32_t x0 = c->roi_x, y0 = c->roi_y, w = c->roi_w, h = c->roi_h;
     if (!w || !h) { w = (s->zones_x + 2) / 3; h = (s->zones_y + 2) / 3; x0 = (s->zones_x - w) / 2; y0 = (s->zones_y - h) / 2; }
-    double sh = 0, sg = 0, cnt = 0;
+    double sh = 0, sg = 0, cnt = 0, sat = 0;
     for (uint32_t y = y0; y < y0 + h && y < s->zones_y; ++y)
         for (uint32_t x = x0; x < x0 + w && x < s->zones_x; ++x) {
             const uint32_t i = y * s->zones_x + x;
@@ -219,8 +219,11 @@ float g3a_af_measure(const g3a_stats *s, const g3a_af_config *c, float *luma) {
             if (s->sharp) sh += s->sharp[i];
             sg += s->sum_g[i];
             cnt += s->count[i];
+            if (s->sat) sat += s->sat[i];
         }
-    if (luma) *luma = cnt > 0 ? (float)(sg / (cnt * s->white)) : 0.f;
+    /* ROI luma with saturated quads counted as white: a sharper image clips more texture, and the mean of the
+     * unsaturated quads alone would then fall with focus (gcampipe test) instead of following the exposure */
+    if (luma) *luma = cnt + sat > 0 ? (float)((sg + sat * s->white) / ((cnt + sat) * s->white)) : 0.f;
     return sg > 0 ? (float)(sh / sg) : 0.f;
 }
 
@@ -265,7 +268,7 @@ uint16_t g3a_af_run(const g3a_stats *s, const g3a_af_config *c, g3a_af_state *st
     const float fv = g3a_af_measure(s, c, &luma);
     if (st->state == G3A_AF_COARSE || st->state == G3A_AF_FINE) {
         if (st->lock_luma <= 0.f) st->lock_luma = luma;
-        else if (luma > 1.5f * st->lock_luma || luma * 1.5f < st->lock_luma) {   /* exposure moved under the scan */
+        else if (luma > 2.f * st->lock_luma || luma * 2.f < st->lock_luma) {   /* exposure moved under the scan (> 1 EV) */
             g3a_af_start(st, c);
             return st->dac;
         }

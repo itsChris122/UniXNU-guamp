@@ -124,7 +124,7 @@ void g3a_af_default(g3a_af_config *c, uint16_t dac_lo, uint16_t dac_hi);
 float g3a_af_measure(const g3a_stats *s, const g3a_af_config *c, float *luma);
 void g3a_af_start(g3a_af_state *st, const g3a_af_config *c);
 /* One frame (stats taken with the lens at the position asked before): returns the DAC to program now.
- * A scan whose ROI luma moves by more than x1.5 from where it started (AE still converging, light changed) starts
+ * A scan whose ROI luma moves by more than x2 (1 EV) from where it started (AE still converging, light changed) starts
  * again: focus values of frames at different exposure are not comparable (read noise in the contrast term).
  * Callers should also skip frames whose exposure is still pending (kGuampFrameSettingsPending). */
 uint16_t g3a_af_run(const g3a_stats *s, const g3a_af_config *c, g3a_af_state *st);
