@@ -740,6 +740,15 @@ int naAccelerator() {
     IOLog("GuampAdreno: NativeTurnipDebug \"%s\"\n", turnipDebug);
   }
   accelerator->setProperty("NativeMetalWithhold", "apple-families");
+  // guamp-m2v-env=NAME=VALUE,NAME=VALUE (patches/adreno-metal/0019): the Metal bridge's switches for every process, read by the plugin
+  // before it makes its device (an empty or absent argument sets nothing). Example: guamp-m2v-env=NMB_XR10=0,NMB_SURFACE_IMPORT_HOLD=0.
+  {
+    static char metalEnv[256] = {};
+    if (PE_parse_boot_argn("guamp-m2v-env", metalEnv, sizeof(metalEnv)) && metalEnv[0]) {
+      accelerator->setProperty("NativeMetalEnv", metalEnv);
+      IOLog("GuampAdreno: NativeMetalEnv \"%s\"\n", metalEnv);
+    }
+  }
   if (!accelerator->attach(IOService::getPlatform())) {accelerator->release(); return GuampAdrenoAccelerator;}
   accelerator->registerService();
   IOLog("GuampAdreno: accelerator AGXAccelerator registered (IOAcceleratorES)\n");

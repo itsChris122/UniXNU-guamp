@@ -1,0 +1,41 @@
+guamp: the board's NativeMetalEnv (boot argument guamp-m2v-env) sets the bridge's switches in every Metal process
+
+The bridge's switches are environment variables (NMB_XR10, NMB_SURFACE_IMPORT_HOLD, NMB_SURFACE_INVALIDATE_GAP_MS, NMB_TEXTURE_FALLBACK,
+NMB_LIMITS, ...), which no boot line or addon could set for launchd's processes, sandboxed extensions included: an A/B test meant a new
+addon. The plugin now reads the accelerator's NativeMetalEnv property ("NAME=VALUE,NAME=VALUE", set by GuampAdrenoProbe from
+guamp-m2v-env) next to NativeTurnipDebug, before the device is made, and sets each variable unless the process already has it.
+fin48 (Home screen flicker until the first standby): guamp-m2v-env=NMB_XR10=0 takes 0018 back without a new addon.
+Applies after 0001-0003, 0009-0018 and 0030; the Objective-C++ is not compiled outside the CI.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index fa6f848..6777a88 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -259,6 +259,27 @@ static void applyBoardTurnipDebug(unsigned port) {
+     // with its GPU time; the frontend points MESA_GPU_TRACEFILE into the runtime's cache directory, which the board exports.
+     CFTypeRef trace = copyProperty && strcmp(getprogname(), "backboardd") == 0
+                           ? copyProperty(port, CFSTR("NativeTurnipTrace"), kCFAllocatorDefault, 0) : nullptr;
++    // guamp (UniXNU-guamp patches/adreno-metal/0019): NativeMetalEnv, the board's "NAME=VALUE,NAME=VALUE" (boot argument guamp-m2v-env),
++    // set in this process's environment before the device is made, without replacing a variable already set: the bridge's switches
++    // (NMB_XR10, NMB_SURFACE_IMPORT_HOLD, NMB_SURFACE_INVALIDATE_GAP_MS, NMB_TEXTURE_FALLBACK, NMB_LIMITS, ...) reach every process,
++    // sandboxed ones included, from the boot line instead of a rebuilt addon. Names are letters, digits and '_' only.
++    if (CFTypeRef env = copyProperty ? copyProperty(port, CFSTR("NativeMetalEnv"), kCFAllocatorDefault, 0) : nullptr) {
++        char list[512];
++        if (CFGetTypeID(env) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) env, list, sizeof list, kCFStringEncodingUTF8)) {
++            for (char *item = list, *next; item && *item; item = next) {
++                next = strchr(item, ',');
++                if (next) *next++ = 0;
++                char *eq = strchr(item, '=');
++                if (!eq || eq == item) continue;
++                *eq = 0;
++                bool ok = true;
++                for (const char *c = item; *c; ++c)
++                    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_')) ok = false;
++                if (ok) setenv(item, eq + 1, 0);
++            }
++        }
++        CFRelease(env);
++    }
+     if (trace) {
+         char points[256];
+         if (CFGetTypeID(trace) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) trace, points, sizeof points, kCFStringEncodingUTF8)) {
