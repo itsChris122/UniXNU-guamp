@@ -57,5 +57,8 @@ data and stay out of this repo (GCAM v1 file, parser `gcam::gcamFind`). Host tes
 Boot argument `guamp-cam2=1|2` (GuampCamss.inc + GuampCamssCore.h, default off): CAMSS RAW capture test, TPG (1) or
 sensor (2, needs a `guamp_camss_sensor_*` provider) -> CSIPHY 2.0.1 / CSID 530 -> TFE 530 RDI write master -> N frames
 in SMMU stream 0x400 buffers; report with counters, CSID/TFE errors and per-buffer FNV/histogram, ending with one
-`GuampCamss: RESULT ...` line. Consumer and sensor interface: GuampCamssApi.h (supersedes GuampCameraRdi.h). Host
-tests: `tests/run-camss-tests.sh` (WSL).
+`GuampCamss: RESULT ...` line. Consumer and sensor interface: GuampCamssApi.h (supersedes GuampCameraRdi.h, ABI 3).
+`guamp_camss_wait_frame` never hands out a buffer the write master is about to take or is rewriting: an already
+programmed next address is moved first (counters claim_redirects / claim_stale / held_overwrites). Continuous
+streaming restarts the CSID/TFE path after `guamp-cam2-recover` ms without a frame (default 2000, 0 off, 8 restarts
+per start; log `GuampCamss: recover ...`). Host tests: `tests/run-camss-tests.sh` (WSL).

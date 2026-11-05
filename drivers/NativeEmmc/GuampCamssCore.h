@@ -428,6 +428,7 @@ struct Stream {
   FrameMeta meta[GUAMP_CAMSS_MAX_BUFFERS] = {};
   volatile uint32_t lastSeq = 0;
   volatile int lastBuf = -1;
+  uint64_t lastProgressNs = 0;         // last buffer done (or start/restart): the stall watchdog compares with it
   Counters c = {};
 };
 // next buffer after `from` that the consumer does not hold; `from` itself (overwrite) when all others are held
@@ -446,10 +447,16 @@ inline void program(const Io &io, Stream &s, int buf) {
 // before tfeStart: the first buffer is part of tfeConfig; this only sets the ring state
 inline void ringReset(Stream &s) {
   s.latched = -1; s.writing = -1; s.pending = 0; s.lastSeq = 0; s.lastBuf = -1; s.curErrors = 0;
-  s.curSof = s.curEof = 0; s.stopRequest = false; s.stopping = false;
+  s.curSof = s.curEof = 0; s.stopRequest = false; s.stopping = false; s.lastProgressNs = 0;
   for (auto &m : s.meta) m = FrameMeta{};
   s.c = Counters{};
   s.c.abi = GUAMP_CAMSS_ABI;
+}
+// after a path restart (recovery): counters, held buffers and the finished frames stay; `first` is the address the
+// caller programs with tfeConfig before tfeStart
+inline void ringRestart(Stream &s, int first, uint64_t now) {
+  s.latched = -1; s.writing = -1; s.pending = first; s.curErrors = 0; s.curSof = s.curEof = 0;
+  s.stopping = false; s.lastProgressNs = now;
 }
 inline void noteErr(uint32_t &count, uint32_t &first, uint32_t bits) { if (!count++) first = bits; }
 
@@ -487,14 +494,18 @@ inline bool serviceTfe(const Io &io, Stream &s) {
     FrameMeta &m = s.meta[b];
     m.seq = s.c.done; m.errors = s.curErrors; m.sofNs = s.curSof; m.eofNs = s.curEof; m.doneNs = now;
     s.lastBuf = b;
+    s.writing = -1;                    // nothing is written until the next SOF
     __atomic_store_n(&s.lastSeq, s.c.done, __ATOMIC_RELEASE);
     s.curErrors = 0; s.curEof = 0;
+    s.lastProgressNs = now;
     if (s.target && s.c.done >= s.target) s.stopRequest = true;
   }
   if (bus[0] & busRup(r)) {
     ++s.c.rup;
     if (s.pending >= 0) s.latched = s.pending;
     s.pending = -1;
+    // a held buffer latched: a claim lost the race with this SOF (its frame is being overwritten)
+    if (s.latched >= 0 && (s.held & (1u << s.latched))) ++s.c.held_overwrites;
     if (s.live && !s.stopping && !s.stopRequest && s.buffers > 1) {
       const int next = pickNext(s, s.latched);
       if (next == s.latched) { ++s.c.drops; s.curErrors |= kFeDrop; }
@@ -524,6 +535,46 @@ inline bool serviceCsid(const Io &io, Stream &s) {
   if (rx & kRxErrMask) { noteErr(s.c.csid_rx_errors, s.c.first_rx_error, rx); s.curErrors |= kFeRx; }
   if (mine & kRdiErrMask) { noteErr(s.c.csid_rdi_errors, s.c.first_rdi_error, mine); s.curErrors |= kFeRdi; }
   return true;
+}
+
+// ---- consumer claim (guamp_camss_wait_frame); the caller holds the interrupt spin lock ----------------------------------
+// The write master takes the programmed address at the next SOF (RUP done), and the address after it is programmed
+// right then. So the buffer b of the newest finished frame can already be:
+//   writing - a SOF came after its done and the following frame is being written into it (all other buffers were
+//             held): stale, not handed out;
+//   pending - programmed for a following frame, not taken yet: the address moves to another free buffer (or to the
+//             buffer being written, which drops the frame in it) before the SOF takes it.
+// Pending statuses are serviced first, so a RUP that already happened is seen. When the stream is not live nothing
+// is written any more and every finished buffer can be held.
+enum : int { kClaimNone = -1, kClaimStale = -2 };
+inline int claimLatest(const Io &io, Stream &s) {
+  if (s.live) serviceTfe(io, s);
+  const int b = s.lastBuf;
+  if (b < 0 || static_cast<unsigned>(b) >= s.buffers) return kClaimNone;
+  if (s.live) {
+    if (b == s.writing) { ++s.c.claim_stale; return kClaimStale; }
+    if (b == s.pending) {
+      int alt = -1;
+      for (unsigned k = 0; k < s.buffers && alt < 0; ++k)
+        if (static_cast<int>(k) != b && static_cast<int>(k) != s.latched && !(s.held & (1u << k))) alt = static_cast<int>(k);
+      if (alt < 0 && s.latched >= 0 && s.latched != b && !(s.held & (1u << s.latched))) { alt = s.latched; ++s.c.drops; }
+      if (alt < 0) { ++s.c.claim_stale; return kClaimStale; }
+      program(io, s, alt);
+      ++s.c.claim_redirects;
+    }
+  }
+  s.held = s.held | (1u << b);
+  return b;
+}
+// first address of a restart: a buffer the consumer does not hold, preferably not the newest finished frame
+inline int restartBuffer(const Stream &s) {
+  const int b = pickNext(s, s.lastBuf);
+  return b >= 0 && static_cast<unsigned>(b) < s.buffers ? b : 0;
+}
+// Continuous-streaming watchdog: no buffer done for stallNs while the path should be running.
+inline bool stalled(const Stream &s, uint64_t now, uint64_t stallNs) {
+  return stallNs && s.live && !s.stopping && !s.stopRequest && !s.target && now > s.lastProgressNs &&
+         now - s.lastProgressNs >= stallNs;
 }
 
 // ---- RAW10 frame statistics (diagnostic report, host-checkable) ---------------------------------------------------------

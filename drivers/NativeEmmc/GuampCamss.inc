@@ -26,6 +26,9 @@
 //   guamp-cam2-timeout=<ms>  capture timeout (default 3000)
 //   guamp-cam2-keep=1        leave the stream open after the test (buffers stay for the ISP agent / guamp_camss_*)
 //   guamp-cam2-settle=<n>    CSIPHY settle count override (sensor only)
+//   guamp-cam2-recover=<ms>  continuous streaming (start(0), the iOS camera service): restart the CSID/TFE path when
+//                            no frame completed for <ms> (default 2000, 0 = off, at most 8 restarts per start). Read
+//                            even with guamp-cam2=0, it is the API's behaviour
 // Every line starts with "GuampCamss:"; the test ends with one "GuampCamss: RESULT ..." line.
 #include "GuampCamssCore.h"
 
@@ -46,7 +49,8 @@ __attribute__((weak)) void guamp_camss_sensor_release(uint32_t) {}
 namespace camss {
 unsigned gMode, gDelay = 25, gFrames = 8, gBufs = 3, gCsid, gRdi, gClk, gPattern = 9, gWidth = 1600, gHeight = 1200,
          gLanes = 4, gCell, gSensorMode = 0, gIrq = 1, gRpm = 1, gKhz = 300000, gSmmuOn = 1, gTimeoutMs = 3000, gKeep,
-         gSettle;
+         gSettle, gRecoverMs = 2000;
+constexpr unsigned kRecoverMax = 8;
 constexpr uint64_t kSmmuPhys = 0x0c600000;
 constexpr uint32_t kRpmMmxi = 0x69786d6du;   // "mmxi": QCOM_SMD_RPM_MMXI_CLK (bengal mmnrt 0, mmrt 1)
 using CamSmmu = guampwifi::SmmuContext<kSmmuStream, 0, 0x20000000ull, 0x28000000ull>;   // 128 MiB of IOVA
@@ -72,6 +76,8 @@ struct Opened {
   uint32_t width = 0, height = 0, lineBytes = 0, frameBytes = 0, bayer = 0;
   uint32_t turnedOn[24] = {};
   unsigned turnedOnCount = 0;
+  CsidCfg csid = {};                 // kept for a path restart
+  unsigned restarts = 0;             // per start
 } gO;
 
 uint32_t ioRd(void *, unsigned b, uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(gMap[b] + off); }
@@ -118,10 +124,22 @@ void attachIrqs(unsigned inst) {
         inst, kIntidTfe[inst], t, rbT, static_cast<unsigned long long>(roT), inst, kIntidCsid[inst], c, rbC,
         static_cast<unsigned long long>(roC));
 }
+bool restartLocked();
+bool stallNow() {
+  const IOInterruptState st = IOSimpleLockLockDisableInterrupt(gSl);
+  const bool s = stalled(gS, ioNow(nullptr), static_cast<uint64_t>(gRecoverMs) * 1000000u);
+  IOSimpleLockUnlockEnableInterrupt(gSl, st);
+  return s;
+}
 void pollThread(void *, wait_result_t) {
   gPollAlive = true;
   while (gPollRun) {
     if (service()) ++gS.c.polls;
+    // stall watchdog; try-lock: stop/close hold gApi while they wait for this thread to end
+    if (gRecoverMs && gO.restarts < kRecoverMax && stallNow() && IOLockTryLock(gApi)) {
+      if (gO.streaming && gPollRun && stallNow()) restartLocked();
+      IOLockUnlock(gApi);
+    }
     IOSleep(gPollMs);
   }
   gPollAlive = false;
@@ -294,6 +312,55 @@ void streamOff() {   // caller holds gApi
   stopPoll();
   gO.streaming = false;
 }
+// CSID/TFE path restart while the source keeps sending (the sensor stays in streaming, the TPG keeps running): halt,
+// reset both blocks, same configuration, first address = a free buffer, resume at the next frame boundary.
+bool restartLocked() {   // caller holds gApi, gO.streaming
+  const unsigned r = gS.rdi;
+  ++gO.restarts;
+  Counters c;
+  {
+    const IOInterruptState st = IOSimpleLockLockDisableInterrupt(gSl);
+    gS.stopping = true;
+    c = gS.c;
+    IOSimpleLockUnlockEnableInterrupt(gSl, st);
+  }
+  IOLog("GuampCamss: recover %u/%u: no frame for %u ms (done %u sof %u/%u eof %u rup %u, errors rx %u rdi %u tfe %u bus %u; "
+        "csid rdi%u status %x, tfe rdi status %x, wm addr status %x)\n", gO.restarts, kRecoverMax, gRecoverMs, c.done, c.sof,
+        c.csid_sof, c.eof, c.rup, c.csid_rx_errors, c.csid_rdi_errors, c.tfe_errors, c.bus_errors, r,
+        gIo.r(kBlkCsid, rdiStatus(r)), gIo.r(kBlkCsid, tfeRdiStatus(r)), gIo.r(kBlkCsid, wmBase(r) + kWmAddrStatus0));
+  smmuFault("before restart");
+  csidHalt(gIo, r, kHaltNow);
+  tfeStop(gIo, r);
+  IOSleep(2);
+  {
+    const IOInterruptState st = IOSimpleLockLockDisableInterrupt(gSl);
+    gS.live = false;   // handlers off while the blocks reset
+    IOSimpleLockUnlockEnableInterrupt(gSl, st);
+  }
+  const int cr = csidReset(gIo);
+  const int cc = cr ? cr : csidConfig(gIo, gO.csid);
+  const int tr = tfeReset(gIo);
+  if (cc || tr) {
+    ++gS.c.recovery_failed;
+    IOLog("GuampCamss: recover: csid reset %d config %d, tfe reset %d: FAILED, stream stays down\n", cr, cc, tr);
+    return false;
+  }
+  int first;
+  {
+    const IOInterruptState st = IOSimpleLockLockDisableInterrupt(gSl);
+    first = restartBuffer(gS);
+    ringRestart(gS, first, ioNow(nullptr));
+    gS.live = true;
+    ++gS.c.recoveries;
+    IOSimpleLockUnlockEnableInterrupt(gSl, st);
+  }
+  tfeConfig(gIo, r, gS.iova[first], gBufBytes);
+  tfeStart(gIo, r, gO.bayer);
+  csidStart(gIo, r);
+  IOLog("GuampCamss: recover: path restarted, first buffer %u\n", first);
+  return true;
+}
+
 void closeLocked() {
   if (!gO.open) return;
   streamOff();
@@ -386,6 +453,7 @@ extern "C" int guamp_camss_open(const struct guamp_camss_config *cfg) {
     CsidCfg c = {gO.lanes, gO.sensor ? gO.link.lane_assign : 0x3210u, gO.sensor ? gO.phy : gO.tpg,
                  gO.sensor ? gO.link.vc : 0u, gO.sensor ? gO.link.dt : 0x2bu, gS.rdi};
     const int cc = cr ? cr : csidConfig(gIo, c);
+    gO.csid = c;
     const int tr = tfeReset(gIo);
     if (!cc && !tr) tfeConfig(gIo, gS.rdi, gS.iova[0], gBufBytes);
     IOLog("GuampCamss: csid%u reset %d config %d (phy_sel %u, %u lanes, lane cfg %x, vc %u dt %x -> rdi%u), tfe%u reset %d\n",
@@ -411,9 +479,11 @@ extern "C" int guamp_camss_start(uint32_t frames) {
     const unsigned rdi = gS.rdi, bufs = gS.buffers;
     ringReset(gS);
     gS.rdi = rdi; gS.buffers = bufs; gS.target = frames; gS.held = 0;
+    gS.lastProgressNs = ioNow(nullptr);
     gS.live = true;
     IOSimpleLockUnlockEnableInterrupt(gSl, st);
   }
+  gO.restarts = 0;
   gPollMs = gIrqOk[gO.inst] ? 10 : 1;
   gPollRun = true;
   thread_t th;
@@ -440,12 +510,19 @@ extern "C" int guamp_camss_wait_frame(uint32_t after, uint32_t timeoutMs, struct
   if (!out || !gSl) return GUAMP_CAMSS_EINVAL;
   for (uint32_t waited = 0;; waited += 1) {
     if (!gO.open) return GUAMP_CAMSS_ENOTREADY;
-    if (__atomic_load_n(&gS.lastSeq, __ATOMIC_ACQUIRE) > after) {
+    const uint32_t seq = __atomic_load_n(&gS.lastSeq, __ATOMIC_ACQUIRE);
+    if (seq > after) {
       const IOInterruptState st = IOSimpleLockLockDisableInterrupt(gSl);
-      const int b = gS.lastBuf;
+      const int b = claimLatest(gIo, gS);   // services pending statuses, may move the next address
       const FrameMeta m = b >= 0 ? gS.meta[b] : FrameMeta{};
-      if (b >= 0) gS.held = gS.held | (1u << b);
+      const uint32_t nowSeq = gS.lastSeq;
       IOSimpleLockUnlockEnableInterrupt(gSl, st);
+      if (b == kClaimStale) {   // being overwritten: wait for a newer one
+        after = nowSeq;
+        if (!gO.streaming || waited >= timeoutMs) return GUAMP_CAMSS_ETIMEDOUT;
+        IOSleep(1);
+        continue;
+      }
       if (b < 0) return GUAMP_CAMSS_ENOTREADY;
       *out = guamp_camss_frame{};
       out->abi = GUAMP_CAMSS_ABI; out->seq = m.seq; out->buffer = static_cast<uint32_t>(b);
@@ -508,6 +585,8 @@ void report(uint32_t frames) {
   IOLog("GuampCamss: counters: tfe sof %u eof %u rup %u done %u drops %u | csid sof %u eof %u | irqs tfe %u csid %u, polls %u | "
         "unmapped vc/dt %u (last hdr %x, PDAF expected)\n", c.sof, c.eof, c.rup, c.done, c.drops, c.csid_sof, c.csid_eof,
         c.tfe_irqs, c.csid_irqs, c.polls, c.csid_rx_unmapped, c.last_unmapped_hdr);
+  IOLog("GuampCamss: claims: redirected %u, stale %u, held overwritten %u | recoveries %u (failed %u)\n",
+        c.claim_redirects, c.claim_stale, c.held_overwrites, c.recoveries, c.recovery_failed);
   IOLog("GuampCamss: errors: csi2 rx %u (first %x), rdi %u (first %x), tfe %u (first %x %x %x), bus %u (first %x %x; "
         "ccif %x overflow %x image size %x)\n", c.csid_rx_errors, c.first_rx_error, c.csid_rdi_errors, c.first_rdi_error,
         c.tfe_errors, c.first_tfe_error[0], c.first_tfe_error[1], c.first_tfe_error[2], c.bus_errors, c.first_bus_error[0],
@@ -605,6 +684,8 @@ void start() {
     if (!tpg) gSensorMode = gSensorMode ? 1 : 0;
   }
   PE_parse_boot_argn("guamp-cam2", &gMode, sizeof(gMode));
+  PE_parse_boot_argn("guamp-cam2-recover", &gRecoverMs, sizeof(gRecoverMs));
+  if (gRecoverMs && gRecoverMs < 200) gRecoverMs = 200;
   if (!gMode) return;
   PE_parse_boot_argn("guamp-cam2-delay", &gDelay, sizeof(gDelay));
   PE_parse_boot_argn("guamp-cam2-frames", &gFrames, sizeof(gFrames));

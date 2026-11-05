@@ -1,7 +1,8 @@
 // Host test of GuampCamssCore.h: clock plan values, CSIPHY lane tables / lane enable / settle, CSID and TFE
 // bring-up sequences against a simulated register file (reset acknowledgements, write-1-to-clear statuses), the
 // TPG start word, the interrupt service + buffer ring against a simulated write master that latches its address at
-// SOF after a reg update (consumer-held buffers, stop after N frames, error accounting), and the RAW10 statistics.
+// SOF after a reg update (consumer-held buffers, stop after N frames, error accounting), the consumer claim against
+// the next-address race (redirect, stale, held overwrite), the stall watchdog / path restart, and the RAW10 statistics.
 #include "../GuampCamssCore.h"
 #include <stdio.h>
 #include <string.h>
@@ -249,6 +250,155 @@ static void testRing() {
   CHECK(s.c.csid_rx_unmapped == 1 && s.c.last_unmapped_hdr == 0x00300041 && s.c.csid_rx_errors == rxBefore);
 }
 
+// Half frames of the simulated hardware (TFE only): SOF with the RUP latch, then EOF + buffer done.
+static std::vector<uint32_t> gLatches;   // every address the write master took, in order
+static void simSof(Stream &s) {
+  S->now += 1000;
+  reg(kBlkCsid, tfeTopStatus(1)) |= tfeSof(s.rdi);
+  if (S->rupPending) {
+    S->latched = S->wmAddr;
+    S->rupPending = false;
+    gLatches.push_back(S->latched);
+    reg(kBlkCsid, tfeTopStatus(0)) |= kTop0Bus;
+    reg(kBlkCsid, busStatus(0)) |= busRup(s.rdi);
+  }
+  CHECK(serviceTfe(kIo, s));
+}
+static uint32_t simEof(Stream &s) {
+  S->now += 30000;
+  reg(kBlkCsid, tfeTopStatus(1)) |= tfeEof(s.rdi);
+  reg(kBlkCsid, tfeTopStatus(0)) |= kTop0Bus;
+  reg(kBlkCsid, busStatus(0)) |= busDone(s.rdi);
+  CHECK(serviceTfe(kIo, s));
+  CHECK(s.lastBuf >= 0 && s.iova[s.lastBuf] == S->latched);
+  return S->latched;
+}
+static void streamSetup(Sim &sim, Stream &s, unsigned buffers) {
+  S = &sim;
+  gLatches.clear();
+  s = Stream{};
+  s.rdi = 0; s.buffers = buffers;
+  for (unsigned i = 0; i < buffers; ++i) s.iova[i] = 0x20000000u + i * 0x300000u;
+  ringReset(s);
+  s.target = 0; s.live = true; s.lastProgressNs = sim.now;
+  tfeConfig(kIo, 0, s.iova[0], 0x300000);
+  tfeStart(kIo, 0, 0);
+}
+static bool latchedSince(size_t from, uint32_t iova) {
+  for (size_t i = from; i < gLatches.size(); ++i) if (gLatches[i] == iova) return true;
+  return false;
+}
+
+static void testClaim() {
+  // 3 buffers, the consumer keeps buffer 0 and comes late for the next frame: the address after it already names it
+  {
+    Sim sim; Stream s;
+    streamSetup(sim, s, 3);
+    simFrame(s);                                   // frame 1 -> buffer 0
+    CHECK(claimLatest(kIo, s) == 0 && s.held == 1u);
+    simFrame(s);                                   // frame 2 -> buffer 1
+    simSof(s);                                     // frame 3 starts in buffer 2; next address = 1 (0 is held)
+    CHECK(s.latched == 2 && s.pending == 1 && s.writing == 2);
+    const size_t mark = gLatches.size();
+    CHECK(claimLatest(kIo, s) == 1);               // frame 2: its buffer is pending -> moved
+    CHECK(s.c.claim_redirects == 1 && s.pending == 2 && s.held == 3u && s.c.drops == 1);
+    simEof(s);
+    for (unsigned k = 0; k < 4; ++k) { simSof(s); simEof(s); }
+    CHECK(!latchedSince(mark, s.iova[1]) && !latchedSince(mark, s.iova[0]));   // held buffers never taken again
+    CHECK(s.c.held_overwrites == 0);
+    const Counters c = s.c;
+    CHECK(c.claim_stale == 0);
+    s.held = 0;                                    // released: the ring uses all three again
+    const size_t mark2 = gLatches.size();
+    for (unsigned k = 0; k < 4; ++k) { simSof(s); simEof(s); }
+    CHECK(latchedSince(mark2, s.iova[0]) && latchedSince(mark2, s.iova[1]));
+  }
+  // 2 buffers, buffer 0 held: everything goes to buffer 1, whose frame is never handed out while it is rewritten
+  {
+    Sim sim; Stream s;
+    streamSetup(sim, s, 2);
+    simFrame(s);
+    CHECK(claimLatest(kIo, s) == 0);
+    simFrame(s);                                   // frame 2 -> buffer 1, next address = 1 again (overwrite)
+    simSof(s);                                     // frame 3 is being written into buffer 1
+    CHECK(s.writing == 1 && s.lastBuf == 1);
+    CHECK(claimLatest(kIo, s) == kClaimStale && s.c.claim_stale == 1 && s.held == 1u);
+    simEof(s);                                     // frame 3 done, next address is buffer 1 again
+    CHECK(claimLatest(kIo, s) == kClaimStale && s.c.claim_stale == 2);
+    s.held = 0;                                    // release 0: the pending address moves away from buffer 1
+    CHECK(claimLatest(kIo, s) == 1 && s.pending == 0 && s.c.claim_redirects == 1);
+    const size_t mark = gLatches.size();
+    simSof(s); simEof(s);
+    CHECK(!latchedSince(mark, s.iova[1]) && s.lastBuf == 0);
+  }
+  // a claim that lost the race (held buffer latched anyway) is counted
+  {
+    Sim sim; Stream s;
+    streamSetup(sim, s, 3);
+    simFrame(s); simFrame(s);
+    simSof(s);
+    s.held = s.held | (1u << s.pending);          // as if the hold came after the SOF took the address
+    simEof(s);
+    simSof(s);
+    CHECK(s.c.held_overwrites == 1);
+  }
+  // pending statuses are serviced before deciding: a RUP not yet seen by the handler counts
+  {
+    Sim sim; Stream s;
+    streamSetup(sim, s, 2);
+    simFrame(s);                                   // frame 1 in buffer 0, next address 1
+    CHECK(claimLatest(kIo, s) == 0);
+    s.held = 0;
+    simFrame(s);                                   // frame 2 in buffer 1, next address 0
+    // SOF 3 latched buffer 0 in hardware, interrupt not serviced yet
+    reg(kBlkCsid, tfeTopStatus(1)) |= tfeSof(0);
+    S->latched = S->wmAddr; S->rupPending = false; gLatches.push_back(S->latched);
+    reg(kBlkCsid, tfeTopStatus(0)) |= kTop0Bus;
+    reg(kBlkCsid, busStatus(0)) |= busRup(0);
+    CHECK(claimLatest(kIo, s) == 1 && s.c.rup == 3 && s.writing == 0 && s.pending == 0);
+    CHECK(s.c.claim_redirects == 1);   // buffer 1 had become the next address after that RUP: moved back to 0
+  }
+  // stopped stream: any finished buffer can be held
+  {
+    Sim sim; Stream s;
+    streamSetup(sim, s, 2);
+    simFrame(s); simFrame(s);
+    simSof(s);
+    s.live = false;
+    CHECK(claimLatest(kIo, s) == 1);
+    Stream e; e.buffers = 2;
+    CHECK(claimLatest(kIo, e) == kClaimNone);
+  }
+}
+
+static void testRecovery() {
+  Sim sim; Stream s;
+  streamSetup(sim, s, 3);
+  const uint64_t stall = 2000000000ull;
+  simFrame(s); simFrame(s);
+  CHECK(!stalled(s, sim.now + stall - 1, stall) && stalled(s, sim.now + stall, stall));
+  CHECK(!stalled(s, sim.now + stall, 0));          // watchdog off
+  s.target = 5;
+  CHECK(!stalled(s, sim.now + stall, stall));      // counted capture: the caller times out itself
+  s.target = 0; s.stopping = true;
+  CHECK(!stalled(s, sim.now + stall, stall));
+  s.stopping = false;
+  // restart: counters, held buffers and the newest frame stay; first address avoids them
+  CHECK(claimLatest(kIo, s) == 1);
+  const uint32_t done = s.c.done;
+  const int first = restartBuffer(s);
+  CHECK(first == 2);
+  ringRestart(s, first, sim.now + stall);
+  CHECK(s.c.done == done && s.held == 2u && s.lastBuf == 1 && s.pending == 2 && s.latched == -1 && s.writing == -1);
+  CHECK(!stalled(s, sim.now + stall, stall));
+  sim.rupPending = false;
+  tfeConfig(kIo, 0, s.iova[first], 0x300000);
+  tfeStart(kIo, 0, 0);
+  sim.now += stall;
+  CHECK(simFrame(s) == 2 && s.c.done == done + 1 && s.meta[2].seq == done + 1);
+  CHECK(s.lastProgressNs == sim.now);
+}
+
 static void testStats() {
   const uint32_t w = 64, h = 4, lb = raw10LineBytes(w);
   std::vector<uint8_t> f(lb * h);
@@ -283,6 +433,8 @@ int main() {
   testPure();
   testBringUp();
   testRing();
+  testClaim();
+  testRecovery();
   testStats();
   if (fails) { printf("camss host: %d FAIL\n", fails); return 1; }
   printf("camss host: PASS\n");

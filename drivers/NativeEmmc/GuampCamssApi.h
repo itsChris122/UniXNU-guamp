@@ -10,7 +10,7 @@
 #define GUAMP_CAMSS_API_H
 #include <stdint.h>
 
-#define GUAMP_CAMSS_ABI 2
+#define GUAMP_CAMSS_ABI 3
 #define GUAMP_CAMSS_MAX_BUFFERS 4
 
 // errors (negative errno style; also returned by the sensor hooks)
@@ -84,6 +84,12 @@ struct guamp_camss_counters {
   uint32_t first_rx_error, first_rdi_error, first_tfe_error[3], first_bus_error[2];
   uint32_t bus_violation, bus_overflow, bus_image_size;
   uint32_t csid_rx_unmapped, last_unmapped_hdr;  // ABI 2: packets of an unmapped VC/DT (PDAF), not an error
+  // ABI 3: buffer claims and stream recovery
+  uint32_t claim_redirects;   // wait_frame took a buffer already programmed as the next address: address moved
+  uint32_t claim_stale;       // wait_frame found the newest frame being overwritten (its buffer is latched): skipped
+  uint32_t held_overwrites;   // a consumer-held buffer was latched anyway (claim lost the race with the SOF)
+  uint32_t recoveries;        // CSID/TFE path restarted after a stall (continuous streaming, guamp-cam2-recover)
+  uint32_t recovery_failed;   // restarts whose CSID/TFE reset did not answer (the stream stays down)
 };
 
 #ifdef __cplusplus
@@ -92,7 +98,9 @@ extern "C" {
 // Consumers
 int guamp_camss_open(const struct guamp_camss_config *config);   // power, clocks, SMMU, buffers; not streaming
 int guamp_camss_start(uint32_t frames);    // 0 = until stop; otherwise the source stops by itself after frames
-int guamp_camss_wait_frame(uint32_t after_seq, uint32_t timeout_ms, struct guamp_camss_frame *out);   // holds it
+// Newest finished frame with seq > after_seq; the buffer is held (never written) until guamp_camss_release. A frame
+// whose buffer the write master is already writing again is skipped (claim_stale) and the wait goes on.
+int guamp_camss_wait_frame(uint32_t after_seq, uint32_t timeout_ms, struct guamp_camss_frame *out);
 void guamp_camss_release(uint32_t buffer);
 int guamp_camss_stop(void);
 void guamp_camss_close(void);
