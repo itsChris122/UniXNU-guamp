@@ -28,7 +28,8 @@ clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -
   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -Wno-c99-designator -Wno-reorder-init-list \
   -I "$WORK/shim" -I "$HERE" -I "$NA" -I "$SMMU" -I "$PM4" -I "$HERE/.." "$HERE/../GuampAdrenoProbe.cpp" && echo "probe: compiled" || rc=1
 echo "== no raw newline inside a string literal"
-(cd "$REPO/drivers/NativeEmmc" && python3 -I tests/check_literals.py ../GuampAdreno/GuampAdrenoProbe.cpp ../GuampAdreno/GuampAdreno.h   ../GuampAdreno/GuampAdrenoRecover.inc ../GuampAdreno/GuampGpuRecoverCore.h) || rc=1
+(cd "$REPO/drivers/NativeEmmc" && python3 -I tests/check_literals.py ../GuampAdreno/GuampAdrenoProbe.cpp ../GuampAdreno/GuampAdreno.h   ../GuampAdreno/GuampAdrenoRecover.inc ../GuampAdreno/GuampGpuRecoverCore.h \
+   ../GuampAdreno/GuampGpuPerf.inc ../GuampAdreno/GuampGpuPerfCore.h) || rc=1
 echo "== guamp-gpu-recover decisions and ring layout (GuampGpuRecoverCore.h): clang (ASan/UBSan) and gcc"
 FLAGS="-std=gnu++20 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -fno-exceptions -fno-rtti"
 clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined "$HERE/recover_host.cpp" -o "$WORK/recover_host" && "$WORK/recover_host" || rc=1
@@ -44,6 +45,12 @@ echo "== patched NativeAdrenoPublish.cpp: arm64-apple-ios, -Werror (guamp-gpu-al
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -fsyntax-only \
   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -Wno-c99-designator -Wno-reorder-init-list \
   -I "$WORK/shim" -I "$HERE" -I "$WORK/na" -I "$SMMU" -I "$PM4" "$WORK/na/NativeAdrenoPublish.cpp" && echo "publish: compiled" || rc=1
+echo "== patched NativeAdrenoRing.cpp and NativeAdrenoSubmit.cpp: arm64-apple-ios, -Werror (guamp-gpu-perf, patch 0019)"
+for f in NativeAdrenoRing NativeAdrenoSubmit; do
+  clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -fsyntax-only \
+    -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -Wno-c99-designator -Wno-reorder-init-list \
+    -I "$WORK/shim" -I "$HERE" -I "$WORK/na" -I "$SMMU" -I "$PM4" "$WORK/na/$f.cpp" && echo "$f: compiled" || rc=1
+done
 echo "== guamp-gpu-all windows, open rate and limits (NativeAdrenoGpuAll.h): clang (ASan/UBSan) and gcc"
 if [ -e "$WORK/na/NativeAdrenoGpuAll.h" ]; then
   clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined -I "$WORK/na" "$HERE/gpu_all_host.cpp" -o "$WORK/gpu_all" && "$WORK/gpu_all" || rc=1
@@ -64,6 +71,19 @@ if [ -e "$WORK/na/NativeAdrenoProcFence.h" ]; then
   g++ $FLAGS -Wvolatile -I "$WORK/na" "$HERE/proc_fence_host.cpp" -o "$WORK/proc_fence_gcc" && "$WORK/proc_fence_gcc" >/dev/null || rc=1
 else
   echo "NativeAdrenoProcFence.h missing (patch 0017 not applied)"; rc=1
+fi
+echo "== guamp-gpu-perf accounting and lines (GuampGpuPerfCore.h): clang (ASan/UBSan) and gcc"
+clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined "$HERE/gpu_perf_host.cpp" -o "$WORK/gpu_perf" && "$WORK/gpu_perf" || rc=1
+g++ $FLAGS -Wvolatile "$HERE/gpu_perf_host.cpp" -o "$WORK/gpu_perf_gcc" && "$WORK/gpu_perf_gcc" >/dev/null || rc=1
+echo "== patch 0019: the job's CP_ALWAYS_ON_COUNTER samples in the patched A6XX ring (ring_perf_host.cpp, NativeAdreno's host fixture)"
+if [ -e "$NA/tests/XnuMemoryFixture.h" ] && [ -e "$PM4/AdrenoPM4.c" ]; then
+  mkdir -p "$WORK/rshim/IOKit"
+  for h in IOLib.h IOTypes.h; do echo '#include "XnuMemoryFixture.h"' > "$WORK/rshim/IOKit/$h"; done
+  clang -c -O1 -I "$PM4" "$PM4/AdrenoPM4.c" -o "$WORK/pm4.o" &&
+  clang++ $FLAGS -fsanitize=address,undefined -I "$WORK/rshim" -I "$NA/tests" -I "$WORK/na" -I "$PM4" "$HERE/ring_perf_host.cpp" \
+    "$WORK/na/NativeAdrenoRing.cpp" "$WORK/pm4.o" -o "$WORK/ring_perf" && "$WORK/ring_perf" || rc=1
+else
+  echo "no NativeAdreno tests/XnuMemoryFixture.h or AdrenoPM4.c: ring samples not tested"; rc=1
 fi
 echo "== the display copy's fence: render server's last or the ring's newest at the swap, the later (GuampCopyTarget.h, fin49)"
 clang++ $FLAGS -Wdeprecated-volatile -fsanitize=address,undefined "$HERE/copy_target_host.cpp" -o "$WORK/copy_target" && "$WORK/copy_target" || rc=1

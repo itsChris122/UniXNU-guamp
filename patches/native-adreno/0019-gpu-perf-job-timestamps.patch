@@ -1,0 +1,234 @@
+guamp: GPU time of every user job from CP_ALWAYS_ON_COUNTER samples (after the prologue, after the IBs) and hooks for the board frame accounting (guamp-gpu-perf, default off)
+
+With native_adreno_perf_ts set (GuampGpuPerf.inc), an A6XX framed submission copies CP_ALWAYS_ON_COUNTER (19.2 MHz) to the fence
+page at 0x800 + 16 * (fence & 63) with CP_REG_TO_MEM, as a6xx_submit() fills rbmemptrs_stats alwayson_start/end; the end sample
+follows a CP_WAIT_FOR_IDLE while the prologue has one. native_adreno_perf_begin/end are called at a job s submission and release,
+native_adreno_perf_mark gets the frame report markers 0x2000..0x3fff (adreno-metal 0023). All off: no ring word, no call.
+
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index dc1cb0b..02c43d5 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -861,6 +861,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
+ }
+ /* limit > 0 caps the connections ever granted: a plugin that crashes its host process on every launch (the process respawns and
+  * loads it again) must not be able to keep a system process in a crash loop, so after the cap further opens are refused. */
++/* guamp 0019: the board's decoder of the frame report markers (null: they are dropped). */
++extern "C" {void (*native_adreno_perf_mark)(uint32_t value);}
+ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t owningTask,void *securityID,UInt32 type,
+     OSDictionary *properties,IOUserClient **handler,unsigned limit)
+ {
+@@ -912,6 +914,12 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+             else if(value<0x7100 && length<sizeof(native_adreno_metal_diag.report2)-1) {line[length++]=char(value&0xff);line[length]=0;}
+             return kIOReturnUnsupported;
+         }
++        /* guamp (UniXNU-guamp patches/native-adreno/0019): 0x2000..0x3fff are a Metal process's frame report (adreno-metal 0023,
++         * NMB_PERF), decoded by the board (GuampGpuPerf.inc) in the caller's context; neither counted nor kept as markers. */
++        if(value>=0x2000 && value<0x4000) {
++            if(native_adreno_perf_mark)native_adreno_perf_mark(value);
++            return kIOReturnUnsupported;
++        }
+         native_adreno_metal_diag.marks[slot]=value;
+         native_adreno_metal_diag.marks_total=native_adreno_metal_diag.marks_total+1;
+         if(value==1) {
+diff --git a/NativeAdrenoRing.cpp b/NativeAdrenoRing.cpp
+index 4d36a2e..fdb0888 100644
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
+@@ -67,7 +67,13 @@ enum : uint32_t {
+     RingA6xxCcuInvalidateColor = 0x19,
+     RingA6xxCacheInvalidate = 0x31,
+     RingA6xxPrologueWords = 6,
+-    RingNoUpdate = 1u << 27
++    RingNoUpdate = 1u << 27,
++    /* guamp 0019: CP_REG_TO_MEM (0x3e; REG bits 0..17, CNT bits 18..29, 64B bit 30, adreno_pm4.xml) of CP_ALWAYS_ON_COUNTER (0x0980,
++     * 64-bit) as a6xx_submit() copies it to rbmemptrs_stats alwayson_start / alwayson_end (pinned a6xx_gpu.c get_stats_counter). */
++    RingRegToMem = 0x3e,
++    RingAlwaysOn = 0x0980,
++    RingRegToMem64 = 1u << 30,
++    RingPerfSampleWords = 4
+ };
+ static uint32_t ilog2(size_t value)
+ {
+@@ -91,6 +97,40 @@ IOReturn NativeAdrenoRing::setGeneration(unsigned generation)
+  * (patches/mesa-turnip/0001, as msm_gem_submit() skips them) keeps Vulkan's ordering. native_adreno_a6xx_prologue_wfi=0 (board,
+  * guamp-adreno-wfi=0) leaves it out. One more word a job. */
+ extern "C" {volatile uint32_t native_adreno_a6xx_prologue_wfi=1;}
++/* guamp (UniXNU-guamp patches/native-adreno/0019): the GPU's own time of each user job (board: guamp-gpu-perf, default 0 = off).
++ * A6XX framed submissions then carry CP_ALWAYS_ON_COUNTER samples after the prologue and after the IBs (perfSample); the end sample
++ * follows a CP_WAIT_FOR_IDLE while the prologue has one (the next job's prologue would drain the pipeline at that point anyway), so
++ * end - start is the job's whole GPU time. 8 or 9 ring words a job; nothing at all with the switch off. */
++extern "C" {volatile uint32_t native_adreno_perf_ts=0;}
++static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count);
++uint32_t NativeAdrenoRing::perfWords(bool framed) const
++{
++    if(!framed || generation_!=6 || !native_adreno_perf_ts)return 0;
++    return 2*RingPerfSampleWords+(native_adreno_a6xx_prologue_wfi?1u:0u);
++}
++uint32_t NativeAdrenoRing::emitPerfSample(uint32_t at,uint32_t slot,uint32_t which,bool idle)
++{
++    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
++    uint32_t words[1+RingPerfSampleWords]={0};
++    const uint64_t iova=fence_iova_+NativeAdrenoRingPerfOffset+16u*slot+8u*which;
++    const uint32_t payload[3]={RingAlwaysOn|(2u<<18)|RingRegToMem64,(uint32_t)iova,(uint32_t)(iova>>32)};
++    size_t n=idle?packet(words,0,RingWaitForIdle,nullptr,0):0;
++    if(idle && !n)return ~0u;
++    n=packet(words,n,RingRegToMem,payload,3);
++    if(!n)return ~0u;
++    for(size_t i=0;i<n;++i)ring_[(at+i)&mask]=words[i];
++    return (at+(uint32_t)n)&mask;
++}
++bool NativeAdrenoRing::perfSample(uint32_t fence,uint64_t *start,uint64_t *end)
++{
++    const uint32_t slot=fence&(NativeAdrenoRingPerfSlots-1);
++    if(!attached_ || poisoned_ || !fence || !start || !end || !(perf_marked_&(1ull<<slot)))return false;
++    perf_marked_&=~(1ull<<slot);
++    volatile uint32_t *words=fence_+(NativeAdrenoRingPerfOffset+16u*slot)/4;
++    if(cache_.acquire(cache_.cookie,words,16))return false;
++    *start=(uint64_t)words[1]<<32|words[0];*end=(uint64_t)words[3]<<32|words[2];
++    return true;
++}
+ uint32_t NativeAdrenoRing::prologueWords(bool reset) const
+ {
+     return generation_==6?RingA6xxPrologueWords+(native_adreno_a6xx_prologue_wfi?1u:0u):RingPrologueWords+(reset?RingResetWords:0);
+@@ -276,6 +316,7 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
+         ring_bytes<8192 || ring_bytes>(1u<<20) || (ring_bytes&(ring_bytes-1)) ||
+         ((ring_iova|ring_bytes)&(ring_bytes-1)) || (ring_iova&4095) ||
+         fence_bytes<64 || (fence_iova&7) || fence_bytes>=(1u<<24))return kIOReturnBadArgument;
++    if(native_adreno_perf_ts && fence_bytes<NativeAdrenoRingPerfOffset+16u*NativeAdrenoRingPerfSlots)native_adreno_perf_ts=0;   /* guamp 0019 */
+     /* No register may be touched before every argument is acceptable. */
+     io_=*io;cache_=*cache;ring_=static_cast<volatile uint32_t *>(ring);
+     ring_bytes_=ring_bytes;ring_iova_=ring_iova;
+@@ -290,7 +331,7 @@ IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdren
+         if(io_.write32(io_.cookie,writes[i],writes[i+1]))return poison();
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+     if(status)return status;
+-    next_=rptr;seqno_=0;completed_=0;submissions_=0;
++    next_=rptr;seqno_=0;completed_=0;submissions_=0;perf_marked_=0;
+     attached_=true;return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoRing::detach()
+@@ -317,7 +358,8 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
+     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
+     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
+     const bool reset=framed && reset_pending_;
+-    const uint32_t extra=framed?prologueWords(reset)+(generation_==6?RingFenceWords:RingFramedFenceWords):RingFenceWords;
++    const uint32_t perf=perfWords(framed);   /* guamp 0019: read once, the words below are sized with it */
++    const uint32_t extra=(framed?prologueWords(reset)+(generation_==6?RingFenceWords:RingFramedFenceWords):RingFenceWords)+perf;
+     if(word_count>size_words-extra-8)return kIOReturnNoResources;
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+     if(status)return status;
+@@ -328,8 +370,17 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
+         status=emitPrologue(at,reset,&at);
+         if(status)return status;
+     }
++    const uint32_t perf_slot=(seqno_+1)&(NativeAdrenoRingPerfSlots-1);
++    if(perf) {
++        at=emitPerfSample(at,perf_slot,0,false);
++        if(at==~0u)return poison();
++    }
+     for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
+     at=(at+(uint32_t)word_count)&mask;
++    if(perf) {
++        at=emitPerfSample(at,perf_slot,1,perf>2*RingPerfSampleWords);
++        if(at==~0u)return poison();
++    }
+     uint32_t end=0;
+     status=framed?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
+     if(status)return status;
+@@ -347,6 +398,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
+     if(io_.barrier(io_.cookie))return poison();
+     if(writeWptr(end))return kIOReturnIOError;
+     next_=end;*fence=++seqno_;++submissions_;
++    if(perf)perf_marked_|=1ull<<perf_slot;else perf_marked_&=~(1ull<<perf_slot);
+     if(reset)reset_pending_=false;
+     return kIOReturnSuccess;
+ }
+diff --git a/NativeAdrenoRing.h b/NativeAdrenoRing.h
+index 093c46b..37b0f7c 100644
+--- a/NativeAdrenoRing.h
++++ b/NativeAdrenoRing.h
+@@ -58,6 +58,9 @@ class NativeAdrenoRing final {
+     unsigned generation_=7;
+     bool attached_=false,poisoned_=false,reset_pending_=false;
+     uint32_t context_=0;
++    uint64_t perf_marked_=0;   /* guamp 0019: slots (fence & 63) whose submission carried the two counter samples */
++    uint32_t perfWords(bool framed) const;
++    uint32_t emitPerfSample(uint32_t at,uint32_t slot,uint32_t which,bool idle);
+     uint32_t prologueWords(bool reset) const;
+     IOReturn poison();
+     IOReturn writeWptr(uint32_t value);
+@@ -130,5 +133,13 @@ public:
+     uint32_t completedFence() const {return completed_;}
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
++    /* guamp (UniXNU-guamp patches/native-adreno/0019): with native_adreno_perf_ts set, an A6XX framed submission also has the CP copy
++     * CP_ALWAYS_ON_COUNTER (19.2 MHz) to the fence page after its prologue and again after its IBs (behind a CP_WAIT_FOR_IDLE while
++     * the prologue has one). perfSample gives both values of a completed fence; false when the submission carried none. */
++    bool perfSample(uint32_t fence,uint64_t *start,uint64_t *end);
+ };
++/* The slots of those samples in the fence page: 64 of 16 bytes {start, end} from byte 0x800, slot = fence & 63 (at most 8 jobs are
++ * outstanding, so a slot is never rewritten before its job is retired). */
++enum : uint32_t {NativeAdrenoRingPerfOffset = 0x800, NativeAdrenoRingPerfSlots = 64};
++extern "C" volatile uint32_t native_adreno_perf_ts;
+ #endif
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index 769eeb1..7106ba1 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -82,8 +82,21 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
+     vm_=vm;ring_=ring;attached_=true;stats_={};
+     return kIOReturnSuccess;
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0019): the board's frame accounting (GuampAdrenoProbe's GuampGpuPerf.inc, guamp-gpu-perf).
++ * native_adreno_perf_begin, called in the submitting process before the ring takes a job: the caller's slot (-1 none) and the
++ * CP_ALWAYS_ON_COUNTER value then. native_adreno_perf_end, at the job's release: that slot, the value, the CP's samples after the
++ * prologue and after the IBs (both 0 when the job carried none) and the kernel's microseconds in submit(). Both null: nothing done. */
++extern "C" {
++int32_t (*native_adreno_perf_begin)(uint64_t *ticks);
++void (*native_adreno_perf_end)(int32_t slot,uint64_t submitted,uint64_t start,uint64_t end,uint32_t kernel_us);
++}
+ IOReturn NativeAdrenoSubmit::release(Job &job)
+ {
++    if(job.perf_slot>=0 && native_adreno_perf_end) {
++        uint64_t start=0,end=0;
++        if(!ring_->perfSample(job.fence,&start,&end))start=end=0;
++        native_adreno_perf_end(job.perf_slot,job.perf_ticks,start,end,job.perf_kernel_us);
++    }
+     IOReturn status=kIOReturnSuccess;
+     for(size_t i=0;i<job.count;++i) {
+         IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
+@@ -386,6 +399,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
++    uint64_t perf_ticks=0;
++    const int32_t perf_slot=native_adreno_perf_begin?native_adreno_perf_begin(&perf_ticks):-1;
+     status=ring_->submitFramed(words,word_count,&value);
+     if(status) {
+         /* A poisoned ring may already have consumed the WPTR write, so the
+@@ -401,6 +416,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+     }
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
++    job->perf_slot=perf_slot;job->perf_ticks=perf_ticks;
++    {const uint64_t spent=submitNowUs()-submit_began;job->perf_kernel_us=spent>0xffffffffull?0xffffffffu:(uint32_t)spent;}
+     ++stats_.submissions;
+     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
+     *fence=value;
+diff --git a/NativeAdrenoSubmit.h b/NativeAdrenoSubmit.h
+index 84a4785..f649bad 100644
+--- a/NativeAdrenoSubmit.h
++++ b/NativeAdrenoSubmit.h
+@@ -39,6 +39,11 @@ class NativeAdrenoSubmit final {
+         uint32_t queue=0;
+         bool active=false;
+         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
++        /* guamp 0019 (native_adreno_perf_begin set): the board's slot for the submitting process (-1 none), CP_ALWAYS_ON_COUNTER when
++         * the kernel took the job, and the kernel's microseconds in submit() */
++        int32_t perf_slot=-1;
++        uint32_t perf_kernel_us=0;
++        uint64_t perf_ticks=0;
+     } jobs_[8];
+     NativeAdrenoVm *vm_=nullptr;
+     NativeAdrenoRing *ring_=nullptr;

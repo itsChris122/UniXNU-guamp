@@ -35,6 +35,7 @@
 #include "NativeAdrenoUserClient.h"
 #include "GuampAdreno.h"
 #include "GuampGpuRecoverCore.h"
+#include "GuampGpuPerfCore.h"
 
 extern "C" {
 // GuampCaMetal.inc (NativeEmmc): the render server gate learns that the Metal device is up (1) or unusable (0), and that the GPU
@@ -76,6 +77,14 @@ volatile uint32_t gCopyWaitCompositor = 1;
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 // patches/native-adreno/0014: the process that last submitted from the window holding an address, and the ban of a process.
 int32_t native_adreno_window_owner(uint64_t iova, char *name, unsigned name_bytes);
+// patches/native-adreno/0019 (guamp-gpu-perf, GuampGpuPerf.inc): the jobs' CP counter samples, the hooks at a job's start and release,
+// and the decoder of the Metal processes' frame report markers.
+extern volatile uint32_t native_adreno_perf_ts;
+extern int32_t (*native_adreno_perf_begin)(uint64_t *ticks);
+extern void (*native_adreno_perf_end)(int32_t slot, uint64_t submitted, uint64_t start, uint64_t end, uint32_t kernel_us);
+extern void (*native_adreno_perf_mark)(uint32_t value);
+int proc_selfpid(void);
+void proc_selfname(char *, int);
 void native_adreno_ban_pid(int32_t pid);
 boolean_t ml_get_interrupts_enabled(void);
 boolean_t ml_at_interrupt_context(void);
@@ -598,6 +607,7 @@ int naPublish(Session &s) {
 }
 
 #include "GuampAdrenoRecover.inc"
+#include "GuampGpuPerf.inc"
 
 // The user-client self test, ported from UniXNU-tb128fu package/GpuProbe.cpp (naSelfTest / ucRound, BSD-2-Clause-Patent): a kernel
 // connection of the plugin's open type, Query and GetDeviceInfo, two 4 KiB BOs mapped in the client window and in the kernel, an IB
@@ -778,7 +788,10 @@ int naAccelerator() {
   // before it makes its device (an empty or absent argument sets nothing). Example: guamp-m2v-env=NMB_XR10=0,NMB_SURFACE_IMPORT_HOLD=0.
   {
     static char metalEnv[256] = {};
-    if (PE_parse_boot_argn("guamp-m2v-env", metalEnv, sizeof(metalEnv)) && metalEnv[0]) {
+    PE_parse_boot_argn("guamp-m2v-env", metalEnv, sizeof(metalEnv));
+    // guamp-gpu-perf (GuampGpuPerf.inc): the bridges' frame reports too (patches/adreno-metal/0023).
+    if (gpuperf::gSeconds) strlcat(metalEnv, metalEnv[0] ? ",NMB_PERF=1" : "NMB_PERF=1", sizeof(metalEnv));
+    if (metalEnv[0]) {
       accelerator->setProperty("NativeMetalEnv", metalEnv);
       IOLog("GuampAdreno: NativeMetalEnv \"%s\"\n", metalEnv);
     }
@@ -891,6 +904,7 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
         native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check, native_adreno_wc_quiet_us);
   IOLog("GuampAdreno: job prologue wait for idle %u, submission maintenance own window %u\n", native_adreno_a6xx_prologue_wfi,
         native_adreno_publish_window);   // default on (verified 28/10); before the ring: its write index is followed from attach on
+  gpuperf::init();   // guamp-gpu-perf (default off): before the ring attach, which checks the fence page for the samples
   do {
     if (!mapRegion(kSmmu, kSmmuBytes, s.smmu)) {result = GuampAdrenoSmmuMap; break;}
     if (!naContext(s)) {result = GuampAdrenoContext; break;}

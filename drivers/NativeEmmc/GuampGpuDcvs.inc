@@ -34,6 +34,10 @@ volatile uint32_t guamp_gpu_dcvs_boost;   // set by a blocked GPU fence wait, cl
 // the busy share, then the usual steps down. fin45: after the wake the GPU sat at 320 MHz while the wallpaper and the render server's
 // surfaces were drawn again, and only went to 900 MHz later (wallpaper late).
 volatile uint32_t guamp_gpu_dcvs_wake;
+// guamp-gpu-perf (GuampAdreno/GuampGpuPerf.inc): the GPU clock now in MHz (also set from guamp-gpu-freq when the governor is off),
+// and since the start [0] busy samples, [1] samples, [2] MHz x samples (1 ms each), for the busy share and the mean clock.
+volatile uint32_t guamp_gpu_mhz_now;
+volatile uint64_t guamp_gpu_dcvs_busy[3];
 // patches/native-adreno/0010 (weak stand-ins for a kernel without it): the submissions' cost and the mappings their maintenance skipped.
 __attribute__((weak)) volatile uint64_t native_adreno_submit_cost[8];
 __attribute__((weak)) volatile uint64_t native_adreno_publish_skipped[2];
@@ -177,6 +181,9 @@ void thread(void *, wait_result_t) {
       IOSleep(GP_GOV_WINDOW);
       continue;
     }
+    guamp_gpu_dcvs_busy[0] = guamp_gpu_dcvs_busy[0] + busy;
+    guamp_gpu_dcvs_busy[1] = guamp_gpu_dcvs_busy[1] + sampled;
+    guamp_gpu_dcvs_busy[2] = guamp_gpu_dcvs_busy[2] + uint64_t(kGpLevels[gS.level].mhz) * sampled;
     if (boosted) ++gBoosts;
     const bool waking = gWakeWindows != 0;
     if (waking) gWakeWindows = gWakeWindows - 1;
@@ -207,6 +214,7 @@ void thread(void *, wait_result_t) {
       }
     }
     ms[gS.level] += boosted ? sampled : GP_GOV_WINDOW;
+    guamp_gpu_mhz_now = kGpLevels[gS.level].mhz;
     if (window % 200 == 0) {
       logState(busy, switches, fails, ms);
       logSubmits();
@@ -275,6 +283,7 @@ void start(volatile uint8_t *gpucc, volatile uint8_t *gpu, unsigned mhz) {
   }
   gS.cx = kGpLevels[level].cx;
   gS.mx = kGpLevels[level].mx;
+  guamp_gpu_mhz_now = kGpLevels[gS.level].mhz;
   IOLog("GuampGpu: dcvs on: %u MHz, levels %u..%u MHz (bin %u from %s, guamp-gpu-max %u), cx floor %u mx floor %u\n",
         kGpLevels[level].mhz, kGpLevels[gS.bottom].mhz, kGpLevels[gS.top].mhz, bin, binFrom, cap, gCxMin, gMxMin);
   IOLog("GuampGpu: dcvs tuning: boost %u, up %u/%u samples, min %u MHz (bottom %u MHz)\n", gBoostOn, gG.up, GP_GOV_WINDOW, minMhz,

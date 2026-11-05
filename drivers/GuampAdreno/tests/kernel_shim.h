@@ -44,6 +44,7 @@ void IOSleep(unsigned);
 int PE_parse_boot_argn(const char *, void *, int);
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
+void nanoseconds_to_absolutetime(uint64_t, uint64_t *);
 void thread_wakeup(event_t);
 int assert_wait_timeout(event_t, int, uint32_t, uint64_t);
 int thread_block(thread_continue_t);
@@ -163,6 +164,7 @@ thread_t current_thread(void);
 void thread_set_thread_name(thread_t, const char *);
 task_t current_task(void);
 size_t strlcpy(char *, const char *, size_t);
+size_t strlcat(char *, const char *, size_t);
 int strncmp(const char *, const char *, size_t);
 int strcmp(const char *, const char *);
 }
