@@ -296,8 +296,130 @@ static void testFill() {
   for (uint32_t v : b) CHECK(v == 0xff000000u);
 }
 
+// Section 16: extended-range (XR10) layers. The code conversion against (c - 384) / 510 * 255 rounded half up and clamped; then
+// each kind drawn (unscaled, scaled bilinear, nearest, blended, clipped) must equal, bit for bit, the same layer drawn from a BGRA
+// surface of the converted pixels; invalid geometry draws nothing.
+static uint32_t refXr(uint32_t c) {
+  double v = std::floor(((double)c - 384.0) / 510.0 * 255.0 + 0.5);
+  return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+struct XrSurface {
+  uint32_t kind, w, h; uint64_t stride, alphaOffset, alphaStride;
+  std::vector<unsigned char> mem;
+  std::vector<unsigned char> bgra;   // the converted pixels, rows of w * 4
+};
+static uint32_t xrRandomCode() { uint32_t r = rnd() % 8; return r == 0 ? 0 : r == 1 ? 1023 : r == 2 ? 384 : r == 3 ? 894 : rnd() % 1024; }
+static void makeXr(XrSurface &s, uint32_t kind, uint32_t w, uint32_t h) {
+  s.kind = kind; s.w = w; s.h = h;
+  const uint64_t pixel = kind == 4 ? 8 : 4;
+  s.stride = w * pixel + (kind == 5 ? 8 : 16);
+  s.alphaStride = kind == 5 ? w + 3 : 0;
+  const uint64_t color = s.stride * (h - 1) + w * pixel;
+  s.alphaOffset = kind == 5 ? ((color + 4095) & ~4095ull) : 0;
+  s.mem.assign(kind == 5 ? s.alphaOffset + s.alphaStride * (h - 1) + w : color, 0xEE);
+  s.bgra.assign((size_t)w * h * 4, 0);
+  for (uint32_t y = 0; y < h; y++)
+    for (uint32_t x = 0; x < w; x++) {
+      uint32_t out;
+      if (kind == 4) {
+        uint32_t c[4];
+        for (int i = 0; i < 4; i++) c[i] = xrRandomCode();
+        uint64_t t = 0;
+        for (int i = 0; i < 4; i++) t |= (uint64_t)(c[i] << 6 | (rnd() & 63)) << (16 * i);   // low 6 bits of each word ignored
+        std::memcpy(s.mem.data() + y * s.stride + x * 8, &t, 8);
+        out = pix(refXr(c[0]), refXr(c[1]), refXr(c[2]), refXr(c[3]));
+      } else {
+        uint32_t b = xrRandomCode(), g = xrRandomCode(), r = xrRandomCode();
+        uint32_t word = b | g << 10 | r << 20 | (rnd() & 3) << 30;   // bits 30 and 31 ignored
+        std::memcpy(s.mem.data() + y * s.stride + x * 4, &word, 4);
+        uint32_t a = 255;
+        if (kind == 5) { a = rnd() & 255; s.mem[s.alphaOffset + y * s.alphaStride + x] = (unsigned char)a; }
+        out = pix(refXr(b), refXr(g), refXr(r), a);
+      }
+      std::memcpy(s.bgra.data() + ((size_t)y * w + x) * 4, &out, 4);
+    }
+}
+static GuampComposeLayer xrLayer(const XrSurface &s, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, int64_t dx, int64_t dy,
+                                 uint32_t dw, uint32_t dh, unsigned filter, bool blend) {
+  GuampComposeLayer l = {};
+  l.base = s.mem.data(); l.bytes = s.mem.size(); l.kind = s.kind; l.width = s.w; l.height = s.h; l.offset = 0; l.stride = s.stride;
+  l.chromaOffset = s.alphaOffset; l.chromaStride = s.alphaStride;
+  l.sx = sx; l.sy = sy; l.sw = sw; l.sh = sh; l.dx = dx; l.dy = dy; l.dw = dw; l.dh = dh; l.filter = filter; l.blend = blend;
+  return l;
+}
+static void testXr() {
+  bool codes = true;
+  for (uint32_t c = 0; c < 1024; c++) codes = codes && guampComposeXrCode(c) == refXr(c);
+  CHECK(codes);
+  CHECK(guampComposeXrCode(384) == 0 && guampComposeXrCode(894) == 255 && guampComposeXrCode(1023) == 255 && guampComposeXrCode(0) == 0);
+  CHECK(guampComposeXr32(894u | 384u << 10 | 639u << 20, 255) == pix(255, 0, 128, 255));
+  CHECK(guampComposeXr64((uint64_t)894 << 6 | (uint64_t)384 << 22 | (uint64_t)639 << 38 | (uint64_t)894 << 54) == pix(255, 0, 128, 255));
+  struct Case { uint32_t sx, sy, sw, sh; int64_t dx, dy; uint32_t dw, dh; unsigned filter; bool blend; };
+  const Case cases[] = {
+    {0, 0, 37, 23, 0, 0, 37, 23, 1, false},     // unscaled
+    {3, 2, 30, 20, 5, 4, 45, 31, 1, true},      // upscaled, blended
+    {0, 0, 37, 23, 0, 0, 16, 9, 1, false},      // more than 2:1 down
+    {1, 1, 35, 21, -7, -3, 50, 30, 0, true},    // nearest, clipped
+  };
+  for (uint32_t kind = 3; kind <= 5; kind++) {
+    XrSurface s;
+    makeXr(s, kind, 37, 23);
+    std::vector<unsigned char> plainMem = s.bgra;
+    Surface plain{37, 23, 37 * 4, &plainMem};
+    for (const Case &c : cases) {
+      const uint32_t W = 48, H = 36;
+      std::vector<uint32_t> a(W * H), b;
+      for (auto &v : a) v = pix(rnd() & 255, rnd() & 255, rnd() & 255, 255);
+      b = a;
+      GuampComposeLayer x = xrLayer(s, c.sx, c.sy, c.sw, c.sh, c.dx, c.dy, c.dw, c.dh, c.filter, c.blend);
+      GuampComposeLayer p = bgraLayer(plain, c.sx, c.sy, c.sw, c.sh, c.dx, c.dy, c.dw, c.dh, c.filter, c.blend);
+      const int64_t nx = draw(a, W, H, x), np = draw(b, W, H, p);
+      CHECK(nx > 0 && nx == np);
+      if (a != b) std::printf("xr kind %u case %u,%u %ux%u -> %ux%u differs\n", kind, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh);
+      CHECK(a == b);
+      std::vector<uint32_t> part = b, whole = a;   // a clipped redraw equals the whole one inside the clip
+      std::vector<uint32_t> base(W * H, 0x01020304u);
+      part = base; whole = base;
+      CHECK(draw(whole, W, H, x) > 0);
+      CHECK(drawClip(part, W, H, x, 9, 5, 30, 20) > 0);
+      bool ok = true;
+      for (uint32_t y = 0; y < H; y++)
+        for (uint32_t xx = 0; xx < W; xx++) {
+          bool in = xx >= 9 && xx < 30 && y >= 5 && y < 20;
+          ok = ok && part[y * W + xx] == (in ? whole[y * W + xx] : base[y * W + xx]);
+        }
+      CHECK(ok);
+    }
+    // Invalid: rows past the allocation, rows narrower than the rectangle, (b3a8) the alpha plane short or narrow.
+    std::vector<uint32_t> out(16 * 16, 7);
+    GuampComposeLayer l = xrLayer(s, 0, 0, 37, 23, 0, 0, 16, 16, 1, false);
+    l.bytes -= 1;
+    CHECK(draw(out, 16, 16, l) == -1);
+    l = xrLayer(s, 0, 0, 37, 23, 0, 0, 16, 16, 1, false);
+    l.stride = (kind == 4 ? 8 : 4) * 36;
+    CHECK(draw(out, 16, 16, l) == -1);
+    if (kind == 5) {
+      l = xrLayer(s, 0, 0, 37, 23, 0, 0, 16, 16, 1, false);
+      l.chromaStride = 36;
+      CHECK(draw(out, 16, 16, l) == -1);
+      l = xrLayer(s, 0, 0, 37, 23, 0, 0, 16, 16, 1, false);
+      l.chromaOffset = l.bytes - 37 * 22;   // the alpha plane's last row past the allocation
+      CHECK(draw(out, 16, 16, l) == -1);
+      l = xrLayer(s, 0, 0, 37, 23, 0, 0, 16, 16, 1, false);
+      l.chromaStride = 0;
+      CHECK(draw(out, 16, 16, l) == -1);
+    }
+    for (uint32_t v : out) CHECK(v == 7);
+  }
+  GuampComposeLayer bad = {};
+  bad.kind = 6;
+  bad.base = reinterpret_cast<const unsigned char *>(1);
+  CHECK(!guampComposeValid(bad));
+}
+
 int main() {
   testOver();
+  testXr();
   testUnscaled();
   testScaled(750, 1666, 720, 1600, 1, 2);   // the canvas onto the panel (Display Zoom)
   testScaled(750, 1666, 720, 1600, 0, 0);

@@ -18,13 +18,14 @@ Section 12 (guamp-compose, default 1): swaps with several layers (a video in a p
 when refused, are composed in software.
 Section 15 (guamp-compose-keep, default 1): a layer the composition cannot draw keeps its last picture (or the screen)
 instead of turning the frame black.
+Section 16 (guamp-compose-xr10, default 1): extended-range layers ('w30r', 'w40a', 'b3a8') are converted to 8-bit BGRA and drawn.
 Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and follows the panel's INTF_1 counters
 (guamp-vsync-hw); swap rate, swap -> completion latency and vsync messages are counted for the 'GuampPacing:' line.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'c7861635aa7d2dd79cd0449d22c5e0a9b3abf7484d510586e56d2cb1825382a0'
+PATCHED_SHA256 = 'baf115da216cae04bba5bfbe6e3b051cfdb34233cb8270a7f3edf478acaec306'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -750,11 +751,12 @@ EDITS.append(('''struct GuampFrame {
 // guamp-compose-core-begin
 struct GuampComposeLayer {
     const unsigned char *base;uint64_t bytes;   // the mapped surface (its whole allocation)
-    uint32_t kind;                              // 0 premultiplied BGRA, 1 biplanar 4:2:0 video range, 2 the same in full range
+    uint32_t kind;                              // 0 premultiplied BGRA, 1 biplanar 4:2:0 video range, 2 the same in full range,
+                                                // section 16: 3 BGR10_XR ('w30r'), 4 BGRA10_XR ('w40a'), 5 RGB10A8_2P_XR10 ('b3a8')
     uint32_t matrix;                            // 4:2:0: 0 BT.601, 1 BT.709
     uint32_t width,height;                      // surface (luma plane) size
     uint64_t offset,stride;                     // first plane: byte offset and row bytes
-    uint64_t chromaOffset,chromaStride;         // 4:2:0: the interleaved Cb Cr plane
+    uint64_t chromaOffset,chromaStride;         // 4:2:0: the interleaved Cb Cr plane; 'b3a8': the alpha plane (one byte a pixel)
     uint32_t sx,sy,sw,sh;                       // source rectangle, surface pixels
     int64_t dx,dy;uint32_t dw,dh;               // destination rectangle, output pixels (may reach past the output)
     unsigned filter;                            // BGRA: 1 bilinear, 0 nearest (4:2:0 always samples the nearest)
@@ -795,14 +797,37 @@ static inline uint32_t guampComposeYuv(uint32_t y,uint32_t cb,uint32_t cr,const 
     const int32_t r=(c+k[1]*e+128)>>8,g=(c-k[2]*d-k[3]*e+128)>>8,b=(c+k[4]*d+128)>>8;
     return 0xff000000U|guampComposeClamp(r)<<16|guampComposeClamp(g)<<8|guampComposeClamp(b);
 }
+// Section 16: Apple's extended-range (XR10) codes to 8 bits. A 10-bit code c stands for (c - 384) / 510 (0 at 384, 1 at 894, the
+// range [-0.75, 1.25]); the 8-bit value is (c - 384) / 2 rounded half up, clamped to 0..255 (wide-gamut and EDR parts saturate).
+static inline uint32_t guampComposeXrCode(uint32_t code) {return guampComposeClamp(((int32_t)(code&1023u)-383)>>1);}
+// A BGR10_XR word (blue in bits 0..9, green 10..19, red 20..29) and an 8-bit alpha to premultiplied BGRA.
+static inline uint32_t guampComposeXr32(uint32_t word,uint32_t alpha) {
+    return alpha<<24|guampComposeXrCode(word>>20)<<16|guampComposeXrCode(word>>10)<<8|guampComposeXrCode(word);
+}
+// A BGRA10_XR texel: four little-endian 16-bit words, blue, green, red, alpha, each code in its word's top 10 bits.
+static inline uint32_t guampComposeXr64(uint64_t texel) {
+    return guampComposeXrCode((uint32_t)(texel>>54))<<24|guampComposeXrCode((uint32_t)(texel>>38))<<16|
+           guampComposeXrCode((uint32_t)(texel>>22))<<8|guampComposeXrCode((uint32_t)(texel>>6));
+}
+// Column x of row `row` of an extended-range layer (kind 3..5) as premultiplied BGRA; guampComposeValid checked every byte.
+static inline uint32_t guampComposeXrPixel(const GuampComposeLayer &l,uint32_t row,uint32_t x) {
+    if(l.kind==4){uint64_t t;__builtin_memcpy(&t,l.base+l.offset+(uint64_t)row*l.stride+(uint64_t)x*8,8);return guampComposeXr64(t);}
+    uint32_t w;__builtin_memcpy(&w,l.base+l.offset+(uint64_t)row*l.stride+(uint64_t)x*4,4);
+    return guampComposeXr32(w,l.kind==5?l.base[l.chromaOffset+(uint64_t)row*l.chromaStride+x]:255u);
+}
 // Every byte the layer reads lies in its surface.
 static inline bool guampComposeValid(const GuampComposeLayer &l) {
-    if(!l.base || l.kind>2 || l.matrix>1 || !l.sw || !l.sh || !l.dw || !l.dh || l.sw>16384 || l.sh>16384 || l.dw>16384 || l.dh>16384 ||
+    if(!l.base || l.kind>5 || l.matrix>1 || !l.sw || !l.sh || !l.dw || !l.dh || l.sw>16384 || l.sh>16384 || l.dw>16384 || l.dh>16384 ||
        l.width>16384 || l.height>16384 || (uint64_t)l.sx+l.sw>l.width || (uint64_t)l.sy+l.sh>l.height || !l.stride || l.stride>(1u<<20) ||
        l.offset>l.bytes)return false;
-    const uint64_t pixel=l.kind?1:4,rows=(uint64_t)l.sy+l.sh,right=((uint64_t)l.sx+l.sw)*pixel;
+    const uint64_t pixel=l.kind==1 || l.kind==2?1:l.kind==4?8:4,rows=(uint64_t)l.sy+l.sh,right=((uint64_t)l.sx+l.sw)*pixel;
     if(l.stride<right || (l.bytes-l.offset)<l.stride*(rows-1)+right)return false;
-    if(!l.kind)return !(l.offset&3) && !(l.stride&3);
+    if(!l.kind || l.kind==3 || l.kind==4)return !(l.offset&3) && !(l.stride&3);
+    if(l.kind==5) {   // section 16: the alpha plane, one byte a pixel, rows of its own
+        const uint64_t alphaRight=(uint64_t)l.sx+l.sw;
+        return !(l.offset&3) && !(l.stride&3) && l.chromaStride && l.chromaStride<=(1u<<20) && l.chromaStride>=alphaRight &&
+               l.chromaOffset<=l.bytes && (l.bytes-l.chromaOffset)>=l.chromaStride*(rows-1)+alphaRight;
+    }
     const uint64_t chromaRows=(rows+1)/2,chromaRight=(((uint64_t)l.sx+l.sw+1)/2)*2;
     return l.chromaStride && l.chromaStride<=(1u<<20) && l.chromaStride>=chromaRight && l.chromaOffset<=l.bytes &&
            (l.bytes-l.chromaOffset)>=l.chromaStride*(chromaRows-1)+chromaRight;
@@ -826,7 +851,7 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
     if(y1>cy1)y1=cy1;
     if(x0>=x1 || y0>=y1)return 0;
     const uint32_t cols=(uint32_t)(x1-x0),rows=(uint32_t)(y1-y0);
-    const bool bgra=!l.kind;
+    const bool xr=l.kind>=3,bgra=!l.kind || xr;   // section 16: an extended-range row is converted into the line, then as BGRA
     if(tapWords<(uint64_t)cols+rows || (bgra && (!line || lineBytes<((uint64_t)l.sw+1)*4)))return -1;
     const unsigned filter=bgra?l.filter:0;
     uint32_t *columnTaps=taps,*rowTaps=taps+cols;
@@ -840,7 +865,14 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
         if(bgra) {
             const unsigned char *first=l.base+l.offset+(uint64_t)row*l.stride+(uint64_t)l.sx*4;
             const unsigned char *src=first;
-            if(weight) {   // the tap guarantees row + 1 inside the rectangle
+            if(xr) {   // section 16: the row (and the next one, weighted) converted to 8-bit premultiplied BGRA
+                for(uint32_t x=0;x<l.sw;++x) {
+                    uint32_t v=guampComposeXrPixel(l,row,l.sx+x);
+                    if(weight)v=guampComposeLerp(v,guampComposeXrPixel(l,row+1,l.sx+x),weight);
+                    __builtin_memcpy(line+(uint64_t)x*4,&v,4);
+                }
+                src=line;
+            } else if(weight) {   // the tap guarantees row + 1 inside the rectangle
                 const unsigned char *second=first+l.stride;
                 for(uint32_t x=0;x<l.sw;++x) {
                     uint32_t a,b;__builtin_memcpy(&a,first+(uint64_t)x*4,4);__builtin_memcpy(&b,second+(uint64_t)x*4,4);
@@ -956,6 +988,39 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         if(composeUndrawableWanted<0){unsigned v=0;PE_parse_boot_argn("guamp-compose-undrawable",&v,sizeof v);composeUndrawableWanted=v!=0;}
         return composeUndrawableWanted==1;
     }
+    // Section 16 (guamp-compose-xr10, default 1): bit 0, extended-range layers are drawn (converted to 8-bit BGRA) instead of skipped
+    // for their format; bit 1 (=3), a single-layer swap of such a surface (reason 4) is composed too. The render server's own 'b3a8'
+    // frame stays refused by default: with the bridge's NMB_XR10_TARGETS=0 it is never drawn (the refusal makes the server fall
+    // back to BGRA); bit 1 goes with NMB_XR10_TARGETS=1 (adreno-metal 0021).
+    int composeXrWanted=-1;
+    unsigned composeXrMode() {
+        if(composeXrWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose-xr10",&v,sizeof v);composeXrWanted=(int)(v&3);}
+        return (unsigned)composeXrWanted;
+    }
+    // The layer kind of an extended-range surface (3 'w30r', 4 'w40a'/'w40m', 5 'b3a8'; '&' the lossless-compressed spellings, which
+    // this port's GPU writes uncompressed), 0 for any other format or when section 16 is off.
+    uint32_t composeXrKind(uint32_t format,uint32_t planes) {
+        if(!(composeXrMode()&1))return 0;
+        if((format==0x77333072 || format==0x26773372) && planes<=1)return 3;   // 'w30r', '&w3r'
+        if((format==0x77343061 || format==0x7734306d || format==0x26773461 || format==0x2677346d) && planes<=1)return 4;   // 'w40a' 'w40m' '&w4a' '&w4m'
+        if(format==0x62336138 && planes==2)return 5;   // 'b3a8'
+        return 0;
+    }
+    // A single-layer swap refused for its surface (reason 4) that section 16 can draw: every updated enabled layer BGRA or XR10.
+    bool composeXrSingle(const unsigned char *bytes) {
+        if(!(composeXrMode()&2))return false;
+        uint32_t updated=0,disabled=0;memcpy(&updated,bytes+792,4);memcpy(&disabled,bytes+796,4);
+        bool any=false;
+        for(unsigned i=0;i<4;++i) {
+            if(!(updated&~disabled&(1u<<i)))continue;
+            OSObject *surface=nullptr;memcpy(&surface,bytes+2624+8*i,sizeof(surface));
+            if(!surface || !surface->metaCast("IOSurface"))return false;
+            const uint32_t format=native_legacy_surface_format(surface),planes=native_legacy_surface_planes(surface);
+            if(composeXrKind(format,planes))any=true;
+            else if(!nativeBgra(format,planes))return false;
+        }
+        return any;
+    }
     // The persistent layers go (a single-layer or blank swap replaced the screen, or teardown).
     void composeReset() {
         for(auto &s: composeCurrent){OSSafeReleaseNULL(s.memory);s={};}
@@ -998,6 +1063,18 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
                luma[2]>allocation || luma[5]>allocation-luma[2] || chroma[2]>allocation || chroma[5]>allocation-chroma[2])return 3;
             l.kind=format==0x34323066?2:1;l.matrix=height>=720?1:0;
             l.offset=luma[2];l.stride=luma[4];l.chromaOffset=chroma[2];l.chromaStride=chroma[4];
+        } else if(const uint32_t xr=composeXrKind(format,planes)) {   // section 16: extended-range (XR10) surfaces
+            l.kind=xr;
+            if(xr==5) {   // 'b3a8': plane 0 the color words, plane 1 the alpha bytes (the plane table, as for 4:2:0)
+                const unsigned char *object=reinterpret_cast<const unsigned char *>(surface);
+                uint64_t table=0;uint32_t entries=0;memcpy(&table,object+0x180,8);memcpy(&entries,object+0x188,4);
+                if(!table || (table>>48)!=0xffff || entries<2)return 1;
+                uint64_t color[6]={},alpha[6]={};
+                memcpy(color,reinterpret_cast<const void *>(table),sizeof(color));memcpy(alpha,reinterpret_cast<const void *>(table+56),sizeof(alpha));
+                if(color[0]<width || color[1]<height || alpha[0]<width || alpha[1]<height ||
+                   color[2]>allocation || color[5]>allocation-color[2] || alpha[2]>allocation || alpha[5]>allocation-alpha[2])return 3;
+                l.offset=color[2];l.stride=color[4];l.chromaOffset=alpha[2];l.chromaStride=alpha[4];
+            } else {l.offset=0;l.stride=native_legacy_surface_stride(surface);}
         } else {guamp_compose[9]=format;return 1;}
         if(transform&7)return 2;
         l.width=(uint32_t)width;l.height=(uint32_t)height;
@@ -1014,6 +1091,7 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
         const bool valid=guampComposeValid(l);l.base=nullptr;l.bytes=0;
         if(!valid)return 3;
         if(out){memory->retain();out->memory=memory;out->allocation=allocation;out->layer=l;}
+        if(l.kind>=3){guamp_compose[30]=guamp_compose[30]+1;guamp_compose[31]=format;}   // section 16: XR10 layers taken, last fourcc
         return 0;
     }
     // A swap the single-layer path refused (reason 2 or 3): known layer bits, no options, every updated enabled layer an IOSurface.
@@ -1191,9 +1269,10 @@ EDITS.append(('    // Section 10: latest-frame-wins.\n', r'''    // Section 12: 
             if(drawn<0)drawn=guampComposeDraw(out,frame.width,frame.height,l,taps,tapWords,line,(widest+1)*4,dirty[0],dirty[1],dirty[2],dirty[3]);
             OSSafeReleaseNULL(map);
             const uint64_t layerTicks=composeTicks()-layerStart;
-            if(l.kind)guamp_compose[19]=guamp_compose[19]+layerTicks;else guamp_compose[18]=guamp_compose[18]+layerTicks;
+            const bool video=l.kind==1 || l.kind==2;   // section 16: the XR10 kinds count with the pages (bgra)
+            if(video)guamp_compose[19]=guamp_compose[19]+layerTicks;else guamp_compose[18]=guamp_compose[18]+layerTicks;
             if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;continue;}
-            if(l.kind)guamp_compose[5]=guamp_compose[5]+1;else guamp_compose[4]=guamp_compose[4]+1;
+            if(video)guamp_compose[5]=guamp_compose[5]+1;else guamp_compose[4]=guamp_compose[4]+1;
         }
         const uint64_t copyStart=composeTicks();
         guamp_compose[10]=guamp_compose[10]+(copyStart-composeStart);
@@ -1229,8 +1308,10 @@ EDITS.append(('''        if(accepted)addValidated(request);else removeValidated(
         // frame was on screen: the boot logo stayed, nothing else came, and the lock screen's idle timer turned the panel off
         // about 30 s later (no lock screen until the power key). guamp-compose-undrawable=1 brings that path back for tests.
         bool composed=false;
-        if(!accepted && enabled==1 && request && (reason==2 || reason==3 || (reason==4 && composeUndrawableOn()))) {
-            if(composeAccepts(bytes)){reason=6;accepted=composed=true;guamp_compose[0]=guamp_compose[0]+1;}
+        // Section 16: reason 4 of an extended-range surface is composed with guamp-compose-xr10=3.
+        const bool xrSingle=!accepted && enabled==1 && request && reason==4 && composeXrSingle(bytes);
+        if(!accepted && enabled==1 && request && (reason==2 || reason==3 || (reason==4 && (composeUndrawableOn() || xrSingle)))) {
+            if(composeAccepts(bytes)){reason=6;accepted=composed=true;guamp_compose[0]=guamp_compose[0]+1;if(xrSingle)guamp_compose[32]=guamp_compose[32]+1;}
             else guamp_compose[12]=guamp_compose[12]+1;
         }
         if(accepted)addValidated(request);else removeValidated(request);
@@ -1517,6 +1598,19 @@ EDITS.append(('''            if(drawn<0)drawn=guampComposeDraw(out,frame.width,f
                 guamp_compose[29]=hash;
             }
 '''))
+# 16. Extended-range (XR10) layers (05/11, fin48: Home flicker after boot while the posters and apps got XR10 drawables from 0018).
+#     A layer of 'w30r' (BGR10_XR: blue, green, red in bits 0..29 of a word), 'w40a'/'w40m' (BGRA10_XR: four 16-bit words, each code
+#     in the top 10 bits) or 'b3a8' (RGB10A8_2P_XR10: plane 0 BGR10_XR words, plane 1 an alpha byte each; the boot frame's
+#     750 x 1666 one is linear: rows of 3008 and 768 bytes, plane 1 at 5013504, allocation 6295552) was skipped for its format;
+#     it is now converted in the core (kinds 3, 4, 5: code c to (c - 384) / 2, rounded, clamped) and drawn like a BGRA layer, with
+#     the same filter and blending. The '&' spellings of the lossless-compressed formats count as the plain ones (one plane), as
+#     '&BGA' does for BGRA: this port's GPU writes them uncompressed. guamp-compose-xr10: 1 (default) the layers of composed swaps,
+#     3 single-layer swaps of such a surface too (reason 4 -> composed), 0 off. Counters: [30] XR10 layers taken, [31] the last one's
+#     fourcc, [32] single-layer XR10 swaps composed; GuampDisplayExt.inc logs them as 'GuampDisplay: compose xr10: ...'. The 4:2:0
+#     statistics of section 15 count video layers only.
+EDITS.append(('extern "C" {volatile uint64_t guamp_compose[30];', 'extern "C" {volatile uint64_t guamp_compose[33];'))
+EDITS.append(('            if(drawn>0 && l.kind) {   // section 15: 16 luma samples',
+              '            if(drawn>0 && (l.kind==1 || l.kind==2)) {   // section 15 (video layers, section 16): 16 luma samples'))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
