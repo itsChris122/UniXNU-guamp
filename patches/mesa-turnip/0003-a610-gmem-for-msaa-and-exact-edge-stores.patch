@@ -1,0 +1,242 @@
+turnip (guamp A610): tile memory (GMEM) again for multisampled passes under TU_DEBUG "sysmem" (TU_GUAMP_GMEM=none|msaa|owned|all, default msaa), exact tile stores where the aligned 16x4 blocks would leave a host-imported image, and pass counters for the plugin's rows (tu_guamp_render_counts)
+
+The board's NativeTurnipDebug "nocb,noconform,sysmem" sends every pass to system memory. On the A610 (one CCU, 8 KiB of colour cache
+in that mode) a multisampled pass writes and reads each sample in DRAM and resolves there again: Maps (VectorKit, 4x MSAA) at a few
+fps, W5 gpu 50-80 ms a frame in fin50. TU_GUAMP_GMEM (one word: guamp-m2v-env=TU_GUAMP_GMEM=<word> sets it in every Metal process)
+lets such passes go on to Turnip's own choice: none = as before, msaa = multisampled passes (default), owned = those and the passes
+whose attachments are all Turnip's own memory (no IOSurface), all = "sysmem" ignored (the fin46d test, glitches).
+The fast tile store writes whole gmem_align_w x gmem_align_h blocks past an unaligned edge "into padding space", which an image over a
+host import (the caller's pitch and size) may not have: such a store now takes Turnip's exact (3D) path instead of writing into the
+next row or past the memory, a probable cause of the fin46d GMEM glitches. Applies after the UniXNU Mesa patches and 0001-0002.
+
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 1d33085..8d6a929 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5979,6 +5979,32 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
+    }
+ }
+ 
++extern "C" void tu_guamp_count_exact_store(void);
++
++/* guamp (UniXNU-guamp patches/mesa-turnip/0003): whether the fast tile store of a linear colour view, whose blocks are aligned up to
++ * gmem_align_w x gmem_align_h past x2/y2, writes past the end of a row (the row's blocks wider than its pitch) or past the memory the
++ * image is bound to. Turnip's own images are padded for it and never are; tiled and depth/stencil layouts are left as they are. */
++static bool
++tu_guamp_store_leaves_image(const struct tu_physical_device *phys_dev, const struct tu_image_view *iview, uint32_t x2, uint32_t y2)
++{
++   const struct tu_image *image = iview->image;
++   if (!image || (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) || !image->mem || !image->mem->bo)
++      return false;
++   if (vk_format_is_depth_or_stencil(image->vk.format) || image->layout[0].cpp == 0 ||
++       fdl_tile_mode(&image->layout[0], iview->vk.base_mip_level) != TILE6_LINEAR)
++      return false;
++   const uint64_t align_w = phys_dev->info->gmem_align_w, align_h = phys_dev->info->gmem_align_h;
++   const uint64_t pitch = iview->view.pitch;
++   const uint64_t row_bytes = align64(x2, align_w) * image->layout[0].cpp;
++   if (row_bytes > pitch)
++      return true;
++   const uint64_t rows = align64(y2, align_h);
++   const uint64_t layers = iview->vk.layer_count ? iview->vk.layer_count : 1;
++   const uint64_t end = iview->view.base_addr + (layers - 1) * (uint64_t) iview->view.layer_size + (rows - 1) * pitch + row_bytes;
++   const struct tu_bo *bo = image->mem->bo;
++   return rows == 0 || end > bo->iova + bo->size;
++}
++
+ static bool
+ tu_attachment_store_unaligned(struct tu_cmd_buffer *cmd, uint32_t a)
+ {
+@@ -6017,6 +6043,14 @@ tu_attachment_store_unaligned(struct tu_cmd_buffer *cmd, uint32_t a)
+           y1 % phys_dev->info->gmem_align_h ||
+           (y2 % phys_dev->info->gmem_align_h && need_y2_align))
+          return true;
++
++      /* guamp 0003: an unaligned x2/y2 at the image's edge writes into "padding space", which Turnip's own layouts have and an image
++       * over a host import (an IOSurface, a no-copy buffer: the caller's pitch and size) may not: the fast store's whole
++       * gmem_align_w x gmem_align_h blocks would reach into the next row or past the memory. Such a store takes the exact path. */
++      if (tu_guamp_store_leaves_image(phys_dev, iview, x2, y2)) {
++         tu_guamp_count_exact_store();
++         return true;
++      }
+    }
+ 
+    return false;
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..52c68e7 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1380,14 +1380,129 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
+    return vsc->binning_possible && vsc->binning_useful;
+ }
+ 
++/* guamp (UniXNU-guamp patches/mesa-turnip/0003): which passes may still render in tile memory (GMEM) while TU_DEBUG has "sysmem".
++ * The A610 board forces system memory for every pass (NativeTurnipDebug "nocb,noconform,sysmem"): its one CCU has 8 KiB of colour
++ * cache in that mode, so a multisampled pass (Maps' VectorKit draws at 4x) writes and reads every sample in DRAM and resolves it there
++ * again, where tile memory keeps the samples on chip and resolves in the tile store. TU_GUAMP_GMEM (one word, so guamp-m2v-env can set
++ * it) says which passes go on to Turnip's own choice (tiling possible, binning, autotune) instead:
++ *   none   every pass in system memory, as before this patch;
++ *   msaa   passes with a multisampled attachment (the default);
++ *   owned  those, and passes whose attachments are all in memory Turnip allocated (no host import: IOSurfaces stay in sysmem);
++ *   all    TU_DEBUG "sysmem" is ignored (Turnip's autotune for every pass, the fin46d test).
++ * Without "sysmem" in TU_DEBUG the variable changes nothing. tu_guamp_render_counts() reads the counters for the Metal plugin's rows. */
++enum tu_guamp_gmem_policy {
++   TU_GUAMP_GMEM_NONE = 0,
++   TU_GUAMP_GMEM_MSAA = 1,
++   TU_GUAMP_GMEM_OWNED = 2,
++   TU_GUAMP_GMEM_ALL = 3,
++};
++
++static uint64_t tu_guamp_counts[8];
++static const char *tu_guamp_last_reason;
++
++static enum tu_guamp_gmem_policy
++tu_guamp_gmem_policy(void)
++{
++   static int policy = -1;
++   int value = __atomic_load_n(&policy, __ATOMIC_RELAXED);
++   if (value < 0) {
++      const char *text = getenv("TU_GUAMP_GMEM");
++      value = TU_GUAMP_GMEM_MSAA;
++      if (text && (!strcmp(text, "none") || !strcmp(text, "0")))
++         value = TU_GUAMP_GMEM_NONE;
++      else if (text && !strcmp(text, "owned"))
++         value = TU_GUAMP_GMEM_OWNED;
++      else if (text && (!strcmp(text, "all") || !strcmp(text, "autotune")))
++         value = TU_GUAMP_GMEM_ALL;
++      __atomic_store_n(&policy, value, __ATOMIC_RELAXED);
++   }
++   return (enum tu_guamp_gmem_policy) value;
++}
++
++static bool
++tu_guamp_pass_multisampled(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++   for (unsigned i = 0; i < pass->attachment_count; i++) {
++      if (cmd->state.attachments && cmd->state.attachments[i] && pass->attachments[i].samples > VK_SAMPLE_COUNT_1_BIT)
++         return true;
++   }
++   return false;
++}
++
++static bool
++tu_guamp_pass_owned(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++   if (!cmd->state.attachments)
++      return false;
++   for (unsigned i = 0; i < pass->attachment_count; i++) {
++      const struct tu_image_view *iview = cmd->state.attachments[i];
++      if (!iview)
++         continue;
++      const struct tu_image *image = iview->image;
++      if (!image || (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) || !image->mem || !image->mem->bo)
++         return false;
++#ifdef TU_HAS_DARWIN
++      if (image->mem->bo->darwin_host_import)
++         return false;
++#endif
++   }
++   return true;
++}
++
++/* Whether a pass TU_DEBUG "sysmem" would send to system memory goes on to Turnip's choice (TU_GUAMP_GMEM). */
++static bool
++tu_guamp_gmem_allowed(const struct tu_cmd_buffer *cmd)
++{
++   switch (tu_guamp_gmem_policy()) {
++   case TU_GUAMP_GMEM_ALL:
++      return true;
++   case TU_GUAMP_GMEM_OWNED:
++      return tu_guamp_pass_multisampled(cmd) || tu_guamp_pass_owned(cmd);
++   case TU_GUAMP_GMEM_MSAA:
++      return tu_guamp_pass_multisampled(cmd);
++   default:
++      return false;
++   }
++}
++
++/* Counters: [0] passes in GMEM, [1] passes in sysmem, [2] multisampled passes in GMEM, [3] passes TU_GUAMP_GMEM let past "sysmem",
++ * [4] tile stores made exact because the aligned blocks would leave the image (tu_clear_blit.cc), [5] the policy, [6] multisampled
++ * passes in sysmem. *reason: the last reason a pass went to sysmem (a static string). */
++extern "C" void tu_guamp_count_exact_store(void);
++extern "C" void
++tu_guamp_count_exact_store(void)
++{
++   __atomic_fetch_add(&tu_guamp_counts[4], 1, __ATOMIC_RELAXED);
++}
++
++extern "C" __attribute__((visibility("default"))) unsigned
++tu_guamp_render_counts(uint64_t *out, unsigned count, const char **reason);
++extern "C" __attribute__((visibility("default"))) unsigned
++tu_guamp_render_counts(uint64_t *out, unsigned count, const char **reason)
++{
++   tu_guamp_counts[5] = tu_guamp_gmem_policy();
++   const unsigned n = MIN2(count, (unsigned) ARRAY_SIZE(tu_guamp_counts));
++   for (unsigned i = 0; out && i < n; i++)
++      out[i] = __atomic_load_n(&tu_guamp_counts[i], __ATOMIC_RELAXED);
++   if (reason)
++      *reason = __atomic_load_n(&tu_guamp_last_reason, __ATOMIC_RELAXED);
++   return n;
++}
++
+ static bool
+ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+                      tu_autotune::rp_ctx_t *rp_ctx,
+                      tu_autotune::rp_key_opt rp_key)
+ {
+    if (TU_DEBUG(SYSMEM)) {
+-      cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
+-      return true;
++      /* guamp 0003: TU_GUAMP_GMEM lets some passes go on to the checks and the autotune below. */
++      if (!tu_guamp_gmem_allowed(cmd)) {
++         cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
++         return true;
++      }
++      __atomic_fetch_add(&tu_guamp_counts[3], 1, __ATOMIC_RELAXED);
+    }
+ 
+    /* can't fit attachments into gmem */
+@@ -4050,7 +4165,15 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+-   if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
++   const bool sysmem = use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key);
++   /* guamp 0003: where the passes went, for the plugin's rows. */
++   const bool multisampled = tu_guamp_pass_multisampled(cmd_buffer);
++   __atomic_fetch_add(&tu_guamp_counts[sysmem ? 1 : 0], 1, __ATOMIC_RELAXED);
++   if (multisampled)
++      __atomic_fetch_add(&tu_guamp_counts[sysmem ? 6 : 2], 1, __ATOMIC_RELAXED);
++   if (sysmem && cmd_buffer->state.rp.gmem_disable_reason)
++      __atomic_store_n(&tu_guamp_last_reason, cmd_buffer->state.rp.gmem_disable_reason, __ATOMIC_RELAXED);
++   if (sysmem)
+       tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx);
+    else
+       tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index a8ccd76..80ad538 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -63,6 +63,9 @@ struct tu_bo {
+     * CPU mapping (IOConnectMapMemory64 memory type). */
+    uint64_t darwin_handle;
+    uint32_t darwin_token;
++   /* guamp (UniXNU-guamp patches/mesa-turnip/0003): the BO is a host import (an IOSurface's or a no-copy buffer's pages), whose
++    * size is the caller's, without the padding Turnip's own layouts give an image. */
++   bool darwin_host_import;
+ #endif
+ 
+    bool implicit_sync : 1;
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 85e59ec..9f89e14 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -512,6 +512,7 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+    };
+    bo->darwin_handle = reply.handle;
+    bo->darwin_token = 0;
++   bo->darwin_host_import = true; /* guamp 0003 */
+    bo->map = pointer;
+    bo->never_unmap = true;
+    tu_dump_bo_init(dev, bo);
