@@ -25,7 +25,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '8abab20f10c1c001192332c07ccac6ece89ce39b07d1b5db6e2383691d3cb1a8'
+PATCHED_SHA256 = '114a2c7aff9380ae002db99ba7f51cd081bbb923a926bbd3c43d4494e5ef5bbf'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1664,6 +1664,49 @@ EDITS.append(('''        for(unsigned i=0;i<4;++i) {
             const bool isVideo=composeCurrent[i].layer.kind==1 || composeCurrent[i].layer.kind==2;
             if(videoUnder?((pass==0)!=isVideo):(pass!=0))continue;
             GuampLayerSource &s=set->source[set->count];'''))
+# 14c. (07/11) Where the request keeps QuartzCore's dirty region. QuartzCore can name the changed part of every swap
+#     (IOMobileFramebufferSwapDirtyRegion, IOMobileFramebuffer 21H461 0x1b63cfcb0: x, y, w, h as int32 at +0x2b0 of the user
+#     object = +0x298 of the 0x508-byte swap record sent by selector 5, valid byte +0x2cc). The kernel request is not a plain copy
+#     of that record (its rectangles are at +17/+81, the masks at +792), so the offset is unknown. With it the scanout copy
+#     (drivers/NativeEmmc/GuampScanout.inc, 2.2 ms hash of the whole 750x1666 surface + 1.5 ms of cache maintenance per frame,
+#     fin53) could read only the changed rows. guamp-swap-probe=<n> (default 400, 0 off): for the 12 swaps from the n-th accepted
+#     one, every byte offset below the surfaces (+2624) holding four int32 that form a partial rectangle inside the canvas
+#     (x,y,w,h, or corners x0,y0,x1,y1 marked 'c'; at least 8x4) is logged, 'GuampSwapProbe:' (at most 16 a swap), with the
+#     offsets holding the whole canvas (expected +17, +81). Logging only: nothing else reads it.
+EDITS.append(('    void guampPacingAccepted(const OriginalLegacySwapRequest *request) {\n',
+              r'''    // Section 14c: candidates for the dirty region's offset in the request (guamp-swap-probe, default 400; 0 off).
+    int swapProbeFrom=-1;uint64_t swapProbeSeen=0;
+    void guampSwapProbe(const OriginalLegacySwapRequest *request) {
+        if(swapProbeFrom<0){unsigned v=400;PE_parse_boot_argn("guamp-swap-probe",&v,sizeof v);swapProbeFrom=(int)(v>1000000?1000000:v);}
+        swapProbeSeen=swapProbeSeen+1;
+        if(!swapProbeFrom || !request || swapProbeSeen<(uint64_t)swapProbeFrom || swapProbeSeen>=(uint64_t)swapProbeFrom+12)return;
+        const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
+        const int64_t w=canvasWidth?canvasWidth:gopWidth,h=canvasWidth?canvasHeight:gopHeight;
+        if(!w || !h)return;
+        char line[512];int used=snprintf(line,sizeof line,"GuampSwapProbe: swap %llu canvas %lldx%lld:",swapProbeSeen,w,h);
+        char whole[96];int wused=snprintf(whole,sizeof whole," whole at");
+        unsigned found=0,full=0;
+        for(unsigned o=0;o+16<=2624;++o) {
+            int32_t r[4];memcpy(r,bytes+o,sizeof r);
+            if(r[0]<0 || r[1]<0 || r[2]<=0 || r[3]<=0)continue;
+            const int64_t x=r[0],y=r[1],a=r[2],b=r[3];
+            if(!x && !y && a==w && b==h) {
+                if(full<6 && wused>0 && wused<(int)sizeof whole)wused+=snprintf(whole+wused,sizeof whole-wused," +%u",o);
+                full=full+1;continue;
+            }
+            const bool sized=a>=8 && b>=4 && x+a<=w && y+b<=h && (a<w || b<h);
+            const bool corners=!sized && a>x+7 && b>y+3 && a<=w && b<=h && (x || y || a<w || b<h);
+            if(!sized && !corners)continue;
+            if(found<16 && used>0 && used<(int)sizeof line)
+                used+=snprintf(line+used,sizeof line-used," +%u%s=%d,%d,%d,%d",o,corners?"c":"",r[0],r[1],r[2],r[3]);
+            found=found+1;
+        }
+        IOLog("%s (%u found)%s (%u)\n",line,found,whole,full);
+    }
+    void guampPacingAccepted(const OriginalLegacySwapRequest *request) {
+'''))
+EDITS.append(('        guamp_pacing[6]=distinct;\n    }\n',
+              '        guamp_pacing[6]=distinct;\n        guampSwapProbe(request);   // section 14c\n    }\n'))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
