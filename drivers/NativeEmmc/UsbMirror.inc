@@ -27,6 +27,10 @@ uint64_t native_usb_touches = 0;
 uint64_t native_usb_events = 0, native_usb_frames = 0, native_usb_frames_skipped = 0, native_usb_bytes = 0, native_usb_errors = 0, native_usb_ended = 0;
 }
 
+// GuampScanout.inc (included later): frames that went to the second buffer / a slot instead of the GOP frame, and the GOP
+// frame's own redraws there.
+extern "C" volatile uint64_t guamp_scanout_taken, guamp_scanout_gop_draws;
+
 namespace usbm {
 
 constexpr uint64_t kDwcPhys = 0x04E00000, kQscratchPhys = 0x04EF8800, kGccUsbPhys = 0x0141A000;
@@ -502,8 +506,12 @@ void thread(void *, wait_result_t)
       m.sendLog();
       uint64_t now = mach_absolute_time();
       if (now - lastFrame > interval) {
-        const uint64_t copies = &native_legacy_copy_n ? native_legacy_copy_n : 0;
-        if (skip && copies && copies == lastCopies && ++idlePeriods < 20) {
+        // 06/11 (fin53, 60 fps status bar animation: mirror 4 % of a core): with guamp-scanout-flip/-hwscale most frames go to
+        // the second buffer or a slot, not to the GOP frame the mirror reads; only the variant's own copies (copy_n - taken)
+        // and the scanout's GOP redraws (idle catch-ups) change it. Before the first display copy: as before.
+        const uint64_t copied = &native_legacy_copy_n ? native_legacy_copy_n : 0;
+        const uint64_t copies = copied ? copied - guamp_scanout_taken + guamp_scanout_gop_draws : 0;
+        if (skip && copied && copies == lastCopies && ++idlePeriods < 20) {
           native_usb_frames_skipped++;
         } else {
           // A whole frame every guamp-usb-full-every frames (6: ~3 s), and after 20 skipped periods: a viewer opened later, or after a lost transfer,

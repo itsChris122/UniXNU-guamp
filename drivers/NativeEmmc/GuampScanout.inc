@@ -114,6 +114,16 @@ struct Kernel {
   volatile uint64_t hwFrames = 0, hwCanvas = 0, hwPanel = 0, hwIdleBacks = 0, hwIdleAborts = 0, hwIdleTicks = 0, hwConfigs = 0;
 };
 static Kernel gK;
+}  // namespace gscan
+
+// For the USB mirror (UsbMirror.inc reads the GOP frame): frames present() took (drawn into the second buffer or a slot,
+// the variant did not copy them into the GOP frame) and the GOP frame's own redraws here (a diff frame drawn into it, the
+// idle catch-ups). native_legacy_copy_n - taken + gop_draws changes only when the GOP frame did.
+extern "C" {
+volatile uint64_t guamp_scanout_taken = 0, guamp_scanout_gop_draws = 0;
+}
+
+namespace gscan {
 
 static inline uint64_t ticks()
 {
@@ -297,6 +307,7 @@ static void hwIdle()
     draw(gK.gs, 0, gK.va[0], gK.stride, from, stride, gK.neon ? neonStore : nullptr);
     __asm__ volatile("dsb sy" ::: "memory");
     drawn = true;
+    guamp_scanout_gop_draws = guamp_scanout_gop_draws + 1;
   }
   IOLockLock(gK.lock);
   gK.hwIdleBusy = false;
@@ -409,6 +420,7 @@ static void probeFlip(volatile uint8_t *gopVa, uint64_t gopPa, uint64_t stride, 
         // No frame since the flip to the second buffer: the GOP frame catches up from it and is shown again.
         if (!held() && gK.flipOn && gK.shown == 1 && gK.va[0] && gK.va[1] && clocksOn() && waitLatch()) {
           catchUp(gK.st, 0, gK.va[0], gK.va[1], gK.stride);
+          guamp_scanout_gop_draws = guamp_scanout_gop_draws + 1;
           __asm__ volatile("dsb sy" ::: "memory");
           point(0);
           gK.idleBacks = gK.idleBacks + 1;
@@ -594,6 +606,7 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     __asm__ volatile("dsb sy" ::: "memory");
     const uint64_t t2 = ticks();
     if (gK.flipOn && gK.st.rowsDrawn && target != gK.shown) point(target);
+    if (target == 0 && gK.st.rowsDrawn) guamp_scanout_gop_draws = guamp_scanout_gop_draws + 1;
     gK.frames = gK.frames + 1;
     if (!changed) gK.unchanged = gK.unchanged + 1;
     // guamp-backlight-wake-wait: this frame is drawn (and, with the flip, pointed at): the light may come up with it.
@@ -615,6 +628,7 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
       thread_call_enter_delayed(gK.idleCall, deadline);   // re-armed by every frame
     }
   } while (false);
+  if (result == 1) guamp_scanout_taken = guamp_scanout_taken + 1;
   IOLockUnlock(gK.lock);
   // Refused: the variant copies it itself.
   if (result != 1 && gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
