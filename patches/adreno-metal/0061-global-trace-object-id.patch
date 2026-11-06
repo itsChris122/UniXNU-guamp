@@ -1,0 +1,49 @@
+guamp: Metal objects answer -globalTraceObjectID (Settings SIGABRT drawing the Siri orb, fin55)
+
+fin55 (live-20261106-092610, 1967.2 s): Preferences[789] died of SIGABRT while the user set up "Hey Siri". The plug-in's exception line
+(0017/0020): NSInvalidArgumentException -[NBComputeEncoder globalTraceObjectID]: unrecognized selector. Symbolized with the iPadOS
+17.7.11 shared cache (slide 0x1a0d4000): -[SUICOrbView _drawSiriFrame:] (SiriUICore, display link) -> -[MPSUnaryImageKernel
+encodeToCommandEncoder:commandBuffer:sourceTexture:destinationTexture:] (MPSImage) -> -[MPSComputeEncoder initWithCommandBuffer:
+withDispatchType:] +0x6c (MPSCore) -> ___forwarding___ -> -[NBObject doesNotRecognizeSelector:]. MPS asks every encoder (and command
+buffer) for MTLToolsObject's trace id SPI for its kdebug signposts; none of the bridge's objects had it. Every Siri orb (Settings'
+Siri pages and enrollment, SpringBoard's Siri presentation, since 0002 gives SpringBoard Apple2 and so MPS) goes through this path.
+NBObject (every buffer, texture, encoder, command buffer, pipeline...) now answers a process-unique nonzero number taken on first ask,
+the device a fixed one. The Objective-C++ is not compiled outside the CI (the method alone checked with clang -fsyntax-only on the
+host). Applies after 0001-0060.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 2fa65de..d8dd868 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -828,8 +828,22 @@ static void startProfile() {
+ @interface NBObject : NSObject
+ @property(atomic,copy) NSString *label;
+ @end
+-@implementation NBObject
++// guamp (UniXNU-guamp patches/adreno-metal/0061): MTLToolsObject's trace id SPI. fin55 (live-20261106-092610, 1967 s): Settings died of
++// SIGABRT setting up Siri: -[SUICOrbView _drawSiriFrame:] -> -[MPSUnaryImageKernel encodeToCommandEncoder:commandBuffer:sourceTexture:
++// destinationTexture:] -> -[MPSComputeEncoder initWithCommandBuffer:withDispatchType:] asks the encoder for -globalTraceObjectID
++// (kdebug signposts), unrecognized by NBComputeEncoder -> NSInvalidArgumentException. Every Siri orb (Settings, SpringBoard) draws
++// through it. Each object answers a process-unique, nonzero number taken on first ask; the device a constant.
++static std::atomic<uint64_t> gTraceObjectIDs{0};
++@implementation NBObject {
++ uint64_t _traceObjectID;
++}
+ - (id<MTLDevice>)device {return gDeviceObject;}
++- (uint64_t)globalTraceObjectID {
++ uint64_t known=__atomic_load_n(&_traceObjectID,__ATOMIC_RELAXED);
++ if(known)return known;
++ uint64_t fresh=++gTraceObjectIDs,expected=0;
++ return __atomic_compare_exchange_n(&_traceObjectID,&expected,fresh,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)?fresh:expected;
++}
+ - (void)doesNotRecognizeSelector:(SEL)selector {
+  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
+@@ -2667,6 +2681,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ @end
+ @implementation NBDeviceMethods
+ - (NSString *)name {return gName;}
++- (uint64_t)globalTraceObjectID {return 1ULL<<63;}   // 0061: one device, a fixed id apart from the objects' counter
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+ - (BOOL)hasUnifiedMemory {return YES;}
