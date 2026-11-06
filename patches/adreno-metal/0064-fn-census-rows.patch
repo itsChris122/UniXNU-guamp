@@ -1,0 +1,215 @@
+guamp: FN/FT rows count draws by fragment function, full-screen surface layers and passes into surfaces without RenderTarget (0064)
+
+Measures for the HakiOS ideas (analisi/hakios-confronto-20261107.md, ideas 1, 2, 5; ideas only, no code taken). Two report rows after
+PU, deltas since the last report:
+  FN rt<passes into a surface texture made without RenderTarget (rendered through a stand-in)> fs<draws whose fragment texture 0 is a
+     surface of 0.9 Mpx or more>/<of them static: surface seed unchanged since its previous such draw>/<their kpx>k
+     lb<luma_boost draws>/<passes>/<pass kpx>k ed<edr_scale likewise>
+  FT the three fragment functions ("_frag", "_lph", "_lpf" dropped) whose passes covered the most render-area kpx: name:passes/kpx k/draws
+The fragment function's slot is found once at pipeline creation (24 slots); a draw adds two atomics, and the pass area once per function
+per pass. backboardd's pipelines.log (crash-ios 20261104-160143, 114 boots) shows luma_boost_lph made once every boot since boot 13 and
+no edr_scale at all; the rows tell whether luma_boost runs every frame and how many kpx the blur chain (downsample/narrow_blur/
+variable_blur, the backdrop behind dock and widgets) and static full-screen layers (wallpaper) cost before a cache or a substitute is
+written. NMB_FN_ROW=0 (guamp-m2v-env) turns the counting off. Two rows more: the rows past the 48th of the dump are dropped.
+Applies after 0051 (the PU row); the Objective-C++ is not compiled outside the CI (new code checked with clang -fsyntax-only on stubs).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b1f12a7..228d33c 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -66,6 +66,42 @@ struct NmbPassShape {uint32_t width,height,format,samples;std::atomic<uint64_t>
+ static NmbPassShape gPassShapes[6];
+ // guamp 0051: passes whose colour attachment 0 is a surface of 1 Mpx or more (the render server's framebuffer), by its load action.
+ static std::atomic<uint64_t> gSurfacePassLoads[3];
++// guamp 0063 (measures for the HakiOS ideas, analisi/hakios-confronto-20261107.md): the FN and FT rows. Draws counted by fragment function
++// (a slot per name, the first kFnSlots names), with the passes each drew in and those passes' render-area kpx once per pass; passes whose
++// colour attachment is a surface texture made without RenderTarget (the runtime renders it through a stand-in, copied in and back); and
++// draws whose fragment texture 0 is a surface of 0.9 Mpx or more (a full-screen layer: wallpaper, app, snapshot), of them those whose
++// surface seed did not change since its previous such draw (static content composited again: what a wallpaper cache would save).
++// NMB_FN_ROW=0 turns the counting off.
++static constexpr unsigned kFnSlots=24;
++static bool gFnOn=true;
++static std::mutex gFnLock;
++static char gFnNames[kFnSlots][16];
++static std::atomic<unsigned> gFnCount;
++static std::atomic<uint64_t> gFnDraws[kFnSlots],gFnPasses[kFnSlots],gFnKpx[kFnSlots];
++static std::atomic<uint64_t> gSurfaceRtMissing,gFsDraws,gFsStatic,gFsKpx;
++// The slot of a fragment function's name, 1-based (0: none, or no slot left): "_frag", "_lph" and "_lpf" dropped, 15 characters kept.
++static int fnSlotFor(NSString *name) {
++ if(!gFnOn || !name.length)return 0;
++ std::string n=name.UTF8String;
++ for(const char *cut:{"_frag","_lph","_lpf"})for(size_t at;(at=n.find(cut))!=std::string::npos;)n.erase(at,strlen(cut));
++ if(n.size()>15)n.resize(15);
++ std::lock_guard<std::mutex> lock(gFnLock);
++ const unsigned have=gFnCount.load();
++ for(unsigned i=0;i<have;i++)if(n==gFnNames[i])return (int)i+1;
++ if(have>=kFnSlots)return 0;
++ memcpy(gFnNames[have],n.c_str(),n.size()+1);gFnCount.store(have+1);
++ return (int)have+1;
++}
++// Whether a full-screen surface sampled now holds what it held at its previous such draw (its seed unchanged): a few surfaces, by ID.
++static bool fsSurfaceStatic(IOSurfaceRef surface) {
++ struct Seen {uint32_t id,seed;};
++ static Seen seen[8];static unsigned next;static std::mutex lock;
++ const uint32_t id=IOSurfaceGetID(surface),seed=IOSurfaceGetSeed(surface);
++ std::lock_guard<std::mutex> guard(lock);
++ for(Seen &s:seen)if(s.id==id){const bool same=s.seed==seed;s.seed=seed;return same;}
++ seen[next++%8]={id,seed};
++ return false;
++}
+ static std::atomic<unsigned> gPassShapeCount;
+ // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
+ // last commits with what each held and how long the GPU took (commit to completion).
+@@ -1566,6 +1602,7 @@ static std::string quartzCoreCallers();
+ @end
+ @interface NBRenderPipeline : NBObject
+ @property(nonatomic) NmbRenderPipeline *handle;
++@property(nonatomic) int fnSlot;   // guamp 0063: its fragment function's slot in the FN census (fnSlotFor), 0 for none
+ @property(nonatomic,copy) NSString *censusName;   // label and fragment function, for the draw census (gDrawCensus)
+ @end
+ @implementation NBRenderPipeline
+@@ -1784,8 +1821,21 @@ static void waitForResource(id resource) {
+  float blendColor[4];
+  uint32_t depthClipPushed;                  // the depth clip mode last pushed (Metal's default clip, 0, until set)
+  BOOL depthClipSet;
++ // guamp 0063 (FN/FT rows): the pipeline's function slot, the slots already counted in this pass, the pass's render-area kpx, and whether
++ // fragment texture 0 is a full-screen surface (its kpx, and whether its content is what it was at its previous draw).
++ int fnSlot;
++ uint32_t fnSeen,passKpx,fsKpx;
++ BOOL fsTex,fsStatic;
+ }
+ @end
++// guamp 0063: a draw in the FN/FT census.
++static inline void noteFnDraw(NBRenderEncoder *e) {
++ if(e->fnSlot>0) {
++  const unsigned slot=(unsigned)e->fnSlot-1;gFnDraws[slot]++;
++  if(!(e->fnSeen&(1u<<slot))){e->fnSeen|=1u<<slot;gFnPasses[slot]++;gFnKpx[slot]+=e->passKpx;}
++ }
++ if(e->fsTex){gFsDraws++;gFsKpx+=e->fsKpx;if(e->fsStatic)gFsStatic++;}
++}
+ // The draw's bucket by what it costs (A3): the first of its encoder, then the later ones by whether the pipeline state changed since the draw
+ // before it.
+ static void noteDrawBucket(NBRenderEncoder *encoder,uint64_t began) {
+@@ -1820,6 +1870,7 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+  if(gDrawCensus)censusPipeline=[(NBRenderPipeline *)state censusName];
++ fnSlot=[(NBRenderPipeline *)state fnSlot];   // guamp 0063
+  lastPipeline=(uintptr_t)(__bridge void *)state;
+  if(lastPipelineSet && lastPipelinePushed==lastPipeline){++gStateSkipped[kStatePipeline];return;}
+  lastPipelinePushed=lastPipeline;lastPipelineSet=true;
+@@ -1842,6 +1893,13 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
+ - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+  if(gDrawCensus && i==0)censusTexture=describeCensusTexture(t);
++ if(gFnOn && i==0) {   // guamp 0063: a full-screen surface layer (FN row)
++  fsTex=NO;
++  if([(id)t isKindOfClass:[NBTexture class]] && ((NBTexture *)t).surface) {
++   const uint64_t pixels=(uint64_t)t.width*t.height;
++   if(pixels>=900000){fsTex=YES;fsKpx=(uint32_t)(pixels>>10);fsStatic=fsSurfaceStatic(((NBTexture *)t).surface);}
++  }
++ }
+  [self texture:t index:i stage:2];
+ }
+ - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+@@ -1974,6 +2032,7 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  if(gDrawCensus)censusDraw(self,n,i);
++ if(gFnOn)noteFnDraw(self);   // guamp 0063
+  const uint64_t began=nowUs();
+  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+  gTimeDraw.add(began);noteDrawBucket(self,began);
+@@ -1990,6 +2049,7 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
+  [self.commandBuffer.resourceOwners addObject:b];
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+  if(gDrawCensus)censusDraw(self,n,i);
++ if(gFnOn)noteFnDraw(self);   // guamp 0063
+  const uint64_t began=nowUs();
+  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+  gTimeDraw.add(began);noteDrawBucket(self,began);
+@@ -2166,10 +2226,12 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+ }
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+  NmbRenderPassDescriptor pass={};   // guamp 0015: zero-filled, so no resolve unless an attachment names one
++ uint64_t passPixels=0;   // guamp 0063
+  {
+   id<MTLTexture> first=d.colorAttachments[0].texture;
+   if(first) {
+    const uint64_t pixels=(uint64_t)first.width*first.height;
++   passPixels=pixels;
+    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
+    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
+    if(pixels>=2000000)gFullScreenPasses++;
+@@ -2186,6 +2248,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+   if(!a.texture)return true;
+   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
+   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];if(a.storeAction!=MTLStoreActionDontCare)[_writtenSurfaces addObject:texture];}
++  if(gFnOn && texture.surface && !(texture.descriptor.usage&MTLTextureUsageRenderTarget))gSurfaceRtMissing++;   // guamp 0063
+   [_resourceOwners addObject:texture];
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+   // guamp 0015: the resolve target of a multisampled attachment (VectorKit, Core Animation's antialiased passes); 2ff4be9 passed none, so a
+@@ -2216,7 +2279,8 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+  const uint64_t began=nowUs();
+  NmbEncoder *encoder=self.committed?nullptr:nmb_render_encoder_new(_handle,&pass);
+  gTimePassOpen.add(began);
+- return [self encoder:[NBRenderEncoder new] handle:encoder what:@"renderCommandEncoder"];
++ NBRenderEncoder *render=[NBRenderEncoder new];render->passKpx=(uint32_t)(passPixels>>10);   // guamp 0063
++ return [self encoder:render handle:encoder what:@"renderCommandEncoder"];
+ }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+@@ -2963,6 +3027,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
++ state.fnSlot=fnSlotFor(d.fragmentFunction.name);   // guamp 0063
+  if(gDrawCensus)state.censusName=[NSString stringWithFormat:@"%@ | %@",d.label?:@"-",d.fragmentFunction.name?:@"-"];
+  return (id<MTLRenderPipelineState>)state;
+ }
+@@ -3107,6 +3172,7 @@ static void installAnswers(Class cls) {
+ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+  if(gDeviceObject)return gDeviceObject;
+  gMissing=missing;gInFlight=[NSMutableSet set];
++ if(const char *v=getenv("NMB_FN_ROW"))gFnOn=strcmp(v,"0")!=0;   // guamp 0063
+  // Turnip's printed GPU trace (the plugin's NativeTurnipTrace) goes beside the journal, which the board exports; without it an earlier
+  // boot's trace is removed (the cache directory persists, and 14 MiB of it overflowed the reader's 32 MiB export copy).
+  if(cache && getenv("NMB_GPU_TRACE")){
+@@ -3367,6 +3433,37 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+      (unsigned long long)(d[6]>>10),(unsigned long long)(d[7]>>10),(unsigned long long)fb[0],(unsigned long long)fb[1],(unsigned long long)fb[2]);
+    }
+   }
++  // guamp 0063 (since the last report): FN rt passes into a surface texture without RenderTarget | fs draws of a full-screen surface layer /
++  // of them static (seed unchanged) / their kpx | lb luma_boost draws/passes/pass kpx, ed edr_scale likewise. FT: the three fragment
++  // functions whose passes covered the most kpx, as name:passes/kpx(k) and their draws.
++  if(gFnOn) {
++   static uint64_t lastRt,lastFs[3],lastFn[kFnSlots][3];
++   uint64_t fn[kFnSlots][3]={};
++   const unsigned have=gFnCount.load();
++   for(unsigned i=0;i<have;i++){
++    const uint64_t v[3]={gFnDraws[i].load(),gFnPasses[i].load(),gFnKpx[i].load()};
++    for(int k=0;k<3;k++){fn[i][k]=v[k]-lastFn[i][k];lastFn[i][k]=v[k];}
++   }
++   const uint64_t rt=gSurfaceRtMissing.load(),fs[3]={gFsDraws.load(),gFsStatic.load(),gFsKpx.load()};
++   uint64_t dfs[3];for(int k=0;k<3;k++){dfs[k]=fs[k]-lastFs[k];lastFs[k]=fs[k];}
++   int lb=-1,ed=-1;
++   for(unsigned i=0;i<have;i++){if(!strncmp(gFnNames[i],"luma_boost",10))lb=(int)i;if(!strncmp(gFnNames[i],"edr_scale",9))ed=(int)i;}
++   row("FN rt%llu fs%llu/%llu/%lluk lb%llu/%llu/%lluk ed%llu/%llu/%lluk",(unsigned long long)(rt-lastRt),(unsigned long long)dfs[0],
++    (unsigned long long)dfs[1],(unsigned long long)(dfs[2]>>10),(unsigned long long)(lb<0?0:fn[lb][0]),(unsigned long long)(lb<0?0:fn[lb][1]),
++    (unsigned long long)(lb<0?0:fn[lb][2]>>10),(unsigned long long)(ed<0?0:fn[ed][0]),(unsigned long long)(ed<0?0:fn[ed][1]),
++    (unsigned long long)(ed<0?0:fn[ed][2]>>10));
++   lastRt=rt;
++   unsigned top[3]={kFnSlots,kFnSlots,kFnSlots};
++   for(unsigned i=0;i<have;i++){
++    if(!fn[i][2])continue;
++    for(unsigned k=0;k<3;k++)if(top[k]==kFnSlots || fn[i][2]>fn[top[k]][2]){for(unsigned m=2;m>k;m--)top[m]=top[m-1];top[k]=i;break;}
++   }
++   char text[96];unsigned used=(unsigned)snprintf(text,sizeof text,"FT");
++   for(unsigned k=0;k<3 && top[k]<kFnSlots && used<sizeof text;k++)
++    used+=(unsigned)snprintf(text+used,sizeof text-used," %s:%llu/%lluk/%llu",gFnNames[top[k]],(unsigned long long)fn[top[k]][1],
++     (unsigned long long)(fn[top[k]][2]>>10),(unsigned long long)fn[top[k]][0]);
++   if(top[0]<kFnSlots)row("%s",text);
++  }
+   HeavyCommit heavy[5];
+   memcpy(heavy,w.heavy,sizeof heavy);
+   std::sort(heavy,heavy+5,[](const HeavyCommit &a,const HeavyCommit &b){return a.gpu>b.gpu;});

@@ -1,0 +1,194 @@
+guamp: NMB_SHADOW_DIFF merges a shadowed texture's writes back as the bytes they changed (bridge 0063)
+
+HakiOS (analisi/hakios-confronto-20261107.md, idea 1; idea only, no code taken: its plug-in has no licence) cured "black bands moving
+from frame to frame" by writing a surface's shadow back only where its bytes differ from the copy the shadow started from. In
+metal2vulkan the copies are GPU commands ordered by the tracker, so the encode-time race they had cannot happen inside one process;
+what a copy back can still undo is a write the encoder does not order (another process's work on the same IOSurface, a CPU write
+racing the GPU): the copy back sets the whole written area to what the copy in saw. The runtime already merges a command that writes
+a texture two ways (shadow_merge.rs: kept copy, changed copy, current bytes, one dispatch taking the changed bytes). NMB_SHADOW_DIFF
+(boot line through guamp-m2v-env, 0019) sends writes through a mergeable shadow of bytes down that path: =1 every write, =2 only a
+write the command does not bound (no scissor bound, a copy back of the whole texture); unset/0 as before. A pass that replaces every
+texel (cleared attachment) still copies back. Cost: a scratch of three copies of the texture and a dispatch instead of one copy back
+(~4x the copy traffic of a 750x1666 framebuffer: diagnostic, default off). Pairs with 0051/0057: NMB_PARTIAL_IN=0 copies in whole,
+NMB_SHADOW_DIFF=1 also copies in whole (a merge compares every byte).
+Applies after bridge 0051/0057 (shadow.rs ShadowSync). Host: metal2vulkan-runtime --lib 891 passed (new test shadow diff setting).
+
+diff --git a/bridge/patches/0063-guamp-shadow-diff.patch b/bridge/patches/0063-guamp-shadow-diff.patch
+new file mode 100644
+index 0000000..c532d84
+--- /dev/null
++++ b/bridge/patches/0063-guamp-shadow-diff.patch
+@@ -0,0 +1,173 @@
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++index 45d992c..6d00b51 100644
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -1050,6 +1050,56 @@ fn partial_in() -> bool {
++     *ON.get_or_init(|| !std::env::var("NMB_PARTIAL_IN").is_ok_and(|v| v.trim() == "0"))
++ }
++ 
+++/// guamp (diff copy back, `NMB_SHADOW_DIFF`): which writes through a shadow of bytes reach the
+++/// buffer as a merge (`shadow_merge.rs`: only the bytes the command changed against the shadow
+++/// as it was copied in) instead of a copy back of the whole written area. A copy back rewrites
+++/// every texel of the area, so bytes something outside the encoder's ordering wrote meanwhile
+++/// (another process's work on the same surface, a CPU write racing the GPU) are set back to
+++/// what the copy in saw; a merge leaves every byte the command did not change. The same result
+++/// for a well-ordered program, at the merge's cost (a scratch of three copies of the texture's
+++/// bytes and one compute dispatch, in place of one copy back). `NMB_SHADOW_DIFF=1` merges every
+++/// such write, `=2` only those whose area the command does not bound (no scissor bound, so the
+++/// copy back would be the whole texture); unset or `0` copies back as before.
+++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+++pub(super) enum DiffBack {
+++    Off,
+++    Unbounded,
+++    All,
+++}
+++
+++impl DiffBack {
+++    /// The setting `NMB_SHADOW_DIFF` names.
+++    pub(super) fn parse(value: Option<&str>) -> DiffBack {
+++        match value.map(str::trim) {
+++            Some("1") | Some("all") => DiffBack::All,
+++            Some("2") | Some("unbounded") => DiffBack::Unbounded,
+++            _ => DiffBack::Off,
+++        }
+++    }
+++
+++    /// The setting of this process, read once.
+++    fn current() -> DiffBack {
+++        static ON: std::sync::OnceLock<DiffBack> = std::sync::OnceLock::new();
+++        *ON.get_or_init(|| DiffBack::parse(std::env::var("NMB_SHADOW_DIFF").ok().as_deref()))
+++    }
+++
+++    /// Whether `shadow`, a command's use, writes through a shadow whose writes this setting
+++    /// merges: one a merge serves, that keeps what it writes, and that does not replace every
+++    /// texel (a cleared attachment changes them all anyway).
+++    fn merges(self, shadow: &ShadowUse) -> bool {
+++        let wanted = match self {
+++            DiffBack::Off => false,
+++            DiffBack::All => true,
+++            DiffBack::Unbounded => shadow.area.is_none(),
+++        };
+++        wanted
+++            && shadow.writes
+++            && !shadow.overwrites
+++            && !shadow.copies.drops_writes
+++            && shadow.copies.unmerged().is_none()
+++    }
+++}
+++
++ /// The rectangle bounding `a` and `b`, each `[x0, y0, x1, y1)`; `None` (anywhere) where either is.
++ fn bounding(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
++     let ([a0, a1, a2, a3], [b0, b1, b2, b3]) = (a?, b?);
++@@ -1060,12 +1110,22 @@ fn bounding(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
++ /// the scratch of a merge.
++ pub(super) struct ShadowSync<M = Arc<ShadowMerge>> {
++     entries: Vec<Entry<M>>,
+++    /// guamp: which writes reach the buffer as merges ([`DiffBack`]).
+++    diff: DiffBack,
++ }
++ 
++ impl<M> Default for ShadowSync<M> {
++     fn default() -> Self {
+++        ShadowSync::with_diff(DiffBack::current())
+++    }
+++}
+++
+++impl<M> ShadowSync<M> {
+++    /// An encoder's, whose writes reach the buffer as `diff` says.
+++    pub(super) fn with_diff(diff: DiffBack) -> Self {
++         ShadowSync {
++             entries: Vec::new(),
+++            diff,
++         }
++     }
++ }
++@@ -1156,7 +1216,8 @@ impl<M: Clone> ShadowSync<M> {
++         }
++         let mut kept = Vec::new();
++         for (i, shadow) in shadows.iter().enumerate() {
++-            if two_ways(shadows, i, uses) {
+++            // guamp: or a write this encoder merges back in any case ([`DiffBack`]).
+++            if two_ways(shadows, i, uses) || self.diff.merges(shadow) {
++                 kept.push((Arc::clone(&shadow.copies), merge(&shadow.copies)?));
++             }
++         }
++diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++index 774a6e3..b4799e3 100644
++--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++@@ -734,3 +734,74 @@ fn a_loaded_attachment_is_copied_in_only_where_the_pass_reads_it() {
++     let copies = sync.before(&joined, &uses, |_| Ok(0)).unwrap();
++     assert_eq!(copies[0].area, None);
++ }
+++
+++/// guamp (`NMB_SHADOW_DIFF`): a write through a shadow of bytes reaches the buffer as a merge
+++/// of the bytes it changed, everywhere (`1`) or where its area is unbounded (`2`); a pass that
+++/// replaces every texel, and the setting off, copy back as before.
+++#[test]
+++fn a_diff_setting_merges_writes_back_instead_of_copying_them() {
+++    use super::super::shadow::DiffBack;
+++    assert_eq!(DiffBack::parse(None), DiffBack::Off);
+++    assert_eq!(DiffBack::parse(Some("0")), DiffBack::Off);
+++    assert_eq!(DiffBack::parse(Some("1")), DiffBack::All);
+++    assert_eq!(DiffBack::parse(Some(" 2 ")), DiffBack::Unbounded);
+++    let buffer = ResourceKey::new();
+++    let t = shadow(buffer, 256..1280);
+++    let key = t.shadow_key;
+++    let area = Some([0, 0, 16, 4]);
+++    let pass = |area: Option<[u32; 4]>, overwrites: bool| ShadowUse {
+++        copies: Arc::clone(&t),
+++        writes: true,
+++        overwrites,
+++        kept: false,
+++        area,
+++        loads: area,
+++    };
+++    let (_, written) = through(&t, true);
+++    let uses = [written];
+++    let run = |diff: DiffBack, shadow: ShadowUse| {
+++        let mut sync = ShadowSync::<u32>::with_diff(diff);
+++        let shadows = [shadow];
+++        let before = sync.before(&shadows, &uses, |_| Ok(7)).unwrap();
+++        sync.after(&shadows, &uses);
+++        let areas: Vec<_> = before.iter().map(|copy| copy.area).collect();
+++        (moved(&before), areas, moved(&sync.finish()))
+++    };
+++    // Off: a copy in of the loaded rectangle, a copy back of it.
+++    assert_eq!(
+++        run(DiffBack::Off, pass(area, false)),
+++        (vec![Moved::Into(key)], vec![area], vec![Moved::Back(key)])
+++    );
+++    // All: the whole texture in (a merge compares every byte), kept, merged at the end.
+++    assert_eq!(
+++        run(DiffBack::All, pass(area, false)),
+++        (
+++            vec![Moved::Into(key), Moved::Keep(key, 7)],
+++            vec![None, None],
+++            vec![Moved::Merge(key, 7)]
+++        )
+++    );
+++    // Unbounded: a bounded write copies back its rectangle, an unbounded one merges.
+++    assert_eq!(
+++        run(DiffBack::Unbounded, pass(area, false)),
+++        (vec![Moved::Into(key)], vec![area], vec![Moved::Back(key)])
+++    );
+++    assert_eq!(
+++        run(DiffBack::Unbounded, pass(None, false)),
+++        (
+++            vec![Moved::Into(key), Moved::Keep(key, 7)],
+++            vec![None, None],
+++            vec![Moved::Merge(key, 7)]
+++        )
+++    );
+++    // A pass that replaces every texel takes no copy in and copies back, whatever the setting.
+++    assert_eq!(
+++        run(DiffBack::All, pass(None, true)),
+++        (vec![], vec![], vec![Moved::Back(key)])
+++    );
+++    // A read is never kept.
+++    let mut sync = ShadowSync::<u32>::with_diff(DiffBack::All);
+++    let (read, used) = through(&t, false);
+++    let copies = sync.before(&[read], &[used], |_| Ok(1)).unwrap();
+++    assert_eq!(moved(&copies), [Moved::Into(key)]);
+++}
