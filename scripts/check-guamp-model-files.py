@@ -156,6 +156,8 @@ static int vn_rdwr(int rw, vnode_t vp, caddr_t b, int n, long off, int seg, int 
 static int vnode_close(vnode_t vp, int f, vfs_context_t c) { (void)f; (void)c; fclose(vp); return 0; }
 static void *kalloc_data(vm_size_t n, int f) { (void)f; allocs++; return malloc(n); }
 static void kfree_data(void *p, size_t n) { (void)n; allocs--; free(p); }
+static char *strnstr(const char *s, const char *f, size_t n) { size_t l = strlen(f);  /* XNU has it, glibc does not */
+	for (; n >= l && *s; s++, n--) { if (!strncmp(s, f, l)) { return (char *)s; } } return NULL; }
 static void native_gpu_addon_mount(proc_t p, user_addr_t s, user_addr_t o, const char *source, size_t source_size, const char *point,
     size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status) {
 	(void)p; (void)s; (void)o;
@@ -209,6 +211,8 @@ bad = [b'', b'NGPUVIEWS1\n', b'NGPUVIEWS2\n/System/a|b\n', ok[:-1], ok.replace(b
        ok.replace(b'Default.bundle|', b'Default.bundle/|'), ok.replace(b'overrides_guamp.plist', b'a/b'),
        ok.replace(b'overrides_guamp.plist', b'..'), ok.replace(b'overrides_guamp.plist', b''), ok.replace(b'|', b'\0|'),
        ok.replace(b'Default.bundle', b'D' * 200), ok.replace(b'overrides_guamp.plist', b'o' * 64), b'NGPUVIEWS1\n/System/|x\n',
+       b'NGPUVIEWS1\n/Applications/|x\n', b'NGPUVIEWS1\n/Applications|x\n', b'NGPUVIEWS1\n/ApplicationsX/a|x\n',
+       b'NGPUVIEWS1\n/Applications/a/../b|x\n', b'NGPUVIEWS1\n/Applications/a.app/|x\n',
        b'NGPUVIEWS1\n' + b'/System/x|y\n' * 129, b'NGPUVIEWS1\n' + b'/System/x|y\n' * 1400]
 for content in bad:
     mounts, result, _ = kernel(content)
@@ -218,6 +222,11 @@ check(len(mounts) == 128 and result == ['128', '128', '0'], f'128 views: {result
 mounts, result, _ = kernel(ok)
 check(mounts == ['/private/var/ngpu/model-files/System/Library/Carrier Bundles/iPad/Default.bundle>/System/Library/Carrier Bundles/'
                  'iPad/Default.bundle>/System/Library/Carrier Bundles/iPad/Default.bundle/overrides_guamp.plist'], f'one view {mounts}')
+
+app = b'NGPUVIEWS1\n/Applications/SIMSetupUIService.app|Localizable.loctable\n'
+mounts, result, _ = kernel(app)
+check(mounts == ['/private/var/ngpu/model-files/Applications/SIMSetupUIService.app>/Applications/SIMSetupUIService.app>'
+                 '/Applications/SIMSetupUIService.app/Localizable.loctable'] and result[:2] == ['1', '1'], f'app view {mounts} {result}')
 
 print('check-guamp-model-files:', 'FAIL' if failures else 'PASS', f'({failures} failures)')
 sys.exit(1 if failures else 0)

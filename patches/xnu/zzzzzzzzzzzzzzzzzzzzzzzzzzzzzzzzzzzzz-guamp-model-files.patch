@@ -13,7 +13,7 @@ index 0420587..7729ff6 100644
 + * name come in the payload addon (scripts/make-guamp-baseband-addon.py --model-files NAME, names model-files/<sealed dir>/<file>),
 + * adapted from the J121 ones without the Mav16 modem's own settings, and are written into Data's /private/var/ngpu by
 + * native_gpu_addon_install. The addon's list /private/var/ngpu/model-files/views ("NGPUVIEWS1\n", then one "<sealed dir>|<file>\n"
-+ * per view, only directories under /System/) says which sealed directories get the read-only union bindfs view of
++ * per view, only directories under /System/ or /Applications/) says which sealed directories get the read-only union bindfs view of
 + * /private/var/ngpu/model-files<sealed dir>, as the ThermalMonitor view of zzzz-guamp-iphone-res.patch: the union falls through to
 + * the sealed directory for every name ours lacks, so the bundle's own files stay the sealed ones. boot-arg guamp-model-files=0 skips
 + * the views. Never panics: a missing or malformed list only logs; stage 5 = the sealed directory and our file both visible. */
@@ -23,7 +23,7 @@ index 0420587..7729ff6 100644
 +#define NATIVE_GUAMP_MODEL_OWN_MAX 64
 +/* Splits the view list in place into points[] and owns[]. Returns the number of views, or -1 when the list is malformed (no magic,
 + * a line without its newline, a NUL, no '|' or more than one, an empty file name or one with '/', a directory that is not an
-+ * absolute path below /System/ without "..", "//" or a trailing '/', more than NATIVE_GUAMP_MODEL_VIEWS_MAX views) or empty. */
++ * absolute path below /System/ or /Applications/ without "..", "//" or a trailing '/', more than NATIVE_GUAMP_MODEL_VIEWS_MAX views) or empty. */
 +static int
 +native_guamp_model_views_parse(char *list, size_t size, const char **points, const char **owns, int max)
 +{
@@ -57,8 +57,8 @@ index 0420587..7729ff6 100644
 +		*bar = 0;
 +		const char *point = line, *own = bar + 1;
 +		size_t point_length = (size_t)(bar - line), own_length = strlen(own);
-+		if (point_length <= 8 || point_length >= NATIVE_GUAMP_MODEL_POINT_MAX || strncmp(point, "/System/", 8) ||
-+		    point[point_length - 1] == '/') {
++		if (point_length >= NATIVE_GUAMP_MODEL_POINT_MAX || point[point_length - 1] == '/' || ((point_length <= 8 ||
++		    strncmp(point, "/System/", 8)) && (point_length <= 14 || strncmp(point, "/Applications/", 14)))) {
 +			return -1;
 +		}
 +		for (size_t k = 0; k + 1 < point_length; ++k) {

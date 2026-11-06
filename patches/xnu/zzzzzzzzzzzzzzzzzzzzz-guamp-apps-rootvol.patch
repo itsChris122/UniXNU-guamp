@@ -2,7 +2,7 @@ diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
 index 8965991..dcdee23 100644
 --- a/bsd/miscfs/bindfs/bind_vfsops.c
 +++ b/bsd/miscfs/bindfs/bind_vfsops.c
-@@ -243,6 +243,36 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+@@ -243,6 +243,39 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
  
  	vfs_setfsprivate(mp, xmp);
  	vfs_getnewfsid(mp);
@@ -19,8 +19,11 @@ index 8965991..dcdee23 100644
 +	 * container, secured system content like the apps of the sealed /Applications. vfs_getvfs() of that fsid still finds the
 +	 * root mount (mounted first). The guamp-ls-auto key holds this fsid, so the first boot rebuilds the database once.
 +	 * Only the boot-time mount on /Applications; guamp-apps-rootvol=0 keeps the view's own fsid.
++	 * 07/11 (*#06# "DEVICE_INFO_TITLE"): also the boot-time model-files views on an app below it (SIMSetupUIService.app),
++	 * so that app too stays on the root volume for LaunchServices.
 +	 */
-+	if (native_bindfs_boot_mount && !strcmp(vfs_statfs(mp)->f_mntonname, "/Applications")) {
++	if (native_bindfs_boot_mount && (!strcmp(vfs_statfs(mp)->f_mntonname, "/Applications") ||
++	    !strncmp(vfs_statfs(mp)->f_mntonname, "/Applications/", 14))) {
 +		uint32_t guamp_rootvol = 1;
 +		vnode_t guamp_root = rootvnode;
 +
