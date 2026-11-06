@@ -17,6 +17,7 @@
 // guamp-touch-rawdump=<tipo> (default 0): mappe diagnostiche mutual + self periodiche nel log, vedi namespace rawdump.
 // guamp-touch-hwcfg=1 (default 0): pin, IRQ, SPI e pin del pannello come li lascia Linux, vedi namespace hwcfg.
 // guamp-touch-softdetect=<m> (default 0): piano B, tocchi calcolati da noi dalla mappa delta/raw (GuampSoftTouch.inc).
+// guamp-touch-storm=0 (default 1): toglie il filtro delle raffiche di contatti di rumore (GuampTouchPolicyCore.h).
 // Outcome of a boot: the single "GuampTouch: RESULT ..." line (stage 3+) and the "GuampTouch: panel" line (every stage).
 // Writes stay limited to the touch pins, SE2 and its GCC clock votes.
 // Board facts: GuampTouchBoard.h; chip protocol: HxProtocol.c (host-tested by tests/hx_host.c).
@@ -1531,6 +1532,20 @@ void thread(void *param, wait_result_t) {
   if (!gridPitch) gridFilter = 0;
   IOLog("GuampTouch: grid filter %s (row %u, x = %u + %u k)\n", gridFilter ? "on" : "off", gridY, gridOffset, gridPitch);
   uint32_t phantoms = 0, repeats = 0, empties = 0;
+  // guamp-touch-storm (06/11, default 1, =0 off): bursts of noise contacts with the cable in, GuampTouchPolicyCore.h
+  // guamp_touch_storm. guamp-touch-storm-usb=0: no re-write of the cable word (A55AA55A at 10007F38) when a storm begins.
+  unsigned stormOn = 1, stormUsb = 1;
+  guamp_touch_storm::Cfg stormCfg;
+  guamp_touch_storm::State storm;
+  PE_parse_boot_argn("guamp-touch-storm", &stormOn, sizeof(stormOn));
+  PE_parse_boot_argn("guamp-touch-storm-usb", &stormUsb, sizeof(stormUsb));
+  PE_parse_boot_argn("guamp-touch-storm-starts", &stormCfg.starts, sizeof(stormCfg.starts));
+  PE_parse_boot_argn("guamp-touch-storm-ms", &stormCfg.windowMs, sizeof(stormCfg.windowMs));
+  PE_parse_boot_argn("guamp-touch-storm-quiet-ms", &stormCfg.quietMs, sizeof(stormCfg.quietMs));
+  PE_parse_boot_argn("guamp-touch-storm-slots", &stormCfg.slots, sizeof(stormCfg.slots));
+  IOLog("GuampTouch: storm filter %s (%u contacts beginning within %u ms or %u at once; quiet %u ms; cable word %s)\n",
+        stormOn ? "on" : "off", stormCfg.starts, stormCfg.windowMs, stormCfg.slots, stormCfg.quietMs,
+        stormUsb ? "re-written at a storm" : "left alone");
   unsigned sameRun = 0;
   struct hx_report lastRep = {};
   PE_parse_boot_argn("guamp-touch-diag", &diagLeft, sizeof(diagLeft));
@@ -1712,8 +1727,8 @@ void thread(void *param, wait_result_t) {
     }
     if (polls == 50 || (polls & 2047) == 0) {
       IOLog("GuampTouch: polls %u irqs %u events %u bad %u released %u info %ux%u pt %u fallback %d | empty %u phantom %u "
-            "repeat %u\n", polls, gIrqs, gEvents, gBad, gReleases, gChip.x_res, gChip.y_res, gChip.max_pt, gChip.info_fallback,
-            empties, phantoms, repeats);
+            "repeat %u storms %u (dropped %u)\n", polls, gIrqs, gEvents, gBad, gReleases, gChip.x_res, gChip.y_res, gChip.max_pt,
+            gChip.info_fallback, empties, phantoms, repeats, storm.storms, storm.dropped);
       if (diag) logStatus(polls);
     }
     rawdump::dump(ev);
@@ -1806,6 +1821,32 @@ void thread(void *param, wait_result_t) {
       continue;
     }
     lastGood = mach_absolute_time();
+    if (stormOn) {
+      uint32_t mask = 0;
+      for (unsigned i = 0; i < rep.count; ++i)
+        if (rep.slot[i] >= 0 && rep.slot[i] < HX_MAX_PT) mask |= 1u << rep.slot[i];
+      uint64_t nowNs = 0;
+      absolutetime_to_nanoseconds(lastGood, &nowNs);
+      bool stormDrop = false;
+      const guamp_touch_storm::Event se = guamp_touch_storm::step(storm, stormCfg, mask, nowNs / 1000000ull, &stormDrop);
+      const bool stormLog = storm.storms <= 16 || (storm.storms & 63) == 0;
+      if (se == guamp_touch_storm::kEnter) {
+        if (down) { struct hx_report up = {}; down = false; publish(up); }   // what iOS holds is lifted once
+        uint32_t usbBefore = 0, usbAfter = 0;
+        hx_reg_read32(&gChip, HX_ADDR_USB_DETECT, &usbBefore);
+        if (stormUsb && gChip.usb_in) gChip.usb_word = usbAfter = write32_verify(&gChip, HX_ADDR_USB_DETECT, HX_HANDSHAKE_PWD);
+        if (stormLog) {
+          IOLog("GuampTouch: storm %u: noise contacts (%u slots down, first %d,%d), reports dropped until quiet; cable word "
+                "%08x -> %08x\n", storm.storms, guamp_touch_storm::popcount(mask), rep.count ? rep.point[0].x : -1,
+                rep.count ? rep.point[0].y : -1, usbBefore, usbAfter);
+          logStatus(polls);
+        }
+      } else if (se == guamp_touch_storm::kLeave && stormLog) {
+        IOLog("GuampTouch: storm %u over after %llu ms, %u reports dropped in all\n", storm.storms,
+              (unsigned long long)(nowNs / 1000000ull - storm.since), storm.dropped);
+      }
+      if (stormDrop) continue;
+    }
     if (!rep.count && !down) continue;
     down = rep.count != 0;
     gEvents = gEvents + 1;

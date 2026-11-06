@@ -4,6 +4,7 @@
 //                      really is in gesture mode after the display-off swap.
 //   guamp_touch_guard  the long "lost finger up" guard: what to do once no interrupt and no valid report came for
 //                      guamp-touch-release-ms, after reading the controller's event stack again.
+//   guamp_touch_storm  bursts of noise contacts (guamp-touch-storm): many contacts beginning at once, reports dropped.
 #ifndef GUAMP_TOUCH_POLICY_CORE_H
 #define GUAMP_TOUCH_POLICY_CORE_H
 #include <stdint.h>
@@ -91,4 +92,61 @@ inline const char *name(Verdict v) {
   return "?";
 }
 }  // namespace guamp_touch_guard
+
+namespace guamp_touch_storm {
+// guamp 06/11 (fin51, live-20261106-014007 1971-1984 s): with the USB cable in (power + mirror, charger mode already told
+// to the firmware: usb a55aa55a in every status line) the Himax reported a burst of noise as valid fingers: ~1100
+// contacts in 13 s (~85 new contacts per second, slots 0..9, 1-6 reports each, scattered over the middle of the panel),
+// none caught by the bad / phantom / repeat / grid filters. A hand never starts that many contacts so fast: storm =
+// at least `starts` contacts beginning (a slot absent in the previous report and present in this one) within `windowMs`,
+// or at least `slots` contacts at once. In a storm every report is dropped (the caller lifts what was published once)
+// until no contact began for `quietMs` and fewer than `slots` are down; then reports go out again (a finger still
+// resting is sent from where it is). Thresholds: guamp-touch-storm-starts (8), -ms (250), -quiet-ms (500), -slots (5,
+// 0 = rule off); guamp-touch-storm=0 turns the filter off.
+struct Cfg {
+  unsigned starts = 8, windowMs = 250, quietMs = 500, slots = 5;
+};
+struct State {
+  uint64_t ring[16] = {};   // times (ms) of the last contact starts
+  unsigned head = 0, n = 0;
+  uint32_t prevMask = 0;    // slots of the previous report
+  bool active = false;
+  uint64_t lastStart = 0, since = 0;
+  uint32_t storms = 0, dropped = 0;
+};
+enum Event { kNone, kEnter, kLeave };
+inline unsigned popcount(uint32_t m) { unsigned c = 0; for (; m; m &= m - 1) ++c; return c; }
+
+// mask: slots present in this (already filtered) report; nowMs: monotonic time. *drop = the report must not be sent.
+inline Event step(State &s, const Cfg &c, uint32_t mask, uint64_t nowMs, bool *drop) {
+  const uint32_t began = mask & ~s.prevMask;
+  s.prevMask = mask;
+  for (uint32_t b = began; b; b &= b - 1) {
+    s.ring[s.head] = nowMs;
+    s.head = (s.head + 1) & 15;
+    if (s.n < 16) ++s.n;
+    s.lastStart = nowMs;
+  }
+  const unsigned need = c.starts > 16 ? 16 : c.starts;
+  bool burst = false;
+  if (need >= 2 && s.n >= need) {
+    const uint64_t oldest = s.ring[(s.head + 16 - need) & 15];
+    burst = nowMs - oldest <= c.windowMs;
+  }
+  const bool crowd = c.slots && popcount(mask) >= c.slots;
+  Event e = kNone;
+  if (!s.active && (burst || crowd)) {
+    s.active = true;
+    s.since = nowMs;
+    ++s.storms;
+    e = kEnter;
+  } else if (s.active && !burst && !crowd && nowMs - s.lastStart >= c.quietMs) {
+    s.active = false;
+    e = kLeave;
+  }
+  *drop = s.active;
+  if (s.active) ++s.dropped;
+  return e;
+}
+}  // namespace guamp_touch_storm
 #endif

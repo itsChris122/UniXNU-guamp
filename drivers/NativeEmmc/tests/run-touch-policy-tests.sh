@@ -11,7 +11,7 @@ trap 'rm -rf "$WORK"' EXIT
 FLAGS="-std=gnu++20 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function -fno-exceptions -fno-rtti"
 rc=0
 echo "== core for the kernel: arm64-apple-ios, -Werror, integer registers only"
-printf '#include "%s/../GuampTouchPolicyCore.h"\nint f(unsigned m, int id, bool e) { return guamp_touch_wake::decide(m, id, true, e).verdict; }\nint g(int rc, int p, unsigned char c, unsigned n, unsigned long long s) { return guamp_touch_guard::verdict(rc, p, c, n, s, 30000); }\n' "$HERE" > "$WORK/k.cpp"
+printf '#include "%s/../GuampTouchPolicyCore.h"\nint f(unsigned m, int id, bool e) { return guamp_touch_wake::decide(m, id, true, e).verdict; }\nint g(int rc, int p, unsigned char c, unsigned n, unsigned long long s) { return guamp_touch_guard::verdict(rc, p, c, n, s, 30000); }\nint h(unsigned m, unsigned long long t) { static guamp_touch_storm::State st; guamp_touch_storm::Cfg c; bool d = false; guamp_touch_storm::step(st, c, m, t, &d); return d; }\n' "$HERE" > "$WORK/k.cpp"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2 -Wall -Wextra \
   -Werror -c "$WORK/k.cpp" -o "$WORK/k.o" && echo "core: compiled" || rc=1
 echo "== no raw newline inside a string literal"

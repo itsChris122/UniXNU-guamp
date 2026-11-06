@@ -191,6 +191,75 @@ static void testSwap(const std::vector<uint8_t> &img) {
   }
 }
 
+// guamp_touch_storm: fin51 noise burst (live-20261106-014007 1971-1984 s) against swipes, a pinch and fast typing.
+static void testStorm() {
+  using namespace guamp_touch_storm;
+  const Cfg c;
+  {  // one finger swiping at 110 reports/s for 2 s, lifted, 10 times: never a storm
+    State s; bool drop = true; unsigned dropped = 0; uint64_t t = 0;
+    for (int k = 0; k < 10; ++k) {
+      for (int i = 0; i < 220; ++i, t += 9) { CHECK(step(s, c, 1u, t, &drop) == kNone); dropped += drop; }
+      step(s, c, 0u, t, &drop); dropped += drop; t += 150;
+    }
+    CHECK(dropped == 0 && s.storms == 0);
+  }
+  {  // two-finger pinch and rotation, repeated: never a storm
+    State s; bool drop = true; unsigned dropped = 0; uint64_t t = 0;
+    for (int k = 0; k < 20; ++k) {
+      step(s, c, 1u, t, &drop); dropped += drop; t += 30;
+      for (int i = 0; i < 60; ++i, t += 9) { step(s, c, 3u, t, &drop); dropped += drop; }
+      step(s, c, 0u, t, &drop); dropped += drop; t += 120;
+    }
+    CHECK(dropped == 0 && s.storms == 0);
+  }
+  {  // two-thumb typing, 24 taps per second (twice a fast typist) alternating slots 0 / 1, overlapping: never a storm
+    State s; bool drop = true; unsigned dropped = 0; uint64_t t = 0;
+    for (int k = 0; k < 120; ++k) {
+      const uint32_t a = (k & 1) ? 2u : 1u;
+      step(s, c, a, t, &drop); dropped += drop; t += 40;
+      step(s, c, 3u, t, &drop); dropped += drop; t += 20;   // next thumb lands before this one lifts
+      step(s, c, a ^ 3u, t, &drop); dropped += drop; t += 23;
+      step(s, c, 0u, t, &drop); dropped += drop;
+    }
+    CHECK(dropped == 0 && s.storms == 0);
+  }
+  {  // noise: a new contact on a changing slot every ~12 ms, 1-3 reports each, for 13 s; then a real finger
+    State s; bool drop = false; uint64_t t = 1000; unsigned sent = 0, total = 0, enters = 0, leaves = 0;
+    uint32_t seed = 12345;
+    for (int i = 0; i < 1100; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      const uint32_t slot = 1u << ((seed >> 16) % 10);
+      const int reps = 1 + (int)((seed >> 8) % 3);
+      for (int r = 0; r < reps; ++r, t += 4) {
+        const Event e = step(s, c, slot, t, &drop);
+        enters += e == kEnter; leaves += e == kLeave;
+        ++total; sent += !drop;
+      }
+      step(s, c, 0u, t, &drop); ++total; sent += !drop; t += 4;
+    }
+    CHECK(enters == 1 && leaves == 0 && total > 2000);
+    CHECK(sent <= 40);            // only the first ~100 ms of the burst go out (8 contacts)
+    CHECK(s.active);
+    // after the burst a finger rests: dropped until quiet 500 ms, then sent
+    t += 100;
+    step(s, c, 1u, t, &drop); CHECK(drop);
+    t += 500;
+    CHECK(step(s, c, 1u, t, &drop) == kLeave); CHECK(!drop);
+    t += 9;
+    step(s, c, 1u, t, &drop); CHECK(!drop);
+    CHECK(s.storms == 1);
+  }
+  {  // a palm: 5 contacts at once is a storm at the first report
+    State s; bool drop = false;
+    CHECK(step(s, c, 0x1Fu, 10, &drop) == kEnter); CHECK(drop);
+  }
+  {  // slots rule off and starts 0: never a storm
+    Cfg off; off.starts = 0; off.slots = 0;
+    State s; bool drop = true;
+    for (uint64_t t = 0; t < 1000; t += 5) { step(s, off, (t / 5) & 1 ? 0x3FFu : 0u, t, &drop); CHECK(!drop); }
+  }
+}
+
 int main(int argc, char **argv) {
   std::vector<uint8_t> img;
   if (argc > 1) {
@@ -206,6 +275,7 @@ int main(int argc, char **argv) {
   testGuard();
   testEventParse();
   testSwap(img);
+  testStorm();
   std::printf("touch policy: %d/%d checks passed\n", checks - fails, checks);
   return fails ? 1 : 0;
 }
