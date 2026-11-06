@@ -1,4 +1,4 @@
-guamp: partial updates of the render server (bridge patch 0050 + PU row of the frame report)
+guamp: partial updates of the render server (bridge patch 0051 + PU row of the frame report)
 
 fin53 (live-20261106-092610): the GuampMetal rows showed 9.6 passes, 100 draws and kpx=6263 a frame for a status bar change of 16 rows,
 but kpx is width x height of each pass's colour attachment, not what the draws cover: the redraw of the whole frame was not shown. What
@@ -10,7 +10,7 @@ loaded/cleared, passes bounded by their draws' scissors with bound kpx / render-
 and passes into a >=1 Mpx surface (the framebuffer) by load action (load/clear/dontcare).
 loadAction/storeAction/scissor/viewport were checked: translated 1:1 (render_target.rs load_op/store_op, render_state.rs scissors);
 the render area is always the whole attachment, which on Turnip in sysmem (TU g0) costs nothing for Load/Store.
-Applies after 0001-0046; adds bridge/patches/0050-guamp-partial-updates.patch (metal2vulkan 720ef1c + bridge 0001-0045).
+Applies after 0001-0046; adds bridge/patches/0051-guamp-partial-updates.patch (metal2vulkan 720ef1c + bridge 0001-0045).
 
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
 index f4e60ee..86d1e05 100644
@@ -20,7 +20,7 @@ index f4e60ee..86d1e05 100644
  // full-screen pass or into a small offscreen one, and whether that pass is multisampled.
  struct NmbPassShape {uint32_t width,height,format,samples;std::atomic<uint64_t> count;};
  static NmbPassShape gPassShapes[6];
-+// guamp 0050: passes whose colour attachment 0 is a surface of 1 Mpx or more (the render server's framebuffer), by its load action.
++// guamp 0051: passes whose colour attachment 0 is a surface of 1 Mpx or more (the render server's framebuffer), by its load action.
 +static std::atomic<uint64_t> gSurfacePassLoads[3];
  static std::atomic<unsigned> gPassShapeCount;
  // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
@@ -29,7 +29,7 @@ index f4e60ee..86d1e05 100644
     gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
     uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
     if(pixels>=2000000)gFullScreenPasses++;
-+   if(pixels>=1000000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface) {   // guamp 0050
++   if(pixels>=1000000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface) {   // guamp 0051
 +    const MTLLoadAction l=d.colorAttachments[0].loadAction;gSurfacePassLoads[l==MTLLoadActionLoad?0:l==MTLLoadActionClear?1:2]++;
 +   }
     const uint32_t w=(uint32_t)first.width,h=(uint32_t)first.height,f=(uint32_t)first.pixelFormat,s=(uint32_t)first.sampleCount;
@@ -39,7 +39,7 @@ index f4e60ee..86d1e05 100644
    row("X spikes gpu8=%llu gpu16=%llu gpu32=%llu ctc16=%llu ctc32=%llu",(unsigned long long)w.spikes[0],(unsigned long long)w.spikes[1],
     (unsigned long long)w.spikes[2],(unsigned long long)w.spikes[3],(unsigned long long)w.spikes[4]);
    if(tuRow[0])row("%s",tuRow);   // guamp 0031
-+  // guamp (UniXNU-guamp patches/adreno-metal/0050): partial updates, since the last report. p passes, L/C colour 0 loaded/cleared,
++  // guamp (UniXNU-guamp patches/adreno-metal/0051): partial updates, since the last report. p passes, L/C colour 0 loaded/cleared,
 +  // b passes whose draws' scissors bound them (bound kpx / their render-area kpx), in shadow texels copied in / of whole images (k),
 +  // fb passes into a surface of 1 Mpx or more by colour 0 load action (load/clear/dontcare). bkpx far below akpx with fb L: the render
 +  // server already redraws only the damage; b~0 or bkpx~akpx with fb C: it redraws the whole frame.
@@ -98,11 +98,11 @@ index acecba0..c4eab48 100644
  /// Separate artifact and driver-record counters, mirroring the C ABI.
  #[repr(C)]
  pub struct NmbShaderCacheStats {
-diff --git a/bridge/patches/0050-guamp-partial-updates.patch b/bridge/patches/0050-guamp-partial-updates.patch
+diff --git a/bridge/patches/0051-guamp-partial-updates.patch b/bridge/patches/0051-guamp-partial-updates.patch
 new file mode 100644
 index 0000000..a823d37
 --- /dev/null
-+++ b/bridge/patches/0050-guamp-partial-updates.patch
++++ b/bridge/patches/0051-guamp-partial-updates.patch
 @@ -0,0 +1,419 @@
 +guamp: partial updates. A pass's loaded color attachment over a shadowed buffer or surface texture, whose draws' scissors bound
 +what it draws (clear_reach::DrawnArea) and which nothing else of the pass uses, is copied in only inside that bound (ShadowUse::loads),
