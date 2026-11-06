@@ -67,6 +67,8 @@ __attribute__((weak)) volatile uint32_t native_adreno_compositor_fence;
 // patches/native-adreno/0019: job slots kept for the render server ([0] app waits, [1] app refusals, [2] app us, [3] render server
 // waits, [4] render server refusals, [5] render server us, [6] render server longest us, [7] app longest us).
 __attribute__((weak)) volatile uint64_t native_adreno_slot_stats[8];
+// GuampAdrenoProbe.cpp guamp-gpu-idle-us: fence-wait sleeps {slept, woken by the GPU interrupt, by the backstop, not slept}.
+__attribute__((weak)) volatile uint64_t native_gpu_idle_stats[4];
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 // patches/native-adreno/0019: the re-assertion's pages ([0] checked, [1] found reset and written back, [2] BO passes) and its time
@@ -188,6 +190,13 @@ void logSubmits() {
           native_adreno_slot_stats[3] != sl[3] ? (native_adreno_slot_stats[5] - sl[5]) / (native_adreno_slot_stats[3] - sl[3]) : 0,
           native_adreno_slot_stats[6]);
   for (unsigned i = 0; i < 6; ++i) sl[i] = native_adreno_slot_stats[i];
+  // guamp-gpu-idle-us: the fence waits' sleeps (each one a CPU wakeup on the waiting thread; fin51 backboardd 293 wakes / s).
+  static uint64_t gs[4];
+  if (native_gpu_idle_stats[0] != gs[0] || native_gpu_idle_stats[3] != gs[3])
+    IOLog("GuampGpu: fence sleeps +%llu (GPU interrupt +%llu, backstop +%llu), not slept +%llu\n",
+          native_gpu_idle_stats[0] - gs[0], native_gpu_idle_stats[1] - gs[1], native_gpu_idle_stats[2] - gs[2],
+          native_gpu_idle_stats[3] - gs[3]);
+  for (unsigned i = 0; i < 4; ++i) gs[i] = native_gpu_idle_stats[i];
   // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
   static uint64_t ro[3];
   const uint64_t om = native_adreno_publish_ro_owned[0], ob = native_adreno_publish_ro_owned[1], os = native_adreno_publish_ro_owned[2];

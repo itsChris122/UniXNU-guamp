@@ -81,6 +81,18 @@ extern volatile uint32_t native_adreno_rs_slots, native_adreno_slot_wait_us, nat
 volatile uint32_t gCopyWaitCompositor = 1;
 // Fence waits that slept until a GPU interrupt or spun.
 volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
+// guamp-gpu-idle-us (default 1000; 100 = as before, 50..20000): the longest sleep of a fence wait (naIdle, guamp_adreno_wait_submitted)
+// while the GPU interrupt is attached and not masked. Each job's fence write raises the interrupt (CACHE_FLUSH_TS with IRQ), which
+// wakes the waiter at once; the timeout is only the backstop. fin51: 100 us slices woke backboardd's GPU waits ~10000 times a second
+// of waiting ("backboardd caught waking the CPU 45121 times over ~153 seconds, 293 wakes / second"; fin50 840 / s behind Maps):
+// every expiry is a timer-interrupt wakeup on the waiting thread's ledger. An interrupt that came between the caller's fence read and
+// the wait (less than kIrqRaceUs before it) ends the wait without sleeping, so a missed edge costs no backstop.
+// native_gpu_idle_stats: [0] sleeps, [1] woken by the GPU interrupt, [2] by the backstop, [3] not slept (interrupt just before).
+volatile uint32_t gIdleUs = 1000;
+volatile uint64_t gIrqAt;   // mach_absolute_time() of the last GPU interrupt
+uint64_t gIrqRaceTicks;
+constexpr uint32_t kIrqRaceUs = 100;
+volatile uint64_t native_gpu_idle_stats[4];
 // patches/native-adreno/0014: the process that last submitted from the window holding an address, and the ban of a process.
 int32_t native_adreno_window_owner(uint64_t iova, char *name, unsigned name_bytes);
 // patches/native-adreno/0019 (guamp-gpu-perf, GuampGpuPerf.inc): the jobs' CP counter samples, the hooks at a job's start and release,
@@ -252,13 +264,27 @@ void gpuIrq(void *c) {
   gIrqSeen = gIrqSeen | status;
   gIrqCount = gIrqCount + 1;
   if (gIrqRepeat > 100000) {gw(s, 0x38, 0); gIrqMasked = 1;}
+  gIrqAt = mach_absolute_time();
   thread_wakeup(event_t(&gIrqCount));
+}
+// One sleep of a fence wait until the next GPU interrupt, at most `fallbackUs` with the interrupt masked, else gIdleUs (see above).
+void gpuSleep(uint32_t fallbackUs) {
+  const uint32_t us = (gIrqMasked || gIdleUs < fallbackUs) ? fallbackUs : gIdleUs;
+  assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, us, NSEC_PER_USEC);
+  if (us > fallbackUs && gIrqRaceTicks && mach_absolute_time() - gIrqAt < gIrqRaceTicks) {
+    clear_wait(current_thread(), THREAD_AWAKENED);   // an interrupt just before the wait: the caller polls again, no sleep
+    native_gpu_idle_stats[3] = native_gpu_idle_stats[3] + 1;
+    return;
+  }
+  const wait_result_t r = thread_block(THREAD_CONTINUE_NULL);
+  native_gpu_idle_stats[0] = native_gpu_idle_stats[0] + 1;
+  if (r == THREAD_TIMED_OUT) native_gpu_idle_stats[2] = native_gpu_idle_stats[2] + 1;
+  else native_gpu_idle_stats[1] = native_gpu_idle_stats[1] + 1;
 }
 int naIdle(void *) {
   guamp_gpu_dcvs_boost = 1;
   if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
-    assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 100, NSEC_PER_USEC);
-    thread_block(THREAD_CONTINUE_NULL);
+    gpuSleep(100);
     native_gpu_idle_sleeps = native_gpu_idle_sleeps + 1;
   } else {
     IODelay(20);
@@ -870,8 +896,7 @@ extern "C" int guamp_adreno_wait_submitted(uint32_t timeout_us, uint32_t *waited
     }
     guamp_gpu_dcvs_boost = 1;
     if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
-      assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 200, NSEC_PER_USEC);
-      thread_block(THREAD_CONTINUE_NULL);
+      gpuSleep(200);
     } else {
       IODelay(20);
     }
@@ -914,6 +939,12 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   // mailbox poller's pause while nobody uses the mailbox (1 = 1 ms always, as before).
   native_adreno_reassert_table = bootArg("guamp-adreno-reassert-table", 1) ? 1 : 0;
   native_adreno_mailbox_idle_ms = bootArg("guamp-adreno-mailbox-idle-ms", 8);
+  {
+    const uint32_t us = bootArg("guamp-gpu-idle-us", 1000);
+    gIdleUs = us < 50 ? 50 : us > 20000 ? 20000 : us;
+    nanoseconds_to_absolutetime(uint64_t(kIrqRaceUs) * NSEC_PER_USEC, &gIrqRaceTicks);
+    IOLog("GuampAdreno: fence wait sleeps until the GPU interrupt, backstop %u us\n", gIdleUs);
+  }
   IOLog("GuampAdreno: re-assert page table reads %u, mailbox idle poll %u ms\n", native_adreno_reassert_table,
         native_adreno_mailbox_idle_ms);
   gCopyWaitCompositor = bootArg("guamp-copy-wait-compositor", 1) ? 1 : 0;
