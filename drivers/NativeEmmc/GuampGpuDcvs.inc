@@ -76,6 +76,7 @@ __attribute__((weak)) volatile uint32_t native_adreno_compositor_fence;
 __attribute__((weak)) volatile uint64_t native_adreno_slot_stats[8];
 // GuampAdrenoProbe.cpp guamp-gpu-idle-us: fence-wait sleeps {slept, woken by the GPU interrupt, by the backstop, not slept}.
 __attribute__((weak)) volatile uint64_t native_gpu_idle_stats[4];
+__attribute__((weak)) volatile uint64_t native_gpu_idle_missed;   // backstops with a fence retired and no interrupt (07/11)
 // patches/native-adreno/0013: read-only imports left out of a submission's maintenance {mappings, bytes, sweeps}.
 __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 // patches/native-adreno/0019: the re-assertion's pages ([0] checked, [1] found reset and written back, [2] BO passes) and its time
@@ -199,12 +200,13 @@ void logSubmits() {
           native_adreno_slot_stats[6]);
   for (unsigned i = 0; i < 6; ++i) sl[i] = native_adreno_slot_stats[i];
   // guamp-gpu-idle-us: the fence waits' sleeps (each one a CPU wakeup on the waiting thread; fin51 backboardd 293 wakes / s).
-  static uint64_t gs[4];
+  static uint64_t gs[4], gm;
   if (native_gpu_idle_stats[0] != gs[0] || native_gpu_idle_stats[3] != gs[3])
-    IOLog("GuampGpu: fence sleeps +%llu (GPU interrupt +%llu, backstop +%llu), not slept +%llu\n",
-          native_gpu_idle_stats[0] - gs[0], native_gpu_idle_stats[1] - gs[1], native_gpu_idle_stats[2] - gs[2],
-          native_gpu_idle_stats[3] - gs[3]);
+    IOLog("GuampGpu: fence sleeps +%llu (GPU interrupt +%llu, backstop +%llu of which fence retired without interrupt +%llu), "
+          "not slept +%llu\n", native_gpu_idle_stats[0] - gs[0], native_gpu_idle_stats[1] - gs[1], native_gpu_idle_stats[2] - gs[2],
+          native_gpu_idle_missed - gm, native_gpu_idle_stats[3] - gs[3]);
   for (unsigned i = 0; i < 4; ++i) gs[i] = native_gpu_idle_stats[i];
+  gm = native_gpu_idle_missed;
   // patch 0013: per submission, the read-only imports left to their map-time clean, and the sweeps that cleaned them anyway.
   static uint64_t ro[3];
   const uint64_t om = native_adreno_publish_ro_owned[0], ob = native_adreno_publish_ro_owned[1], os = native_adreno_publish_ro_owned[2];

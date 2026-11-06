@@ -51,6 +51,8 @@ volatile int gHold = 0;
 struct Kernel {
   bool read = false, diff = false, neon = false, flipWanted = false;
   bool rowFlush = true;        // guamp-scanout-rowflush (default 1): cache maintenance of the source row by row inside the scan
+  uint32_t flushAhead = 8;     // guamp-scanout-flush-ahead (default 8, 0 = right before the row as fin55, max 64): rows between a
+                               // row's maintenance and its read (GuampScanoutCore.h prepFirst/prepNext)
   uint32_t dline = 64;         // smallest data cache line (CTR_EL0.DminLine)
   unsigned fullEvery = 600, idleMs = 500;
   unsigned earlyFrames = 12;   // guamp-scanout-early=<n> (default 12, 0 = none): the first n frames logged one by one
@@ -192,6 +194,7 @@ static void readOptions()
   unsigned v = 0;
   PE_parse_boot_argn("guamp-copy-diff", &v, sizeof(v)); gK.diff = v == 1;
   v = 1; PE_parse_boot_argn("guamp-scanout-rowflush", &v, sizeof(v)); gK.rowFlush = v != 0;
+  v = 8; PE_parse_boot_argn("guamp-scanout-flush-ahead", &v, sizeof(v)); gK.flushAhead = v > kMaxPrepAhead ? kMaxPrepAhead : v;
   {
     uint64_t ctr = 0;
     __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
@@ -566,7 +569,7 @@ static int presentHw(const u8 *src, uint64_t srcStride, uint32_t srcW, uint32_t 
   const uint64_t t0 = ticks();
   const RowPrep prep = srcPrep();   // guamp-scanout-rowflush
   const u32 changed = scanDraw(gK.ss, target, gK.slotVa[target], stride, src, srcStride, gK.diff, gK.neon ? neonStore : nullptr,
-                               prep);
+                               prep, gK.flushAhead);
   srcPrepDone(prep);
   const uint64_t t1 = ticks();
   __asm__ volatile("dsb sy" ::: "memory");
@@ -654,9 +657,9 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     const RowPrep prep = srcPrep();   // guamp-scanout-rowflush
     if (!gK.st.rows) {
       changed = scanDraw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.diff,
-                         gK.neon ? neonStore : nullptr, prep);
+                         gK.neon ? neonStore : nullptr, prep, gK.flushAhead);
     } else {
-      changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff, prep);
+      changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff, prep, gK.flushAhead);
       accumulate(gK.st);
     }
     srcPrepDone(prep);
@@ -778,13 +781,13 @@ void log()
   const uint64_t flips = now[4] - last[4];
   IOLog("GuampScanout: frames +%llu (unchanged +%llu), drawn %llu.%llu%% of the pixels (rows/frame %llu), scan %llu us draw %llu us "
         "per frame, last box %u,%u-%u,%u; diff %u neon %u full redraws %llu; flip %s: flips +%llu latch mean %llu us max %llu, "
-        "timeouts %llu, idle returns %llu, externals %llu, refused %llu (last reason %u); rowflush %u: rows +%llu whole +%llu\n",
+        "timeouts %llu, idle returns %llu, externals %llu, refused %llu (last reason %u); rowflush %u ahead %u: rows +%llu whole +%llu\n",
         frames, now[1] - last[1], frames && area ? (now[3] - last[3]) * 100 / (frames * area) : 0,
         frames && area ? (now[3] - last[3]) * 1000 / (frames * area) % 10 : 0, frames ? (now[2] - last[2]) / frames : 0,
         frames ? (now[6] - last[6]) / frames * 1000000 / f : 0, frames ? (now[7] - last[7]) / frames * 1000000 / f : 0,
         gK.box[0], gK.box[1], gK.box[2], gK.box[3], gK.diff, gK.neon, gK.full, gK.flipOn ? "on" : gK.flipWanted ? "off" : "not asked",
         flips, flips ? (now[5] - last[5]) / flips : 0, gK.latchMax, gK.latchTimeouts, gK.idleBacks, gK.externals, gK.refused,
-        gK.lastRefusal, gK.rowFlush, gK.rowFlushed - lastRowFlushed, gK.wholeFlushed - lastWholeFlushed);
+        gK.lastRefusal, gK.rowFlush, gK.flushAhead, gK.rowFlushed - lastRowFlushed, gK.wholeFlushed - lastWholeFlushed);
   lastRowFlushed = gK.rowFlushed; lastWholeFlushed = gK.wholeFlushed;
   if (gK.hwWanted) {
     static uint64_t lastHw[6];

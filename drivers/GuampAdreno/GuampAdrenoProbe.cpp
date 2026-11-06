@@ -93,6 +93,10 @@ volatile uint64_t gIrqAt;   // mach_absolute_time() of the last GPU interrupt
 uint64_t gIrqRaceTicks;
 constexpr uint32_t kIrqRaceUs = 100;
 volatile uint64_t native_gpu_idle_stats[4];
+// 07/11 gpu-frame: backstop expiries during which the CP retired a fence (the fence page moved) with no GPU interrupt seen:
+// an upper bound of the jobs whose end did not wake the waiter (each costs up to guamp-gpu-idle-us of latency). fin55: 10643
+// backstops against 524 interrupts in 11 s = waits on jobs of ~20 ms woken every 1 ms, or interrupts lost: this tells which.
+volatile uint64_t native_gpu_idle_missed;
 // patches/native-adreno/0014: the process that last submitted from the window holding an address, and the ban of a process.
 int32_t native_adreno_window_owner(uint64_t iova, char *name, unsigned name_bytes);
 // patches/native-adreno/0019 (guamp-gpu-perf, GuampGpuPerf.inc): the jobs' CP counter samples, the hooks at a job's start and release,
@@ -152,6 +156,7 @@ __attribute__((weak)) IOReturn native_gop_handoff_call(uint32_t, task_t, const v
 }
 }
 
+static uint32_t retiredFence(void);   // below (patch 0017), read by gpuSleep (07/11 gpu-frame)
 namespace {
 // kgsl_smmu (msm-arm-smmu-bengal.dtsi): base 0x59a0000, 0x10000; context banks at 0x8000 (IDR1 PAGESIZE 4K, NUMPAGENDXB 2,
 // as the M2 probe read: idr1 20000005).
@@ -270,6 +275,7 @@ void gpuIrq(void *c) {
 // One sleep of a fence wait until the next GPU interrupt, at most `fallbackUs` with the interrupt masked, else gIdleUs (see above).
 void gpuSleep(uint32_t fallbackUs) {
   const uint32_t us = (gIrqMasked || gIdleUs < fallbackUs) ? fallbackUs : gIdleUs;
+  const uint32_t irqs = gIrqCount, retired = retiredFence();
   assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, us, NSEC_PER_USEC);
   if (us > fallbackUs && gIrqRaceTicks && mach_absolute_time() - gIrqAt < gIrqRaceTicks) {
     clear_wait(current_thread(), THREAD_AWAKENED);   // an interrupt just before the wait: the caller polls again, no sleep
@@ -278,8 +284,12 @@ void gpuSleep(uint32_t fallbackUs) {
   }
   const wait_result_t r = thread_block(THREAD_CONTINUE_NULL);
   native_gpu_idle_stats[0] = native_gpu_idle_stats[0] + 1;
-  if (r == THREAD_TIMED_OUT) native_gpu_idle_stats[2] = native_gpu_idle_stats[2] + 1;
-  else native_gpu_idle_stats[1] = native_gpu_idle_stats[1] + 1;
+  if (r == THREAD_TIMED_OUT) {
+    native_gpu_idle_stats[2] = native_gpu_idle_stats[2] + 1;
+    if (!gIrqMasked && gIrqCount == irqs && retiredFence() != retired) native_gpu_idle_missed = native_gpu_idle_missed + 1;
+  } else {
+    native_gpu_idle_stats[1] = native_gpu_idle_stats[1] + 1;
+  }
 }
 int naIdle(void *) {
   guamp_gpu_dcvs_boost = 1;

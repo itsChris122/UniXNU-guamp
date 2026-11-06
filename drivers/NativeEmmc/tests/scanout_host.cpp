@@ -247,6 +247,75 @@ int main()
     for (unsigned r = 0; r < 1666; ++r) same = same && !memcmp(out.data() + r * 3008, src.data() + r * 3008, 3000);
     CHECK(same, "scanDraw prep: slot equals the source");
   }
+  // guamp-scanout-flush-ahead (07/11 gpu-frame): the prep runs `ahead` rows early, still once per row, in order, before the row's
+  // first read. Simulated stale cache: the "cache" (what scan/scanDraw read) holds old rows, the prep of a row copies the fresh
+  // "memory" row into it (clean + invalidate). A read before the prep would hash / draw the stale row.
+  {
+    static uint8_t *cache; static const uint8_t *memory; static uint64_t calls, bad, next;
+    struct P { static void prep(const uint8_t *row, unsigned long long bytes) {
+      const uint64_t r = (uint64_t)(row - cache) / 3008;
+      if (row != cache + next * 3008 || bytes != 750ull * 4) ++bad;
+      memcpy(cache + r * 3008, memory + r * 3008, 3008);
+      ++next; ++calls; } };
+    const unsigned aheads[] = {0, 1, 8, 64, 1000};
+    for (unsigned ai = 0; ai < sizeof(aheads) / sizeof(aheads[0]); ++ai) {
+      const unsigned ahead = aheads[ai];
+      std::vector<uint8_t> mem(3008 * 1666), stale(mem.size()), st(gscan::bytesFor(750, 1666, 750, 1666)),
+          st2(st.size()), out(3008 * 1666, 0), ref(3008 * 1666, 0);
+      gscan::State a, b;
+      CHECK(gscan::layout(a, st.data(), st.size(), 750, 1666, 750, 1666, nullptr, nullptr) &&
+            gscan::layout(b, st2.data(), st2.size(), 750, 1666, 750, 1666, nullptr, nullptr), "ahead layout");
+      uint64_t seed = 77 + ahead;
+      for (int round = 0; round < 4; ++round) {
+        for (int k = 0; k < 40; ++k) {   // a few changed pixels per frame
+          seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+          const uint64_t at = (seed >> 33) % (3008ull * 1666);
+          mem[at] ^= (uint8_t)(1 + (seed >> 20));
+        }
+        if (round == 0) for (size_t i = 0; i < mem.size(); ++i) mem[i] = (uint8_t)(i * 13 + 5);
+        for (size_t i = 0; i < stale.size(); ++i) stale[i] = (uint8_t)(i * 7 + round);   // never the frame's pixels
+        cache = stale.data(); memory = mem.data(); calls = next = 0;
+        const unsigned ca = gscan::scanDraw(a, round & 1, out.data(), 3008, stale.data(), 3008, true, nullptr, P::prep, ahead);
+        const unsigned cb = gscan::scanDraw(b, round & 1, ref.data(), 3008, mem.data(), 3008, true, nullptr);
+        CHECK(calls == 1666 && !bad && ca == cb, "ahead %u round %d: calls %llu bad %llu changed %u/%u", ahead, round,
+              (unsigned long long)calls, (unsigned long long)bad, ca, cb);
+        CHECK(!memcmp(out.data(), ref.data(), out.size()), "ahead %u round %d: slot differs from the fresh frame", ahead, round);
+        // scan() (scaled path) with the same prep
+        for (size_t i = 0; i < stale.size(); ++i) stale[i] = (uint8_t)(i * 11 + round);
+        calls = next = 0;
+        gscan::State c; std::vector<uint8_t> st3(st.size());
+        gscan::layout(c, st3.data(), st3.size(), 750, 1666, 750, 1666, nullptr, nullptr);
+        gscan::scan(c, stale.data(), 3008, true, P::prep, ahead);
+        gscan::scan(c, mem.data(), 3008, true);   // same pixels: nothing may change
+        bool none = true;
+        for (unsigned r = 0; r < 1666; ++r) none = none && !c.srcMask[r];
+        CHECK(calls == 1666 && !bad && none, "scan ahead %u round %d: calls %llu bad %llu", ahead, round,
+              (unsigned long long)calls, (unsigned long long)bad);
+      }
+    }
+  }
+  // Four-lane hash: one changed 32-bit word anywhere in a band always changes that band (and only that band).
+  {
+    std::vector<uint8_t> row(750 * 4);
+    for (size_t i = 0; i < row.size(); ++i) row[i] = (uint8_t)(i * 29 + 3);
+    std::vector<gscan::u64> h(gscan::bandsFor(750));
+    gscan::hashRow(row.data(), 750, h.data());
+    unsigned misses = 0;
+    for (unsigned x = 0; x < 750; ++x)
+      for (unsigned bit = 0; bit < 32; bit += 7) {
+        std::vector<gscan::u64> h2 = h;
+        std::vector<uint8_t> r2 = row;
+        r2[x * 4 + bit / 8] ^= (uint8_t)(1u << (bit % 8));
+        const unsigned m = gscan::hashRow(r2.data(), 750, h2.data());
+        if (m != (1u << (x >> 6))) ++misses;
+      }
+    CHECK(!misses, "four-lane hash: %u single-word changes missed or misplaced", misses);
+    // two pixels swapped inside a band (a moving 1-pixel line) must change it too
+    std::vector<uint8_t> r3 = row;
+    for (int k = 0; k < 4; ++k) { const uint8_t v = r3[10 * 4 + k]; r3[10 * 4 + k] = r3[11 * 4 + k]; r3[11 * 4 + k] = v; }
+    std::vector<gscan::u64> h3 = h;
+    CHECK(gscan::hashRow(r3.data(), 750, h3.data()) == 1u, "four-lane hash: swapped pixels");
+  }
   run(750, 1666, 720, 1600, 1, 1, false, 120);
   run(750, 1666, 720, 1600, 1, 1, true, 80);
   run(750, 1666, 720, 1600, 1, 0, true, 60);

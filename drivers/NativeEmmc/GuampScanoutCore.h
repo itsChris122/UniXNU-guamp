@@ -52,6 +52,10 @@ inline u64 mix(u64 h, u64 w)
   return h ^ (h >> 29);          // xorshift: a bijection too
 }
 // The band hashes of one source row into h[0..bands); returns the mask of the bands whose hash changed.
+// Four lanes (07/11, gpu-frame): each mix is a dependent multiply chain (~7 cycles on the A73), four independent chains per
+// 32 bytes instead of two per 16 halve the compute of the scan (fin55: scan of the whole 750x1666 surface every frame). Each lane
+// is a bijection of each of its words, and the lanes are folded with odd multipliers: one changed word still always changes
+// the band's hash.
 inline u32 hashRow(const u8 *row, u32 width, u64 *h)
 {
   u32 changed = 0;
@@ -60,8 +64,19 @@ inline u32 hashRow(const u8 *row, u32 width, u64 *h)
     const u32 x0 = b << kBandShift, x1 = x0 + 64 < width ? x0 + 64 : width;
     const u8 *p = row + (u64)x0 * 4;
     const u32 bytes = (x1 - x0) * 4;
-    u64 a = 0x243F6A8885A308D3ull ^ b, c = 0x13198A2E03707344ull;
+    u64 a = 0x243F6A8885A308D3ull ^ b, c = 0x13198A2E03707344ull, d = 0xA4093822299F31D0ull, e = 0x082EFA98EC4E6C89ull;
     u32 i = 0;
+    for (; i + 32 <= bytes; i += 32) {
+      u64 u, v, w, z;
+      __builtin_memcpy(&u, p + i, 8);
+      __builtin_memcpy(&v, p + i + 8, 8);
+      __builtin_memcpy(&w, p + i + 16, 8);
+      __builtin_memcpy(&z, p + i + 24, 8);
+      a = mix(a, u);
+      c = mix(c, v);
+      d = mix(d, w);
+      e = mix(e, z);
+    }
     for (; i + 16 <= bytes; i += 16) {
       u64 u, v;
       __builtin_memcpy(&u, p + i, 8);
@@ -74,7 +89,7 @@ inline u32 hashRow(const u8 *row, u32 width, u64 *h)
       __builtin_memcpy(&u, p + i, 4);
       a = mix(a, u);
     }
-    const u64 value = a ^ (c * 0xC2B2AE3D27D4EB4Full);
+    const u64 value = a ^ (c * 0xC2B2AE3D27D4EB4Full) ^ (d * 0x165667B19E3779F9ull) ^ (e * 0x27D4EB2F165667C5ull);
     if (value != h[b]) {
       h[b] = value;
       changed |= 1u << b;
@@ -194,12 +209,32 @@ inline u32 allBands(const State &s) { return s.bands >= 32 ? 0xffffffffu : (1u <
 // prep (may be null) runs for every source row (its first srcW pixels) before the row is read, also with diff off: the kernel
 // cleans and invalidates the row's cache lines there instead of the whole surface before the scan (guamp-scanout-rowflush).
 typedef void (*RowPrep)(const u8 *row, u64 bytes);
-inline u32 scan(State &s, const u8 *src, u64 srcStride, bool diff, RowPrep prep = nullptr)
+// ahead (guamp-scanout-flush-ahead, 07/11 gpu-frame): the prep runs `ahead` rows before the read of a row (rows 0..ahead-1 first,
+// then row y + ahead while row y is read), still once per row, in order, and always before the row's first read; 0 = right
+// before it (fin55). fin55: "scan 6.3-7.7 ms" with the prep (dc civac) of each row just before its read, against 1.56 ms of whole
+// flush + 2.2 ms of scan in fin53: the loads of a row waited for its own maintenance, and the lines the prefetcher had already
+// brought in for the next row were thrown out again by that row's civac (read twice from DRAM). Done ahead, the maintenance of
+// a row is long finished when it is read and what the prefetcher brings in after it stays.
+constexpr u32 kMaxPrepAhead = 64;
+inline void prepFirst(RowPrep prep, const u8 *src, u64 srcStride, u64 rowBytes, u32 rows, u32 ahead)
+{
+  if (!prep) return;
+  for (u32 r = 0; r < ahead && r < rows; ++r) prep(src + (u64)r * srcStride, rowBytes);
+}
+inline void prepNext(RowPrep prep, const u8 *src, u64 srcStride, u64 rowBytes, u32 rows, u32 ahead, u32 y)
+{
+  if (!prep) return;
+  const u32 r = y + ahead;
+  if (r < rows) prep(src + (u64)r * srcStride, rowBytes);
+}
+inline u32 scan(State &s, const u8 *src, u64 srcStride, bool diff, RowPrep prep = nullptr, u32 ahead = 0)
 {
   u32 changedRows = 0;
   const bool compare = diff && s.hashValid;
+  if (ahead > kMaxPrepAhead) ahead = kMaxPrepAhead;
+  prepFirst(prep, src, srcStride, (u64)s.srcW * 4, s.srcH, ahead);
   for (u32 r = 0; r < s.srcH; ++r) {
-    if (prep) prep(src + (u64)r * srcStride, (u64)s.srcW * 4);
+    prepNext(prep, src, srcStride, (u64)s.srcW * 4, s.srcH, ahead, r);
     u32 m = 0;
     if (diff) m = hashRow(src + (u64)r * srcStride, s.srcW, s.hash + (u64)r * s.bands);
     if (!compare) m = allBands(s);
@@ -302,7 +337,7 @@ inline void draw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *
 // redrew them (horizontal bands until the next full redraw). Here a torn row is at most one frame old: the next frame compares
 // against what was really drawn. Returns the number of source rows with a change.
 inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *src, u64 srcStride, bool diff, BulkStore bulk,
-                    RowPrep prep = nullptr)
+                    RowPrep prep = nullptr, u32 ahead = 0)
 {
   s.rowsDrawn = s.pixelsDrawn = 0;
   s.box[0] = s.box[1] = s.box[2] = s.box[3] = 0;
@@ -311,10 +346,12 @@ inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u
   const bool compare = diff && s.hashValid;
   const u64 rowBytes = (u64)s.srcW * 4;
   u32 changedRows = 0;
+  if (ahead > kMaxPrepAhead) ahead = kMaxPrepAhead;
+  prepFirst(prep, src, srcStride, rowBytes, s.srcH, ahead);
   for (u32 y = 0; y < s.srcH; ++y) {
     volatile u8 *out = to + (u64)y * toStride;
     u8 *stage = s.stage + (((u64)out) & 15);   // same 16-byte phase as the destination row (bulk stores)
-    if (prep) prep(src + (u64)y * srcStride, rowBytes);   // before the one read of the row (see scan)
+    prepNext(prep, src, srcStride, rowBytes, s.srcH, ahead, y);   // before the one read of the row (see scan)
     __builtin_memcpy(stage, src + (u64)y * srcStride, rowBytes);
     u32 m = 0;
     if (diff) m = hashRow(stage, s.srcW, s.hash + (u64)y * s.bands);
