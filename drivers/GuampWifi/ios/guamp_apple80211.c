@@ -606,6 +606,22 @@ get(struct apple80211req *request)
 
 		return give(request, answer, sizeof(answer));
 	}
+	case 106: {
+		/*
+		 * guamp 06/11: RSSI_BOUNDS {version, min, max, threshold} (Apple80211GetWithIOCTL 17.7.11: three SInt32 at +4/+8/+12 ->
+		 * RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD). wifid (WiFiDevice, "Device RSSI bounds (%ld, %ld) with treshold (%ld)") keeps the
+		 * threshold as the auto-join minimum (__WiFiDeviceManagerGetAutoJoinThreshold); refused, its default stays 7 dBm, so every
+		 * saved network was "Join candidate is not allowed (Below minimum RSSI threshold)" even at -48 dBm (log 04/11: 1104
+		 * times, the TIM network never joined by itself). -80 like WiFiUsagePoorLinkSession badRssiThreshold;
+		 * guamp-wifi-aj-rssi=<dBm> changes it (0: refused as before).
+		 */
+		int32_t threshold = -80;
+
+		PE_parse_boot_argn("guamp-wifi-aj-rssi", &threshold, sizeof(threshold));
+		const int32_t answer[4] = { 1, -95, -20, threshold };
+
+		return threshold == 0 ? EOPNOTSUPP : give(request, answer, sizeof(answer));
+	}
 	case 353:                               /* guamp 03/11: NSS? (no buffer): one spatial stream (WCN3950: 1x1) */
 		return give_value(request, 1);
 	case 423: {
