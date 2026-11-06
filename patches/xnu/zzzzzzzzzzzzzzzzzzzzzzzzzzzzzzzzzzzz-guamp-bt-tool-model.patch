@@ -54,5 +54,5 @@ index 4a36cb7..002f09e 100644
 -	for (size_t m = 0; !error && m < sizeof(models) / sizeof(models[0]); m++) {
 +	for (size_t m = 0; !error && m < sizeof(models) / sizeof(models[0]) && models[m]; m++) {
  		for (size_t s = 0; s < sizeof(scripts) / sizeof(scripts[0]); s++) {
- 			const char *text = s == 0 ? bt_boot : bt_idle;
+ 			const char *text = s != 2 ? bt_boot : bt_idle;	/* boot and init (power on from the switch): same sequence */
  			snprintf(path, sizeof(path), "/private/var/ngpu/etc/bluetool/%s.%s.script", models[m], scripts[s]);

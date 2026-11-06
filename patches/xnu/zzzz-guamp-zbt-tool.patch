@@ -50,7 +50,7 @@ index 3edb139..e03d4d7 100644
 +	char path[96];
 +	for (size_t m = 0; !error && m < sizeof(models) / sizeof(models[0]); m++) {
 +		for (size_t s = 0; s < sizeof(scripts) / sizeof(scripts[0]); s++) {
-+			const char *text = s == 0 ? bt_boot : bt_idle;
++			const char *text = s != 2 ? bt_boot : bt_idle;	/* boot and init (power on from the switch): same sequence */
 +			snprintf(path, sizeof(path), "/private/var/ngpu/etc/bluetool/%s.%s.script", models[m], scripts[s]);
 +			int written = native_guamp_write_file(p, scratch, path, (const uint8_t *)text, strlen(text), 0, 0644, 1);
 +			if (written) {
