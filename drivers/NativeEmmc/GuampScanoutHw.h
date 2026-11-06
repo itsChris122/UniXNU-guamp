@@ -44,8 +44,9 @@ constexpr u32 kPhaseShift = 21;
 // mult_frac() of linux/math.h for unsigned values: x * n / d without overflowing x * n.
 inline u32 multFrac(u32 x, u32 n, u32 d) { return (x / d) * n + ((x % d) * n) / d; }
 
-// QSEED3LITE: HW_VERSION major 3 (bits 31:28).
-inline bool liteScaler(u32 version) { return (version >> 28) == 3; }
+// QSEED3LITE: HW_VERSION 0x3000 as the register reads on SM6115 (major in bits 15:12, the sde/dpu compare values 0x1002,
+// 0x2004, 0x3000); major 3 in bits 31:28 accepted too (the catalog form SSPP_SCALER_VER packed differently).
+inline bool liteScaler(u32 version) { return (version >> 12) == 3 || (version >> 28) == 3; }
 
 // The registers a flip writes: everything the configuration of one kind of frame (1:1 or scaled) owns. The order of `regs` is
 // the write order (scaler OP_MODE last of the scaler block, as dpu_hw_setup_scaler3 does).

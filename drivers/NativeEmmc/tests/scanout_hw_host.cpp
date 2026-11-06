@@ -40,7 +40,8 @@ int main()
       const u64 want = ((u64)(1u << kPhaseShift) * n) / d;
       if (want <= 0xffffffULL) CHECK(multFrac(1u << kPhaseShift, n, d) == want, "multFrac %u/%u", n, d);   // 24-bit step field
     }
-  CHECK(liteScaler(0x30000000) && liteScaler(0x30010000) && !liteScaler(0x20040000) && !liteScaler(0x10020000), "version");
+  CHECK(liteScaler(0x3000) && liteScaler(0x30000000) && liteScaler(0x30010000) && !liteScaler(0x2004) && !liteScaler(0x1002) &&
+        !liteScaler(0x20040000) && !liteScaler(0x10020000) && !liteScaler(0), "version");   // 0x3000: VIG0 on the phone
 
   u32 saved[kSavedCount];
   bootSaved(saved);
