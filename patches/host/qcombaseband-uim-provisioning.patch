@@ -1,0 +1,311 @@
+diff --git a/baseband/coachz_baseband.cpp b/baseband/coachz_baseband.cpp
+index bd9ab69..7181113 100644
+--- a/baseband/coachz_baseband.cpp
++++ b/baseband/coachz_baseband.cpp
+@@ -25,6 +25,7 @@
+ #include "coachz_bb_data.h"
+ #include "coachz_bb_pdp.h"
+ #include "coachz_bb_esim.h"
++#include "coachz_bb_uimprov.h"
+ 
+ #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
+ // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
+@@ -1183,6 +1184,35 @@ extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint
+   IOLockUnlock(bb_lock);
+ }
+ 
++// guamp: UIM provisioning session (coachz_bb_uimprov.h). Every card status the modem gives CommCenter is looked at; with a card and no
++// primary GW session the bridge asks the modem, on the eSIM code's UIM client, to open it for the card's USIM (once per card, 3 tries).
++static struct cbu_prov bb_prov;
++static uint8_t bb_prov_req[96];
++static void bb_uim_status_note(uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++  struct cbu_status s;
++  if (service != CBU_SVC_UIM || !cbu_parse(sdu, n, &s)) return;
++  if (bb_prov.logged < 24) {
++    bb_prov.logged++;
++    printf("COACHZ baseband: UIM card status (%s): primary GW session 0x%04x, %u cards, slot one card %u error %u apps %u, slot two card %u error %u apps %u; %s in slot %u state %u PIN1 %u perso %u\n",
++           sdu[0] == 4u ? "indication" : "answer", s.gw_primary, s.cards, s.card_state[0], s.card_error[0], s.card_apps[0], s.card_state[1],
++           s.card_error[1], s.card_apps[1], s.app_type == CBU_APP_USIM ? "USIM" : s.app_type == CBU_APP_SIM ? "SIM" : "no application", s.slot,
++           s.app_state, s.pin1_state, s.perso_state);
++  }
++  const uint32_t now = bb_now_ms();
++  if (bb_esim.freeze || bb_esim.active >= 0 || bb_esim_slot < 0 || !cbu_need(&bb_prov, &s, now)) return;
++  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBE_SVC_UIM);
++  if (!server) return;
++  const uint32_t txn = cbu_next_txn(&bb_prov), len = cbu_request(bb_prov_req, sizeof bb_prov_req, txn, &s);
++  if (!len) return;
++  const uint32_t queued = bb_tx_count;
++  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_esim_slot, server->node, server->port, bb_prov_req, len);
++  if (bb_tx_count == queued) return;
++  cbu_sent(&bb_prov, txn, now);
++  printf("COACHZ baseband: UIM provisioning session asked for slot %u (%s, state %u), try %u\n", s.slot,
++         s.app_type == CBU_APP_USIM ? "USIM" : "SIM", s.app_state, bb_prov.tries);
++}
++
+ // QRTR data for one of the bridge's client ports: 1 when the port is the bridge's.
+ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t, const void *body, uint32_t size)
+ {
+@@ -1193,7 +1223,10 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
+   if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
+     bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
+     if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
+-      cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
++      uint32_t error = 0;
++      if (cbu_answer(&bb_prov, static_cast<const uint8_t *>(body), size, &error))
++        printf("COACHZ baseband: UIM provisioning session answer: error 0x%x\n", error);
++      else cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
+     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
+   } else if (r.kind == CBQ_TO_HOST) {
+     if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
+@@ -1215,6 +1248,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
+       bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, CBQ_HDR + fixed);
+     } else bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, r.len);
+     bb_sim_answer(r, sdu, size);   // after the answer itself: bb_activation_indicate reuses bb_out
++    bb_uim_status_note(r.service, sdu, size);
+   }
+   IOLockUnlock(bb_lock);
+   return 1;
+diff --git a/baseband/coachz_bb_uimprov.h b/baseband/coachz_bb_uimprov.h
+new file mode 100644
+index 0000000..78712f6
+--- /dev/null
++++ b/baseband/coachz_bb_uimprov.h
+@@ -0,0 +1,125 @@
++/* guamp: UIM provisioning session for a modem whose firmware waits for the host to choose the SIM application.
++ *
++ * The SM6115 modem (Moto G9 Play, Android firmware) reads the card but does not open the GW provisioning session by itself: on
++ * Android QCRIL sends UIM Change Provisioning Session (0x38) for the card's USIM. Until then Get Card Status has no primary GW
++ * session (index 0xffff), the USIM stays "detected", the modem camps for emergency calls only ("SOS") and CommCenter, which on an
++ * Apple modem never sends 0x38, reads no file of the card (no ICCID, IMSI or PIN state). postmarketOS does the same for these modems
++ * (msm-modem-uim-selection: --uim-change-provisioning-session slot=N,activate=yes,session-type=primary-gw-provisioning,aid=USIM).
++ *
++ * The bridge watches every card status (CommCenter's Get Card Status answers and the Status Change indications) and, while a card is
++ * present with a USIM (or SIM) application and there is no primary GW session, sends 0x38 once per card on its own UIM client. The
++ * modem then initialises the application and indicates the new status to CommCenter, which goes on as with an Apple modem. The card
++ * status is logged as states only (card, application type and state, PIN1 state), never the AID or a file of the card. */
++#ifndef COACHZ_BB_UIMPROV_H
++#define COACHZ_BB_UIMPROV_H
++#include <stdint.h>
++#include "coachz_bb_data.h"
++
++#define CBU_SVC_UIM 0x0bu
++#define CBU_GET_CARD_STATUS 0x002fu
++#define CBU_STATUS_CHANGE 0x0032u
++#define CBU_CHANGE_PROVISIONING 0x0038u
++#define CBU_NO_SESSION 0xffffu
++#define CBU_CARD_PRESENT 1u
++#define CBU_APP_SIM 1u
++#define CBU_APP_USIM 2u
++#define CBU_APP_ILLEGAL 6u
++#define CBU_SLOTS 4u
++#define CBU_TRIES 3u
++#define CBU_TIMEOUT_MS 10000u
++#define CBU_TXN_BASE 0x7e00u          /* far from the eSIM client's own transactions on the same UIM client */
++
++struct cbu_status {
++    uint16_t gw_primary;
++    uint8_t cards, present;
++    uint8_t card_state[CBU_SLOTS], card_apps[CBU_SLOTS], card_error[CBU_SLOTS];
++    uint8_t slot;                     /* 1-based slot of the chosen application, 0 when there is none */
++    uint8_t app_type, app_state, pin1_state, perso_state, aid_len;
++    uint8_t aid[32];
++};
++
++/* Card status (TLV 0x10) of a Get Card Status answer without error or of a Status Change indication: 1 when parsed. */
++static inline int cbu_parse(const uint8_t *sdu, uint32_t n, struct cbu_status *s)
++{
++    if (n < 7u || !cbd_sdu_ok(sdu, n)) return 0;
++    const uint32_t message = cbd_rd16(sdu + 3);
++    if (!((sdu[0] == 2u && message == CBU_GET_CARD_STATUS && !cbd_error(sdu, n)) || (sdu[0] == 4u && message == CBU_STATUS_CHANGE)))
++        return 0;
++    uint32_t len = 0;
++    const uint8_t *p = cbd_find(sdu, n, 0x10, &len);
++    if (!p || len < 9u) return 0;
++    for (uint32_t i = 0; i < sizeof *s; i++) ((uint8_t *)s)[i] = 0;
++    s->gw_primary = cbd_rd16(p);
++    s->cards = p[8];
++    uint32_t at = 9u;
++    for (uint32_t c = 0; c < s->cards; c++) {
++        if (len - at < 6u) return 0;
++        const uint8_t state = p[at], error = p[at + 4], apps = p[at + 5];
++        at += 6u;
++        if (c < CBU_SLOTS) { s->card_state[c] = state; s->card_error[c] = error; s->card_apps[c] = apps; }
++        if (state == CBU_CARD_PRESENT) s->present++;
++        for (uint32_t a = 0; a < apps; a++) {
++            if (len - at < 7u) return 0;
++            const uint8_t type = p[at], app_state = p[at + 1], perso = p[at + 2], aid_len = p[at + 6];
++            if (len - at < 7u + aid_len + 7u) return 0;
++            const uint8_t *aid = p + at + 7u, *pins = aid + aid_len;
++            const int better = state == CBU_CARD_PRESENT && aid_len && aid_len <= sizeof s->aid && app_state != CBU_APP_ILLEGAL &&
++                (type == CBU_APP_USIM ? s->app_type != CBU_APP_USIM : (type == CBU_APP_SIM && !s->slot));
++            if (better && c < 255u) {
++                s->slot = (uint8_t)(c + 1u); s->app_type = type; s->app_state = app_state; s->perso_state = perso;
++                s->pin1_state = pins[1]; s->aid_len = aid_len;
++                for (uint32_t i = 0; i < aid_len; i++) s->aid[i] = aid[i];
++            }
++            at += 7u + aid_len + 7u;
++        }
++    }
++    return 1;
++}
++
++/* UIM Change Provisioning Session: activate the primary GW session on the application. */
++static inline uint32_t cbu_request(uint8_t *sdu, uint32_t room, uint32_t txn, const struct cbu_status *s)
++{
++    if (!s->slot || !s->aid_len || room < 7u + 5u + 5u + s->aid_len) return 0;
++    const uint8_t session[2] = { 0u /* primary GW provisioning */, 1u /* activate */ };
++    uint8_t app[2 + sizeof s->aid];
++    app[0] = s->slot; app[1] = s->aid_len;
++    for (uint32_t i = 0; i < s->aid_len; i++) app[2 + i] = s->aid[i];
++    uint32_t w = cbd_tlv(sdu + 7, room - 7u, 0x01, session, 2);
++    w += cbd_tlv(sdu + 7 + w, room - 7u - w, 0x10, app, 2u + s->aid_len);
++    return cbd_request(sdu, txn, CBU_CHANGE_PROVISIONING, w);
++}
++
++struct cbu_prov {
++    uint8_t tries, pending, done, logged;
++    uint16_t txn, wait_txn;
++    uint32_t deadline, sent, answered, last_error;
++};
++
++/* After a parsed card status: 1 when the bridge should send the request now (then cbu_sent). */
++static inline int cbu_need(struct cbu_prov *p, const struct cbu_status *s, uint32_t now)
++{
++    if (p->pending && (int32_t)(now - p->deadline) >= 0) p->pending = 0;
++    if (!s->present) { p->tries = 0; p->done = 0; return 0; }            /* no card: a new card gets new tries */
++    if (s->gw_primary != CBU_NO_SESSION) { p->done = 1; return 0; }      /* the session exists (the modem or the request made it) */
++    p->done = 0;
++    return s->slot && !p->pending && p->tries < CBU_TRIES;
++}
++static inline uint32_t cbu_next_txn(struct cbu_prov *p)
++{
++    p->txn = (uint16_t)(p->txn + 1u);
++    return CBU_TXN_BASE + (p->txn & 0xffu);
++}
++static inline void cbu_sent(struct cbu_prov *p, uint32_t txn, uint32_t now)
++{
++    p->tries++; p->sent++; p->pending = 1; p->wait_txn = (uint16_t)txn; p->deadline = now + CBU_TIMEOUT_MS;
++}
++/* The modem's answer on the bridge's UIM client: 1 when it was the provisioning answer (error in *error). */
++static inline int cbu_answer(struct cbu_prov *p, const uint8_t *sdu, uint32_t n, uint32_t *error)
++{
++    if (!p->pending || n < 7u || !cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBU_CHANGE_PROVISIONING ||
++        cbd_rd16(sdu + 1) != p->wait_txn) return 0;
++    *error = cbd_error(sdu, n);
++    p->pending = 0; p->answered++; p->last_error = *error;
++    return 1;
++}
++#endif
+diff --git a/tests/coachz_bb_uimprov_model_test.c b/tests/coachz_bb_uimprov_model_test.c
+new file mode 100644
+index 0000000..fa98709
+--- /dev/null
++++ b/tests/coachz_bb_uimprov_model_test.c
+@@ -0,0 +1,106 @@
++/* guamp: host model of the UIM provisioning session (coachz_bb_uimprov.h): card status parsing, the 0x38 request, once per card. */
++#include <stdio.h>
++#include <string.h>
++#include "coachz_bb_uimprov.h"
++
++static int failures;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
++
++static const uint8_t usim_aid[16] = { 0xa0, 0, 0, 0, 0x87, 0x10, 0x02, 0xff, 0x39, 0xff, 0xff, 0x89, 0x06, 0x05, 0, 0xff };
++static const uint8_t isim_aid[16] = { 0xa0, 0, 0, 0, 0x87, 0x10, 0x04, 0xff, 0x39, 0xff, 0xff, 0x89, 0x06, 0x05, 0, 0xff };
++
++static uint32_t app(uint8_t *p, uint8_t type, uint8_t state, const uint8_t *aid)
++{
++    uint32_t w = 0;
++    p[w++] = type; p[w++] = state; p[w++] = 0; p[w++] = 0; p[w++] = 0; p[w++] = 0; p[w++] = 16;
++    memcpy(p + w, aid, 16); w += 16;
++    p[w++] = 0; p[w++] = 1 /* PIN1 enabled, not verified */; p[w++] = 3; p[w++] = 10; p[w++] = 1; p[w++] = 3; p[w++] = 10;
++    return w;
++}
++/* type 2 answer to 0x2f or type 4 indication 0x32; card one present (ISIM then USIM) or absent, card two absent */
++static uint32_t card_status(uint8_t *sdu, uint8_t type, uint16_t gw, int present, int truncate)
++{
++    uint8_t t[200];
++    uint32_t w = 0;
++    t[w++] = (uint8_t)gw; t[w++] = (uint8_t)(gw >> 8);
++    for (int i = 0; i < 6; i++) t[w++] = 0xff;
++    t[w++] = 2;
++    t[w++] = present ? 1 : 0; t[w++] = 0; t[w++] = 3; t[w++] = 10; t[w++] = present ? 0 : 3; t[w++] = present ? 2 : 0;
++    if (present) { w += app(t + w, 5, 1, isim_aid); w += app(t + w, CBU_APP_USIM, 1, usim_aid); }
++    t[w++] = 0; t[w++] = 0; t[w++] = 3; t[w++] = 10; t[w++] = 3; t[w++] = 0;
++    if (truncate) w -= 10;
++    uint32_t n = 7;
++    sdu[0] = type; cbd_wr16(sdu + 1, 5); cbd_wr16(sdu + 3, type == 2 ? CBU_GET_CARD_STATUS : CBU_STATUS_CHANGE);
++    if (type == 2) { const uint8_t ok[4] = { 0, 0, 0, 0 }; n += cbd_tlv(sdu + n, 512, 0x02, ok, 4); }
++    n += cbd_tlv(sdu + n, 512, 0x10, t, w);
++    const uint8_t hot[3] = { 2, 1, 1 };
++    n += cbd_tlv(sdu + n, 512, 0x11, hot, 3);
++    cbd_wr16(sdu + 5, n - 7);
++    return n;
++}
++
++int main(void)
++{
++    uint8_t sdu[512], req[96];
++    struct cbu_status s;
++    struct cbu_prov p;
++    memset(&p, 0, sizeof p);
++
++    /* card present, USIM detected, no primary GW session: one request with slot 1 and the USIM AID (not the ISIM) */
++    uint32_t n = card_status(sdu, 2, CBU_NO_SESSION, 1, 0);
++    CHECK(cbu_parse(sdu, n, &s));
++    CHECK(s.gw_primary == CBU_NO_SESSION && s.cards == 2 && s.present == 1);
++    CHECK(s.card_state[0] == 1 && s.card_apps[0] == 2 && s.card_state[1] == 0 && s.card_error[1] == 3);
++    CHECK(s.slot == 1 && s.app_type == CBU_APP_USIM && s.app_state == 1 && s.pin1_state == 1 && s.aid_len == 16);
++    CHECK(!memcmp(s.aid, usim_aid, 16));
++    CHECK(cbu_need(&p, &s, 1000));
++    const uint32_t txn = cbu_next_txn(&p);
++    const uint32_t len = cbu_request(req, sizeof req, txn, &s);
++    const uint8_t want[] = { 0, (uint8_t)txn, (uint8_t)(txn >> 8), 0x38, 0, 26, 0, 0x01, 2, 0, 0, 1, 0x10, 18, 0, 1, 16 };
++    CHECK(len == 7 + 5 + 3 + 18);
++    CHECK(!memcmp(req, want, sizeof want) && !memcmp(req + sizeof want, usim_aid, 16));
++    CHECK(txn >= CBU_TXN_BASE);
++    cbu_sent(&p, txn, 1000);
++    /* while it is pending, the same status asks nothing more; the indication form parses the same way */
++    n = card_status(sdu, 4, CBU_NO_SESSION, 1, 0);
++    CHECK(cbu_parse(sdu, n, &s) && s.slot == 1);
++    CHECK(!cbu_need(&p, &s, 2000));
++    /* the answer: matched by message and transaction, others are left to the eSIM code */
++    uint8_t ans[32];
++    uint32_t error = 99, an = 7;
++    ans[0] = 2; cbd_wr16(ans + 1, txn + 1); cbd_wr16(ans + 3, 0x38);
++    const uint8_t ok[4] = { 0, 0, 0, 0 };
++    an += cbd_tlv(ans + an, 25, 0x02, ok, 4); cbd_wr16(ans + 5, an - 7);
++    CHECK(!cbu_answer(&p, ans, an, &error));
++    cbd_wr16(ans + 1, txn);
++    CHECK(cbu_answer(&p, ans, an, &error) && error == 0 && !p.pending);
++    /* the modem then reports the session: done, nothing more */
++    n = card_status(sdu, 4, 0x0001, 1, 0);
++    CHECK(cbu_parse(sdu, n, &s) && s.gw_primary == 1);
++    CHECK(!cbu_need(&p, &s, 3000) && p.done);
++
++    /* no answer: after the timeout a new card status tries again, at most CBU_TRIES times per card */
++    memset(&p, 0, sizeof p);
++    n = card_status(sdu, 2, CBU_NO_SESSION, 1, 0);
++    CHECK(cbu_parse(sdu, n, &s));
++    uint32_t now = 0, sent = 0;
++    for (int i = 0; i < 6; i++, now += CBU_TIMEOUT_MS) if (cbu_need(&p, &s, now)) { cbu_sent(&p, cbu_next_txn(&p), now); sent++; }
++    CHECK(sent == CBU_TRIES);
++    /* card removed: tries reset, nothing sent; a new card is tried again */
++    n = card_status(sdu, 4, CBU_NO_SESSION, 0, 0);
++    CHECK(cbu_parse(sdu, n, &s) && !s.present && !s.slot);
++    CHECK(!cbu_need(&p, &s, now) && p.tries == 0);
++    n = card_status(sdu, 4, CBU_NO_SESSION, 1, 0);
++    CHECK(cbu_parse(sdu, n, &s) && cbu_need(&p, &s, now + 2 * CBU_TIMEOUT_MS));
++
++    /* malformed or other messages are not parsed */
++    n = card_status(sdu, 2, CBU_NO_SESSION, 1, 1);
++    CHECK(!cbu_parse(sdu, n, &s));
++    n = card_status(sdu, 2, CBU_NO_SESSION, 1, 0);
++    sdu[3] = 0x20;
++    CHECK(!cbu_parse(sdu, n, &s));
++    CHECK(!cbu_parse(sdu, 5, &s));
++
++    printf("%s: %d failures\n", __FILE__, failures);
++    return failures != 0;
++}

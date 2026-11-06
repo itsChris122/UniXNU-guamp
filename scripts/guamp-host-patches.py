@@ -18,6 +18,10 @@ PATCHES = [
     # Device submodule (UniXNU/QcomBaseband dd0199c), only present with --baseband: skipped when not initialised.
     ('drivers/QcomBaseband', 'patches/host/qcombaseband-short-revision.patch',
      {'baseband/coachz_bb_data.h': 'cbd_revision_fix', 'baseband/coachz_baseband.cpp': 'cbd_revision_fix'}),
+    # 07/11: UIM provisioning session (0x38) for the card's USIM: the SM6115 modem waits for the host (QCRIL on Android) to open it,
+    # CommCenter never asks, so the SIM stayed unread ("SOS", no ICCID/IMSI). Applies after qcombaseband-short-revision.patch.
+    ('drivers/QcomBaseband', 'patches/host/qcombaseband-uim-provisioning.patch',
+     {'baseband/coachz_bb_uimprov.h': 'cbu_request', 'baseband/coachz_baseband.cpp': 'bb_uim_status_note'}),
 ]
 OPTIONAL = {'drivers/QcomBaseband'}
 
@@ -34,7 +38,7 @@ def device_root():
 
 
 def patched(module, markers):
-    return all(marker in (module / name).read_text(errors='replace') for name, marker in markers.items())
+    return all((module / name).is_file() and marker in (module / name).read_text(errors='replace') for name, marker in markers.items())
 
 
 def main():
