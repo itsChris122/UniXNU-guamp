@@ -1,0 +1,50 @@
+guamp: a refused buffer says its size and options first (Maps "VectorKit received null buffer from Metal", fin55)
+
+fin55 (live-20261106-092610, 2871.7 s): Maps[996] SIGABRT "VectorKit received null buffer from Metal" while starting a route.
+Symbolized (dsc-ipad, slide 0x1a0d4000): ggl::MetalResourceManager::newBuffer +0x130 <- ggl::MetalResourceAccessor::endAccess <-
+md::DaVinciGroundTileData::_buildTileMeshes (a ground tile's mesh buffer, on a geo::TaskQueue thread). The plug-in's problem lines
+(0020) were "native-metal: buffer refused: buffer: OutOfMem..." and "OutOfMemory(Device)": the kernel log's line is cut at 80
+characters, so the size and options asked were lost. The cause was the process's GPU address window (256 MiB of the 512 asked, all
+windows taken; fixed by patches/native-adreno/0022); this patch only puts the length (KiB) and MTLResourceOptions ahead of the
+runtime's error in the four buffer refusals (newBufferWithLength, newBufferWithBytes, no-copy, heap), so that the next one says
+whether it was a large buffer or the window. Not compiled outside the CI (format arguments checked by hand: %lu/%lx with casts).
+Applies after 0001-0061.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index d8dd868..b1f12a7 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2581,7 +2581,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ }
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
+  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+- if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
++ if(!handle){NBLOG(@"native-metal: heap buffer refused (%lu KiB, options %lx): %@",(unsigned long)(length>>10),(unsigned long)options,lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ }
+@@ -2806,13 +2806,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  ++tBufferOps;
+  const uint64_t began=nowUs();
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);gTimeCreate.add(began);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ if(!handle){NBLOG(@"native-metal: buffer refused (%lu KiB, options %lx): %@",(unsigned long)(length>>10),(unsigned long)options,lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ if(!handle){NBLOG(@"native-metal: buffer refused (%lu KiB, options %lx): %@",(unsigned long)(length>>10),(unsigned long)options,lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+@@ -2820,7 +2820,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
+  if(!handle) {
+   if(context)(void)(__bridge_transfer id)context;
+-  NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
++  NBLOG(@"native-metal: no-copy buffer refused (%lu KiB, options %lx): %@",(unsigned long)(length>>10),(unsigned long)options,lastError());return nil;
+  }
+  gNoCopyAll++;if(context)gNoCopyMade++;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
