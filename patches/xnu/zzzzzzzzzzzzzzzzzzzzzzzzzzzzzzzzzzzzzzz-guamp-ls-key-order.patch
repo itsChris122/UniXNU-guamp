@@ -1,0 +1,69 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5ba982d..c7cb709 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8797,14 +8797,24 @@ native_guamp_ls_auto_fnv(uint64_t hash, const uint8_t *data, uint64_t size)
+ 	}
+ 	return hash;
+ }
++/*
++ * guamp 06/11 (fin50/fin51: ls-auto rebuilt 1 at every boot, ~90-180 s of black screen after the logo, lsd 85 % of a core):
++ * the hash was taken over the addon entries in file order, and the composer wrote the same 186 /Applications entries in
++ * another order (resa40-delta unsorted, resa41-delta sorted), so the same apps gave another key and a full LaunchServices
++ * rebuild. The key hash is now order-independent: the sum of the FNV-1a of each entry (header, name, compressed bytes),
++ * mixed with the entry count. The old order-dependent hash is kept in native_guamp_ls_auto_legacy_hash: a key file
++ * written by an older kernel that matches it counts as unchanged (no rebuild for the switch) and is rewritten in the new form.
++ */
++static uint64_t native_guamp_ls_auto_legacy_hash;
+ static uint64_t
+ native_guamp_ls_auto_apps_hash(uint32_t *entries)
+ {
+ 	static const char prefix[] = "iphone-res/Applications/";
+ 	const uint8_t *addon = NULL;
+-	uint64_t bytes = 0, hash = 0xcbf29ce484222325ULL, at = 24;
++	uint64_t bytes = 0, hash = 0xcbf29ce484222325ULL, at = 24, set = 0;
+ 	uint32_t count = 0;
+ 	*entries = 0;
++	native_guamp_ls_auto_legacy_hash = 0;
+ 	if (!native_ram_block_gpu_addon || !native_ram_block_gpu_addon(&addon, &bytes) || bytes < 24 || memcmp(addon, "NGPUADD2", 8)) {
+ 		return 0;
+ 	}
+@@ -8825,11 +8835,18 @@ native_guamp_ls_auto_apps_hash(uint32_t *entries)
+ 		if (name_bytes > sizeof(prefix) && !strncmp(name, prefix, sizeof(prefix) - 1)) {
+ 			hash = native_guamp_ls_auto_fnv(hash, addon + at, 24 + (uint64_t)name_bytes);
+ 			hash = native_guamp_ls_auto_fnv(hash, addon + at + 24 + name_padded, packed);
++			uint64_t one = native_guamp_ls_auto_fnv(0xcbf29ce484222325ULL, addon + at, 24 + (uint64_t)name_bytes);
++			set += native_guamp_ls_auto_fnv(one, addon + at + 24 + name_padded, packed);
+ 			*entries = *entries + 1;
+ 		}
+ 		at += 24 + name_padded + packed_padded;
+ 	}
+-	return *entries ? hash : 0;
++	if (!*entries) {
++		return 0;
++	}
++	native_guamp_ls_auto_legacy_hash = hash;
++	set = native_guamp_ls_auto_fnv(set, (const uint8_t *)entries, sizeof(*entries));
++	return set ? set : 1;
+ }
+ /* The deletion of guamp-ls-rebuild (same containers, same name pattern), without its cycle marker. */
+ static int
+@@ -9484,7 +9501,17 @@ native_guamp_ls_auto(proc_t p, user_addr_t scratch)
+ 	if (!native_guamp_ls_auto_entries && strlen(old) == 35) {
+ 		memcpy(key + 18, old + 18, 18);	/* no addon this boot: the apps written before are unchanged */
+ 	}
+-	int rebuild = mode == 2 || strcmp(old, key);
++	int legacy = 0;
++	if (strcmp(old, key) && native_guamp_ls_auto_legacy_hash && strlen(old) == 35) {
++		char was[48];
++		memcpy(was, key, sizeof(was));
++		snprintf(was + 18, sizeof(was) - 18, "%016llx\n", (unsigned long long)native_guamp_ls_auto_legacy_hash);
++		legacy = !strcmp(old, was);	/* key of an older kernel, same apps in the same order: switch to the new form, no rebuild */
++		if (legacy) {
++			printf("guamp-ls-auto: stored key %.34s is the order-dependent form of these apps: rewritten, no rebuild\n", old);
++		}
++	}
++	int rebuild = mode == 2 || (strcmp(old, key) && !legacy);
+ 	int already = native_guamp_ls_rebuild_deleted > 0;	/* guamp-ls-rebuild=N deleted the stores in this boot */
+ 	if (mode == 3 && !rebuild && !already) {
+ 		rebuild = native_guamp_lsv_decide(p, scratch);	/* guamp-ls-auto=3: rebuild only when the stores lost the view apps */
