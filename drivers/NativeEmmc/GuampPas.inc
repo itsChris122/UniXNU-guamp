@@ -48,6 +48,28 @@ struct Deferred {
   void (*report)(void *)=nullptr;   // right after the load loop, once every deferred segment was hashed (log only)
 };
 
+// fw::verify split around boot() for a caller that starts the peripheral (the ADSP, GuampAdsp.inc): here the metadata,
+// the hash table and every segment the load does not read (segment 0, segments outside the plan); the plan's segments
+// with file bytes (hashedWhileLoading) go to boot() through *d (res->deferred counts them). image: parsed, hash table
+// set, hashSeg inside mdt. After boot(), finishLoadCheck(): res then holds exactly what fw::verify alone returns.
+inline void checkBeforeLoad(ext4::Fs &fs,const Peripheral &p,uint8_t *mdt,uint8_t *chunk,uint32_t chunkBytes,
+                            fw::Result *res,fw::Image *image,Deferred *d) {
+  fw::verify(fs,p.dir,p.firmware,mdt,chunk,chunkBytes,res,~1ull,image);
+  d->image=image;d->res=res;d->mask=0;d->checked=0;
+  if(res->error)return;
+  d->mask=hashedWhileLoading(*image);
+  res->deferred=0;
+  for(uint32_t i=1;i<64;++i)if(d->mask>>i&1)res->deferred++;
+  fw::verifyRest(fs,p.dir,p.firmware,mdt,chunk,chunkBytes,*image,~1ull&~d->mask,0,res);   // not loaded: now
+}
+// The deferred segments boot() did not hash (it stopped before or during the load), from the disk as fw::verify.
+inline void finishLoadCheck(ext4::Fs &fs,const Peripheral &p,const uint8_t *mdt,uint8_t *chunk,uint32_t chunkBytes,
+                            Deferred *d) {
+  if(d->mask && d->checked!=d->mask)
+    fw::verifyRest(fs,p.dir,p.firmware,mdt,chunk,chunkBytes,*d->image,d->mask,d->checked,d->res);
+  d->checked=d->mask;
+}
+
 inline bool scmOkay(const Peripheral &p,const char *stage,const scm::Result &r) {
   IOLog("%s: PAS %u %s transport %d status %d calls %u resumes %u busy %u\n",
     p.tag,p.id,stage,r.transport,scm::code(r.value),r.calls,r.resumes,r.busy);

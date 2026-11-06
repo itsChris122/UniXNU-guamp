@@ -95,8 +95,9 @@ static bool hookVote(void *,bool on) {if(on){++votesOn;return voteOk;}++votesOff
 static int hookReady(void *) {++readyCalls;return readyState;}
 static void hookFailure(void *) {++failures;}
 static int diskFd;
+static uint64_t diskBytes;   // bytes read from the image (one read of the loaded firmware vs two)
 static bool readDisk(void *,uint64_t sector,uint32_t count,uint8_t *out) {
-  assert(count && count<=128);
+  assert(count && count<=128);diskBytes+=count*512ull;
   return pread(diskFd,out,count*512,static_cast<off_t>(sector*512))==static_cast<ssize_t>(count*512);
 }
 static void reset() {
@@ -172,6 +173,75 @@ static unsigned exercise(ext4::Fs &fs,const pas::Peripheral &p,std::vector<uint8
   verifyLoaded();assert(logs.find("left untouched")!=std::string::npos);
   return expected.count;
 }
+// Check folded into the load (pas::checkBeforeLoad + pas::Deferred + pas::finishLoadCheck, as GuampAdsp.inc mode 1):
+// the loaded segments are read once and hashed while copied; the result equals fw::verify alone in every path.
+static unsigned reports;
+static void reported(void *) {++reports;}
+static void folded(ext4::Fs &fs,const pas::Peripheral &p,std::vector<uint8_t> &mdt,std::vector<uint8_t> &chunk) {
+  peripheral=p;
+  fw::Result full;
+  diskBytes=0;fw::verify(fs,p.dir,p.firmware,mdt.data(),chunk.data(),chunk.size(),&full);
+  const uint64_t verifyBytes=diskBytes;
+  assert(!full.error && !full.failed && full.verified);
+  char path[128];ext4::Inode ino;
+  assert(fw::joinName(path,sizeof(path),p.dir,p.firmware,".mdt",-1) && !fs.lookupPath(path,&ino));
+  pas::Hooks hooks;hooks.stopped=hookStopped;hooks.vote=hookVote;hooks.awaitReady=hookReady;hooks.failure=hookFailure;
+  scm::Transport t={guampScmInstruction,[](void *,uint32_t){},nullptr,true};
+  static fw::Image img;fw::Result r;pas::Deferred d;
+  auto same=[&](const fw::Result &x){return !x.error && x.verified==full.verified && x.failed==full.failed &&
+    x.bytes==full.bytes && x.empty==full.empty && x.failedMask==full.failedMask && x.segments==full.segments &&
+    x.mbnVersion==full.mbnVersion;};
+  auto prepass=[&]{
+    pas::checkBeforeLoad(fs,p,mdt.data(),chunk.data(),chunk.size(),&r,&img,&d);
+    assert(!r.error && d.mask && !d.checked && d.image==&img && d.res==&r);d.ctx=nullptr;d.report=reported;reports=0;
+    unsigned withBytes=0;for(unsigned i=0;i<expected.count;i++)withBytes+=expected.segments[i].filesz && expected.segments[i].index;
+    assert(r.deferred==withBytes && r.verified+r.failed+r.deferred==full.verified);
+    // what boot() will read is exactly the plan's segments with file bytes
+    pas::Plan q;assert(!pas::plan(p,img,true,pas::metadataBytes(img,ino.size),xnuBase,xnuBytes,&q));
+    uint64_t planMask=0;for(unsigned i=0;i<q.count;i++)if(q.segments[i].filesz && q.segments[i].index)planMask|=1ull<<q.segments[i].index;
+    assert(planMask==d.mask);};
+  auto run=[&](unsigned mode,const fw::Image &check){d.image=const_cast<fw::Image *>(&check);
+    return pas::boot(p,hooks,t,fs,mdt.data(),ino.size,img,chunk.data(),chunk.size(),!r.failed&&r.verified+r.deferred>0,mode,
+                     xnuBase,xnuBytes,&d);};
+  // success: same counters as fw::verify, report once right after the load, the firmware read once
+  reset();diskBytes=0;prepass();const uint64_t before=diskBytes;
+  assert(run(1,img)==pas::kUp && d.checked==d.mask && reports==1 && same(r) && authenticates==1 && !shutdowns);
+  verifyLoaded();
+  pas::finishLoadCheck(fs,p,mdt.data(),chunk.data(),chunk.size(),&d);assert(same(r));   // nothing left: no change
+  const uint64_t once=diskBytes;
+  reset();diskBytes=0;{fw::Result twice;fw::verify(fs,p.dir,p.firmware,mdt.data(),chunk.data(),chunk.size(),&twice);}
+  assert(pas::boot(p,hooks,t,fs,mdt.data(),ino.size,img,chunk.data(),chunk.size(),true,1,xnuBase,xnuBytes)==pas::kUp);
+  const uint64_t two=diskBytes;
+  printf("%s folded check: %llu bytes read instead of %llu (check %llu + load %llu), %llu before the load\n",p.tag,
+         (unsigned long long)once,(unsigned long long)two,(unsigned long long)verifyBytes,(unsigned long long)(two-verifyBytes),
+         (unsigned long long)before);
+  uint64_t deferredBytes=0;for(uint32_t i=1;i<64;i++)if(d.mask>>i&1)deferredBytes+=img.seg[i].filesz;
+  assert(two-once>=deferredBytes);   // at least the bytes hashed while loading are no longer read twice
+  // a loaded segment that does not match its table entry (a copy of the table: the metadata sent to TrustZone stays
+  // the original): no AUTH_AND_RESET, SHUTDOWN, region cleared, the later segments still hashed for the report
+  std::vector<uint8_t> table;fw::Image bad;
+  auto corrupt=[&](uint32_t seg){bad=img;table.assign(img.hashSeg,img.hashSeg+img.hashSegBytes);
+    table[img.tableOffset+seg*fw::kHashBytes+5]^=0x5a;bad.hashSeg=table.data();};
+  uint32_t last=0,first=0;for(uint32_t i=1;i<64;i++)if(d.mask>>i&1){last=i;if(!first)first=i;}
+  for(uint32_t seg:{last,first}) {
+    reset();prepass();corrupt(seg);
+    assert(run(1,bad)==pas::kErrLoad && !authenticates && shutdowns==1 && d.checked==d.mask && reports==1);
+    assert(r.failed==1 && r.failedMask==(1ull<<seg) && r.verified==full.verified-1 && r.bytes==full.bytes);
+    assert(logs.find("does not match its hash table entry")!=std::string::npos);
+    assert(allZero(expected.first,expected.span));
+  }
+  // stopped before the load (live peer, vote refused, INIT_IMAGE refused): nothing hashed there, finished from the disk
+  reset();stopped=false;prepass();assert(run(1,img)==pas::kErrPeer && !d.checked && !reports && !maps);
+  pas::finishLoadCheck(fs,p,mdt.data(),chunk.data(),chunk.size(),&d);assert(same(r) && d.checked==d.mask);
+  reset();voteOk=false;prepass();assert(run(1,img)==pas::kErrVote && !d.checked && !reports);
+  pas::finishLoadCheck(fs,p,mdt.data(),chunk.data(),chunk.size(),&d);assert(same(r));
+  reset();denyInit=true;prepass();assert(run(1,img)==pas::kErrInit && !d.checked && !reports);
+  pas::finishLoadCheck(fs,p,mdt.data(),chunk.data(),chunk.size(),&d);assert(same(r));
+  // queries only cannot take a deferred check: refused before any SCM call
+  reset();prepass();assert(run(2,img)==pas::kErrPlace && !discovers && !maps);
+  // TrustZone refuses after a clean load: report once, counters complete
+  reset();denyAuth=true;prepass();assert(run(1,img)==pas::kErrAuth && reports==1 && same(r) && shutdowns==1);
+}
 int main(int argc,char **argv) {
   assert(argc==3);diskFd=open(argv[1],O_RDONLY);assert(diskFd>=0);extracted=argv[2];
   struct stat st;assert(!fstat(diskFd,&st));std::vector<uint8_t> scratch(ext4::kScratchBytes),mdt(fw::kMdtMax),chunk(65536);
@@ -180,6 +250,7 @@ int main(int argc,char **argv) {
   const pas::Peripheral adsp={"GuampAdsp",1,0x52200000ULL,0x1c00000ULL,"/image","adsp"};
   unsigned a=exercise(fs,adsp,mdt,chunk,0x52200000u,0x1c00000u);
   assert(firmware.hashWhere==1 && expected.relocatable && metadata.size()==9580);
+  folded(fs,adsp,mdt,chunk);
   // Same loader, modem parameters (the generalisation of GuampModem.inc): pas-id 4, modem_region 0x4ab00000 0x6900000
   const pas::Peripheral modem={"GuampModem",4,0x4ab00000ULL,0x6900000ULL,"/image","modem"};
   unsigned m=exercise(fs,modem,mdt,chunk,0,0);
@@ -188,6 +259,7 @@ int main(int argc,char **argv) {
   const pas::Peripheral zap={"GuampAdreno: zap",13,0x53e15000ULL,0x2000ULL,"/image","a610_zap"};
   unsigned z=exercise(fs,zap,mdt,chunk,0x53e15000u,0x1000u);
   assert(expected.relocatable && expected.count==1 && expected.segments[0].index==2 && metadata.size()==6860);
+  folded(fs,zap,mdt,chunk);
   {pas::Hooks none;   // as GuampGpuZap.inc: no peer check, no votes, no ready signal
    scm::Transport t={guampScmInstruction,[](void *,uint32_t){},nullptr,true};
    reset();votesOn=1;   // the monitor checks the order (map, vote, INIT_IMAGE): no vote hook here

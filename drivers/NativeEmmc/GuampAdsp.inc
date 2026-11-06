@@ -5,6 +5,8 @@
 //                  placement only: nothing mapped, written or started
 //   guamp-adsp=1   the authenticated start of GuampPas.inc (PAS INIT_IMAGE, MEM_SETUP, load, AUTH_AND_RESET),
 //                  then the ready signal over SMP2P; PAS SHUTDOWN and cleanup on any failure
+//   guamp-adsp-fw-once=0  with guamp-adsp=1: check the whole firmware before the start and read it again in the load
+//                  (as up to fin55); default 1 = the loaded segments are read once, hashed while copied (pas::Deferred)
 //   guamp-adsp-delay=<s>  start later (0..600 s, default 0), so the USB mirror (connected ~4 s after boot) sees every
 //                  GuampAdsp line (as guamp-gpu-delay / guamp-wifi-delay); the thread logs the delay it honoured
 //   guamp-adsp-ipc=1|2|3|4  with guamp-adsp=1 only, audio phase 2 (GuampAdspIpc.inc): 1 apps SMP2P item 429 before
@@ -229,6 +231,25 @@ const char *firmwareName() {
   return variant ? "adsp2" : "adsp";
 }
 
+// The firmware line, same text whether the check runs before boot() or is folded into the load (FirmwareCheck)
+void firmwareLine(const pas::Peripheral &p, const char *part, const fw::Result &r) {
+  IOLog("GuampAdsp: %s/%s firmware on %s: error %d, %u verified / %u failed / %u empty of %u, MBN v%u, %llu bytes, mask %llx\n",
+        p.dir, p.firmware, part, r.error, r.verified, r.failed, r.empty, r.segments, r.mbnVersion, r.bytes, r.failedMask);
+}
+// Mode 1: the 15 MB of the loaded segments are read once (fin53: 546 ms of check, then the same bytes again in the
+// 770 ms load). pas::boot hashes them while it copies them; the line above is printed right after the load loop.
+struct FirmwareCheck {
+  const pas::Peripheral *p;
+  const char *part;
+  fw::Result *res;
+  bool done;
+};
+void firmwareLoaded(void *ctx) {
+  auto &c = *static_cast<FirmwareCheck *>(ctx);
+  firmwareLine(*c.p, c.part, *c.res);
+  c.done = true;
+}
+
 void run(unsigned mode) {
   IOLog("GuampAdsp: mode %u, ipc %u, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in %u out %u, reason %u\n",
         mode, adspipc::gLevel, kPasId, kBase, kBytes, guamp_phys_base, guamp_phys_size, kSmp2pIn, kSmp2pOut, kReason);
@@ -255,24 +276,43 @@ void run(unsigned mode) {
     if (r) {
       IOLog("GuampAdsp: %s ext4 mount: %s\n", part, ext4::errorName(r));
     } else {
-      fw::verify(*fs, peripheral.dir, peripheral.firmware, mdt, chunk, wifiprep::kChunkBytes, res);
-      IOLog("GuampAdsp: %s/%s firmware on %s: error %d, %u verified / %u failed / %u empty of %u, MBN v%u, %llu bytes, mask %llx\n",
-            peripheral.dir, peripheral.firmware, part, res->error, res->verified, res->failed, res->empty, res->segments,
-            res->mbnVersion, res->bytes, res->failedMask);
-      const bool verified = !res->error && !res->failed && res->verified > 0;
+      // Mode 1 (start): metadata, hash table and the segments the load does not read checked here, the loaded ones
+      // by pas::boot while it copies them. Mode 2 (queries) or guamp-adsp-fw-once=0: the whole check first, as before.
+      unsigned once = 1;
+      PE_parse_boot_argn("guamp-adsp-fw-once", &once, sizeof(once));
+      pas::Deferred deferred;
+      FirmwareCheck check = {&peripheral, part, res, false};
+      if (mode == 1 && once) {
+        pas::checkBeforeLoad(*fs, peripheral, mdt, chunk, wifiprep::kChunkBytes, res, image, &deferred);
+        if (deferred.mask) {
+          IOLog("GuampAdsp: %s/%s firmware on %s: %u verified / %u failed before the load, %u hashed while loading, mask %llx\n",
+                peripheral.dir, peripheral.firmware, part, res->verified, res->failed, res->deferred, res->failedMask);
+          deferred.ctx = &check;
+          deferred.report = firmwareLoaded;
+        }
+      } else {
+        fw::verify(*fs, peripheral.dir, peripheral.firmware, mdt, chunk, wifiprep::kChunkBytes, res);
+      }
+      if (!deferred.mask) { firmwareLine(peripheral, part, *res); check.done = true; }
+      const bool verified = !res->error && !res->failed && res->verified + res->deferred > 0;
       char path[128];
       ext4::Inode inode;
       int parsed = fw::joinName(path, sizeof(path), peripheral.dir, peripheral.firmware, ".mdt", -1) ? fs->lookupPath(path, &inode)
                                                                                                     : fw::kErrFormat;
-      if (!parsed && inode.size <= fw::kMdtMax / 2) parsed = fw::parse(mdt, static_cast<uint32_t>(inode.size), image);
-      else if (!parsed) parsed = fw::kErrTooBig;
-      if (!parsed && image->hashWhere == 3) {
+      if (!parsed && inode.size > fw::kMdtMax / 2) parsed = fw::kErrTooBig;
+      else if (!parsed && !deferred.mask) parsed = fw::parse(mdt, static_cast<uint32_t>(inode.size), image);
+      // (deferred: image is the one fw::verify parsed from these same .mdt bytes, hash table already set)
+      if (!parsed && !deferred.mask && image->hashWhere == 3) {
         const uint32_t hashAt = (static_cast<uint32_t>(inode.size) + 63) & ~63u;   // where fw::verify read it
         if (image->hashSegBytes > fw::kMdtMax - hashAt) parsed = fw::kErrFormat;
         else image->hashSeg = mdt + hashAt;
       }
       if (parsed) {
         IOLog("GuampAdsp: metadata not usable (%d); nothing started\n", parsed);
+        if (!check.done) {
+          pas::finishLoadCheck(*fs, peripheral, mdt, chunk, wifiprep::kChunkBytes, &deferred);
+          firmwareLine(peripheral, part, *res);
+        }
       } else {
         scm::Transport transport = {guampScmInstruction, [](void *, uint32_t ms) { IOSleep(ms); }, nullptr, true};
         pas::Hooks hooks;
@@ -282,7 +322,14 @@ void run(unsigned mode) {
         hooks.failure = failure;
         if (adspipc::gLevel) hooks.prepare = adspipc::prepare;
         const int rc = pas::boot(peripheral, hooks, transport, *fs, mdt, static_cast<uint32_t>(inode.size), *image, chunk,
-                                 wifiprep::kChunkBytes, verified, mode, guamp_phys_base, guamp_phys_size);
+                                 wifiprep::kChunkBytes, verified, mode, guamp_phys_base, guamp_phys_size,
+                                 deferred.mask ? &deferred : nullptr);
+        if (!check.done) {   // stopped before the load ended (live peer, SCM, votes, TrustZone): finish from the disk
+          pas::finishLoadCheck(*fs, peripheral, mdt, chunk, wifiprep::kChunkBytes, &deferred);
+          firmwareLine(peripheral, part, *res);
+          check.done = true;
+        }
+        if (deferred.mask && rc == pas::kErrLoad && res->failed) IOLog("GuampAdsp: firmware failed its hash check during the load: start refused\n");
         IOLog("GuampAdsp: RESULT %d (%s)\n", rc,
               rc == pas::kUp ? "ADSP up" : rc == pas::kQueried ? "queries only" : "not started, cleaned up");
         if (mode == 1) glinkReport("after start");
