@@ -10,13 +10,19 @@ both with kIOReturnUnsupported-like 0xe00002c7, so every keychain write fails; b
 With guamp-aks-wrap=1 the two selectors answer: the blob is an 8-byte tag followed by the key (the size of an RFC 3394 wrap). It
 is NOT encryption and protects nothing, like the rest of this stand-in (the Data volume has no data protection either). Default on
 since 28/10 (package/KeyStoreProbe.cpp); with guamp-aks-wrap=0 the selectors fail exactly as before.
+
+guamp-aks-keybag=1 (default 0, 07/11): the user client first asks native_aks_keybag_method() (package/KeyStoreProbe.cpp +
+package/GuampKeybagCore.h): a real software keybag in /private/var/keybags/systembag.kb, RFC 3394 wrap per class,
+entitlement check (rights taken at open), keybagd --init flow (aks_get_system NotFound -> load/set_system/unload).
+Keys wrapped by the GUAMPAKS stand-in still unwrap (guamp-aks-legacy=1); with the keybag off, keys wrapped during a
+keybag boot still unwrap from systembag.kb (read only). See analisi/KEYBAG-REALE-20261107.md.
 """
 from pathlib import Path
 import hashlib
 root=Path(__file__).resolve().parents[1]
 path=root/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp'
 PRISTINE='273b030afee897e48c30bc917c4df8a9c4d94a189d073ef80c0e0a15caef82ee'
-FINAL_RECORDED='a923387d6846fd565f06d581b5f3861e732d5b0195adecaf3e279ef8391308d8'
+FINAL_RECORDED='886943cfbd7187a772302e0c09d60d3f2d82c72abd59e8183970ae0b18191692'
 raw=path.read_bytes();digest=hashlib.sha256(raw).hexdigest()
 if digest==FINAL_RECORDED:
     print('GuampAks: pinned key-wrap variant already prepared')
@@ -103,6 +109,22 @@ edits=[
   '                  selector == 15 ? " (aks_change_secret: passcode not set, keybag unchanged)" : "");\n'
   '        }\n'
   '        native_aks_call(selector, (int32_t)rc);\n'),
+ ('extern "C" bool native_aks_wrap_enabled(void);\n',
+  'extern "C" bool native_aks_wrap_enabled(void);\n'
+  '// guamp-aks-keybag=1 (default 0): a real software keybag (package/GuampKeybagCore.h, package/KeyStoreProbe.cpp) answers\n'
+  '// selectors 3/4/5/6/10/11/14/23 before this stand-in; the client rights come from its entitlements at open. With it off,\n'
+  '// only an unwrap of a key wrapped during a keybag boot (read-only, from systembag.kb), so a rollback loses nothing.\n'
+  'extern "C" uint32_t native_aks_client_rights(task_t task);\n'
+  'extern "C" bool native_aks_keybag_method(uint32_t selector, IOExternalMethodArguments *args, uint32_t rights, IOReturn *result);\n'),
+ ('    OSDeclareDefaultStructors(AppleKeyStoreUserClient)\npublic:\n',
+  '    OSDeclareDefaultStructors(AppleKeyStoreUserClient)\npublic:\n'
+  '    uint32_t keybagRights = 0;   // guamp-aks-keybag: 1 = com.apple.keystore.device (keybagd), 2 = access-keychain-keys (securityd)\n'),
+ ('        else switch (selector) {\n',
+  '        else if (native_aks_keybag_method(selector, args, keybagRights, &rc)) {}\n'
+  '        else switch (selector) {\n'),
+ ('        if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }\n',
+  '        if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }\n'
+  '        client->keybagRights = native_aks_client_rights(task);\n'),
  ('extern "C" uint32_t native_aks_lock_state(void);\n',
   'extern "C" uint32_t native_aks_lock_state(void);\nextern "C" uint32_t native_aks_state_flags(void);   // guamp-aks-nopass (scripts/guamp-aks-variant.py)\n'),
  ('constexpr uint64_t kUnlockedSinceBoot = 4;\nconstexpr uint32_t kStateFlags = 4;\n',
