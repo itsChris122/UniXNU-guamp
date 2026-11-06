@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,424 @@
+@@ -650,6 +650,435 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -97,6 +97,13 @@
 + * fd 1/2, sets OS_ACTIVITY_DT_MODE too, clears guamp-oslog-mode-clear (default 0xd00) from the mode word, and logs
 + * the gates ("guamp oslog: libtrace state name[pid]: ... mode, atm (commpage, whole system), prefs (process_prefs.0),
 + * os_trace, buffers"), so the next log says which one is closed.
++ * 07/11 (fin56: the state line shows every gate open: mode 0x1, atm 0, buffers yes): the cause was in the tee itself.
++ * writev_uio passes a uio made by uio_create whose uio_iovcnt is still 0 when writev_internal runs (fp_writev counts
++ * the iovecs later, uio_calculateresid_user), so the tee copied nothing from any writev; the lines seen so far were
++ * all plain write() calls (objc, AssertMacros, fprintf), while _os_log_impl_mirror_to_stderr always writes with
++ * writev (__os_trace_writev). The tee now calls uio_calculateresid_user first. The environment of guamp_oslog_exec_env
++ * already reached libtrace (fin55 "env DT_MODE yes"), so the poke is not needed: guamp-oslog-poke is now 0 by
++ * default (=1 brings back the bytes, the mode word and the state line).
 + * The tee also joins the iovecs of one writev (the mirror writes header, message and newline separately).
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
@@ -115,7 +122,7 @@
 +static int guamp_oslog_sugid = 1;
 +static SInt32 guamp_oslog_sugid_said;
 +static SInt32 guamp_oslog_amfi_said;
-+static int guamp_oslog_poke_on = 1;
++static int guamp_oslog_poke_on = 0;
 +static SInt32 guamp_oslog_poke_said;
 +static SInt32 guamp_oslog_state_said;
 +static int guamp_oslog_mode_clear = 0xd00;
@@ -352,7 +359,7 @@
 +		return;
 +	}
 +	/* the state the gates of os_log_type_enabled / flatten_and_send read: on every change, and on the first writes */
-+	if (changed || OSAddAtomic(1, &guamp_oslog_state_said) < 12) {
++	if (changed || OSAddAtomic(1, &guamp_oslog_state_said) < 4) {
 +		if (OSAddAtomic(1, &guamp_oslog_poke_said) >= 40) {
 +			return;
 +		}
@@ -392,11 +399,15 @@
 +{
 +	char buf[512];
 +	size_t used = 0;
-+	int iovcnt = uio_iovcnt(uio);
++	int iovcnt;
 +	guamp_oslog_poke(p, 1);
-+	if (!uio_isuserspace(uio)) {
++	/* 07/11: writev() hands over a uio whose iovec count is still 0 (uio_create; fp_writev sets it only later with
++	 * uio_calculateresid_user), so until now only write() (one iovec, uio_addiov) reached the log, never the os_log
++	 * mirror, which uses writev. This is the same call fp_writev makes next, on iovecs not touched yet. */
++	if (!uio_isuserspace(uio) || uio_calculateresid_user(uio) != 0) {
 +		return;
 +	}
++	iovcnt = uio_iovcnt(uio);
 +	/* one writev = one buffer: the os_log mirror writes header, message and newline as three iovecs */
 +	for (int i = 0; i < iovcnt && i < 8 && used < sizeof(buf) - 1; i++) {
 +		user_addr_t base = 0;
@@ -461,7 +472,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +1084,9 @@
+@@ -666,6 +1095,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
