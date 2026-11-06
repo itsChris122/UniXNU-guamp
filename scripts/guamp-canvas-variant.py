@@ -27,7 +27,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '490ca6b5f6d20b3e3caa6e91157c01bab21d03ebc0664566bde0a0a207629862'
+PATCHED_SHA256 = '66848adc5ad34c4d173f6f181a01f9ca255194aa9a930d256bf7d6074c7f0f85'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1838,10 +1838,15 @@ EDITS.append(('composeDumpRows(n,bytes,0x000,0x160);composeDumpRows(n,bytes,0x1c
 EDITS.append(('    uint32_t composeGen[4]={};uint64_t composeSerial=0;\n',
               '    uint32_t composeGen[4]={};uint64_t composeSerial=0;\n'
               '    // Section 19 (guamp-compose-diff, default 1): band hashes of the source each slot shows and the generation they are of.\n'
-              '    GuampComposeHashes composeHashes[4]={};uint32_t composeHashGen[4]={};int composeDiffWanted=-1;\n'
+              '    // (4 x ~2 KB: allocated on first use, so that the class stays under KALLOC_SAFE_ALLOC_SIZE for kalloc_type)\n'
+'    GuampComposeHashes *composeHashes=nullptr;uint32_t composeHashGen[4]={};int composeDiffWanted=-1;\n'
               '    bool composeDiffOn() {\n'
               '        if(composeDiffWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose-diff",&v,sizeof v);composeDiffWanted=v!=0;}\n'
-              '        return composeDiffWanted==1;\n'
+              '        if(composeDiffWanted==1 && !composeHashes) {\n'
+'            composeHashes=static_cast<GuampComposeHashes *>(IOMalloc(4*sizeof(GuampComposeHashes)));\n'
+'            if(composeHashes)__builtin_memset(composeHashes,0,4*sizeof(GuampComposeHashes));\n'
+'        }\n'
+'        return composeDiffWanted==1 && composeHashes;\n'
               '    }\n'))
 EDITS.append(('''        int64_t dirty[4]={0,0,0,0};
         if(full) {dirty[2]=frame.width;dirty[3]=frame.height;}''', '''        // Section 19: every layer of a new generation is hashed (also on whole redraws: the next frame compares with it); the
@@ -1895,7 +1900,7 @@ EDITS.append(('''            IOMemoryMap *map=guampSourceMap(src.memory,src.allo
                 continue;
             }'''))
 EDITS.append(('            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;continue;}\n',
-              '            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;if(src.slot<4)composeHashes[src.slot].valid=false;continue;}\n'))
+              '            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;if(src.slot<4 && composeHashes)composeHashes[src.slot].valid=false;continue;}\n'))
 EDITS.append(('''        else {guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);}
         return ok;''', '''        else {guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);}
         for(auto &m: hashMaps)OSSafeReleaseNULL(m);   // section 19: layers off the changed part
