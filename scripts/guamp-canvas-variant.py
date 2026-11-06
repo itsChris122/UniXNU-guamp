@@ -25,7 +25,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '7f0b7bd9e9c20c49486bea9616b96282f8d419de34277ee6462b8600a9b7a9a8'
+PATCHED_SHA256 = '8abab20f10c1c001192332c07ccac6ece89ce39b07d1b5db6e2383691d3cb1a8'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -306,11 +306,15 @@ EDITS.append(('extern "C" {volatile uint32_t guamp_canvas_state[4];volatile uint
               '// Section 10 counters: [0] frames started, [1] coalesced (replaced before they started), [2] stale-skipped (a newer frame was\n'
               '// queued when the GPU wait ended), [3] GPU frames, [4] CPU frames, [5] in-thread refreshes, [6] trailing re-shows, [7] GPU\n'
               '// failures, [8] CPU copy failures, [9] latest-frame-wins on.\n'
+              '// guamp-copy-wake-keep / guamp-copy-stale-max (section 10): superseded frames copied anyway, [0] while a display-on holds\n'
+              '// the LEDs at 0 (drivers/NativeEmmc guamp_backlight_wake_dark), [1] after guamp-copy-stale-max drops in a row.\n'
+              'volatile uint64_t guamp_copy_kept[2];\n'
+              '__attribute__((weak)) int guamp_backlight_wake_dark(void){return 0;}\n'
               'volatile uint64_t guamp_copy_latest[10];}'))
 EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
     // guamp copy options (scripts/guamp-canvas-variant.py section 9), read once.
     int copyOptions=-1;bool fastCopy=false,fastFlush=true,mapCache=false;unsigned asyncMode=0,probeBudget=0,gpuWaitMs=500;   // guamp-copy-gpu-wait default 500 (verified 28/10)
-    bool latestWanted=false,gpuScaled=true;unsigned trailMs=0;
+    bool latestWanted=false,gpuScaled=true,wakeKeep=true;unsigned trailMs=0,staleMax=2,staleRun=0;
     void readCopyOptions() {
         if(copyOptions>=0)return;
         unsigned v=1;PE_parse_boot_argn("guamp-fast-copy",&v,sizeof v);fastCopy=v==1;   // default on (owner 28/10)
@@ -330,6 +334,9 @@ EDITS.append(('    GuampScaler scaler={};\n', r'''    GuampScaler scaler={};
         trailMs=25;PE_parse_boot_argn("guamp-copy-trail",&trailMs,sizeof trailMs);if(trailMs>200)trailMs=200;
         v=1;PE_parse_boot_argn("guamp-gpu-scaled",&v,sizeof v);gpuScaled=v!=0;
         guamp_copy_latest[9]=latestWanted?1:0;
+        // guamp-copy-wake-keep (default 1) / guamp-copy-stale-max (default 2, 0 = always drop, as before 06/11): see latestCopy.
+        v=1;PE_parse_boot_argn("guamp-copy-wake-keep",&v,sizeof v);wakeKeep=v!=0;
+        staleMax=2;PE_parse_boot_argn("guamp-copy-stale-max",&staleMax,sizeof staleMax);if(staleMax>16)staleMax=16;
         copyOptions=1;
         guamp_copy_split[14]=(fastCopy?1:0)|(fastFlush?2:0)|(mapCache?4:0)|((uint64_t)asyncMode<<3)|32|(gpuWaitMs?64:0)|
                              (latestWanted?128:0)|(gpuScaled?256:0);
@@ -630,7 +637,17 @@ EDITS.append(('    void freeAsync() {\n', r'''    // Section 10: latest-frame-wi
             }
         } else if(frame.memory) {
             guampGpuWait();
-            if(latest.superseded())result=1;
+            // fin51 (live-20261106-014007): after a standby every GPU wait took 60-130 ms while the render server swapped every
+            // ~50 ms, so each finished frame was dropped for a newer, unfinished one (stale-skipped 6 of 8, 2 copied in 1 s) and the
+            // display-on gate ran out (500 ms) before any frame reached the panel: the wallpaper came late. A superseded frame is
+            // still copied while the LEDs are held at 0 (nobody sees it, and it is the newest finished picture: guamp-copy-wake-keep)
+            // and after guamp-copy-stale-max drops in a row (no starvation behind a GPU slower than the swaps).
+            if(latest.superseded()) {
+                if(wakeKeep && guamp_backlight_wake_dark())guamp_copy_kept[0]=guamp_copy_kept[0]+1;
+                else if(staleMax && staleRun>=staleMax)guamp_copy_kept[1]=guamp_copy_kept[1]+1;
+                else result=1;
+            }
+            if(result==1){}
             else if(latestCopyOnce(frame)) {
                 result=0;
                 // The GPU took more work since the wait: perhaps this frame's own rendering, submitted after its swap. Wait for it and
@@ -645,6 +662,7 @@ EDITS.append(('    void freeAsync() {\n', r'''    // Section 10: latest-frame-wi
             }
         }
         shownMark=mark;
+        if(result==1)staleRun=staleRun+1;else if(!result)staleRun=0;
         IOWorkLoop *loop=getWorkLoop();
         auto action=[](OSObject *target,void *value,void *,void *,void *)->IOReturn {
             static_cast<NativeLegacyDisplay *>(target)->latestCpuDone((int)(uintptr_t)value);return kIOReturnSuccess;

@@ -613,6 +613,14 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
   return result;
 }
 
+// guamp-copy-wake-keep (variant section 10): 1 while a display-on holds the LEDs at 0 waiting for the first lit frame, so the copy
+// thread copies a finished frame even when a newer one is queued (it cannot be seen, and it may be the frame that opens the gate).
+extern "C" int guamp_backlight_wake_dark(void)
+{
+  return __atomic_load_n(&guamp_backlight::gWakeGate.waiting, __ATOMIC_ACQUIRE) &&
+         !__atomic_load_n(&guamp_backlight::gWakeGate.lit, __ATOMIC_ACQUIRE) ? 1 : 0;
+}
+
 // Section 15 of the variant (guamp-compose-keep): the buffer the panel shows now (the second buffer while flipped), so a composed
 // frame with an undrawable layer can start from the screen. 1 = va/stride set; 0 = no flip (the variant reads the GOP frame).
 extern "C" int guamp_scanout_shown(const volatile unsigned char **va, uint64_t *stride)

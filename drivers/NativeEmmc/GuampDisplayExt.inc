@@ -72,6 +72,7 @@ extern "C" volatile uint64_t guamp_copy_gpu_wait[8];
 // Section 10 of the variant, latest-frame-wins: [0] frames started, [1] coalesced, [2] stale-skipped, [3] GPU frames, [4] CPU frames,
 // [5] in-thread refreshes, [6] trailing re-shows, [7] GPU failures, [8] CPU copy failures, [9] on.
 extern "C" volatile uint64_t guamp_copy_latest[10];
+extern "C" volatile uint64_t guamp_copy_kept[2];   // variant section 10: superseded frames copied anyway (dark wake, stale run)
 // Section 12, software composition of multi-layer swaps: [0] composed swaps accepted, [1] frames handed over, [2] frames composed,
 // [3] failures, [4] BGRA layers drawn, [5] 4:2:0 layers drawn, [6]-[8] layers skipped (format, transform, geometry), [9] last skipped
 // format, [10] compose ticks, [11] map failures, [12] swaps refused by the composition too, [13] background fills, [14] most layers,
@@ -265,16 +266,18 @@ static void copyLog()
   const uint64_t waited = (waits - lastWaits) + (timeouts - lastTimeouts);
   // Latest-frame-wins (variant section 10), since the previous report: frames started, coalesced (replaced before they started),
   // stale-skipped (a newer frame queued during the GPU wait), shown by the GPU / the CPU, refreshes, trailing re-shows, failures.
-  char latest[200] = "";
+  char latest[256] = "";
   {
-    static uint64_t last[9] = {};
-    uint64_t now[9];
+    static uint64_t last[11] = {};
+    uint64_t now[11];
     for (unsigned i = 0; i < 9; i++) now[i] = guamp_copy_latest[i];
+    now[9] = guamp_copy_kept[0]; now[10] = guamp_copy_kept[1];
     if (guamp_copy_latest[9])
       snprintf(latest, sizeof(latest), "; latest: frames +%llu coalesced +%llu stale-skipped +%llu gpu +%llu cpu +%llu refresh +%llu "
-               "trail +%llu fail gpu +%llu cpu +%llu", now[0] - last[0], now[1] - last[1], now[2] - last[2], now[3] - last[3],
-               now[4] - last[4], now[5] - last[5], now[6] - last[6], now[7] - last[7], now[8] - last[8]);
-    for (unsigned i = 0; i < 9; i++) last[i] = now[i];
+               "trail +%llu fail gpu +%llu cpu +%llu kept +%llu (dark +%llu)", now[0] - last[0], now[1] - last[1], now[2] - last[2],
+               now[3] - last[3], now[4] - last[4], now[5] - last[5], now[6] - last[6], now[7] - last[7], now[8] - last[8],
+               (now[9] - last[9]) + (now[10] - last[10]), now[9] - last[9]);
+    for (unsigned i = 0; i < 11; i++) last[i] = now[i];
   }
   if (guamp_copy_gpu_wait[6])
     IOLog("GuampDisplay: copy frames %llu (total %llu) mean %llu us max %llu us (all-time max %s) %llu KiB/frame, "
