@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,679 @@
+@@ -7858,6 +7858,687 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -73,6 +73,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 + * while the sensors give no samples; opt-in guamp-slim-locationd=1), routined (abort loop, needs locationd), accessoryupdaterd,
 + * biomesyncd, knowledgeconstructiond, spotlightknowledged (background only), mediaanalysisd (CPU/eMMC/RAM), the stackshot takers. */
 +static int native_guamp_slim_locationd;	/* 07/11: guamp-slim-locationd=1 leaves locationd out of the 29/10 list */
++static int native_guamp_slim_ids;	/* 07/11: guamp-slim-ids=1 leaves identityservicesd out of every slim list (Apple Watch pairing runs over IDS) */
 +#define GUAMP_SLIM_NOW 1
 +#define GUAMP_SLIM_LEGACY 2
 +#define GUAMP_SLIM_BT 4
@@ -193,7 +194,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	size_t used = strlcpy(native_guamp_slim_plist, head, sizeof(native_guamp_slim_plist));
 +	for (size_t i = 0; i < sizeof(native_guamp_slim_jobs) / sizeof(native_guamp_slim_jobs[0]); i++) {
 +		if (!(native_guamp_slim_jobs[i].lists & list) || (native_guamp_slim_jobs[i].lists & skip) ||
-+		    (native_guamp_slim_locationd && (list & GUAMP_SLIM_NOW) && strcmp(native_guamp_slim_jobs[i].label, "com.apple.locationd") == 0)) {
++		    (native_guamp_slim_locationd && (list & GUAMP_SLIM_NOW) && strcmp(native_guamp_slim_jobs[i].label, "com.apple.locationd") == 0) ||
++		    (native_guamp_slim_ids && strcmp(native_guamp_slim_jobs[i].label, "com.apple.identityservicesd") == 0)) {
 +			continue;
 +		}
 +		int n = snprintf(native_guamp_slim_plist + used, sizeof(native_guamp_slim_plist) - used, "\t<key>%s</key>\n\t<%s/>\n",
@@ -503,6 +505,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	unsigned int guamp_slim_locationd = 0;	/* 07/11, opt-in: 1 leaves locationd enabled (29/10 list only) */
 +	PE_parse_boot_argn("guamp-slim-locationd", &guamp_slim_locationd, sizeof(guamp_slim_locationd));
 +	native_guamp_slim_locationd = guamp_slim_locationd == 1;
++	unsigned int guamp_slim_ids = 0;	/* 07/11, opt-in: 1 leaves identityservicesd enabled (Watch: nanoregistryd/Bridge pair over IDS) */
++	PE_parse_boot_argn("guamp-slim-ids", &guamp_slim_ids, sizeof(guamp_slim_ids));
++	native_guamp_slim_ids = guamp_slim_ids == 1;
 +	unsigned int guamp_slim_fast = 0, guamp_slim_commcenter = 0;	/* 29/10, opt-in: GUAMP_SLIM_FAST jobs off, CommCenter on */
 +	PE_parse_boot_argn("guamp-slim-fast", &guamp_slim_fast, sizeof(guamp_slim_fast));
 +	PE_parse_boot_argn("guamp-slim-commcenter", &guamp_slim_commcenter, sizeof(guamp_slim_commcenter));
@@ -562,6 +567,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			if (list == GUAMP_SLIM_NOW) {
 +				printf("guamp-slim: 29/10 list (07/11) leaves CommCenter, fairplayd, Spotlight, newsd, siriknowledged on; locationd %s\n",
 +				    native_guamp_slim_locationd ? "on" : "off");
++			}
++			if (native_guamp_slim_ids) {
++				printf("guamp-slim-ids=1: identityservicesd left enabled (Apple Watch pairing)\n");
 +			}
 +		}
 +		if (guamp_migration_rerun == 1 && strcmp(native_guamp_setup_files[i].path, "/private/var/mobile/Library/Preferences/com.apple.migration.plist") == 0) {
@@ -681,7 +689,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8569,7 @@
+@@ -7983,6 +8577,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
