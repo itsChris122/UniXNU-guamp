@@ -22,8 +22,12 @@ Added (refuses a BASE that already has /arm-io/isp):
                 so no Apple kext attaches (and the H9 kext is not in our kernelcache anyway).
   --j120: also copies the /product/camera properties of J120 that guamp lacks (auto-focus, hdr, burst, video fps...),
           only for the level with a real capture service; not needed for the icon.
-The MobileGestalt cache keeps old answers: boot once with guamp-mg-reset=1, or use a kernel whose guamp-mg-adt-sync
-stamps /arm-io/isp camera-front/camera-rear (branch codex/cam-capability-20261105).
+The MobileGestalt cache keeps old answers: the guamp-mg-adt-sync stamp of the integration kernel (since d699070, e.g.
+fin51 7929aef) includes /arm-io/isp camera-front/camera-rear, so the first boot with this ADT resets the cache by itself;
+otherwise boot once with guamp-mg-reset=1 (guamp-home-reset=2 if the icon is still missing).
+Without guamp-camera-ios=1|2 the capture plug-in and the motorola,guamp CMCapture view are not mounted: CMCapture uses
+its generic iOS/ description (no AVCaptureDevices), as today when Camera is opened from Control Center, so apps that
+look for a camera get an empty device list / nil default device (black preview or their own error message).
 Writes OUTDIR/kernel.macho.adt and OUTDIR/configurazione.json; every existing property is checked unchanged."""
 import argparse
 import importlib.util
@@ -98,10 +102,10 @@ def main():
             'changes': changes, 'only': args.only, 'j120': str(args.j120) if args.j120 else None,
             'mg_keys': {'still-camera': 'front || rear', 'front-facing-camera': '/arm-io/isp camera-front',
                         'rear-facing-camera': '/arm-io/isp camera-rear', 'camera-flash': '/product/camera flash'},
-            'boot_args': 'guamp-mg-reset=1 once (or a kernel with guamp-mg-adt-sync stamping /arm-io/isp, '
-                         'codex/cam-capability-20261105); guamp-home-reset if the icon is still missing',
+            'boot_args': 'none with an integration kernel (guamp-mg-adt-sync stamp has /arm-io/isp since d699070); '
+                         'otherwise guamp-mg-reset=1 once; guamp-home-reset=2 if the icon is still missing',
             'runtime_verified': False,
-            'tool': 'scripts/make-guamp-camera-adt.py (worktree wt-cam-cap, branch codex/cam-capability-20261105)'}
+            'tool': 'scripts/make-guamp-camera-adt.py'}
     (args.outdir / 'configurazione.json').write_text(json.dumps(meta, indent=2) + '\n')
     print('\n'.join(changes))
     print(f'{args.outdir / "kernel.macho.adt"}: {len(base_bytes)} -> {len(result)} bytes, {len(added)} keys added, '
