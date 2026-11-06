@@ -181,6 +181,31 @@ struct Result {                  // plain data
   uint32_t segments, verified, failed, empty, mbnVersion;
   uint64_t bytes;                // bytes hashed (verified and failed)
   uint64_t failedMask;           // bit per program header
+  uint32_t deferred;             // segments left to the loader (verify skip mask): hashed while they are copied
+};
+
+// One segment's SHA-384 check, fed in file order: by verify() below, or by the PAS loader while it copies the same
+// bytes (GuampPas.inc, pas::Deferred: one eMMC read for check and load). Same verdict and counters in both cases.
+struct SegmentCheck {
+  Sha384 sha;
+  const uint8_t *expected = nullptr;
+  bool ok = false;
+  void begin(const Image &img, uint32_t i) {
+    static const uint8_t zero[kHashBytes] = {};
+    expected = img.hashSeg + img.tableOffset + i * kHashBytes;
+    ok = memcmp(expected, zero, kHashBytes) != 0;   // a loaded segment without a hash fails
+    sha.init();
+  }
+  void feed(const uint8_t *p, uint32_t n, Result *res) {
+    sha.update(p, n);
+    res->bytes += n;
+  }
+  void finish(uint32_t i, Result *res) {
+    uint8_t digest[kHashBytes];
+    sha.final(digest);
+    if (ok && !memcmp(digest, expected, kHashBytes)) res->verified++;
+    else { res->failed++; res->failedMask |= 1ull << i; }
+  }
 };
 
 // path/name + suffix into out (bounded)
@@ -196,12 +221,43 @@ inline bool joinName(char *out, uint32_t cap, const char *dir, const char *base,
   return n + 1 < cap;
 }
 
-// dir "/image", base "modem". mdtBuf: kMdtMax bytes; chunk: chunkBytes (a multiple of the fs block size)
-inline void verify(ext4::Fs &fs, const char *dir, const char *base, uint8_t *mdtBuf, uint8_t *chunk, uint32_t chunkBytes,
-                   Result *res) {
+// One segment read from name.bNN (or the .mdt headers for segment 0) and checked: the body of verify(), also used to
+// finish the segments a loader left unchecked (verifyRest). img: hash table set (setHash).
+inline void checkFile(ext4::Fs &fs, const char *dir, const char *base, const uint8_t *mdtBuf, uint8_t *chunk,
+                      uint32_t chunkBytes, const Image &img, uint32_t i, Result *res) {
   char path[128];
   ext4::Inode ino;
-  Image img;
+  const Segment &s = img.seg[i];
+  SegmentCheck check;
+  check.begin(img, i);
+  joinName(path, sizeof(path), dir, base, ".b", static_cast<int>(i));
+  int lr = fs.lookupPath(path, &ino);
+  if (lr == ext4::kErrNotFound && i == 0) {
+    check.feed(mdtBuf, img.headerBytes, res);     // headers only inside the .mdt
+  } else if (lr || !ino.isFile() || ino.size != s.filesz) {
+    check.ok = false;
+  } else {
+    for (uint64_t off = 0; check.ok && off < ino.size;) {
+      uint32_t n = ino.size - off < chunkBytes ? static_cast<uint32_t>(ino.size - off) : chunkBytes;
+      if (fs.readFile(ino, off, chunk, n)) { check.ok = false; break; }
+      check.feed(chunk, n, res);
+      off += n;
+    }
+  }
+  check.finish(i, res);
+}
+
+// dir "/image", base "modem". mdtBuf: kMdtMax bytes; chunk: chunkBytes (a multiple of the fs block size)
+// skip: program headers NOT read here (bit per index; only segments with p_filesz != 0, never 0 or the hash segment),
+// counted in res->deferred; their caller hashes them while loading (see SegmentCheck). out: the parsed image with the
+// hash table set (hashSeg inside mdtBuf), when the caller needs it.
+inline void verify(ext4::Fs &fs, const char *dir, const char *base, uint8_t *mdtBuf, uint8_t *chunk, uint32_t chunkBytes,
+                   Result *res, uint64_t skip = 0, Image *out = nullptr) {
+  char path[128];
+  ext4::Inode ino;
+  Image local;
+  Image &img = out ? *out : local;
+  img = Image();
   *res = Result();
   joinName(path, sizeof(path), dir, base, ".mdt", -1);
   int r = fs.lookupPath(path, &ino);
@@ -222,36 +278,20 @@ inline void verify(ext4::Fs &fs, const char *dir, const char *base, uint8_t *mdt
   res->mbnVersion = img.mbnVersion;
   res->segments = img.count;
   if (r) { res->error = r; return; }
-  static const uint8_t zero[kHashBytes] = {};
   for (uint32_t i = 0; i < img.count; i++) {
     if (i == img.hashIndex) continue;
-    const uint8_t *expected = img.hashSeg + img.tableOffset + i * kHashBytes;
-    const Segment &s = img.seg[i];
-    if (!s.filesz) { res->empty++; continue; }
-    bool ok = memcmp(expected, zero, kHashBytes) != 0;   // a loaded segment without a hash fails
-    Sha384 sha;
-    sha.init();
-    joinName(path, sizeof(path), dir, base, ".b", static_cast<int>(i));
-    int lr = fs.lookupPath(path, &ino);
-    if (lr == ext4::kErrNotFound && i == 0) {
-      sha.update(mdtBuf, img.headerBytes);           // headers only inside the .mdt
-      res->bytes += img.headerBytes;
-    } else if (lr || !ino.isFile() || ino.size != s.filesz) {
-      ok = false;
-    } else {
-      for (uint64_t off = 0; ok && off < ino.size;) {
-        uint32_t n = ino.size - off < chunkBytes ? static_cast<uint32_t>(ino.size - off) : chunkBytes;
-        if (fs.readFile(ino, off, chunk, n)) { ok = false; break; }
-        sha.update(chunk, n);
-        off += n;
-        res->bytes += n;
-      }
-    }
-    uint8_t digest[kHashBytes];
-    sha.final(digest);
-    if (ok && !memcmp(digest, expected, kHashBytes)) res->verified++;
-    else { res->failed++; res->failedMask |= 1ull << i; }
+    if (!img.seg[i].filesz) { res->empty++; continue; }
+    if (i && i < 64 && (skip >> i & 1)) { res->deferred++; continue; }
+    checkFile(fs, dir, base, mdtBuf, chunk, chunkBytes, img, i, res);
   }
+}
+
+// The deferred segments of `mask` that a loader did not hash (bit set in `checked`), from the disk as verify() would.
+inline void verifyRest(ext4::Fs &fs, const char *dir, const char *base, const uint8_t *mdtBuf, uint8_t *chunk,
+                       uint32_t chunkBytes, const Image &img, uint64_t mask, uint64_t checked, Result *res) {
+  for (uint32_t i = 1; i < img.count && i < 64; i++)
+    if ((mask >> i & 1) && !(checked >> i & 1) && i != img.hashIndex && img.seg[i].filesz)
+      checkFile(fs, dir, base, mdtBuf, chunk, chunkBytes, img, i, res);
 }
 
 }  // namespace fw

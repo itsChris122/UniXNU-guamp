@@ -115,8 +115,9 @@ struct HookFixture {
   wifiprep::ModemBootHooks hooks() {return {this,prepare,started,shutdown};}
 };
 static int diskFd;
+static uint64_t diskBytes;   // bytes read from the image (one read vs two of the modem firmware)
 static bool readDisk(void *,uint64_t sector,uint32_t count,uint8_t *out) {
-  assert(count && count<=128);
+  assert(count && count<=128);diskBytes+=count*512ull;
   return pread(diskFd,out,count*512,static_cast<off_t>(sector*512))==static_cast<ssize_t>(count*512);
 }
 static void reset() {
@@ -166,6 +167,57 @@ int main(int argc,char **argv) {
   reset();denyShutdown=true;{HookFixture h;h.startError=-12;auto hooks=h.hooks();
     assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,&hooks));
     assert(h.sequence=="PSD" && !h.actualStopped);}
+  // Check folded into the load (firmwareReport with a start): the loaded segments are read once, hashed while copied
+  {fw::Result full;fw::verify(fs,"/image","modem",mdt.data(),chunk.data(),chunk.size(),&full);
+   auto prepass=[&](fw::Result &r,fw::Image &img,wifiprep::ModemFirmwareCheck &c){
+     fw::verify(fs,"/image","modem",mdt.data(),chunk.data(),chunk.size(),&r,~1ull,&img);assert(!r.error);
+     c={&r,pas::hashedWhileLoading(img),0,false};r.deferred=0;
+     for(uint32_t i=1;i<64;i++)if(c.mask>>i&1)r.deferred++;
+     fw::verifyRest(fs,"/image","modem",mdt.data(),chunk.data(),chunk.size(),img,~1ull&~c.mask,0,&r);};
+   auto same=[&](const fw::Result &r){return r.verified==full.verified && r.failed==full.failed && r.bytes==full.bytes &&
+     r.empty==full.empty && r.failedMask==full.failedMask && r.segments==full.segments && r.mbnVersion==full.mbnVersion;};
+   static fw::Image img;fw::Result r;wifiprep::ModemFirmwareCheck c;
+   // success: same counters as fw::verify, the load reads every loaded byte once
+   reset();diskBytes=0;prepass(r,img,c);const uint64_t before=diskBytes;
+   assert(c.mask && r.deferred==expected.count-0u-[&]{unsigned z=0;for(unsigned i=0;i<expected.count;i++)z+=!expected.segments[i].filesz;return z;}());
+   assert(r.verified+r.failed<full.verified && before<1000000);
+   assert(wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));
+   assert(c.done && same(r) && authenticates==1 && !shutdowns);
+   assert(logs.find("GuampWifi: modem firmware 26 segments verified/0 failed, 53100628 bytes")!=std::string::npos);
+   const uint64_t once=diskBytes;
+   reset();diskBytes=0;{fw::Result twice;fw::verify(fs,"/image","modem",mdt.data(),chunk.data(),chunk.size(),&twice);}const uint64_t verifyBytes=diskBytes;
+   assert(wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true));const uint64_t two=diskBytes;
+   printf("folded check: %llu bytes read from the eMMC instead of %llu (check %llu + load %llu)\n",(unsigned long long)once,
+          (unsigned long long)two,(unsigned long long)verifyBytes,(unsigned long long)(two-verifyBytes));
+   assert(once+40000000ull<two);
+   // a loaded segment that does not match its hash: no AUTH_AND_RESET, SHUTDOWN, region cleared, every segment counted
+   reset();prepass(r,img,c);
+   uint32_t bad=0;for(uint32_t i=1;i<64;i++)if(c.mask>>i&1)bad=i;   // the last loaded segment
+   uint8_t *entry=const_cast<uint8_t *>(img.hashSeg)+img.tableOffset+bad*fw::kHashBytes;entry[7]^=0x5a;
+   assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));
+   assert(c.done && !authenticates && shutdowns==1 && r.failed==1 && r.failedMask==(1ull<<bad) && r.verified==full.verified-1);
+   assert(r.bytes==full.bytes && logs.find("does not match its hash table entry")!=std::string::npos);
+   for(uint64_t i=0;i<expected.span;i++)assert(ram[expected.first-kModemBase+i]==0);
+   // an earlier loaded segment: the later ones are still hashed (report) but not written
+   reset();entry[7]^=0x5a;prepass(r,img,c);
+   uint32_t early=0;for(uint32_t i=63;i>0;i--)if(c.mask>>i&1)early=i;
+   entry=const_cast<uint8_t *>(img.hashSeg)+img.tableOffset+early*fw::kHashBytes;entry[0]^=1;
+   assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));
+   assert(c.done && !authenticates && r.failed==1 && r.failedMask==(1ull<<early) && r.bytes==full.bytes);
+   entry[0]^=1;
+   // start refused before the load (live peer) or queries only: the report is completed from the disk, nothing written
+   reset();stopped=false;prepass(r,img,c);
+   assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));assert(c.done && same(r) && !maps);
+   reset();mode=2;prepass(r,img,c);
+   assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));assert(c.done && same(r) && !maps && !c.mask);
+   // Wi-Fi owner (hooks): same order as before
+   reset();mode=0;prepass(r,img,c);{HookFixture h;auto hooks=h.hooks();
+     assert(wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,&hooks,true,&c));
+     assert(h.sequence=="PS" && c.done && same(r));}
+   // TrustZone refuses the image after a clean load: report printed once, after the load
+   reset();denyAuth=true;prepass(r,img,c);
+   assert(!wifiprep::modemBoot(fs,mdt.data(),chunk.data(),true,nullptr,false,&c));assert(c.done && same(r) && shutdowns==1);
+   size_t n=0;for(size_t at=0;(at=logs.find("GuampWifi: modem firmware",at))!=std::string::npos;at++)n++;assert(n==1);}
   printf("PASS actual modem loader: %u real segments; placement, byte/BSS comparison, metadata/PAS order, probe-only, live-peer refusal, integrity/auth failures, readiness timeout, provider hook order/failures and actual cleanup result\n",expected.count);
   close(diskFd);
 }

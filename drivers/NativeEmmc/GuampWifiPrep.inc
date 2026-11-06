@@ -412,6 +412,7 @@ void firmwareReport() {
   uint8_t *chunk = static_cast<uint8_t *>(IOMallocZero(kChunkBytes));
   ext4::Fs *fs = static_cast<ext4::Fs *>(IOMallocZero(sizeof(ext4::Fs)));
   fw::Result *res = static_cast<fw::Result *>(IOMallocZero(sizeof(fw::Result)));
+  fw::Image *image = static_cast<fw::Image *>(IOMallocZero(sizeof(fw::Image)));   // optional: without it, two reads
   if (scratch && mdt && chunk && fs && res) {
     const uint64_t began = mach_absolute_time();
     int r = fs->mount(readWindow, &window, window.blocks, scratch);
@@ -420,13 +421,41 @@ void firmwareReport() {
           fs->inodeSize, fs->compat, fs->incompat, fs->roCompat, r == ext4::kErrUnsupported ? " refused " : " ",
           fs->refused);
     if (!r) {
-      fw::verify(*fs, "/image", "modem", mdt, chunk, kChunkBytes, res);
+      // One read of the modem image when it is started (mode 1): the loaded segments are hashed by pas::boot while
+      // it copies them (ModemFirmwareCheck, GuampModem.inc); here only the metadata, the hash table and the segments
+      // the load does not read. Same verdict, same report line (after the load). guamp-modem-fw-once=0: check all
+      // here first, then read again in the load (as up to fin55).
+      const unsigned mode=radioMode();
+      unsigned once=1;
+      PE_parse_boot_argn("guamp-modem-fw-once",&once,sizeof(once));
+      bool willStart=false;
+      if(mode) {
+#if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
+        willStart=true;
+#if !defined(GUAMP_WIFI_REDWOOD) || !GUAMP_WIFI_REDWOOD
+        if(mode==2)willStart=false;
+#endif
+#endif
+      } else willStart=modemStartMode(false)==1;
+      const bool fold=once!=0&&willStart&&image;
+      ModemFirmwareCheck check={res,0,began,false};
+      fw::verify(*fs, "/image", "modem", mdt, chunk, kChunkBytes, res, fold ? ~1ull : 0, image);
+      if(fold && !res->error) {
+        check.mask=pas::hashedWhileLoading(*image);
+        res->deferred=0;
+        for(uint32_t i=1;i<64;i++)if(check.mask>>i&1)res->deferred++;
+        fw::verifyRest(*fs,"/image","modem",mdt,chunk,kChunkBytes,*image,~1ull&~check.mask,0,res);   // not loaded: now
+      }
       uint64_t us = 0;
       absolutetime_to_nanoseconds(mach_absolute_time() - began, &us);
       us /= 1000;
       if (res->error) {
         IOLog("GuampWifi: modem firmware not checked: %s (%d)\n",
               res->error < -19 ? "bad mdt or hash segment" : ext4::errorName(res->error), res->error);
+      } else if (check.mask) {
+        IOLog("GuampWifi: modem firmware %u segments verified/%u failed before the load, %u hashed while loading (%u program headers, MBN v%u, %u empty, failed mask %llx, %llu ms)\n",
+              res->verified, res->failed, res->deferred, res->segments, res->mbnVersion, res->empty, res->failedMask,
+              us / 1000);
       } else {
         IOLog("GuampWifi: modem firmware %u segments verified/%u failed, %llu bytes (%u program headers, MBN v%u, %u empty, failed mask %llx, %llu ms)\n",
               res->verified, res->failed, res->bytes, res->segments, res->mbnVersion, res->empty, res->failedMask,
@@ -443,8 +472,7 @@ void firmwareReport() {
         });
       IOLog("GuampWifi: wlanmdsp.mbn %s %llu bytes, %u bdwlan.* board files\n", w ? "absent" : "present",
             w ? 0ull : file.size, bdwlan);
-      const bool verified=!res->error&&!res->failed&&res->verified>0;
-      const unsigned mode=radioMode();
+      const bool verified=!res->error&&!res->failed&&res->verified+res->deferred>0;
       if(mode) {
         // Only the radio opt-in keeps a mounted store past this thread (guamp-wifi-prep=1 alone stays as before).
         int persistent=gFirmwareStore.mount(window.first,window.blocks);
@@ -460,15 +488,22 @@ void firmwareReport() {
           // The persistent store precedes PAS boot: QFTP may request firmware
           // while the started hook is negotiating GLINK/QRTR/WLFW.
           const ModemBootHooks hooks={nullptr,runtimePrepare,runtimeStarted,runtimeShutdown};
-          if(modemBoot(*fs,mdt,chunk,verified,&hooks,true)) {
+          if(modemBoot(*fs,mdt,chunk,verified,&hooks,true,&check)) {
             const int e=guamp_sm6115_wifi_start_station(mode);
             if(e)IOLog("GuampWifi: station worker could not start %d; live modem resources retained\n",e);
-          } else guamp_sm6115_wifi_abort();
+          } else {
+            if(res->failed)IOLog("GuampWifi: radio start refused: modem firmware failed its hash check during the load\n");
+            guamp_sm6115_wifi_abort();
+          }
         }
 #else
         IOLog("GuampWifi: guamp-wifi-start requires the GUAMP_WIFI_RUNTIME component; prep completed only\n");
 #endif
-      } else (void)modemBoot(*fs,mdt,chunk,verified);
+      } else (void)modemBoot(*fs,mdt,chunk,verified,nullptr,false,&check);
+      if(check.mask && !check.done) {   // no load ran (start refused earlier): finish the check, as before
+        fw::verifyRest(*fs,"/image","modem",mdt,chunk,kChunkBytes,*image,check.mask,0,res);
+        modemFirmwareLine(*res,began);
+      }
     }
   } else {
     IOLog("GuampWifi: out of memory\n");
@@ -478,6 +513,7 @@ void firmwareReport() {
   if (chunk) IOFree(chunk, kChunkBytes);
   if (fs) IOFree(fs, sizeof(ext4::Fs));
   if (res) IOFree(res, sizeof(fw::Result));
+  if (image) IOFree(image, sizeof(fw::Image));
 }
 
 void thread(void *, wait_result_t) {

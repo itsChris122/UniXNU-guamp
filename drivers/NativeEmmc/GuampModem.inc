@@ -72,11 +72,39 @@ static bool modemHookVote(void *,bool on) {
 }
 #endif
 
-static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
-                      const ModemBootHooks *hooks=nullptr,bool startForWifi=false) {
+// Modem firmware check folded into the load (firmwareReport, GuampWifiPrep.inc): fw::verify skipped the segments of
+// mask (pas::hashedWhileLoading), pas::boot hashes them while it copies them (pas::Deferred): 53 MB read once at boot
+// instead of twice (fin53: 1605 ms of check + 2477 ms of load, both on the eMMC while launchd starts). res is the
+// verify result, completed here; began: mach time of the check start (the ms of the report line). done: line printed.
+struct ModemFirmwareCheck {
+  fw::Result *res;
+  uint64_t mask,began;
+  bool done;
+};
+// The firmwareReport line, same format as before the folded check (ms from the start of the check to its end).
+static void modemFirmwareLine(const fw::Result &res,uint64_t began) {
+  uint64_t us=0;
+  absolutetime_to_nanoseconds(mach_absolute_time()-began,&us);
+  us/=1000;
+  IOLog("GuampWifi: modem firmware %u segments verified/%u failed, %llu bytes (%u program headers, MBN v%u, %u empty, failed mask %llx, %llu ms)\n",
+        res.verified,res.failed,res.bytes,res.segments,res.mbnVersion,res.empty,res.failedMask,us/1000);
+}
+static void modemFirmwareLoaded(void *ctx) {
+  auto &c=*static_cast<ModemFirmwareCheck *>(ctx);
+  modemFirmwareLine(*c.res,c.began);c.done=true;
+}
+// Mode modemBoot will run with: 1 start, 2 queries only, 0 nothing (also read by firmwareReport to pick the check).
+static unsigned modemStartMode(bool startForWifi) {
   unsigned enabled=0;
-  if(startForWifi)enabled=1; // caller has already checked its explicit Wi-Fi opt-in
-  else if(!PE_parse_boot_argn("guamp-modem-start",&enabled,sizeof(enabled)) || (enabled!=1 && enabled!=2))return false;
+  if(startForWifi)return 1; // caller has already checked its explicit Wi-Fi opt-in
+  if(!PE_parse_boot_argn("guamp-modem-start",&enabled,sizeof(enabled)) || (enabled!=1 && enabled!=2))return 0;
+  return enabled;
+}
+
+static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
+                      const ModemBootHooks *hooks=nullptr,bool startForWifi=false,ModemFirmwareCheck *check=nullptr) {
+  const unsigned enabled=modemStartMode(startForWifi);
+  if(!enabled)return false;
   const pas::Peripheral peripheral={"GuampModem",modem::kPas,modem::kBase,modem::kBytes,"/image","modem"};
   IOLog("GuampModem: start mode %u%s, PAS id %u, carveout %llx + %llx, XNU RAM %lx + %lx, smp2p in 435 out 428, "
         "reason 421, proxy votes by %s\n",enabled,startForWifi?" (Wi-Fi owner)":"",modem::kPas,modem::kBase,modem::kBytes,
@@ -91,6 +119,19 @@ static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
     uint32_t hashAt=(static_cast<uint32_t>(inode.size)+63)&~63u;
     if(image->hashSegBytes>fw::kMdtMax-hashAt)parsed=fw::kErrFormat;
     else image->hashSeg=mdt+hashAt; // original bytes already read/verified by fw::verify
+  }
+  pas::Deferred deferred;
+  if(check && check->mask) {
+    if(!parsed)parsed=fw::setHash(image,image->hashSeg,image->hashSegBytes);
+    if(!parsed && (enabled!=1 || pas::hashedWhileLoading(*image)!=check->mask)) {
+      // not a start, or not the same segments: finish the check from the disk first, as before the folded check
+      fw::verifyRest(fs,"/image","modem",mdt,chunk,kChunkBytes,*image,check->mask,0,check->res);
+      check->mask=0;modemFirmwareLine(*check->res,check->began);check->done=true;
+      verified=verified && !check->res->failed;
+    } else if(!parsed) {
+      deferred.image=image;deferred.res=check->res;deferred.mask=check->mask;
+      deferred.ctx=check;deferred.report=modemFirmwareLoaded;
+    }
   }
   bool booted=false;
   if(parsed) {
@@ -114,8 +155,12 @@ static bool modemBoot(ext4::Fs &fs,uint8_t *mdt,uint8_t *chunk,bool verified,
     if(hooks && hooks->shutdown)h.cleanup=modemHookCleanup;
     gModemHooks=hooks;
     const int rc=pas::boot(peripheral,h,transport,fs,mdt,static_cast<uint32_t>(inode.size),*image,chunk,kChunkBytes,
-                           verified,enabled,guamp_phys_base,guamp_phys_size);
+                           verified,enabled,guamp_phys_base,guamp_phys_size,deferred.mask?&deferred:nullptr);
     gModemHooks=nullptr;
+    if(deferred.mask && !check->done) {   // start stopped before the load finished: complete the report from the disk
+      fw::verifyRest(fs,"/image","modem",mdt,chunk,kChunkBytes,*image,deferred.mask,deferred.checked,check->res);
+      modemFirmwareLine(*check->res,check->began);check->done=true;
+    }
     booted=rc==pas::kUp;
     if(booted)IOLog("GuampModem: firmware ready%s\n",hooks&&hooks->started?"; board owner active":"; WLAN transport board adapter not attached");
     else IOLog("GuampModem: RESULT %d (%s)\n",rc,rc==pas::kQueried?"SCM/PAS capabilities checked only; modem not started":"not started");

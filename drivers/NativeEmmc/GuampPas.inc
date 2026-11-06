@@ -11,7 +11,8 @@
 //   succeeded (TrustZone may still protect it otherwise: a write would fault) or if INIT_IMAGE was never accepted.
 // TrustZone alone authenticates the signature: firmware, metadata and hashes are copied byte for byte, never altered;
 // every PAS status is honoured (nonzero = stop and clean up). The SHA-384 check of fw::verify is only an integrity
-// gate on the eMMC read (nothing is loaded from a file that does not match its own hash table).
+// gate on the eMMC read (nothing is authenticated from a file that does not match its own hash table: checked before
+// boot(), or during the copy with pas::Deferred, where a mismatch stops before AUTH_AND_RESET and clears the region).
 // Disk read-only. Only the peripheral's carveout is written, through an uncached mapping with aligned 32-bit stores.
 #ifndef GUAMP_PAS_INC
 #define GUAMP_PAS_INC
@@ -31,6 +32,20 @@ struct Hooks {
   // guamp-adsp-ipc>=1 (GuampAdspIpc.inc: apps SMP2P item 429 the ADSP reads at boot).
   int (*prepare)(void *)=nullptr;
   void (*cleanup)(void *,bool stopped)=nullptr;
+};
+
+// Integrity check folded into the load (modem, GuampModem.inc): the segments of `mask` were NOT read by fw::verify
+// (skip mask, res->deferred); boot() hashes each one while it copies it (fw::SegmentCheck, same verdict and counters
+// as fw::verify), so the 53 MB of the modem image are read once instead of twice. A mismatch is a failed load: no
+// AUTH_AND_RESET, PAS SHUTDOWN, region cleared as for any load failure. After a mismatch the remaining deferred
+// segments are still read and hashed (not written) so the report counts every segment as fw::verify does.
+// checked: segments boot() actually hashed (equal to mask once the load loop ran to the end).
+struct Deferred {
+  fw::Image *image=nullptr;   // with the hash table set (fw::setHash)
+  fw::Result *res=nullptr;    // fw::verify's result, completed here
+  uint64_t mask=0,checked=0;
+  void *ctx=nullptr;
+  void (*report)(void *)=nullptr;   // right after the load loop, once every deferred segment was hashed (log only)
 };
 
 inline bool scmOkay(const Peripheral &p,const char *stage,const scm::Result &r) {
@@ -67,12 +82,6 @@ struct Ram {
   void synchronize() {guampModemBarrier();}
 };
 
-inline bool readExact(ext4::Fs &fs,const char *path,uint64_t offset,uint8_t *out,uint32_t bytes) {
-  ext4::Inode inode;
-  return !fs.lookupPath(path,&inode) && inode.isFile() && offset<=inode.size && bytes<=inode.size-offset &&
-         !fs.readFile(inode,offset,out,bytes);
-}
-
 // The metadata TrustZone receives, original bytes only: the .mdt file as the guamp kernel's pil_init_image_trusted
 // copies it (fw->data, fw->size) when the hash segment is inside it (hashWhere 1 or 2); ELF + program headers followed
 // by the hash segment read from its own .bNN when it is not (hashWhere 3, upstream qcom_mdt_read_metadata layout).
@@ -85,8 +94,11 @@ inline uint32_t metadataBytes(const fw::Image &image,uint32_t mdtFileBytes) {
 // mode 2: SCM/PAS queries, integrity and placement only (nothing mapped or written); mode 1: authenticated start.
 inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext4::Fs &fs,const uint8_t *mdt,
                 uint32_t mdtFileBytes,const fw::Image &image,uint8_t *chunk,uint32_t chunkBytes,bool verified,
-                unsigned mode,uint64_t liveBase,uint64_t liveBytes) {
+                unsigned mode,uint64_t liveBase,uint64_t liveBytes,Deferred *deferred=nullptr) {
   if(mode!=1 && mode!=2)return kQueried;
+  if(deferred && (mode!=1 || !deferred->image || !deferred->res)) {   // queries need the full check before boot()
+    IOLog("%s: integrity check deferred to a load that will not run; no RAM written\n",p.tag);return kErrPlace;
+  }
   if(!transport.discover()) {IOLog("%s: SCM convention unavailable; no RAM written\n",p.tag);return kErrScm;}
   IOLog("%s: SCM%u detected, PAS id %u, mode %u\n",p.tag,transport.wide?64u:32u,p.id,mode);
   // PAS_IS_SUPPORTED is informational, as in Linux's remoteproc PAS driver (which never asks it): on guamp TrustZone answers 0
@@ -151,12 +163,45 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
   if(okay) {
     uint64_t loaded=0,zeroed=0;
     const uint64_t began=mach_absolute_time();
+    bool hashBad=false;   // a deferred segment failed its check: keep hashing the rest, write nothing more
     for(uint32_t i=0;okay && i<plan->count;++i) {
       const Segment &s=plan->segments[i];char path[128];
       okay=fw::joinName(path,sizeof(path),p.dir,p.firmware,".b",static_cast<int>(s.index));
+      if(okay && deferred && s.index<64 && (deferred->mask>>s.index&1)) {
+        // One read for check and copy: same steps and verdict as fw::verify (lookup, regular file of p_filesz bytes,
+        // nonzero table entry, SHA-384 of the file bytes), the chunk goes to the carveout only after it was hashed.
+        fw::SegmentCheck check;check.begin(*deferred->image,s.index);
+        ext4::Inode inode;
+        if(fs.lookupPath(path,&inode) || !inode.isFile() || inode.size!=s.filesz)check.ok=false;
+        for(uint64_t off=0;check.ok && off<s.filesz;) {
+          uint32_t n=s.filesz-off<chunkBytes?static_cast<uint32_t>(s.filesz-off):chunkBytes;
+          if(fs.readFile(inode,off,chunk,n)) {check.ok=false;break;}
+          check.feed(chunk,n,deferred->res);
+          if(!hashBad && !ram.write(s.address+off,chunk,n)) {okay=false;break;}
+          off+=n;if(!hashBad)loaded+=n;
+        }
+        if(!okay)break;
+        const uint32_t failedBefore=deferred->res->failed;
+        check.finish(s.index,deferred->res);
+        deferred->checked|=1ull<<s.index;
+        if(deferred->res->failed!=failedBefore) {
+          if(!hashBad)IOLog("%s: segment %u does not match its hash table entry: load stopped, start refused\n",p.tag,s.index);
+          hashBad=true;
+        }
+        if(!hashBad && s.memsz>s.filesz) {
+          okay=ram.write(s.address+s.filesz,nullptr,s.memsz-s.filesz,true);
+          if(okay)zeroed+=s.memsz-s.filesz;
+        }
+        continue;
+      }
+      if(hashBad)continue;   // only the deferred segments are still read (for the report)
+      // The file is looked up once per segment, not once per chunk (the /image directory walk cost the modem load
+      // ~26 MB of extra eMMC reads, host-measured on modem_a.img); same checks as the former per-chunk readExact.
+      ext4::Inode inode;
+      if(okay && s.filesz)okay=!fs.lookupPath(path,&inode) && inode.isFile() && s.filesz<=inode.size;
       for(uint64_t off=0;okay && off<s.filesz;) {
         uint32_t n=s.filesz-off<chunkBytes?static_cast<uint32_t>(s.filesz-off):chunkBytes;
-        okay=readExact(fs,path,off,chunk,n) && ram.write(s.address+off,chunk,n);
+        okay=!fs.readFile(inode,off,chunk,n) && ram.write(s.address+off,chunk,n);
         if(okay){off+=n;loaded+=n;}
       }
       if(okay && s.memsz>s.filesz) {
@@ -164,10 +209,16 @@ inline int boot(const Peripheral &p,const Hooks &h,scm::Transport &transport,ext
         if(okay)zeroed+=s.memsz-s.filesz;
       }
     }
+    if(deferred && okay && (hashBad || deferred->checked!=deferred->mask)) {
+      if(!hashBad)IOLog("%s: deferred segments %llx not all in the plan (%llx hashed): start refused\n",p.tag,
+                        deferred->mask,deferred->checked);
+      okay=false;
+    }
     ram.synchronize();
     uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
     IOLog("%s: segments %u loaded %llu zeroed %llu in %llu ms: %s\n",p.tag,plan->count,loaded,zeroed,ns/1000000,
           okay?"ok":"failed");
+    if(deferred && deferred->report && deferred->checked==deferred->mask)deferred->report(deferred->ctx);
     if(!okay)result=kErrLoad;
   }
   if(okay) {okay=scmOkay(p,"auth-and-reset",transport.authenticate(p.id));if(!okay)result=kErrAuth;}

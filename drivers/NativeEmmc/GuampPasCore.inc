@@ -39,6 +39,14 @@ inline bool loadable(const fw::Segment &s) {
   const uint32_t type=(s.flags>>24)&7;
   return s.type==1 && s.memsz && type!=2 && type!=7;
 }
+// Segments whose SHA-384 the loader can check while it copies them (pas::Deferred): loadable, with file bytes, never
+// the ELF header segment 0 (its fallback is the .mdt) nor the hash segment. Exactly the plan's segments with filesz.
+inline uint64_t hashedWhileLoading(const fw::Image &image) {
+  uint64_t mask=0;
+  for(uint32_t i=1;i<image.count && i<64;++i)
+    if(i!=image.hashIndex && loadable(image.seg[i]) && image.seg[i].filesz)mask|=1ull<<i;
+  return mask;
+}
 // metadataBytes: what goes to region_start before INIT_IMAGE (the original .mdt, see GuampPas.inc)
 inline int plan(const Peripheral &p,const fw::Image &image,bool verified,uint32_t metadataBytes,
                 uint64_t liveBase,uint64_t liveBytes,Plan *out) {
