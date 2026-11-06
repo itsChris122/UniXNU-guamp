@@ -1,0 +1,110 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -11141,6 +11141,99 @@
+ 	vnode_put(vp);
+ }
+ 
++/*
++ * guamp-data-space (07/11, default 1, =0 off). Data is a 4 GiB APFS container on /private/var (the 64 GB in Settings is
++ * guamp-disk-capacity's commercial total; free and available are the real ones): fin55 About showed 288.7 MB available.
++ * The 04/11 dump of Data (3755 of 4096 MiB used) holds, besides apps and user data: a 631 MiB watchdogd core in
++ * /private/var/cores left by an early boot (user core dumps are off since zzzz-guamp-no-coredump, nothing removes it),
++ * CoreSymbolication's 538 MiB symbol cache of the OS build (made again by coresymbolicationd when ReportCrash
++ * symbolicates), and the GPU bridge's diagnostic messages.log and pipelines.log in backboardd's m2v cache, appended on
++ * every boot without a limit (22 and 32 MiB). Here, before any daemon runs: the stale core always goes; the symbol cache
++ * only while Data has less than 512 MiB available (so it is not made again on every boot); messages.log past 16 MiB and
++ * pipelines.log past 64 MiB (the shader priming replays its last 8 MiB: one image then primes from the library pass only).
++ * No user data is touched; downloaded assets (Siri voices, dictionaries) stay with CacheDelete and the owner.
++ */
++static uint64_t
++native_guamp_data_avail(mount_t mp)
++{
++	struct vfs_attr va;
++	VFSATTR_INIT(&va);
++	VFSATTR_WANTED(&va, f_bsize);
++	VFSATTR_WANTED(&va, f_bavail);
++	if (vfs_getattr(mp, &va, vfs_context_current()) != 0 || !VFSATTR_IS_SUPPORTED(&va, f_bavail)) {
++		return UINT64_MAX;
++	}
++	uint64_t bs = (VFSATTR_IS_SUPPORTED(&va, f_bsize) && va.f_bsize) ? va.f_bsize : vfs_statfs(mp)->f_bsize;
++	return va.f_bavail * bs;
++}
++
++/* 0 removed, ENOENT absent, EEXIST kept (size not above the limit), other: the error */
++static int
++native_guamp_data_space_remove(proc_t p, user_addr_t scratch, const char *path, off_t limit, off_t *size_out)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int error = vnode_lookup(path, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	error = vnode_vtype(vp) == VREG ? vnode_size(vp, &size, ctx) : EFTYPE;
++	vnode_put(vp);
++	*size_out = size;
++	if (error) {
++		return error;
++	}
++	if (size <= limit) {
++		return EEXIST;
++	}
++	int32_t result = 0;
++	error = copyout(path, scratch + 0xa00, strlen(path) + 1);
++	if (!error) {
++		struct unlink_args ua = {.path = scratch + 0xa00};
++		error = unlink(p, &ua, &result);
++	}
++	return error;
++}
++
++static void
++native_guamp_data_space(proc_t p, user_addr_t scratch, mount_t data_mount)
++{
++	unsigned int enabled = 1;
++	PE_parse_boot_argn("guamp-data-space", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("guamp-data-space=0: Data left as it is\n");
++		return;
++	}
++	static const struct {
++		const char *path;
++		off_t limit;            /* removed when larger; -1: only while Data is low */
++	} items[] = {
++		{"/private/var/cores/watchdogd.core", 0},
++		{"/private/var/root/Library/Caches/com.apple.coresymbolicationd/21H461", -1},
++		{"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/messages.log", 16LL << 20},
++		{"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/pipelines.log", 64LL << 20},
++	};
++	const uint64_t low = 512ULL << 20;
++	uint64_t before = native_guamp_data_avail(data_mount), freed = 0;
++	for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++		off_t limit = items[i].limit;
++		if (limit < 0) {
++			limit = (before != UINT64_MAX && before + freed < low) ? 0 : INT64_MAX;
++		}
++		off_t size = 0;
++		int error = native_guamp_data_space_remove(p, scratch, items[i].path, limit, &size);
++		if (!error && size > 0) {
++			freed += (uint64_t)size;
++		}
++		printf("guamp-data-space: %s %lld bytes: %s (%d)\n", items[i].path, (long long)size,
++		    error == 0 ? "removed" : error == ENOENT ? "absent" : error == EEXIST ? "kept" : "error", error);
++	}
++	printf("guamp-data-space: Data available %llu MiB at mount, %llu MiB freed (low below %llu MiB)\n",
++	    before == UINT64_MAX ? 0ULL : (unsigned long long)(before >> 20), (unsigned long long)(freed >> 20),
++	    (unsigned long long)(low >> 20));
++}
++
+ static int
+ native_owner_data_prepare(proc_t p, user_addr_t scratch)
+ {
+@@ -11204,6 +11297,7 @@
+ 	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
+ 	if (!error) native_guamp_data_skeleton(p, scratch);
+ 	if (!error) native_guamp_setup_skip(p, scratch);
++	if (!error) native_guamp_data_space(p, scratch, data_mount);
+ done:
+ 	if (data_root) vnode_put(data_root);
+ 	native_owner_data_status = error;
