@@ -470,6 +470,8 @@ static void testCtl() {
     CHECK(bts_ctl_admit(true, true, 1, 1) == BTS_CTL_REFUSE);
     CHECK(bts_ctl_admit(true, true, 0, 0) == BTS_CTL_REFUSE);
     CHECK(bts_ctl_admit(true, false, 0, 1) == BTS_CTL_REFUSE);   // the tty holds it
+    CHECK(bts_ctl_readopt(false));    // sk closed (power off): BlueTool's old socket takes the slot back
+    CHECK(!bts_ctl_readopt(true));    // sk (or the tty) holds it: ENOTCONN as before
 
     // RAM test 7: the WCN3950 mask (octet 18 = 0x83) lacks Read/Write Default Erroneous Data Reporting; the shim
     // advertises them and answers them, everything else in the mask is untouched.

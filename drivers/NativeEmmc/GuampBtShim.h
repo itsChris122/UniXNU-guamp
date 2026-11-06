@@ -643,6 +643,11 @@ static inline enum bts_ctl_admit_result bts_ctl_admit(bool open, bool viaKctl, u
     if (!open) return BTS_CTL_ACCEPT;
     return viaKctl && holder == 0 && which == 1 ? BTS_CTL_PREEMPT : BTS_CTL_REFUSE;
 }
+// A connected control that lost the slot (BlueTool's com.apple.uart.bluetooth, taken over by bluetoothd's sk control)
+// and sends or asks an option again gets the slot back when nobody holds it (open false: sk closed at power off).
+// fin52b: on the switch bluetoothd asks the BlueTool of the boot (still alive, still on that socket) for the init
+// script; its hci reset got ENOTCONN, BlueTool waited 31 s until bluetoothd replaced it. Held slot: stays ENOTCONN.
+static inline bool bts_ctl_readopt(bool open) { return !open; }
 // Bytes for the socket: no more than the receive buffer has room for (space, from ctl_getenqueuespace) nor cap.
 // Packets may be split across enqueues (stream socket; the client reassembles by H4 header).
 static inline size_t bts_ctl_take(struct bts_shim *s, uint8_t *out, size_t cap, size_t space) {

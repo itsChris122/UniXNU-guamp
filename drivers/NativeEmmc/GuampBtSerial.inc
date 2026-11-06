@@ -63,7 +63,7 @@ bool gViaKctl = false;
 kern_ctl_ref gKctlRef = nullptr;
 uint32_t gKctlUnit = 0, gKctlWhich = 0;
 uint32_t gKctlRegs = 0, gKctlConnects = 0, gKctlBusy = 0, gKctlSends = 0, gKctlOpts = 0, gKctlOptErrs = 0;
-uint32_t gKctlFull = 0, gKctlEnqErrs = 0, gKctlPreempts = 0;
+uint32_t gKctlFull = 0, gKctlEnqErrs = 0, gKctlPreempts = 0, gKctlReadopts = 0;
 uint64_t gKctlTxBytes = 0, gKctlRxBytes = 0;
 
 int bsOpen(dev_t dev, int flags, int devtype, struct proc *p);
@@ -369,10 +369,31 @@ errno_t kctlDisconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo) {
   return 0;
 }
 
+// Under gLock: a connected unit that is not the holder takes the free slot back (bts_ctl_readopt), as kctlConnect
+// would give it; the tty state (speed) is kept. Returns true when it did.
+bool kctlReadoptLocked(kern_ctl_ref ref, uint32_t unit) {
+  if (kctlMine(ref, unit) || !bts_ctl_readopt(gOpen)) return false;
+  gOpen = true;
+  gViaKctl = true;
+  gKctlRef = ref;
+  gKctlUnit = unit;
+  gKctlWhich = ref == gKctlRefs[1] ? 1 : 0;
+  gKctlReadopts = gKctlReadopts + 1;
+  bts_shim_flush_rx(gShim);
+  bts_shim_flush_tx(gShim);
+  return true;
+}
+
+void kctlReadoptLog(kern_ctl_ref ref, uint32_t unit, const char *what) {
+  IOLog("GuampBtShim: %s unit %u back on the free slot at %s (%u), link %s\n", kKctlNames[ref == gKctlRefs[1] ? 1 : 0],
+        unit, what, gKctlReadopts, gShim->link.tx ? "attached" : "NOT attached: commands fail");
+}
+
 // write()/send() of the client: one record, possibly an mbuf chain; the H4 reassembly of the shim takes any split.
 errno_t kctlSend(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags) {
   bool more = false;
   IOLockLock(gLock);
+  const bool readopted = kctlReadoptLocked(ref, unit);
   const bool mine = kctlMine(ref, unit);
   if (mine) {
     gKctlSends = gKctlSends + 1;
@@ -386,6 +407,7 @@ errno_t kctlSend(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int
     }
   }
   IOLockUnlock(gLock);
+  if (readopted) kctlReadoptLog(ref, unit, "send");
   mbuf_freem(m);   // the send callback owns the chain
   if (more) pumpCtl();
   return mine ? 0 : ENOTCONN;
@@ -394,6 +416,7 @@ errno_t kctlSend(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int
 errno_t kctlOption(kern_ctl_ref ref, uint32_t unit, int opt, bool set, void *data, size_t *len) {
   const size_t given = len ? *len : 0;
   IOLockLock(gLock);
+  const bool readopted = kctlReadoptLocked(ref, unit);
   if (!kctlMine(ref, unit)) { IOLockUnlock(gLock); return ENOTCONN; }
   int flush = 0;
   const bts_ctl_opt_result r = bts_ctl_sockopt(&gTty, static_cast<uint32_t>(opt), set, static_cast<uint8_t *>(data),
@@ -408,6 +431,7 @@ errno_t kctlOption(kern_ctl_ref ref, uint32_t unit, int opt, bool set, void *dat
   const uint32_t count = gKctlOpts;
   const uint64_t speed = gTty.speed;
   IOLockUnlock(gLock);
+  if (readopted) kctlReadoptLog(ref, unit, "option");
   if (count <= 32 || refused) {   // the first 32 options since boot (BlueTool, then bluetoothd) and every refusal
     const char *what = r == BTS_CTL_OPT_NOPROTO ? "ENOPROTOOPT" : r == BTS_CTL_OPT_INVAL ? "EINVAL" : "ok";
     IOLog("GuampBtShim: %s %s %#x (%zu bytes): %s, speed %llu\n", kKctlNames[gKctlWhich],
