@@ -1,6 +1,6 @@
 --- a/pexpert/gen/bootargs.c
 +++ b/pexpert/gen/bootargs.c
-@@ -187,13 +187,68 @@
+@@ -187,13 +187,70 @@
  	return arg_found;
  }
  
@@ -32,11 +32,13 @@
 + *   guamp-bt-idle-ms=10                           UART read every 10 ms while the controller says it sleeps (IBS)
 + *   guamp-perf-static-every=6                     constant per-core lines once a minute (first 3 samples always)
 + *   guamp-emmc-log-ms=10000                       periodic kpan log write every 10 s instead of 5 (panic flush unchanged)
++ *   guamp-gpu-dcvs-step=4 guamp-gpu-dcvs-idle=10  GPU DCVS reads RBBM_STATUS every 4 ms, 10 ms after an idle window (07/11: was 1 ms)
 + * Not here on purpose: guamp-slim-fast (the owner keeps the services on, 29/10), guamp-oslog (a diagnostic chosen on the line).
 + */
 +static char guamp_perfmode_defaults[] =
 +    "guamp-wifi-poll-max=8 guamp-wifi-poll-idle=4 guamp-wifi-beat=60 guamp-usb-fps=1 guamp-usb-poll-ms=20 guamp-usb-full-every=30 "
-+    "guamp-bt-idle-ms=10 guamp-perf-static-every=6 guamp-emmc-log-ms=10000";
++    "guamp-bt-idle-ms=10 guamp-perf-static-every=6 guamp-emmc-log-ms=10000 "
++    "guamp-gpu-dcvs-step=4 guamp-gpu-dcvs-idle=10";
 +
 +static boolean_t
 +guamp_bootarg_default(const char *arg_string, void *arg_ptr, int max_len, boolean_t force_string)
@@ -70,7 +72,7 @@
  }
  
  boolean_t
-@@ -213,7 +268,10 @@
+@@ -213,7 +270,10 @@
  	char            *arg_ptr,
  	int                     strlen)
  {

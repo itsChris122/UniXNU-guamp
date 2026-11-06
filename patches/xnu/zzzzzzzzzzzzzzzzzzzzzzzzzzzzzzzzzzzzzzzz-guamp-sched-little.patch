@@ -1,0 +1,105 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 7d44de5..920f509 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2389,6 +2389,17 @@ static processor_t choose_processor_for_realtime_thread(processor_set_t pset, pr
+  */
+ static uint32_t guamp_sched_amp_pri = BASEPRI_DEFAULT;
+ static uint32_t guamp_sched_rt_big = 1;
++/*
++ * guamp 07/11 (perf-cpu) guamp-sched-little=1 (default; 0 = off): the kernel background threads marked TH_OPT_GUAMP_LITTLE
++ * (thread.c, thread_set_thread_name) are placed like the threads below guamp-sched-amp: idle Silver cores first.
++ */
++static uint32_t guamp_sched_little = 1;
++
++static inline bool
++guamp_sched_amp_little(thread_t thread)
++{
++	return thread->base_pri < (int)guamp_sched_amp_pri || (guamp_sched_little && (thread->options & TH_OPT_GUAMP_LITTLE));
++}
+ static uint64_t guamp_sched_amp_placed[2];   /* idle core chosen: [0] Silver, [1] Gold (GuampCore line) */
+ static uint64_t guamp_sched_rt_placed[2];
+ 
+@@ -2396,7 +2407,7 @@ static inline uint64_t
+ guamp_sched_amp_preferred(processor_set_t pset, thread_t thread)
+ {
+ 	uint64_t big = pset->perfcontrol_cpu_preferred_bitmask;
+-	if (big == 0 || guamp_sched_amp_pri == 0 || thread->base_pri >= (int)guamp_sched_amp_pri) {
++	if (big == 0 || guamp_sched_amp_pri == 0 || !guamp_sched_amp_little(thread)) {
+ 		return big;
+ 	}
+ 	return pset->cpu_bitmask & ~big;
+@@ -2406,7 +2417,7 @@ static inline uint64_t
+ guamp_sched_amp_avoided(processor_set_t pset, thread_t thread)
+ {
+ 	uint64_t big = pset->perfcontrol_cpu_preferred_bitmask;
+-	if (big == 0 || guamp_sched_amp_pri == 0 || thread->base_pri >= (int)guamp_sched_amp_pri) {
++	if (big == 0 || guamp_sched_amp_pri == 0 || !guamp_sched_amp_little(thread)) {
+ 		return pset->perfcontrol_cpu_migration_bitmask;
+ 	}
+ 	return big;
+@@ -9570,8 +9581,11 @@ guamp_sys_init(void)
+ 	if (PE_parse_boot_argn("guamp-sched-rt-big", &value, sizeof(value))) {
+ 		guamp_sched_rt_big = value ? 1 : 0;
+ 	}
+-	printf("guamp-sched-amp: base priority %u and above on Gold first, below on Silver first (0 = off); realtime on Gold first %u\n",
+-	    guamp_sched_amp_pri, guamp_sched_rt_big);
++	if (PE_parse_boot_argn("guamp-sched-little", &value, sizeof(value))) {
++		guamp_sched_little = value ? 1 : 0;
++	}
++	printf("guamp-sched-amp: base priority %u and above on Gold first, below on Silver first (0 = off); realtime on Gold first %u; "
++	    "guamp background kernel threads on Silver first %u\n", guamp_sched_amp_pri, guamp_sched_rt_big, guamp_sched_little);
+ 
+ 	if (PE_parse_boot_argn("guamp-kthr", &value, sizeof(value))) {
+ 		guamp_sys_kthr = value ? 1 : 0;
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 539cb83..2037512 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -3767,11 +3767,34 @@ thread_has_thread_name(thread_t th)
+ 	return FALSE;
+ }
+ 
++/*
++ * guamp 07/11 (perf-cpu): the kernel threads of the guamp drivers that poll in the background (Wi-Fi copy engines, USB
++ * mirror, Bluetooth UART, GPU DCVS sampling, statistics) name themselves here once at start. They run at kernel priority
++ * (81), so guamp-sched-amp sent them to the Gold cores first: in fin53 (live-20261106-092610, 190-370 s) ~1100 idle Gold
++ * picks per second against ~30 Silver ones, ~760 timer interrupts/s on every Gold core and ~20-90 on the Silver ones, while
++ * the render thread of backboardd used ~1 Gold core. A name in this list marks the thread TH_OPT_GUAMP_LITTLE and
++ * choose_processor tries the idle Silver cores first for it (sched_prim.c, guamp_sched_amp_preferred; still work
++ * conserving). Not in the list on purpose: touch, audio/mic/jack device nodes, ADSP (audio periods), the CA/GPU submit
++ * threads and the PC sampler. Only a thread that names itself is marked (options are written by their own thread).
++ */
++static const char *const guamp_little_names[] = {
++	"guamp-usb-mirror", "guamp-wifi", "guamp-wifi-scan", "guamp-wifi-prep", "guamp-bt", "guamp-gpu-dcvs",
++	"guamp-gpu-perf", "guamp-hid-stats", "guamp-jack", "guamp-modem-watch", "guamp-pmic", "guamp-rpm-test",
++};
++
+ void
+ thread_set_thread_name(thread_t th, const char* name)
+ {
+ 	if (th && name) {
+ 		bsd_setthreadname(get_bsdthread_info(th), thread_tid(th), name);
++		if (th == current_thread() && get_threadtask(th) == kernel_task) {
++			for (unsigned int i = 0; i < sizeof(guamp_little_names) / sizeof(guamp_little_names[0]); i++) {
++				if (strcmp(name, guamp_little_names[i]) == 0) {
++					th->options |= TH_OPT_GUAMP_LITTLE;
++					break;
++				}
++			}
++		}
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/thread.h b/osfmk/kern/thread.h
+index e4080e4..5b4abf3 100644
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -425,6 +425,7 @@ struct thread {
+ 	uint16_t                options;        /* options set by thread itself */
+ #define TH_OPT_INTMASK          0x0003          /* interrupt / abort level */
+ #define TH_OPT_VMPRIV           0x0004          /* may allocate reserved memory */
++#define TH_OPT_GUAMP_LITTLE     0x0008          /* guamp: kernel background thread, Silver cores first (guamp-sched-little) */
+ #define TH_OPT_SYSTEM_CRITICAL  0x0010          /* Thread must always be allowed to run - even under heavy load */
+ #define TH_OPT_PROC_CPULIMIT    0x0020          /* Thread has a task-wide CPU limit applied to it */
+ #define TH_OPT_PRVT_CPULIMIT    0x0040          /* Thread has a thread-private CPU limit applied to it */
