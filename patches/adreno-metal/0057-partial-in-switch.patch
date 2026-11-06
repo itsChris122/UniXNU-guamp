@@ -1,0 +1,43 @@
+guamp: NMB_PARTIAL_IN=0 turns the 0051 partial copy in off (bridge patch 0057)
+
+fin55 (live-20261106-092610 from line ~7185, mirror captures sel0/sel2): black trails stay behind a card moved in the app
+switcher, and the card's preview is black. Bridge patch 0051 copies a loaded attachment into its shadow only inside its draws'
+scissors and has no switch, so it cannot be told apart from the scanout's differential copy (guamp-copy-diff), the row flush
+(guamp-scanout-rowflush) or the scheduler-thread submit (NMB_SUBMIT_INLINE) without a new build. NMB_PARTIAL_IN=0 (boot line
+through guamp-m2v-env, 0019) copies the whole image in again, as before 0051; default unchanged (partial on).
+Applies after bridge 0051 (shadow.rs ShadowSync::before). Host: metal2vulkan-runtime --lib shadow, 18 passed.
+
+diff --git a/bridge/patches/0057-guamp-partial-in-switch.patch b/bridge/patches/0057-guamp-partial-in-switch.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0057-guamp-partial-in-switch.patch
+@@ -0,0 +1,29 @@
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++index a73e17b..45d992c 100644
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -1041,6 +1041,15 @@ pub(super) struct ShadowUse {
++     pub(super) loads: Option<[u32; 4]>,
++ }
++ 
+++/// guamp (partial updates): whether a loaded attachment's copy in may be bounded by
+++/// [`ShadowUse::loads`]. `NMB_PARTIAL_IN=0` (boot line through guamp-m2v-env) copies the whole
+++/// image in again, as before 0051, to tell the partial copy in apart from other causes of
+++/// texels left unredrawn (fin55: black trails behind a card moved in the app switcher).
+++fn partial_in() -> bool {
+++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+++    *ON.get_or_init(|| !std::env::var("NMB_PARTIAL_IN").is_ok_and(|v| v.trim() == "0"))
+++}
+++
++ /// The rectangle bounding `a` and `b`, each `[x0, y0, x1, y1)`; `None` (anywhere) where either is.
++ fn bounding(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
++     let ([a0, a1, a2, a3], [b0, b1, b2, b3]) = (a?, b?);
++@@ -1185,7 +1194,7 @@ impl<M: Clone> ShadowSync<M> {
++                         copies: Arc::clone(&shadow.copies),
++                         step: Step::Into,
++                         kept: shadow.kept,
++-                        area: shadow.loads.filter(|_| !merged && !shadow.kept),
+++                        area: shadow.loads.filter(|_| !merged && !shadow.kept && partial_in()),
++                     });
++                 }
++                 self.entries[i].current = true;
