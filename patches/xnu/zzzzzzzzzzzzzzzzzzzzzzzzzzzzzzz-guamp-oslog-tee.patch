@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,387 @@
+@@ -650,6 +650,424 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -88,6 +88,15 @@
 + * stderr byte 0 -> 1, mode a -> b, env DT_MODE yes|no" (the last field says whether OS_ACTIVITY_DT_MODE= is in the
 + * argument/environment area of the process: no = the exec injection did not happen, yes = it got there and was not
 + * read). guamp-oslog-poke=0 turns this off.
++ * 07/11 (fin55: "stderr byte 0 -> 1 ... env DT_MODE yes" for wifid, Bridge, nanoregistryd, still no mirrored line): the
++ * environment was there, so libtrace had set the bytes itself and the mirror is stopped by another gate. The gates
++ * (libsystem_trace 17.7.11): os_log_type_enabled is false with mode/ATM bit 0x100, with 0x400 unless DT mode, and
++ * for a log level 4 ("off"); _os_log_impl_flatten_and_send returns before sending and mirroring with mode/ATM bit
++ * 0x800 (0x1a0704790) and mirrors only when the level is not 4 (w19 = 0xff at 0x1a0704c98). logd can rewrite the
++ * mode word after the init (__XChangeMode), so the kernel now redoes the poke at every write of a listed process to
++ * fd 1/2, sets OS_ACTIVITY_DT_MODE too, clears guamp-oslog-mode-clear (default 0xd00) from the mode word, and logs
++ * the gates ("guamp oslog: libtrace state name[pid]: ... mode, atm (commpage, whole system), prefs (process_prefs.0),
++ * os_trace, buffers"), so the next log says which one is closed.
 + * The tee also joins the iovecs of one writev (the mirror writes header, message and newline separately).
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
@@ -108,6 +117,8 @@
 +static SInt32 guamp_oslog_amfi_said;
 +static int guamp_oslog_poke_on = 1;
 +static SInt32 guamp_oslog_poke_said;
++static SInt32 guamp_oslog_state_said;
++static int guamp_oslog_mode_clear = 0xd00;
 +
 +static int
 +guamp_oslog_enabled(void)
@@ -138,6 +149,7 @@
 +	PE_parse_boot_argn("guamp-oslog-stderr", &guamp_oslog_stderr, sizeof(guamp_oslog_stderr));
 +	PE_parse_boot_argn("guamp-oslog-sugid", &guamp_oslog_sugid, sizeof(guamp_oslog_sugid));
 +	PE_parse_boot_argn("guamp-oslog-poke", &guamp_oslog_poke_on, sizeof(guamp_oslog_poke_on));
++	PE_parse_boot_argn("guamp-oslog-mode-clear", &guamp_oslog_mode_clear, sizeof(guamp_oslog_mode_clear));
 +	guamp_oslog_left = lines > 0 ? lines : 0;
 +	guamp_oslog_level = level;
 +	os_atomic_store(&guamp_oslog_state, 1, release);
@@ -242,7 +254,12 @@
 +#define GUAMP_TRACE_INIT_INSN   0x9107f000b0000040ULL
 +#define GUAMP_TRACE_ENV_NAME    0x1a07171fcULL
 +#define GUAMP_TRACE_MODE        0x1f4847af8ULL          /* uint32_t mode: 1 info, 2 debug */
-+#define GUAMP_TRACE_LOG_STDERR  0x1f4847b6eULL          /* uint8_t ACTIVITY_LOG_STDERR */
++#define GUAMP_TRACE_LOG_STDERR  0x1f4847b6eULL          /* uint8_t ACTIVITY_LOG_STDERR, then OS_ACTIVITY_DT_MODE */
++#define GUAMP_TRACE_OS_TRACE    0x1f4847ae0ULL          /* _os_trace (dispatch once of the init, -1 when done) */
++#define GUAMP_TRACE_BUFFERS     0x1f4847ae8ULL          /* firehose buffers pointer (0: not connected to logd) */
++#define GUAMP_TRACE_B68         0x1f4847b68ULL
++#define GUAMP_TRACE_PREFS       0x1f4847b98ULL          /* process_prefs.0 */
++#define GUAMP_COMMPAGE_ATM      0xfffffc104ULL          /* _COMM_PAGE_ATM_DIAGNOSTIC_CONFIG (64-bit) */
 +
 +/* 1 when needle is in the argument/environment strings of p (the area KERN_PROCARGS2 returns), 0 not, -1 unknown */
 +static int
@@ -274,16 +291,17 @@
 +	return 0;
 +}
 +
-+/* 06/11: libtrace mirror bytes set by the kernel for a listed process (see the comment at the top); p is current_proc() */
++/* 06/11: libtrace mirror state set by the kernel for a listed process (see the comment at the top); p is current_proc().
++ * why: 0 issetugid, 1 a write of the process to fd 1/2 (later, after logd may have changed the mode word). */
 +static void
-+guamp_oslog_poke(struct proc *p)
++guamp_oslog_poke(struct proc *p, int why)
 +{
 +	static const char name[] = "ACTIVITY_LOG_STDERR";
 +	char seen[sizeof(name)];
 +	mach_vm_offset_t start = 0;
-+	uint64_t insn = 0, slide;
-+	uint32_t mode = 0, mode_was = 0, want = 0;
-+	uint8_t was = 0, on = 1;
++	uint64_t insn = 0, slide, trace = 0, buffers = 0;
++	uint32_t mode = 0, mode_was = 0, want = 0, atm = 0;
++	uint8_t was[2] = { 0, 0 }, on[2] = { 1, 1 }, prefs = 0, b68 = 0;
 +	int changed = 0;
 +
 +	if (!guamp_oslog_poke_on || p != current_proc() || !proc_is64bit(p)) {
@@ -308,31 +326,49 @@
 +		}
 +		return;
 +	}
-+	if (copyin((user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), &was, sizeof(was)) != 0) {
++	/* ACTIVITY_LOG_STDERR and OS_ACTIVITY_DT_MODE (DT mode also keeps os_log_type_enabled true under mode "off") */
++	if (copyin((user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), was, sizeof(was)) != 0) {
 +		return;
 +	}
-+	if (was == 0) {
-+		if (copyout(&on, (user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), sizeof(on)) != 0) {
++	if (was[0] == 0 || was[1] == 0) {
++		if (copyout(on, (user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), sizeof(on)) != 0) {
 +			return;
 +		}
 +		changed = 1;
 +	}
++	/* mode word: + info/debug (guamp-oslog-level), - the bits that stop every os_log of the process before the mirror
++	 * (0x100 disable, 0x400 off, 0x800: _os_log_impl_flatten_and_send 0x1a0704790 returns at once), set by
++	 * OS_ACTIVITY_MODE or later by logd (__XChangeMode) */
 +	want = guamp_oslog_level == 1 ? 1u : guamp_oslog_level >= 2 ? 3u : 0u;
-+	if (want != 0 && copyin((user_addr_t)(GUAMP_TRACE_MODE + slide), &mode_was, sizeof(mode_was)) == 0 &&
-+	    (mode_was & want) != want) {
-+		mode = mode_was | want;
-+		if (copyout(&mode, (user_addr_t)(GUAMP_TRACE_MODE + slide), sizeof(mode)) == 0) {
++	if (copyin((user_addr_t)(GUAMP_TRACE_MODE + slide), &mode_was, sizeof(mode_was)) == 0) {
++		mode = (mode_was | want) & ~(uint32_t)guamp_oslog_mode_clear;
++		if (mode != mode_was && copyout(&mode, (user_addr_t)(GUAMP_TRACE_MODE + slide), sizeof(mode)) == 0) {
 +			changed = 1;
++		} else {
++			mode = mode_was;
 +		}
-+	} else {
-+		mode = mode_was;
 +	}
-+	if (changed && OSAddAtomic(1, &guamp_oslog_poke_said) < 16) {
-+		int env = guamp_oslog_env_has(p, "OS_ACTIVITY_DT_MODE=");
-+		printf("guamp oslog: libtrace mirror for %s[%d]: stderr byte %u -> 1, mode %#x -> %#x, env DT_MODE %s\n",
-+		    p->p_comm, proc_getpid(p), (unsigned)was, mode_was, mode, env > 0 ? "yes" : env == 0 ? "no" : "?");
++	if (!changed && why == 0) {
++		return;
++	}
++	/* the state the gates of os_log_type_enabled / flatten_and_send read: on every change, and on the first writes */
++	if (changed || OSAddAtomic(1, &guamp_oslog_state_said) < 12) {
++		if (OSAddAtomic(1, &guamp_oslog_poke_said) >= 40) {
++			return;
++		}
++		(void)copyin((user_addr_t)GUAMP_COMMPAGE_ATM, &atm, sizeof(atm));
++		(void)copyin((user_addr_t)(GUAMP_TRACE_PREFS + slide), &prefs, sizeof(prefs));
++		(void)copyin((user_addr_t)(GUAMP_TRACE_B68 + slide), &b68, sizeof(b68));
++		(void)copyin((user_addr_t)(GUAMP_TRACE_OS_TRACE + slide), &trace, sizeof(trace));
++		(void)copyin((user_addr_t)(GUAMP_TRACE_BUFFERS + slide), &buffers, sizeof(buffers));
++		int env = changed ? guamp_oslog_env_has(p, "OS_ACTIVITY_DT_MODE=") : -1;
++		printf("guamp oslog: libtrace %s %s[%d]: stderr/dt %u/%u -> 1/1, mode %#x -> %#x, atm %#x, prefs %#x, b68 %#x, "
++		    "os_trace %#llx, buffers %s, env DT_MODE %s\n", why ? "state" : "mirror for", p->p_comm, proc_getpid(p),
++		    (unsigned)was[0], (unsigned)was[1], mode_was, mode, atm, (unsigned)prefs, (unsigned)b68,
++		    (unsigned long long)trace, buffers ? "yes" : "no", env > 0 ? "yes" : env == 0 ? "no" : "-");
 +	}
 +}
++
 +/* 06/11: issetugid() of the listed processes (see the comment at the top); sugid is proc_issetugid(p). */
 +int guamp_oslog_issetugid(struct proc *p, int sugid);
 +int
@@ -341,7 +377,7 @@
 +	if (!guamp_oslog_enabled() || !guamp_oslog_match(p->p_comm)) {
 +		return sugid;
 +	}
-+	guamp_oslog_poke(p);
++	guamp_oslog_poke(p, 0);
 +	int answer = guamp_oslog_sugid ? 0 : sugid;
 +	if (OSAddAtomic(1, &guamp_oslog_sugid_said) < 16) {
 +		printf("guamp oslog: issetugid for %s[%d]: %d -> %d\n", p->p_comm, proc_getpid(p), sugid, answer);
@@ -357,6 +393,7 @@
 +	char buf[512];
 +	size_t used = 0;
 +	int iovcnt = uio_iovcnt(uio);
++	guamp_oslog_poke(p, 1);
 +	if (!uio_isuserspace(uio)) {
 +		return;
 +	}
@@ -424,7 +461,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +1047,9 @@
+@@ -666,6 +1084,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
