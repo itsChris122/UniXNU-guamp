@@ -70,7 +70,7 @@ GUAMP = {'DeviceClassNumber': 1, 'HasBaseband': True, 'cellular-data': True, 'co
          'sms': True, 'CellularTelephonyCapability': True, 'mms': True, 'data-plan': False, 'EUICCChipID': None}
 # ADT properties the answers above come from: guamp-mg-adt-sync must stamp all of them.
 STAMPED = {('/baseband', 'name'), ('/baseband', 'class'), ('/baseband', 'euicc-chip-id'), ('/product', 'baseband-chipset'),
-           ('/', 'model')}
+           ('/', 'model'), ('/', 'model-number'), ('/', 'region-info'), ('/', 'regulatory-model-number')}
 
 
 def check_guamp(a, where):
@@ -237,7 +237,8 @@ class Dylib:
 
 
 KEYS = ('HasBaseband', 'cellular-data', 'contains-cellular-radio', 'telephony', 'sms', 'CellularTelephonyCapability', 'mms',
-        'data-plan', 'BasebandClass', 'EUICCChipID', 'BasebandChipset')
+        'data-plan', 'BasebandClass', 'EUICCChipID', 'BasebandChipset',
+        'ModelNumber', 'RegionInfo', 'RegulatoryModelNumber')   # 07/11 About (scripts/make-guamp-model-number-adt.py)
 
 
 def check_mg(path):
@@ -256,6 +257,9 @@ def check_mg(path):
     assert s['BasebandClass'][0] == ['IODeviceTree:/baseband', obf('class')], s['BasebandClass']
     assert s['EUICCChipID'][0] == ['IODeviceTree:/baseband', obf('euicc-chip-id')], s['EUICCChipID']
     assert s['BasebandChipset'][0] == ['IODeviceTree:/product', obf('baseband-chipset')], s['BasebandChipset']
+    assert s['ModelNumber'][0] == ['IODeviceTree:/', 'model-number'], s['ModelNumber']
+    assert s['RegionInfo'][0] == ['IOPlatformExpertDevice', 'region-info'], s['RegionInfo']
+    assert s['RegulatoryModelNumber'][0] == ['IODeviceTree:/', obf('regulatory-model-number')], s['RegulatoryModelNumber']
     return s
 
 
