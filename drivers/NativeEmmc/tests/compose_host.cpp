@@ -417,7 +417,79 @@ static void testXr() {
   CHECK(!guampComposeValid(bad));
 }
 
+// Section 19 (guamp-compose-diff): after changing random rows of a layer's source, redrawing only the output rows the band hash
+// reports must give, bit for bit, the whole redraw of the new source (BGRA bilinear and nearest, scaled down and up, blended over
+// a background with holes; 4:2:0 with its chroma; 'b3a8' with its alpha plane); unchanged sources report 0; another geometry -1.
+static void hashCase(GuampComposeLayer l, std::vector<unsigned char> &mem, uint32_t W, uint32_t H, int rounds) {
+  GuampComposeHashes hs = {};
+  std::vector<uint32_t> base(W * H);
+  for (auto &v : base) v = pix(rnd() & 255, rnd() & 255, rnd() & 255, 255);
+  std::vector<uint32_t> shown = base;
+  int64_t y0 = 0, y1 = 0; uint32_t changed = 0;
+  l.base = mem.data(); l.bytes = mem.size();
+  CHECK(guampComposeHashDiff(l, hs, H, &y0, &y1, &changed) == -1);   // first time: nothing to compare with
+  CHECK(draw(shown, W, H, l) > 0);
+  CHECK(guampComposeHashDiff(l, hs, H, &y0, &y1, &changed) == 0 && changed == 0);
+  int partial = 0;
+  for (int round = 0; round < rounds; round++) {
+    const int edits = 1 + rnd() % 3;
+    for (int e = 0; e < edits; e++) {   // a few bytes somewhere in the planes (possibly outside the source rectangle)
+      const uint64_t at = rnd() % mem.size();
+      const unsigned n = 1 + rnd() % 64;
+      for (unsigned i = 0; i < n && at + i < mem.size(); i++) mem[at + i] = (unsigned char)rnd();
+    }
+    const int r = guampComposeHashDiff(l, hs, H, &y0, &y1, &changed);
+    CHECK(r == 0 || r == 1);
+    if (r == 1) {
+      partial++;
+      CHECK(y0 >= 0 && y1 <= (int64_t)H && y0 < y1 && changed > 0);
+      // what the composition does: the changed rows get the background again, then the layer over them
+      for (int64_t y = y0; y < y1; y++)
+        for (uint32_t x = 0; x < W; x++) shown[y * W + x] = base[y * W + x];
+      CHECK(drawClip(shown, W, H, l, 0, y0, W, y1) >= 0);
+    }
+    std::vector<uint32_t> fresh = base;
+    CHECK(draw(fresh, W, H, l) > 0);
+    if (fresh != shown) {
+      std::printf("hash diff: round %d kind %u result %d rows %lld..%lld\n", round, l.kind, r, (long long)y0, (long long)y1);
+      CHECK(false); return;
+    }
+  }
+  CHECK(partial > 0);
+  GuampComposeLayer other = l; other.sy = l.sy ? 0 : 1; other.sh = l.sh - 1;   // another source rectangle: not comparable
+  CHECK(guampComposeHashDiff(other, hs, H, &y0, &y1, &changed) == -1);
+  CHECK(guampComposeHashDiff(other, hs, H, &y0, &y1, &changed) == 0);
+}
+static void testHashDiff() {
+  {   // the page: the 750 x 1666 canvas onto the 720 x 1600 panel, bilinear, blended (with a transparent hole for a video)
+    std::vector<unsigned char> mem;
+    Surface s = makeBgra(750, 1666, 750 * 4 + 8, mem, true);
+    for (uint32_t y = 400; y < 700; y++) std::memset(mem.data() + y * s.stride + 40 * 4, 0, 600 * 4);
+    hashCase(bgraLayer(s, 0, 0, 750, 1666, 0, 0, 720, 1600, 1, true), mem, 720, 1600, 12);
+  }
+  {   // nearest, upscaled, clipped by the output, replacing
+    std::vector<unsigned char> mem;
+    Surface s = makeBgra(70, 90, 70 * 4, mem, false);
+    hashCase(bgraLayer(s, 3, 5, 60, 80, -7, 9, 150, 200, 0, false), mem, 140, 180, 40);
+  }
+  {   // 4:2:0 video, odd source rectangle, upscaled
+    const uint32_t w = 64, h = 36, ls = 72, cs = 68;
+    std::vector<unsigned char> mem(ls * h + 16 + cs * (h / 2 - 1) + w);
+    for (auto &b : mem) b = rnd() & 255;
+    GuampComposeLayer l = {};
+    l.kind = 1; l.matrix = 0; l.width = w; l.height = h; l.offset = 0; l.stride = ls; l.chromaOffset = ls * h + 16; l.chromaStride = cs;
+    l.sx = 1; l.sy = 1; l.sw = 61; l.sh = 35; l.dx = 4; l.dy = 6; l.dw = 120; l.dh = 70;
+    hashCase(l, mem, 130, 80, 60);
+  }
+  {   // 'b3a8': colour words and an alpha plane
+    XrSurface x;
+    makeXr(x, 5, 40, 50);
+    hashCase(xrLayer(x, 0, 2, 40, 47, 1, 1, 60, 70, 1, true), x.mem, 64, 74, 40);
+  }
+}
+
 int main() {
+  testHashDiff();
   testOver();
   testXr();
   testUnscaled();

@@ -83,7 +83,9 @@ extern "C" volatile uint64_t guamp_copy_kept[2];   // variant section 10: supers
 // [18] BGRA layer ticks, [19] 4:2:0 layer ticks, [20] scanout copy ticks, [21] whole redraws, [22] partial, [23] unchanged.
 // Section 16 (guamp-compose-xr10): [30] extended-range (XR10) layers taken, [31] the last one's fourcc, [32] single-layer XR10 swaps
 // composed.
-extern "C" volatile uint64_t guamp_compose[33];
+// Section 19 (guamp-compose-diff): [33] layers sent again with the same content, [34] partly changed, [35] not comparable, [36] hash
+// ticks, [37] bands changed, [38] layers hashed, [39] map failures while hashing.
+extern "C" volatile uint64_t guamp_compose[40];
 extern "C" volatile uint32_t guamp_compose_layer[4][14];
 // package/LegacyDisplayProbe.cpp: the surface of the last swap refused for its surface (reason 4): width, height, format, planes,
 // row bytes, allocation, descriptor bytes.
@@ -199,10 +201,17 @@ static char fourcc(uint32_t format, unsigned shift)
 // before the scanout copy), layers drawn and skipped; then every layer that changed since the previous report.
 static void composeLog(uint64_t f)
 {
-  static uint64_t last[33] = {};
+  static uint64_t last[40] = {};
   static uint32_t lastLayer[4][14] = {};
-  uint64_t now[33];
-  for (unsigned i = 0; i < 33; i++) now[i] = guamp_compose[i];
+  uint64_t now[40];
+  for (unsigned i = 0; i < 40; i++) now[i] = guamp_compose[i];
+  // Section 19: layers the render server sent again, compared by content (same: not redrawn; partly: only the changed rows).
+  if (now[38] != last[38]) {
+    const uint64_t hashed = now[38] - last[38];
+    IOLog("GuampDisplay: compose diff: layers hashed +%llu: same +%llu, partly changed +%llu (bands +%llu), not comparable +%llu, "
+          "map failures +%llu; hash %llu us per layer\n", hashed, now[33] - last[33], now[34] - last[34], now[37] - last[37],
+          now[35] - last[35], now[39] - last[39], (now[36] - last[36]) / hashed * 1000000 / f);
+  }
   // Section 16: extended-range layers, with the fourcc of the last one.
   if (now[30] != last[30] || now[32] != last[32]) {
     const uint32_t xr = (uint32_t)now[31];
@@ -240,7 +249,7 @@ static void composeLog(uint64_t f)
           "(dark draws +%llu, same picture +%llu of +%llu 420 draws)\n", now[24] - last[24], now[25] - last[25], now[26],
           now[27] - last[27], now[28] - last[28], now[5] - last[5]);
   }
-  for (unsigned i = 0; i < 33; i++) last[i] = now[i];
+  for (unsigned i = 0; i < 40; i++) last[i] = now[i];
 }
 
 static void copyLog()

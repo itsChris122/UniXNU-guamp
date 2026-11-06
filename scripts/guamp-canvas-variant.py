@@ -19,13 +19,15 @@ when refused, are composed in software.
 Section 15 (guamp-compose-keep, default 1): a layer the composition cannot draw keeps its last picture (or the screen)
 instead of turning the frame black.
 Section 16 (guamp-compose-xr10, default 1): extended-range layers ('w30r', 'w40a', 'b3a8') are converted to 8-bit BGRA and drawn.
+Section 19 (guamp-compose-diff, default 1): a layer sent again at the same place is compared by content (band hashes):
+unchanged layers are not redrawn, partly changed ones only in their rows (a video in a page redraws its own rectangle).
 Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and follows the panel's INTF_1 counters
 (guamp-vsync-hw); swap rate, swap -> completion latency and vsync messages are counted for the 'GuampPacing:' line.
 """
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = 'ed8ffc306f84e235d8b2f0e23e64e9b34efe04905b7c66c3e0c9ac332031494b'
+PATCHED_SHA256 = '490ca6b5f6d20b3e3caa6e91157c01bab21d03ebc0664566bde0a0a207629862'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -810,7 +812,8 @@ static inline uint32_t guampComposeOver(uint32_t s,uint32_t d) {
 static inline uint32_t guampComposeClamp(int32_t v) {return v<0?0:v>255?255:(uint32_t)v;}
 // Y'CbCr to BGRA (8.8 fixed point): luma gain, Cr to R, Cb to G, Cr to G, Cb to B, luma offset. 601/709 video range, 601/709 full.
 static const int32_t kGuampComposeYuv[4][6]={{298,409,100,208,516,16},{298,459,55,136,541,16},{256,359,88,183,454,0},{256,403,48,120,475,0}};
-static inline uint32_t guampComposeYuv(uint32_t y,uint32_t cb,uint32_t cr,const int32_t *k) {
+// (section 19: the reference of the 4:2:0 draw, which regroups the same sums; the host test checks both)
+__attribute__((unused)) static inline uint32_t guampComposeYuv(uint32_t y,uint32_t cb,uint32_t cr,const int32_t *k) {
     const int32_t c=((int32_t)y-k[5])*k[0],d=(int32_t)cb-128,e=(int32_t)cr-128;
     const int32_t r=(c+k[1]*e+128)>>8,g=(c-k[2]*d-k[3]*e+128)>>8,b=(c+k[4]*d+128)>>8;
     return 0xff000000U|guampComposeClamp(r)<<16|guampComposeClamp(g)<<8|guampComposeClamp(b);
@@ -877,6 +880,9 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
     for(uint32_t r=0;r<rows;++r)rowTaps[r]=guampComposeTap((uint32_t)(y0-l.dy)+r,l.dh,l.sh,filter);
     const int32_t *k=kGuampComposeYuv[(l.kind==2?2:0)+l.matrix];
     const bool direct=l.sw==l.dw;   // one source column per output column: no column weights
+    // Section 19: only the source columns the visible output columns read (taps never decrease; a weighted tap reads the next
+    // column too), so a clipped redraw (the rectangle of a video under the page) converts a part of each row, not all of it.
+    const uint32_t lineFrom=columnTaps[0]>>9,lastTap=columnTaps[cols-1]>>9,lineTo=lastTap+2<l.sw?lastTap+2:l.sw;
     for(uint32_t r=0;r<rows;++r) {
         uint32_t *o=out+(uint64_t)(y0+r)*width+(uint64_t)x0;
         const uint32_t row=l.sy+(rowTaps[r]>>9),weight=rowTaps[r]&511;
@@ -884,7 +890,7 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
             const unsigned char *first=l.base+l.offset+(uint64_t)row*l.stride+(uint64_t)l.sx*4;
             const unsigned char *src=first;
             if(xr) {   // section 16: the row (and the next one, weighted) converted to 8-bit premultiplied BGRA
-                for(uint32_t x=0;x<l.sw;++x) {
+                for(uint32_t x=lineFrom;x<lineTo;++x) {
                     uint32_t v=guampComposeXrPixel(l,row,l.sx+x);
                     if(weight)v=guampComposeLerp(v,guampComposeXrPixel(l,row+1,l.sx+x),weight);
                     __builtin_memcpy(line+(uint64_t)x*4,&v,4);
@@ -892,28 +898,96 @@ static inline int64_t guampComposeDraw(uint32_t *out,uint32_t width,uint32_t hei
                 src=line;
             } else if(weight) {   // the tap guarantees row + 1 inside the rectangle
                 const unsigned char *second=first+l.stride;
-                for(uint32_t x=0;x<l.sw;++x) {
+                for(uint32_t x=lineFrom;x<lineTo;++x) {
                     uint32_t a,b;__builtin_memcpy(&a,first+(uint64_t)x*4,4);__builtin_memcpy(&b,second+(uint64_t)x*4,4);
-                    const uint32_t v=guampComposeLerp(a,b,weight);__builtin_memcpy(line+(uint64_t)x*4,&v,4);
+                    const uint32_t v=(a|b)?guampComposeLerp(a,b,weight):0;__builtin_memcpy(line+(uint64_t)x*4,&v,4);
                 }
                 src=line;
             }
             for(uint32_t c=0;c<cols;++c) {
                 const uint32_t tap=columnTaps[c],at=(tap>>9)*4,w=direct?0:(tap&511);
                 uint32_t s;__builtin_memcpy(&s,src+at,4);
-                if(w){uint32_t t;__builtin_memcpy(&t,src+at+4,4);s=guampComposeLerp(s,t,w);}
-                o[c]=l.blend?guampComposeOver(s,o[c]):s;
+                if(w){uint32_t t;__builtin_memcpy(&t,src+at+4,4);s=(s|t)?guampComposeLerp(s,t,w):0;}
+                if(l.blend){if(s)o[c]=guampComposeOver(s,o[c]);}   // section 19: a transparent sample (the hole over a video) keeps o
+                else o[c]=s;
             }
         } else {
+            // Section 19: the chroma terms once per Cb Cr pair (bit-exact with guampComposeYuv: the same sums, regrouped).
             const unsigned char *luma=l.base+l.offset+(uint64_t)row*l.stride;
             const unsigned char *chroma=l.base+l.chromaOffset+(uint64_t)(row/2)*l.chromaStride;
+            uint32_t lastPair=0xffffffffU;int32_t rc=0,gc=0,bc=0;
             for(uint32_t c=0;c<cols;++c) {
                 const uint32_t column=l.sx+(columnTaps[c]>>9),pair=column&~1u;
-                o[c]=guampComposeYuv(luma[column],chroma[pair],chroma[pair+1],k);
+                if(pair!=lastPair) {
+                    lastPair=pair;
+                    const int32_t d=(int32_t)chroma[pair]-128,e=(int32_t)chroma[pair+1]-128;
+                    rc=k[1]*e+128;gc=128-k[2]*d-k[3]*e;bc=k[4]*d+128;
+                }
+                const int32_t y=((int32_t)luma[column]-k[5])*k[0];
+                o[c]=0xff000000U|guampComposeClamp((y+rc)>>8)<<16|guampComposeClamp((y+gc)>>8)<<8|guampComposeClamp((y+bc)>>8);
             }
         }
     }
     return (int64_t)cols*rows;
+}
+// Section 19 (guamp-compose-diff): the content of a layer's source rectangle, hashed in bands of rows. The render server sends
+// the page layer again with every video frame (a new buffer, mostly the same picture), and a decoder that runs slower than the
+// display repeats its picture: a layer whose bands all hash as before is not redrawn, one with changed bands redraws only the
+// output rows that read them. Two multiply-xor lanes per row (one changed word always changes the hash; two or more collide with
+// probability ~2^-64), folded into the band.
+struct GuampComposeHashes {uint32_t key[10];uint32_t bands,bandRows;bool valid;uint64_t h[256];};
+static inline uint64_t guampComposeMix(uint64_t h,uint64_t w) {h^=w;h*=0x9E3779B97F4A7C15ull;return h^(h>>29);}
+static inline uint64_t guampComposeHashBytes(const unsigned char *p,uint64_t n,uint64_t seed) {
+    uint64_t a=0x243F6A8885A308D3ull^seed,c=0x13198A2E03707344ull;uint64_t i=0;
+    for(;i+16<=n;i+=16){uint64_t u,v;__builtin_memcpy(&u,p+i,8);__builtin_memcpy(&v,p+i+8,8);a=guampComposeMix(a,u);c=guampComposeMix(c,v);}
+    for(;i<n;++i)a=guampComposeMix(a,p[i]);
+    return a^(c*0xC2B2AE3D27D4EB4Full);
+}
+// Hashes every band of the layer (base and bytes set, any kind). -1: not comparable (invalid layer, or another source geometry or
+// format than the hashes held: they are taken again); 0: every band as before; 1: some changed, and [*y0, *y1) are the output rows
+// (inside the layer's destination and [0, height)) that read a changed band (a sample reads its row and the next one, a margin
+// of one source row and one output row each side). *changed: bands that changed.
+static inline int guampComposeHashDiff(const GuampComposeLayer &l,GuampComposeHashes &s,uint32_t height,int64_t *y0,int64_t *y1,
+    uint32_t *changed) {
+    *changed=0;
+    if(!guampComposeValid(l)){s.valid=false;return -1;}
+    uint32_t bandRows=16;
+    while((l.sh+bandRows-1)/bandRows>256)bandRows*=2;
+    const uint32_t bands=(l.sh+bandRows-1)/bandRows;
+    const uint32_t key[10]={l.kind,l.width,l.sx,l.sy,l.sw,l.sh,(uint32_t)l.stride,(uint32_t)l.chromaStride,(uint32_t)l.offset,
+                            (uint32_t)l.chromaOffset};
+    bool same=s.valid && s.bands==bands && s.bandRows==bandRows;
+    for(unsigned i=0;i<10 && same;++i)same=s.key[i]==key[i];
+    const bool yuv=l.kind==1 || l.kind==2;
+    const uint64_t pixel=yuv?1:l.kind==4?8:4,left=(uint64_t)l.sx*pixel,bytes=(uint64_t)l.sw*pixel;
+    const uint64_t chromaLeft=(uint64_t)(l.sx&~1u),chromaBytes=(((uint64_t)l.sx+l.sw+1)/2)*2-chromaLeft;
+    int64_t lo=-1,hi=-1;
+    for(uint32_t b=0;b<bands;++b) {
+        const uint32_t r0=b*bandRows,r1=r0+bandRows<l.sh?r0+bandRows:l.sh;
+        uint64_t h=0x452821E638D01377ull^b;
+        for(uint32_t r=r0;r<r1;++r) {
+            const uint64_t row=(uint64_t)l.sy+r;
+            h=guampComposeMix(h,guampComposeHashBytes(l.base+l.offset+row*l.stride+left,bytes,row));
+            if(yuv && (r==r0 || !(row&1)))   // the Cb Cr row of this luma row, once
+                h=guampComposeMix(h,guampComposeHashBytes(l.base+l.chromaOffset+(row/2)*l.chromaStride+chromaLeft,chromaBytes,row/2));
+            else if(l.kind==5)   // the alpha plane
+                h=guampComposeMix(h,guampComposeHashBytes(l.base+l.chromaOffset+row*l.chromaStride+l.sx,l.sw,row));
+        }
+        if(same && s.h[b]!=h){if(lo<0)lo=b;hi=b;*changed=*changed+1;}
+        s.h[b]=h;
+    }
+    for(unsigned i=0;i<10;++i)s.key[i]=key[i];
+    s.bands=bands;s.bandRows=bandRows;s.valid=true;
+    if(!same)return -1;
+    if(lo<0)return 0;
+    const int64_t first=lo*(int64_t)bandRows-1,last=(hi+1)*(int64_t)bandRows+1;   // source rows, one more each side
+    int64_t a=l.dy+(first<0?0:first*(int64_t)l.dh/(int64_t)l.sh)-1;
+    int64_t z=l.dy+(last*(int64_t)l.dh+(int64_t)l.sh-1)/(int64_t)l.sh+1;
+    const int64_t top=l.dy<0?0:l.dy,bottom=l.dy+(int64_t)l.dh<(int64_t)height?l.dy+(int64_t)l.dh:(int64_t)height;
+    if(a<top)a=top;
+    if(z>bottom)z=bottom;
+    if(a>=z)return 0;
+    *y0=a;*y1=z;return 1;
 }
 // Union of a destination rectangle (clipped to the output) into the box r = {x0, y0, x1, y1} (empty when x0 >= x1).
 static inline void guampComposeUnion(int64_t *r,int64_t dx,int64_t dy,uint64_t dw,uint64_t dh,uint32_t width,uint32_t height) {
@@ -1745,6 +1819,87 @@ EDITS.append(('''            ok=hooked>0 || (frame.scaled
             guamp_scanout_src_unflushed=0;
             ok=hooked>0 || (frame.scaled
                 ?guampScalePixels('''))
+# 19. Video in a page (06/11, fin51 live-20261106-014007 1463-1533 s): every composed frame was a whole redraw (frames whole
+#     +70..+110, partial +0), ~30 ms each (page 23 ms + video 7 ms, + scanout 4 ms): 7-11 fps. The render server sends the page
+#     layer again with every video frame (a new buffer, the page itself unchanged), so its new generation dirtied the whole screen.
+#     guamp-compose-diff (default 1, 0 = as before): a layer sent again at the same place is compared by content (band hashes of
+#     its source, guampComposeHashDiff in the core): all bands the same -> nothing to redraw for it; some changed -> only the
+#     output rows that read them. A video frame then redraws its own rectangle (and the page over it), and a decoder that repeats
+#     its picture (fin51: 'same picture +23 of +70') redraws nothing. The maps taken for the hashes are kept for the draw (one
+#     cache flush per surface). In the core: only the source columns a clipped redraw reads are prepared, transparent page
+#     samples skip the blend, 4:2:0 chroma terms once per pair (bit-exact). guamp_compose: [33] layers sent again with the same
+#     content, [34] sent again partly changed, [35] not comparable (first time, other geometry), [36] hash ticks, [37] bands
+#     changed, [38] layers hashed, [39] map failures while hashing. GuampDisplayExt.inc: 'GuampDisplay: compose diff: ...'.
+#     The compose dump now also shows bytes 0x160-0x1c0 (the per-layer damage rectangles of the request seem to sit at 0x90 + 0x40 i
+#     in 24.8 fixed point, their counts near 0x1c0: logged only, not used yet).
+EDITS.append(('extern "C" {volatile uint64_t guamp_compose[33];', 'extern "C" {volatile uint64_t guamp_compose[40];'))
+EDITS.append(('composeDumpRows(n,bytes,0x000,0x160);composeDumpRows(n,bytes,0x1c0,0x260);',
+              'composeDumpRows(n,bytes,0x000,0x160);composeDumpRows(n,bytes,0x160,0x260);   // section 19: 0x160-0x1c0 too'))
+EDITS.append(('    uint32_t composeGen[4]={};uint64_t composeSerial=0;\n',
+              '    uint32_t composeGen[4]={};uint64_t composeSerial=0;\n'
+              '    // Section 19 (guamp-compose-diff, default 1): band hashes of the source each slot shows and the generation they are of.\n'
+              '    GuampComposeHashes composeHashes[4]={};uint32_t composeHashGen[4]={};int composeDiffWanted=-1;\n'
+              '    bool composeDiffOn() {\n'
+              '        if(composeDiffWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose-diff",&v,sizeof v);composeDiffWanted=v!=0;}\n'
+              '        return composeDiffWanted==1;\n'
+              '    }\n'))
+EDITS.append(('''        int64_t dirty[4]={0,0,0,0};
+        if(full) {dirty[2]=frame.width;dirty[3]=frame.height;}''', '''        // Section 19: every layer of a new generation is hashed (also on whole redraws: the next frame compares with it); the
+        // maps are kept for the draw below.
+        IOMemoryMap *hashMaps[4]={};int hashResult[4]={-1,-1,-1,-1};int64_t hashRows[4][2]={};
+        if(composeDiffOn() && set->serial!=composeLastSerial) {
+            const uint64_t hashStart=composeTicks();
+            for(uint32_t i=0;i<set->count && i<4;++i) {
+                const GuampLayerSource &src=set->source[i];
+                if(src.slot>=4 || (composeHashGen[src.slot]==src.gen && composeHashes[src.slot].valid))continue;
+                composeHashGen[src.slot]=src.gen;
+                IOMemoryMap *map=guampSourceMap(src.memory,src.allocation);
+                if(!map || !map->getVirtualAddress() || map->getLength()<src.allocation) {
+                    OSSafeReleaseNULL(map);composeHashes[src.slot].valid=false;guamp_compose[39]=guamp_compose[39]+1;continue;
+                }
+                GuampComposeLayer l=src.layer;
+                l.base=reinterpret_cast<const unsigned char *>(map->getVirtualAddress());l.bytes=src.allocation;
+                uint32_t changedBands=0;
+                const int r=guampComposeHashDiff(l,composeHashes[src.slot],frame.height,&hashRows[src.slot][0],&hashRows[src.slot][1],&changedBands);
+                hashResult[src.slot]=r;hashMaps[i]=map;
+                guamp_compose[38]=guamp_compose[38]+1;guamp_compose[37]=guamp_compose[37]+changedBands;
+                if(r==0)guamp_compose[33]=guamp_compose[33]+1;else if(r==1)guamp_compose[34]=guamp_compose[34]+1;else guamp_compose[35]=guamp_compose[35]+1;
+            }
+            guamp_compose[36]=guamp_compose[36]+(composeTicks()-hashStart);
+        }
+        int64_t dirty[4]={0,0,0,0};
+        if(full) {dirty[2]=frame.width;dirty[3]=frame.height;}'''))
+EDITS.append(('''            if(same)continue;
+            if(was.present)guampComposeUnion(dirty,was.dx,was.dy,was.dw,was.dh,frame.width,frame.height);''', '''            if(same)continue;
+            // Section 19: the same place, a new generation compared by content: only the rows that read a changed band.
+            if(now && was.present && was.dx==now->layer.dx && was.dy==now->layer.dy && was.dw==now->layer.dw && was.dh==now->layer.dh &&
+               hashResult[slot]>=0) {
+                if(hashResult[slot]==1)guampComposeUnion(dirty,now->layer.dx,hashRows[slot][0],now->layer.dw,
+                    (uint64_t)(hashRows[slot][1]-hashRows[slot][0]),frame.width,frame.height);
+                continue;
+            }
+            if(was.present)guampComposeUnion(dirty,was.dx,was.dy,was.dw,was.dh,frame.width,frame.height);'''))
+EDITS.append(('guamp_compose[23]=guamp_compose[23]+1;guamp_compose[2]=guamp_compose[2]+1;return true;',
+              'guamp_compose[23]=guamp_compose[23]+1;guamp_compose[2]=guamp_compose[2]+1;\n'
+              '            for(auto &m: hashMaps)OSSafeReleaseNULL(m);   // section 19\n'
+              '            return true;'))
+EDITS.append(('''            IOMemoryMap *map=guampSourceMap(src.memory,src.allocation);
+            if(!map || !map->getVirtualAddress() || map->getLength()<src.allocation) {
+                OSSafeReleaseNULL(map);guamp_compose[11]=guamp_compose[11]+1;continue;
+            }''', '''            // Section 19: the map the hash took, else a new one.
+            IOMemoryMap *map=i<4 && hashMaps[i]?hashMaps[i]:guampSourceMap(src.memory,src.allocation);
+            if(i<4)hashMaps[i]=nullptr;
+            if(!map || !map->getVirtualAddress() || map->getLength()<src.allocation) {
+                OSSafeReleaseNULL(map);guamp_compose[11]=guamp_compose[11]+1;
+                __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 19: the buffer misses this layer, redraw all next time
+                continue;
+            }'''))
+EDITS.append(('            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;continue;}\n',
+              '            if(drawn<0){guamp_compose[8]=guamp_compose[8]+1;if(src.slot<4)composeHashes[src.slot].valid=false;continue;}\n'))
+EDITS.append(('''        else {guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);}
+        return ok;''', '''        else {guamp_compose[3]=guamp_compose[3]+1;__atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);}
+        for(auto &m: hashMaps)OSSafeReleaseNULL(m);   // section 19: layers off the changed part
+        return ok;'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
