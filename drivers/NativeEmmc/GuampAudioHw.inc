@@ -23,7 +23,13 @@
 //   guamp-audio-hw-i2c=<kHz>   100, 400 (default, as Linux) or 1000
 //   guamp-audio-hw-hph=<dB>    headphone PA gain (HPHL/HPHR Volume), -30..0, default -12 (vendor default -6)
 //   guamp-audio-hw-ear=<dB>    earpiece PA gain ("EAR PA GAIN"), -18..6, default -12 (vendor default +6)
-//   The RX macro digital gain of routes 2/3 follows guamp-audio-hw-att / -floor like the speaker amplifier.
+//   The RX macro digital gain of routes 2/3 follows guamp-audio-hw-att / -floor.
+//   guamp-audio-hw-spk-att=<dB>  speaker amplifier attenuation (07/11), default 6 dB (never below -floor); before 07/11 the
+//                              speaker used guamp-audio-hw-att, 12 dB from the defaults table: =12 gives that level back.
+//                              Motorola runs the amplifier at 0 dB (spk profile HAGCCFG4 0x0064, no aw882xx_rx_volume in
+//                              mixer_paths) behind the Awinic DSP speaker protection we do not have: 6 dB stay as headroom.
+//   guamp-audio-hw-guard=0     no speaker guard (default 1): at every amp on, VBAT and die temperature read from the chip
+//                              lower the boost peak current and add 0.5..6 dB of attenuation like the Motorola monitor
 #define GUAMP_AUDIO_HW_PROVIDED 1
 #define GUAMP_WCD937X_POWER_PROVIDED 1   // guamp_wcd937x_power below; GuampMicDev.inc leaves its stand-in out
 #include "GuampAudioHw.h"
@@ -35,7 +41,8 @@
 #include "GeniI2cCpp.inc"
 
 namespace audiohw {
-unsigned gMode, gAttDb = 30, gFloorDb = 6, gKhz = 400, gDelay;
+unsigned gMode, gAttDb = 30, gFloorDb = 6, gKhz = 400, gDelay, gSpkAttDb = 6, gGuard = 1;
+uint32_t gGuardCb;              // extra speaker attenuation from the last guard reading (0 until the first amp on)
 int gHphDb = -12, gEarDb = -12;
 IOLock *gLock;
 volatile uint8_t *gGcc, *gTlmm, *gSe, *gWrap, *gLpi, *gRxmMap, *gVamMap;
@@ -150,6 +157,9 @@ void rxBusLog(void *, const char *what, uint32_t a, uint32_t b) { IOLog("GuampAu
 
 uint32_t floorCb() { return gFloorDb * 100u; }
 uint32_t attNowCb() { return gah_att_from_level(gLevelCb == INT32_MIN ? -static_cast<int32_t>(gAttDb * 100u) : gLevelCb, floorCb()); }
+uint32_t spkAttCb() {
+  return gah_att_from_level(gLevelCb == INT32_MIN ? -static_cast<int32_t>(gSpkAttDb * 100u) : gLevelCb, floorCb()) + gGuardCb;
+}
 
 // QUP0 SE1: GPLL0, wrapper AHB/core + SE1 branch votes, 19.2 MHz source (DFS level or TCXO), pins, engine, clock.
 int busUp() {
@@ -221,7 +231,7 @@ int speakerPrepare(const guamp_audio_hw_format *fmt) {
   gah_lpi_i2s1(&gOps, 1);
   r = gah_aw_probe(&gOps, &gChip);
   if (r) return r;
-  r = gah_aw_cold(&gOps, gah_aw_att_code(attNowCb()));
+  r = gah_aw_cold(&gOps, gah_aw_att_code(spkAttCb()));
   if (r) return r;
   gSpk = 1;
   gMuted = true;
@@ -342,6 +352,8 @@ void start() {
   if (!gMode) return;
   PE_parse_boot_argn("guamp-audio-hw-att", &gAttDb, sizeof(gAttDb));
   PE_parse_boot_argn("guamp-audio-hw-floor", &gFloorDb, sizeof(gFloorDb));
+  PE_parse_boot_argn("guamp-audio-hw-spk-att", &gSpkAttDb, sizeof(gSpkAttDb));
+  PE_parse_boot_argn("guamp-audio-hw-guard", &gGuard, sizeof(gGuard));
   PE_parse_boot_argn("guamp-audio-hw-i2c", &gKhz, sizeof(gKhz));
   PE_parse_boot_argn("guamp-audio-hw-delay", &gDelay, sizeof(gDelay));
   PE_parse_boot_argn("guamp-audio-hw-hph", &gHphDb, sizeof(gHphDb));
@@ -352,11 +364,12 @@ void start() {
   if (gEarDb > 6) gEarDb = 6;
   if (gAttDb > 95) gAttDb = 95;
   if (gFloorDb > 95) gFloorDb = 95;
+  if (gSpkAttDb > 95) gSpkAttDb = 95;
   if (gKhz != 100 && gKhz != 1000) gKhz = 400;
   if (gDelay > 600) gDelay = 600;
   gLock = IOLockAlloc();
-  IOLog("GuampAudioHw: mode %u, att %u dB, floor %u dB, i2c %u kHz, hph %d dB, ear %d dB\n", gMode, gAttDb, gFloorDb, gKhz,
-        gHphDb, gEarDb);
+  IOLog("GuampAudioHw: mode %u, att %u dB, speaker att %u dB guard %u, floor %u dB, i2c %u kHz, hph %d dB, ear %d dB\n",
+        gMode, gAttDb, gSpkAttDb, gGuard, gFloorDb, gKhz, gHphDb, gEarDb);
   if (!gLock) { gMode = 0; return; }
   if (gMode >= 2) {
     thread_t th;
@@ -392,7 +405,20 @@ extern "C" int guamp_audio_hw_amp(uint32_t route, int on) {
   }
   if (on) {
     if (gSpk < 1) r = -22;
-    else if (gSpk == 1) { r = gah_aw_start(&gOps, &gSysst); if (!r) { gSpk = 2; gMuted = false; } }
+    else if (gSpk == 1) {
+      r = gah_aw_start(&gOps, &gSysst);
+      if (!r) {
+        gSpk = 2;
+        gMuted = false;
+        gah_aw_guard g = {};
+        // A failed guard read keeps the last extra attenuation (never less protection because of an I2C hiccup).
+        if (gGuard && !gah_aw_guard_apply(&gOps, &g)) gGuardCb = g.att_cb;
+        if (!gGuard) gGuardCb = 0;
+        gah_aw_set_att(&gOps, gah_aw_att_code(spkAttCb()));
+        IOLog("GuampAudioHw: speaker gain -%u.%u dB (speaker att %u dB, floor %u dB, guard +%u cb, vbat %u mV, temp %d C)\n",
+              spkAttCb() / 100, spkAttCb() % 100 / 10, gSpkAttDb, gFloorDb, gGuardCb, g.vbat_mv, g.temp_c);
+      }
+    }
   } else if (gSpk == 2) {
     r = gah_aw_stop(&gOps);
     gSpk = 1;
@@ -410,9 +436,10 @@ extern "C" int guamp_audio_hw_volume(uint32_t route, int32_t centibel) {
   IOLockLock(gLock);
   gLevelCb = centibel;
   int r = 0;
-  if (route == GUAMP_AUDIO_ROUTE_SPEAKER && gSpk) r = gah_aw_set_att(&gOps, gah_aw_att_code(attNowCb()));
+  if (route == GUAMP_AUDIO_ROUTE_SPEAKER && gSpk) r = gah_aw_set_att(&gOps, gah_aw_att_code(spkAttCb()));
   else if (route != GUAMP_AUDIO_ROUTE_SPEAKER && gCdc && route == gCdcRoute) gah_rxm_volume(&gOps, isEar(route), rxmLevelDb());
-  IOLog("GuampAudioHw: volume route %u request %d cb -> attenuation %u cb (floor %u): rc %d\n", route, centibel, attNowCb(), floorCb(), r);
+  IOLog("GuampAudioHw: volume route %u request %d cb -> attenuation %u cb (floor %u): rc %d\n", route, centibel,
+        route == GUAMP_AUDIO_ROUTE_SPEAKER ? spkAttCb() : attNowCb(), floorCb(), r);
   IOLockUnlock(gLock);
   return r;
 }
@@ -457,7 +484,7 @@ extern "C" int guamp_audio_hw_get_state(uint32_t route, struct guamp_audio_hw_st
   st->running = spk ? gSpk == 2 : mine && gCdc == 2;
   st->muted = gMuted;
   st->chip_id = spk ? gChip : gWcdChip;
-  st->att_cb = attNowCb();
+  st->att_cb = spk ? spkAttCb() : attNowCb();
   st->sysst = gSysst;
   st->last_rc = gLastRc;
   return gMode ? 0 : GUAMP_AUDIO_HW_ABSENT;

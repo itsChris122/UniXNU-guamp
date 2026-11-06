@@ -39,6 +39,9 @@
 #define AW_REG_HAGCCFG4 0x0c
 #define AW_REG_VTMCTRL3 0x56
 #define AW_REG_EFRH 0x78
+#define AW_REG_VBAT 0x12                      // aw882xx_reg.h AW882XX_VBAT_REG (10-bit ADC, 6025 mV full scale)
+#define AW_REG_TEMP 0x13                      // AW882XX_TEMP_REG (die temperature, signed 10 bit, degrees C)
+#define AW_IPEAK_MASK 0x000f                  // SYSCTRL2[3:0] BST_IPEAK (profile 0x0028: 8 = 3.5 A)
 #define AW_REG_EFRM1 0x7a
 #define AW_ID 0x1852                          // aw882xx.h AW882XX_ID
 #define AW_PWDN 0x0001                        // SYSCTRL bit 0: 1 = power down
@@ -325,6 +328,48 @@ static inline int gah_aw_stop(const struct gah_ops *o) {
 static inline int gah_aw_set_att(const struct gah_ops *o, uint8_t att_code) {
     int r = gah_aw_bits(o, AW_REG_HAGCCFG4, 0x00ff, (uint16_t)(att_code << 8));
     gah_note(o, "aw gain (att code, att cb)", r, att_code, gah_aw_att_cb(att_code));
+    return r;
+}
+
+// Speaker guard = the Motorola monitor (aw882xx.c, DTBO0 aw882xx_smartpa@34 monitor-flag 1), evaluated at amp on: low battery
+// or a cold chip lowers the boost peak current and adds attenuation, as vol_down_table / temp_down_table (first entry):
+//   VBAT < 3500 mV: 2.5 A, -1.5 dB   < 3700: 2.75 A, -1.0 dB   < 3900: 3.0 A, -0.5 dB   else 3.5 A, 0 dB
+//   TEMP < -5 C:    2.5 A, -6.0 dB   < 0:    2.75 A, -4.5 dB   < 5:    3.0 A, -3.0 dB   else 3.5 A, 0 dB
+// The two are combined like aw882xx_monitor_get_cfg (lowest current, most attenuation). Differences: the temperature is
+// sign-extended to int (Linux keeps it in a uint16_t, so a negative reading never matched), and a VBAT that reads 0 (ADC not
+// ready) counts as low battery (more attenuation, never less). Android also limits Vmax in the DSP (AFE_PARAM_ID_AWDSP_RX_VMAX)
+// and runs Awinic speaker protection there with aw882xx_mono.bin; we have neither, hence the extra headroom of the default.
+struct gah_aw_guard { uint32_t vbat_mv; int32_t temp_c; uint8_t ipeak; uint32_t att_cb; };
+static inline uint32_t gah_aw_vbat_mv(uint16_t raw) { return (uint32_t)(raw & 0x03ff) * 6025u / 1023u; }
+static inline int32_t gah_aw_temp_c(uint16_t raw) {
+    int32_t t = raw & 0x03ff;
+    return (t & 0x0200) ? t - 0x0400 : t;
+}
+static inline struct gah_aw_guard gah_aw_guard_pick(uint32_t vbat_mv, int32_t temp_c) {
+    struct gah_aw_guard g = {vbat_mv, temp_c, 8, 0};
+    uint8_t vi = 8, ti = 8;
+    uint32_t va = 0, ta = 0;
+    if (vbat_mv < 3500) { vi = 4; va = 150; } else if (vbat_mv < 3700) { vi = 5; va = 100; } else if (vbat_mv < 3900) { vi = 6; va = 50; }
+    if (temp_c < -5) { ti = 4; ta = 600; } else if (temp_c < 0) { ti = 5; ta = 450; } else if (temp_c < 5) { ti = 6; ta = 300; }
+    g.ipeak = vi < ti ? vi : ti;
+    g.att_cb = va > ta ? va : ta;
+    return g;
+}
+// Reads VBAT and TEMP (valid with the amplifier powered: call after gah_aw_start) and lowers BST_IPEAK if the guard asks for
+// less current than SYSCTRL2 has (never raises it above the profile). Returns the I2C error, or 0 with *g filled.
+static inline int gah_aw_guard_apply(const struct gah_ops *o, struct gah_aw_guard *g) {
+    uint16_t v = 0, t = 0, c2 = 0;
+    int r = o->i2c_r16(o->ctx, GAH_AW_ADDR, AW_REG_VBAT, &v);
+    if (!r) r = o->i2c_r16(o->ctx, GAH_AW_ADDR, AW_REG_TEMP, &t);
+    if (!r) r = o->i2c_r16(o->ctx, GAH_AW_ADDR, AW_REG_SYSCTRL2, &c2);
+    if (r) { gah_note(o, "aw guard: VBAT/TEMP read", r, 0, 0); return r; }
+    *g = gah_aw_guard_pick(gah_aw_vbat_mv(v), gah_aw_temp_c(t));
+    if ((c2 & AW_IPEAK_MASK) > g->ipeak)
+        r = o->i2c_w16(o->ctx, GAH_AW_ADDR, AW_REG_SYSCTRL2, (uint16_t)((c2 & (uint16_t)~AW_IPEAK_MASK) | g->ipeak));
+    else
+        g->ipeak = (uint8_t)(c2 & AW_IPEAK_MASK);
+    gah_note(o, "aw guard (VBAT mV, TEMP C)", r, g->vbat_mv, (uint32_t)g->temp_c);
+    gah_note(o, "aw guard (ipeak code, extra att cb)", r, g->ipeak, g->att_cb);
     return r;
 }
 

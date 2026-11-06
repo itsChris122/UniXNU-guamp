@@ -444,10 +444,54 @@ static void testMbhc() {
   CHECK(gah_mbhc_lost(&o) == 1);
 }
 
+// Speaker guard (Motorola monitor tables) and the 07/11 speaker level: 6 dB -> code 0x10, 12 dB (old) -> 0x20.
+static void testGuard() {
+  CHECK(gah_aw_att_code(600) == 0x10 && gah_aw_att_code(1200) == 0x20);
+  CHECK(gah_aw_att_code(600 + 50) == 0x11 && gah_aw_att_code(600 + 600) == 0x20);
+  CHECK(gah_aw_vbat_mv(0) == 0 && gah_aw_vbat_mv(1023) == 6025 && gah_aw_vbat_mv(0xfc00 | 700) == 700u * 6025 / 1023);
+  CHECK(gah_aw_temp_c(25) == 25 && gah_aw_temp_c(0x3ff) == -1 && gah_aw_temp_c(0x3f6) == -10 && gah_aw_temp_c(0x200) == -512);
+  gah_aw_guard g = gah_aw_guard_pick(4100, 30);
+  CHECK(g.ipeak == 8 && g.att_cb == 0);
+  g = gah_aw_guard_pick(3899, 30);
+  CHECK(g.ipeak == 6 && g.att_cb == 50);
+  g = gah_aw_guard_pick(3600, 30);
+  CHECK(g.ipeak == 5 && g.att_cb == 100);
+  g = gah_aw_guard_pick(0, 30);                                             // ADC not ready: treated as low battery
+  CHECK(g.ipeak == 4 && g.att_cb == 150);
+  g = gah_aw_guard_pick(4100, 4);
+  CHECK(g.ipeak == 6 && g.att_cb == 300);
+  g = gah_aw_guard_pick(3600, -1);                                          // lowest current, most attenuation
+  CHECK(g.ipeak == 5 && g.att_cb == 450);
+  g = gah_aw_guard_pick(3400, -20);
+  CHECK(g.ipeak == 4 && g.att_cb == 600);
+  Board b;
+  setup(b);
+  gah_ops o = makeOps(false);
+  CHECK(geni_i2c_init(&b.i2c) == 0);
+  uint16_t id = 0;
+  CHECK(gah_aw_probe(&o, &id) == 0);
+  CHECK(gah_aw_cold(&o, 0x10) == 0 && b.aw.r[AW_REG_HAGCCFG4] == 0x1064);
+  b.aw.clocks = true;
+  uint16_t st = 0;
+  CHECK(gah_aw_start(&o, &st) == 0);
+  b.aw.r[AW_REG_VBAT] = 700;                                                // 4122 mV
+  b.aw.r[AW_REG_TEMP] = 31;
+  b.aw.writes.clear();
+  CHECK(gah_aw_guard_apply(&o, &g) == 0 && g.ipeak == 8 && g.att_cb == 0 && b.aw.writes.empty());
+  CHECK(b.aw.r[AW_REG_SYSCTRL2] == 0x0028);
+  b.aw.r[AW_REG_VBAT] = 620;                                                // 3651 mV: 2.75 A, +1 dB
+  CHECK(gah_aw_guard_apply(&o, &g) == 0 && g.ipeak == 5 && g.att_cb == 100 && g.vbat_mv == 3651);
+  CHECK(b.aw.r[AW_REG_SYSCTRL2] == 0x0025);                                 // HMUTE 0, only BST_IPEAK lowered
+  b.aw.r[AW_REG_VBAT] = 700;                                                // never raised above what SYSCTRL2 has
+  CHECK(gah_aw_guard_apply(&o, &g) == 0 && g.ipeak == 5 && g.att_cb == 0 && b.aw.r[AW_REG_SYSCTRL2] == 0x0025);
+  CHECK(gah_aw_set_att(&o, gah_aw_att_code(600 + 300)) == 0 && b.aw.r[AW_REG_HAGCCFG4] == 0x1664);
+}
+
 int main() {
   testGeni();
   testHelpers();
   testSpeaker();
+  testGuard();
   testLpi();
   testRxMacro();
   testWcd();
