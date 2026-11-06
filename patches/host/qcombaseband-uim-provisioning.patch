@@ -1,5 +1,25 @@
+diff --git a/README.md b/README.md
+index c1f93ba..360c172 100644
+--- a/README.md
++++ b/README.md
+@@ -36,3 +36,15 @@ A board provides modem power/firmware startup, SMEM/SMP2P, GLINK/QRTR transport
+ Run the imported host models with `python3 scripts/check.py`. Test cellular traffic with a SIM that has an active data plan.
+ 
+ Vendor modem firmware, EFS/NV data and Apple `.bbfw` files are external build inputs. Record their source and destination in the device repository's `proprietary-files.txt`.
++
++## Guamp device patch: UIM follow-up
++
++The guamp device-owned patch opens a missing primary GW provisioning session, polls a detected application and bounds its
++close/reopen attempts. While an application remains detected with a verified or disabled PIN, it reads EF_IMSI once using
++the primary GW session and the MF/ADF path, as in ModemManager's UIM reader. This is a diagnostic read: QMI error, card status
++and byte count are logged; the identifier is never logged. It performs no PIN operation or card write and does not fabricate
++the application's ready state. Host models cover request bytes, response matching, short buffers, PIN gating and per-card limits.
++
++Guamp 设备补丁会打开缺失的主 GW 会话，并有限次查询及重新打开会话。若应用仍处于 detected 状态且 PIN 已验证或已禁用，
++每张卡仅诊断读取一次 EF_IMSI；只记录 QMI 错误、卡状态和返回字节数，不记录用户标识，不执行 PIN 操作或写卡，也不伪造 ready 状态。
++相关协议模型验证请求编码、响应匹配、缓冲区长度、PIN 条件和每卡次数限制。
 diff --git a/baseband/coachz_baseband.cpp b/baseband/coachz_baseband.cpp
-index bd9ab69..611b68e 100644
+index bd9ab69..f5d2ac6 100644
 --- a/baseband/coachz_baseband.cpp
 +++ b/baseband/coachz_baseband.cpp
 @@ -25,6 +25,7 @@
@@ -10,7 +30,7 @@ index bd9ab69..611b68e 100644
  
  #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
  // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
-@@ -1183,6 +1184,77 @@ extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint
+@@ -1183,6 +1184,88 @@ extern "C" void coachz_baseband_del_server(uint32_t service, uint32_t node, uint
    IOLockUnlock(bb_lock);
  }
  
@@ -20,7 +40,7 @@ index bd9ab69..611b68e 100644
 +// reopen of the session when the USIM is still "detected" 20 s later (twice at most).
 +static struct cbu_prov bb_prov;
 +static uint8_t bb_prov_req[96];
-+static const char *const bb_prov_what[] = { "", "open", "close", "card status" };
++static const char *const bb_prov_what[] = { "", "open", "close", "card status", "IMSI read" };
 +static int bb_uim_send(int what, const struct cbu_status *s)
 +{
 +  if (bb_esim.freeze || bb_esim.active >= 0 || bb_esim_slot < 0) return 0;
@@ -28,13 +48,16 @@ index bd9ab69..611b68e 100644
 +  if (!server) return 0;
 +  const uint32_t now = bb_now_ms(), txn = cbu_next_txn(&bb_prov);
 +  const uint32_t len = what == CBU_WAIT_STATUS ? cbu_status_request(bb_prov_req, sizeof bb_prov_req, txn) :
++    what == CBU_WAIT_IMSI ? cbu_imsi_request(bb_prov_req, sizeof bb_prov_req, txn) :
 +    cbu_request(bb_prov_req, sizeof bb_prov_req, txn, s, what == CBU_WAIT_OPEN);
 +  if (!len) return 0;
 +  const uint32_t queued = bb_tx_count;
 +  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_esim_slot, server->node, server->port, bb_prov_req, len);
 +  if (bb_tx_count == queued) return 0;
 +  cbu_sent(&bb_prov, txn, now, what);
-+  if (what != CBU_WAIT_STATUS)
++  if (what == CBU_WAIT_IMSI)
++    printf("COACHZ baseband: UIM IMSI read diagnostic asked once (application state %u, PIN1 %u)\n", s->app_state, s->pin1_state);
++  else if (what != CBU_WAIT_STATUS)
 +    printf("COACHZ baseband: UIM provisioning session %s asked for slot %u (%s, state %u), try %u, reopen %u\n", bb_prov_what[what], s->slot,
 +           s->app_type == CBU_APP_USIM ? "USIM" : "SIM", s->app_state, bb_prov.tries, bb_prov.reopens);
 +  return 1;
@@ -61,12 +84,19 @@ index bd9ab69..611b68e 100644
 +  struct cbu_status s;
 +  if (service == CBU_SVC_UIM && cbu_parse(sdu, n, &s)) bb_uim_status(sdu[0] == 4u ? "indication" : "answer", s);
 +}
++static void bb_uim_imsi_result(const uint8_t *sdu, uint32_t n, uint32_t error)
++{
++  const struct cbu_imsi_summary result = cbu_imsi_summary(sdu, n);
++  printf("COACHZ baseband: UIM IMSI read diagnostic: error 0x%x, card status 0x%04x, result bytes %u; application state %u (identifier not logged)\n",
++         error, result.card_status, result.bytes, bb_prov.last.app_state);
++}
 +// The modem's answer to one of the bridge's own requests: 1 when it was one.
 +static int bb_uim_answer(const uint8_t *sdu, uint32_t n)
 +{
 +  uint32_t error = 0;
 +  const int what = cbu_answer(&bb_prov, sdu, n, &error);
 +  if (!what) return 0;
++  if (what == CBU_WAIT_IMSI) { bb_uim_imsi_result(sdu, n, error); return 1; }
 +  if (what == CBU_WAIT_STATUS) {
 +    struct cbu_status s;
 +    if (!error && cbu_parse(sdu, n, &s)) bb_uim_status("bridge", s);
@@ -83,12 +113,13 @@ index bd9ab69..611b68e 100644
 +  const int action = cbu_tick(&bb_prov, bb_now_ms());
 +  if (action == CBU_DO_POLL) bb_uim_send(CBU_WAIT_STATUS, &bb_prov.last);
 +  else if (action == CBU_DO_CLOSE) bb_uim_send(CBU_WAIT_CLOSE, &bb_prov.last);
++  else if (action == CBU_DO_IMSI) bb_uim_send(CBU_WAIT_IMSI, &bb_prov.last);
 +}
 +
  // QRTR data for one of the bridge's client ports: 1 when the port is the bridge's.
  extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32_t, const void *body, uint32_t size)
  {
-@@ -1193,7 +1265,8 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
+@@ -1193,7 +1276,8 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
    if (r.kind == CBQ_TO_HOST && r.channel == CBQ_INTERNAL) {
      bb_trace("int-rx", 0, r.service, r.cid, static_cast<const uint8_t *>(body), size);
      if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
@@ -98,7 +129,7 @@ index bd9ab69..611b68e 100644
      } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
    } else if (r.kind == CBQ_TO_HOST) {
      if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
-@@ -1215,6 +1288,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
+@@ -1215,6 +1299,7 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
        bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, CBQ_HDR + fixed);
      } else bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, r.len);
      bb_sim_answer(r, sdu, size);   // after the answer itself: bb_activation_indicate reuses bb_out
@@ -106,7 +137,7 @@ index bd9ab69..611b68e 100644
    }
    IOLockUnlock(bb_lock);
    return 1;
-@@ -1228,6 +1302,7 @@ extern "C" void coachz_baseband_poll(void)
+@@ -1228,6 +1313,7 @@ extern "C" void coachz_baseband_poll(void)
    uint32_t n = 0, released[16], r = 0, port;
    IOLockLock(bb_lock);
    bb_esim_step();
@@ -116,10 +147,10 @@ index bd9ab69..611b68e 100644
      bb_tx_head = (bb_tx_head + 1) % BB_TX;
 diff --git a/baseband/coachz_bb_uimprov.h b/baseband/coachz_bb_uimprov.h
 new file mode 100644
-index 0000000..31af4b9
+index 0000000..afc0565
 --- /dev/null
 +++ b/baseband/coachz_bb_uimprov.h
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,227 @@
 +/* guamp: UIM provisioning session for a modem whose firmware waits for the host to choose the SIM application.
 + *
 + * The SM6115 modem (Moto G9 Play, Android firmware) reads the card but does not open the GW provisioning session by itself: on
@@ -137,6 +168,9 @@ index 0000000..31af4b9
 + * application is not ready (each status logged when it changes), and when it is still "detected" 20 s after the session opened it
 + * closes and reopens the session (msm-modem-uim-selection does the same for a "bugged" session), at most twice per card.
 + * The card status is logged as states only (card, application type, state, personalization, PIN1, the TLV list), never the AID. */
++/* fin59 still stayed detected after both successful reopens. Once per card, after 10 s with an open session and a verified
++ * or disabled PIN, read EF_IMSI only to distinguish a readable USIM from a modem initialization failure. Log QMI error,
++ * card SW1/SW2 and result length; never the identifier and never replace the application's real status. */
 +#ifndef COACHZ_BB_UIMPROV_H
 +#define COACHZ_BB_UIMPROV_H
 +#include <stdint.h>
@@ -146,6 +180,7 @@ index 0000000..31af4b9
 +#define CBU_GET_CARD_STATUS 0x002fu
 +#define CBU_STATUS_CHANGE 0x0032u
 +#define CBU_CHANGE_PROVISIONING 0x0038u
++#define CBU_READ_TRANSPARENT 0x0020u
 +#define CBU_NO_SESSION 0xffffu
 +#define CBU_CARD_PRESENT 1u
 +#define CBU_APP_SIM 1u
@@ -245,10 +280,37 @@ index 0000000..31af4b9
 +    return room < 7u ? 0 : cbd_request(sdu, txn, CBU_GET_CARD_STATUS, 0);
 +}
 +
-+enum { CBU_WAIT_NONE, CBU_WAIT_OPEN, CBU_WAIT_CLOSE, CBU_WAIT_STATUS };
-+enum { CBU_DO_NOTHING, CBU_DO_POLL, CBU_DO_CLOSE };
++/* Read-only EF_IMSI probe: the same primary-GW session and MF/ADF path used by ModemManager's UIM reader.
++ * No PIN operation, card write or application-state override. Never print the returned identifier. */
++static inline uint32_t cbu_imsi_request(uint8_t *sdu, uint32_t room, uint32_t txn)
++{
++    if (room < 29u) return 0;
++    const uint8_t session[2] = { 0, 0 }; /* primary GW, empty AID */
++    const uint8_t file[7] = { 0x07, 0x6f, 4, 0x00, 0x3f, 0xff, 0x7f };
++    const uint8_t read[4] = { 0, 0, 0, 0 }; /* offset zero, whole file */
++    uint32_t w = cbd_tlv(sdu + 7, room - 7u, 0x01, session, sizeof session);
++    w += cbd_tlv(sdu + 7 + w, room - 7u - w, 0x02, file, sizeof file);
++    w += cbd_tlv(sdu + 7 + w, room - 7u - w, 0x03, read, sizeof read);
++    return cbd_request(sdu, txn, CBU_READ_TRANSPARENT, w);
++}
++struct cbu_imsi_summary { uint32_t bytes; uint16_t card_status; };
++static inline struct cbu_imsi_summary cbu_imsi_summary(const uint8_t *sdu, uint32_t n)
++{
++    struct cbu_imsi_summary result = { 0, 0xffffu };
++    if (!cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 3) != CBU_READ_TRANSPARENT) return result;
++    uint32_t len = 0;
++    const uint8_t *value = cbd_find(sdu, n, 0x10, &len);
++    if (value && len == 2u) result.card_status = (uint16_t)((uint16_t)value[0] << 8 | value[1]);
++    if (cbd_error(sdu, n)) return result;
++    value = cbd_find(sdu, n, 0x11, &len);
++    if (value && len >= 2u && (uint32_t)cbd_rd16(value) + 2u == len) result.bytes = cbd_rd16(value);
++    return result;
++}
++
++enum { CBU_WAIT_NONE, CBU_WAIT_OPEN, CBU_WAIT_CLOSE, CBU_WAIT_STATUS, CBU_WAIT_IMSI };
++enum { CBU_DO_NOTHING, CBU_DO_POLL, CBU_DO_CLOSE, CBU_DO_IMSI };
 +struct cbu_prov {
-+    uint8_t tries, pending, done, logged, reopens, have, ready;
++    uint8_t tries, pending, done, logged, reopens, have, ready, imsi_probed;
 +    uint16_t txn, wait_txn;
 +    uint32_t deadline, sent, answered, last_error, session_ms, polled_ms, key;
 +    struct cbu_status last;           /* the last parsed status with a card: the application for a close or reopen */
@@ -260,7 +322,7 @@ index 0000000..31af4b9
 +    if (p->pending && (int32_t)(now - p->deadline) >= 0) p->pending = 0;
 +    if (s->slot || !s->present) { p->last = *s; p->have = 1; }
 +    if (!s->present) {                                                  /* no card: a new card starts again */
-+        p->tries = 0; p->done = 0; p->reopens = 0; p->session_ms = 0; p->ready = 0;
++        p->tries = 0; p->done = 0; p->reopens = 0; p->session_ms = 0; p->ready = 0; p->imsi_probed = 0;
 +        return 0;
 +    }
 +    if (s->gw_primary != CBU_NO_SESSION) {                              /* the session exists (the modem or the request made it) */
@@ -278,6 +340,8 @@ index 0000000..31af4b9
 +    if (p->pending && (int32_t)(now - p->deadline) >= 0) p->pending = 0;
 +    if (p->pending || !p->have || !p->done || p->ready || !p->session_ms || !p->tries) return CBU_DO_NOTHING;
 +    const uint32_t age = now - p->session_ms;
++    if (age >= CBU_POLL_MS && !p->imsi_probed && p->last.app_state == CBU_APP_DETECTED &&
++        (p->last.pin1_state == 2u || p->last.pin1_state == 3u)) return CBU_DO_IMSI;
 +    if (age >= CBU_STUCK_MS && p->last.app_state == CBU_APP_DETECTED && p->last.slot && p->reopens < CBU_REOPENS) return CBU_DO_CLOSE;
 +    if (age < CBU_WATCH_MS && now - p->polled_ms >= CBU_POLL_MS) return CBU_DO_POLL;
 +    return CBU_DO_NOTHING;
@@ -292,6 +356,7 @@ index 0000000..31af4b9
 +    if (what == CBU_WAIT_OPEN) p->tries++;
 +    if (what == CBU_WAIT_CLOSE) p->reopens++;
 +    if (what == CBU_WAIT_STATUS) p->polled_ms = now;
++    if (what == CBU_WAIT_IMSI) p->imsi_probed = 1;
 +    p->sent++; p->pending = (uint8_t)what; p->wait_txn = (uint16_t)txn; p->deadline = now + CBU_TIMEOUT_MS;
 +}
 +/* The modem's answer on the bridge's UIM client: the CBU_WAIT_ kind it answered (error in *error), 0 when it is not the bridge's.
@@ -300,7 +365,9 @@ index 0000000..31af4b9
 +{
 +    if (!p->pending || n < 7u || !cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 1) != p->wait_txn) return 0;
 +    const uint32_t message = cbd_rd16(sdu + 3);
-+    if (message != (p->pending == CBU_WAIT_STATUS ? CBU_GET_CARD_STATUS : CBU_CHANGE_PROVISIONING)) return 0;
++    const uint32_t expected = p->pending == CBU_WAIT_STATUS ? CBU_GET_CARD_STATUS :
++        p->pending == CBU_WAIT_IMSI ? CBU_READ_TRANSPARENT : CBU_CHANGE_PROVISIONING;
++    if (message != expected) return 0;
 +    const int what = p->pending;
 +    *error = cbd_error(sdu, n);
 +    p->pending = 0; p->answered++; p->last_error = *error;
@@ -313,10 +380,10 @@ index 0000000..31af4b9
 +#endif
 diff --git a/tests/coachz_bb_uimprov_model_test.c b/tests/coachz_bb_uimprov_model_test.c
 new file mode 100644
-index 0000000..d6ad213
+index 0000000..bf95808
 --- /dev/null
 +++ b/tests/coachz_bb_uimprov_model_test.c
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,213 @@
 +/* guamp: host model of the UIM provisioning session (coachz_bb_uimprov.h): card status parsing, the 0x38 open and close, once per
 +   card, then the follow-up of a session whose USIM stays "detected" (own card status every 10 s, close and reopen after 20 s). */
 +#include <stdio.h>
@@ -410,7 +477,28 @@ index 0000000..d6ad213
 +    CHECK(cbu_parse(sdu, n, &s) && s.gw_primary == 1);
 +    CHECK(!cbu_need(&p, &s, 3000) && p.done && !p.ready && p.session_ms == 3000);
 +    CHECK(cbu_tick(&p, 3000) == CBU_DO_NOTHING);                     /* 10 s between polls, from the session */
-+    CHECK(cbu_tick(&p, 13000) == CBU_DO_POLL);
++    CHECK(cbu_tick(&p, 13000) == CBU_DO_IMSI);
++    txn = cbu_next_txn(&p);
++    len = cbu_imsi_request(req, sizeof req, txn);
++    const uint8_t read_imsi[] = { 0, (uint8_t)txn, (uint8_t)(txn >> 8), 0x20, 0, 22, 0,
++        1, 2, 0, 0, 0, 2, 7, 0, 0x07, 0x6f, 4, 0, 0x3f, 0xff, 0x7f, 3, 4, 0, 0, 0, 0, 0 };
++    CHECK(len == sizeof read_imsi && !memcmp(req, read_imsi, sizeof read_imsi));
++    CHECK(!cbu_imsi_request(req, 28, txn));
++    cbu_sent(&p, txn, 13000, CBU_WAIT_IMSI);
++    CHECK(p.imsi_probed && cbu_tick(&p, 13001) == CBU_DO_NOTHING);
++    n = answer(sdu, txn, CBU_READ_TRANSPARENT, 0);
++    const uint8_t sw[] = { 0x90, 0 }, content[] = { 9, 0, 8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 };
++    n += cbd_tlv(sdu + n, 512 - n, 0x10, sw, sizeof sw);
++    n += cbd_tlv(sdu + n, 512 - n, 0x11, content, sizeof content);
++    cbd_wr16(sdu + 5, n - 7);
++    struct cbu_imsi_summary summary = cbu_imsi_summary(sdu, n);
++    CHECK(summary.bytes == 9 && summary.card_status == 0x9000);
++    CHECK(!cbu_imsi_summary(sdu, n - 1).bytes);
++    CHECK(cbu_answer(&p, sdu, n, &error) == CBU_WAIT_IMSI && !error);
++    CHECK(!p.ready && p.last.app_state == CBU_APP_DETECTED);           /* a read never fabricates readiness */
++    CHECK(cbu_tick(&p, 13001) == CBU_DO_POLL);                        /* no second identifier read */
++    n = answer(sdu, txn, CBU_READ_TRANSPARENT, 0x25);
++    CHECK(!cbu_imsi_summary(sdu, n).bytes);                          /* modem error is not a readable file */
 +    txn = cbu_next_txn(&p);
 +    len = cbu_status_request(req, sizeof req, txn);
 +    CHECK(len == 7 && req[0] == 0 && cbd_rd16(req + 3) == 0x2f && cbd_rd16(req + 5) == 0);
@@ -460,6 +548,14 @@ index 0000000..d6ad213
 +    n = card_status(sdu, 4, 0x0001, 1, CBU_APP_READY, 0);
 +    CHECK(cbu_parse(sdu, n, &s) && !cbu_need(&p, &s, 1000) && p.ready);
 +    CHECK(cbu_tick(&p, 30000) == CBU_DO_NOTHING);
++    /* A required/unverified PIN suppresses the diagnostic read; it never attempts to verify a PIN. */
++    memset(&p, 0, sizeof p);
++    p.tries = 1;
++    n = card_status(sdu, 4, 0x0001, 1, CBU_APP_DETECTED, 0);
++    CHECK(cbu_parse(sdu, n, &s));
++    s.pin1_state = 1;
++    CHECK(!cbu_need(&p, &s, 1000));
++    CHECK(cbu_tick(&p, 11000) == CBU_DO_POLL && !p.imsi_probed);
 +    /* a session the modem opened by itself is left alone */
 +    memset(&p, 0, sizeof p);
 +    n = card_status(sdu, 4, 0x0001, 1, 1, 0);
@@ -474,9 +570,10 @@ index 0000000..d6ad213
 +    for (int i = 0; i < 6; i++, now += CBU_TIMEOUT_MS) if (cbu_need(&p, &s, now)) { cbu_sent(&p, cbu_next_txn(&p), now, CBU_WAIT_OPEN); sent++; }
 +    CHECK(sent == CBU_TRIES);
 +    /* card removed: tries reset, nothing sent; a new card is tried again */
++    p.imsi_probed = 1;
 +    n = card_status(sdu, 4, CBU_NO_SESSION, 0, 1, 0);
 +    CHECK(cbu_parse(sdu, n, &s) && !s.present && !s.slot);
-+    CHECK(!cbu_need(&p, &s, now) && p.tries == 0);
++    CHECK(!cbu_need(&p, &s, now) && p.tries == 0 && !p.imsi_probed);
 +    n = card_status(sdu, 4, CBU_NO_SESSION, 1, 1, 0);
 +    CHECK(cbu_parse(sdu, n, &s) && cbu_need(&p, &s, now + 2 * CBU_TIMEOUT_MS));
 +
