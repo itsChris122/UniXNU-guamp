@@ -31,6 +31,7 @@ RINGER='f5fa8fa8d63f498d648435957e0e2f5fa3dabba09d59cff930a34fc4e9bc58d0'
 FINAL_RECORDED='08eff226eb1aad34be27b5aab1e21129ca5eed32faed072e20f30c98ec2a03f5'
 SENSORS_RECORDED='7432dbacae81b5568d5c72befa444a708205278c1664aa0fc462dd709b2c86ae'
 ALS_RECORDED='19b3b32f0571b61bdd552850ce9969daf5bc640180f3f1f2a663ef3db2fba7f8'
+TOUCHPAD_RECORDED='9b02f284270bb48393043734afa102a25fe692e115ca8d80e748dedff228eb66'
 # Step 4 edits. Axes: logical/physical -32768..32767 in 32-bit fields, unit exponent -3 (milli-g, mrad/s), as
 # IOHIDFamily's IOHIDGyroDescriptor.h; feature Report Interval (us) so the driver publishes the ReportInterval property.
 SENSOR_DESCRIPTORS=r'''#define TOUCH_FINGERS 10
@@ -249,9 +250,27 @@ if digest==SENSORS_RECORDED:
         text=text.replace(old,new)
     digest=hashlib.sha256(text.encode()).hexdigest()
     assert ALS_RECORDED is None or digest==ALS_RECORDED,'HID ambient light variant result differs from the recorded source: '+digest
-    path.write_text(text)
     print('GuampHid: ambient light device (report 8, light events through its own dispatch wrapper) behind guamp-sensors')
-elif digest==ALS_RECORDED:
-    print('GuampHid: pinned Consumer-only opt-in, ring/silent switch, sensor and ambient light devices already prepared')
+if digest==ALS_RECORDED:
+    # Step 6 (06/11, fin51 "due dita in Mappe"): unused finger fields of report 3 carry Contact Identifier 0xFF instead of 0.
+    # IOHIDEventDriver (collection dispatch) keeps its touch state per Contact Identifier (TransducerState) and handles a
+    # finger field whenever one of its elements changed. A field that held a finger (or its lift) and goes back to zeros
+    # therefore read as "identifier 0, tip 0": with Himax slot 0 still down that was a lift of finger 0 at 0,0 and, on the
+    # next report, a new touch: every time the second finger lifted (or the panel lost it for one frame) the first finger
+    # ended and began again, and the pinch/rotation was cut. 0xFF is never a panel slot (0..9); its state stays untouched,
+    # so the driver drops those fields ("multiple untouch"), as before for the never used ones.
+    old_pad='        if(!slot)return;\n        report[1+TOUCH_FINGERS*6]=(unsigned char)slot;\n'
+    new_pad=('        if(!slot)return;\n'
+             '        // unused fields: identifier 0xFF, never a real contact (guamp-hid-variant.py step 6)\n'
+             '        for(unsigned k=slot;k<TOUCH_FINGERS;++k)report[1+k*6+1]=0xff;\n'
+             '        report[1+TOUCH_FINGERS*6]=(unsigned char)slot;\n')
+    assert text.count(old_pad)==1,'HID touch padding: anchor not unique'
+    text=text.replace(old_pad,new_pad)
+    digest=hashlib.sha256(text.encode()).hexdigest()
+    assert TOUCHPAD_RECORDED is None or digest==TOUCHPAD_RECORDED,'HID touch padding result differs from the recorded source: '+digest
+    path.write_text(text)
+    print('GuampHid: unused touch fields with Contact Identifier 0xFF (no false lift of finger 0)')
+elif digest==TOUCHPAD_RECORDED:
+    print('GuampHid: pinned Consumer-only opt-in, ring/silent switch, sensor, ambient light and touch padding already prepared')
 else:
     raise SystemExit('Pinned NativeHidInput source differs; do not guess an ABI or source layout')
