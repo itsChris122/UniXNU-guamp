@@ -1,0 +1,525 @@
+guamp: partial updates of the render server (bridge patch 0050 + PU row of the frame report)
+
+fin53 (live-20261106-092610): the GuampMetal rows showed 9.6 passes, 100 draws and kpx=6263 a frame for a status bar change of 16 rows,
+but kpx is width x height of each pass's colour attachment, not what the draws cover: the redraw of the whole frame was not shown. What
+the log does show (row L, 331 s): 149006 shadow copies in (~12 a frame, each of the whole texture) and 58.95 G texels copied back
+(~4.7 M a frame) for textures over buffers/surfaces that no linear image aliases. The bridge already copies back a loaded attachment only
+inside its draws' scissors; this patch copies it in only there too (metal2vulkan ShadowUse::loads), when nothing else of the pass uses it,
+and counts what is needed to tell whether Core Animation redraws only the damage: row PU (deltas between reports) = passes, colour 0
+loaded/cleared, passes bounded by their draws' scissors with bound kpx / render-area kpx, shadow texels copied in / of whole images,
+and passes into a >=1 Mpx surface (the framebuffer) by load action (load/clear/dontcare).
+loadAction/storeAction/scissor/viewport were checked: translated 1:1 (render_target.rs load_op/store_op, render_state.rs scissors);
+the render area is always the whole attachment, which on Turnip in sysmem (TU g0) costs nothing for Load/Store.
+Applies after 0001-0046; adds bridge/patches/0050-guamp-partial-updates.patch (metal2vulkan 720ef1c + bridge 0001-0045).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f4e60ee..86d1e05 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -64,6 +64,8 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
+ // full-screen pass or into a small offscreen one, and whether that pass is multisampled.
+ struct NmbPassShape {uint32_t width,height,format,samples;std::atomic<uint64_t> count;};
+ static NmbPassShape gPassShapes[6];
++// guamp 0050: passes whose colour attachment 0 is a surface of 1 Mpx or more (the render server's framebuffer), by its load action.
++static std::atomic<uint64_t> gSurfacePassLoads[3];
+ static std::atomic<unsigned> gPassShapeCount;
+ // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
+ // last commits with what each held and how long the GPU took (commit to completion).
+@@ -2089,6 +2091,9 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
+    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
+    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
+    if(pixels>=2000000)gFullScreenPasses++;
++   if(pixels>=1000000 && [(id)first isKindOfClass:[NBTexture class]] && ((NBTexture *)first).surface) {   // guamp 0050
++    const MTLLoadAction l=d.colorAttachments[0].loadAction;gSurfacePassLoads[l==MTLLoadActionLoad?0:l==MTLLoadActionClear?1:2]++;
++   }
+    const uint32_t w=(uint32_t)first.width,h=(uint32_t)first.height,f=(uint32_t)first.pixelFormat,s=(uint32_t)first.sampleCount;
+    unsigned n=0;const unsigned have=gPassShapeCount.load();
+    for(;n<have&&n<6;n++)if(gPassShapes[n].width==w&&gPassShapes[n].height==h&&gPassShapes[n].format==f&&gPassShapes[n].samples==s)break;
+@@ -3264,6 +3269,20 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+   row("X spikes gpu8=%llu gpu16=%llu gpu32=%llu ctc16=%llu ctc32=%llu",(unsigned long long)w.spikes[0],(unsigned long long)w.spikes[1],
+    (unsigned long long)w.spikes[2],(unsigned long long)w.spikes[3],(unsigned long long)w.spikes[4]);
+   if(tuRow[0])row("%s",tuRow);   // guamp 0031
++  // guamp (UniXNU-guamp patches/adreno-metal/0050): partial updates, since the last report. p passes, L/C colour 0 loaded/cleared,
++  // b passes whose draws' scissors bound them (bound kpx / their render-area kpx), in shadow texels copied in / of whole images (k),
++  // fb passes into a surface of 1 Mpx or more by colour 0 load action (load/clear/dontcare). bkpx far below akpx with fb L: the render
++  // server already redraws only the damage; b~0 or bkpx~akpx with fb C: it redraws the whole frame.
++  {
++   static uint64_t last[8],lastFb[3];uint64_t pc[8]={};
++   if(gDevice && nmb_device_partial_counts(gDevice,pc)) {
++    uint64_t d[8],fb[3];for(int i=0;i<8;i++){d[i]=pc[i]-last[i];last[i]=pc[i];}
++    for(int i=0;i<3;i++){const uint64_t v=gSurfacePassLoads[i].load();fb[i]=v-lastFb[i];lastFb[i]=v;}
++    row("PU p%llu L%llu C%llu b%llu bkpx%llu/%llu in%llu/%lluk fb %llu/%llu/%llu",(unsigned long long)d[0],(unsigned long long)d[1],
++     (unsigned long long)d[2],(unsigned long long)d[3],(unsigned long long)(d[4]>>10),(unsigned long long)(d[5]>>10),
++     (unsigned long long)(d[6]>>10),(unsigned long long)(d[7]>>10),(unsigned long long)fb[0],(unsigned long long)fb[1],(unsigned long long)fb[2]);
++   }
++  }
+   HeavyCommit heavy[5];
+   memcpy(heavy,w.heavy,sizeof heavy);
+   std::sort(heavy,heavy+5,[](const HeavyCommit &a,const HeavyCommit &b){return a.gpu>b.gpu;});
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 36ed07a..da0fe19 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -52,6 +52,9 @@ bool nmb_device_memory_census(const NmbDevice *, uint64_t out[14]);
+ const char *nmb_runtime_build(void);
+ // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
+ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
++/* guamp (partial updates): passes, colour 0 loaded, cleared, scissor-bounded passes, their bound pixels, their render-area pixels,
++ * texels copied into shadows, texels of those whole shadows. */
++bool nmb_device_partial_counts(const NmbDevice *, uint64_t out[8]);
+ // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
+ bool nmb_no_copy_remaps(uint64_t out[2]);
+ /* Artifact lookups and driver pipeline records are separate cache layers. */
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index acecba0..c4eab48 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -365,6 +365,23 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut
+     })
+ }
+ 
++/// guamp (partial updates): passes ended; colour 0 loaded; cleared; passes whose draws' scissors bound them; the pixels of those bounds;
++/// of those passes' render areas; texels the shadow copies in moved; texels of their whole images.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_partial_counts(device: *const NmbDevice, out: *mut u64) -> bool {
++    guard(false, || {
++        if out.is_null() {
++            return Err("null counts".into());
++        }
++        // SAFETY: the header's eight words.
++        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
++        let w = get(device)?.0.work_counts();
++        out.copy_from_slice(&[w.passes_ended, w.passes_color0_load, w.passes_color0_clear, w.passes_bounded, w.bounded_area_pixels,
++                              w.bounded_extent_pixels, w.shadow_texels_copied_in, w.shadow_texels_in_whole]);
++        Ok(true)
++    })
++}
++
+ /// Separate artifact and driver-record counters, mirroring the C ABI.
+ #[repr(C)]
+ pub struct NmbShaderCacheStats {
+diff --git a/bridge/patches/0050-guamp-partial-updates.patch b/bridge/patches/0050-guamp-partial-updates.patch
+new file mode 100644
+index 0000000..a823d37
+--- /dev/null
++++ b/bridge/patches/0050-guamp-partial-updates.patch
+@@ -0,0 +1,419 @@
++guamp: partial updates. A pass's loaded color attachment over a shadowed buffer or surface texture, whose draws' scissors bound
++what it draws (clear_reach::DrawnArea) and which nothing else of the pass uses, is copied in only inside that bound (ShadowUse::loads),
++as it was already copied back only there: a render server redrawing a damaged rectangle of its framebuffer (Load + scissor) copies that
++rectangle, not the frame, both ways. Counters (WorkCounts): texels copied in and of the whole images; passes ended, colour 0 loaded or
++cleared, passes whose draws' scissors bound them with the bound's and render area's pixels.
++
++diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
++index 5363494..34d867f 100644
++--- a/crates/metal2vulkan-runtime/src/encoder.rs
+++++ b/crates/metal2vulkan-runtime/src/encoder.rs
++@@ -753,6 +753,11 @@ impl EncoderCore {
++         })?;
++         let texels = copies.iter().map(ShadowCopy::texels_back).sum();
++         (device.shared().counts).shadow_copies_planned(copies.len(), texels);
+++        let (moved, whole) = copies
+++            .iter()
+++            .map(ShadowCopy::texels_in)
+++            .fold((0, 0), |(m, w), (a, b)| (m + a, w + b));
+++        (device.shared().counts).shadow_texels_in(moved, whole);
++         for copy in &copies {
++             if let Step::Keep(merge) = &copy.step {
++                 self.retain(Arc::clone(merge));
++diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
++index bed9bd2..236c91b 100644
++--- a/crates/metal2vulkan-runtime/src/render.rs
+++++ b/crates/metal2vulkan-runtime/src/render.rs
++@@ -3739,6 +3739,24 @@ impl RenderCommandEncoder {
++             visibility.end(raw, last.draws);
++         }
++         let results = visibility.plan(&mut core)?;
+++        // guamp (partial updates): what the pass loads and where its draws' scissors bound its
+++        // drawing, counted for the device (`WorkCounts::passes_bounded`): a render server that
+++        // redraws only the damaged rectangle of its framebuffer shows here as a loaded pass with
+++        // a small bound.
+++        {
+++            let color0_load = layout.colors.first().and_then(Option::as_ref).and_then(|c| {
+++                match c.load {
+++                    LoadAction::Load => Some(true),
+++                    LoadAction::Clear => Some(false),
+++                    LoadAction::DontCare => None,
+++                }
+++            });
+++            let bounds = match (reach, &reach_clears) {
+++                (clear_reach::PassReach::Draws, None) => drawn.bounds(),
+++                _ => None,
+++            };
+++            (device.shared().counts).pass_ended(layout.extent, color0_load, bounds);
+++        }
++         // A shadowed texture the pass renders, resolves into or a draw uses.
++         let texels_shadowed = shadows::attachments_shadowed(&layout)
++             || instances
++diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
++index 768c128..797f6f4 100644
++--- a/crates/metal2vulkan-runtime/src/render/executions.rs
+++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
++@@ -634,6 +634,7 @@ impl RenderCommandEncoder {
++                     overwrites: false,
++                     kept: false,
++                     area: None,
+++                    loads: None,
++                 };
++                 shadow::join(&mut shadows, &used);
++             }
++diff --git a/crates/metal2vulkan-runtime/src/render/shadows.rs b/crates/metal2vulkan-runtime/src/render/shadows.rs
++index 57a3786..20801aa 100644
++--- a/crates/metal2vulkan-runtime/src/render/shadows.rs
+++++ b/crates/metal2vulkan-runtime/src/render/shadows.rs
++@@ -241,6 +241,22 @@ pub(super) fn plan<'a>(
++     let attachments = attachment_shadows(layout, reached, drawn);
++     let attached = crate::render_target::attachment_uses(layout)?;
++     let mut copies = Vec::new();
+++    // guamp (partial updates): an attachment copied in only where the pass loads it
+++    // (`ShadowUse::loads`) is one nothing else of the pass uses; a draw that also binds its
+++    // texture, or a tile dispatch's staging, reads it anywhere, so it takes the whole copy in.
+++    let instances: Vec<&InstanceShadows> = instances.collect();
+++    let mut attachments = attachments;
+++    for attachment in attachments.iter_mut().filter(|a| a.loads.is_some()) {
+++        let used_apart = instances.iter().any(|instance| {
+++            instance
+++                .shadows
+++                .iter()
+++                .any(|s| s.copies.shadow_key == attachment.copies.shadow_key)
+++        });
+++        if used_apart {
+++            attachment.loads = None;
+++        }
+++    }
++     for instance in instances {
++         let mut shadows = Vec::with_capacity(attachments.len() + instance.shadows.len());
++         for shadow in attachments.iter().chain(&instance.shadows) {
++@@ -330,6 +346,7 @@ fn attachment_shadows(
++                     overwrites,
++                     kept: false,
++                     area: None,
+++                    loads: None,
++                 };
++                 shadow::join(&mut shadows, &used);
++             }
++@@ -347,6 +364,7 @@ fn attachment_shadows(
++                     overwrites: false,
++                     kept: false,
++                     area: None,
+++                    loads: None,
++                 };
++                 shadow::join(&mut shadows, &used);
++             }
++@@ -403,6 +421,8 @@ fn attachment_shadows(
++                     overwrites,
++                     kept: !reached,
++                     area,
+++                    // guamp: read only where it is written (`ShadowUse::loads`).
+++                    loads: area,
++                 };
++                 shadow::join(&mut shadows, &used);
++             }
++@@ -420,6 +440,7 @@ fn attachment_shadows(
++                     overwrites: false,
++                     kept: false,
++                     area: None,
+++                    loads: None,
++                 };
++                 shadow::join(&mut shadows, &used);
++             }
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++index 9e37fb9..a73e17b 100644
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -504,6 +504,25 @@ impl<M> ShadowCopy<M> {
++     /// The texels a copy back of a 2D texture's image over a buffer's bytes moves (its every
++     /// region's, or its one region's inside [`area`](Self::area)): 0 for every other copy.
++     pub(super) fn texels_back(&self) -> u64 {
+++        match self.step {
+++            Step::Back => self.texels_moved().0,
+++            _ => 0,
+++        }
+++    }
+++
+++    /// guamp (partial updates): the texels a copy in of a 2D texture's image over a buffer's
+++    /// bytes moves, and those of its whole image: equal but where [`area`](Self::area) bounds
+++    /// it ([`ShadowUse::loads`]). `(0, 0)` for every other copy.
+++    pub(super) fn texels_in(&self) -> (u64, u64) {
+++        match self.step {
+++            Step::Into => self.texels_moved(),
+++            _ => (0, 0),
+++        }
+++    }
+++
+++    /// The texels the copy moves between a 2D texture's image and its buffer's bytes, as
+++    /// `record` cuts the region, and those of the whole image.
+++    fn texels_moved(&self) -> (u64, u64) {
++         let Some(ShadowTarget::Image {
++             regions,
++             staging,
++@@ -511,22 +530,20 @@ impl<M> ShadowCopy<M> {
++             ..
++         }) = self.copies.target()
++         else {
++-            return 0;
+++            return (0, 0);
++         };
++-        if !matches!(self.step, Step::Back) {
++-            return 0;
++-        }
++         let texels = |r: &vk::BufferImageCopy| {
++             let e = r.image_extent;
++             u64::from(e.width) * u64::from(e.height) * u64::from(e.depth)
++         };
++-        // As `record` cuts the region.
++-        match (self.area, staging, regions.as_slice(), texel) {
+++        let whole = regions.iter().map(texels).sum();
+++        let moved = match (self.area, staging, regions.as_slice(), texel) {
++             (Some(area), None, [region], Some(texel)) => {
++                 part_of(region, area, *texel).as_ref().map_or(0, texels)
++             }
++-            _ => regions.iter().map(texels).sum(),
++-        }
+++            _ => whole,
+++        };
+++        (moved, whole)
++     }
++ }
++ 
++@@ -729,7 +746,8 @@ impl ShadowCopy {
++                 texel,
++             } => {
++                 let regions = match (self.area, staging, regions.as_slice(), *texel) {
++-                    (Some(area), None, [region], Some(texel)) if !into_shadow => {
+++                    // Back: what the commands wrote; in (guamp): what the command reads.
+++                    (Some(area), None, [region], Some(texel)) => {
++                         match part_of(region, area, texel) {
++                             Some(part) => std::borrow::Cow::Owned(vec![part]),
++                             // The commands wrote no texel.
++@@ -943,6 +961,7 @@ pub(super) fn copies_used<'a>(
++             overwrites: false,
++             kept: false,
++             area: None,
+++            loads: None,
++         });
++     }
++     shadows
++@@ -962,6 +981,8 @@ pub(super) fn join(shadows: &mut Vec<ShadowUse>, shadow: &ShadowUse) {
++                 (false, true) => shadow.area,
++                 (_, false) => other.area,
++             };
+++            // Read anywhere either use reads it.
+++            other.loads = bounding(other.loads, shadow.loads);
++             other.writes |= shadow.writes;
++             other.overwrites &= shadow.overwrites;
++             other.kept &= shadow.kept;
++@@ -972,6 +993,7 @@ pub(super) fn join(shadows: &mut Vec<ShadowUse>, shadow: &ShadowUse) {
++             overwrites: shadow.overwrites,
++             kept: shadow.kept,
++             area: shadow.area,
+++            loads: shadow.loads,
++         }),
++     }
++ }
++@@ -1011,6 +1033,12 @@ pub(super) struct ShadowUse {
++     /// `[x0, y0, x1, y1)` of a one-level, one-slice texture's image (a pass's attachment it
++     /// loads, which only its draws' scissors change, `render/shadows.rs`); `None` for anywhere.
++     pub(super) area: Option<[u32; 4]>,
+++    /// guamp (partial updates): where the command reads the texture's texels, where it bounds
+++    /// that: a pass's loaded attachment that nothing else of the pass uses reads only inside
+++    /// [`area`](Self::area), the only texels copied back, so its copy in moves those alone. A
+++    /// render server that redraws a small damaged rectangle of a full-screen framebuffer (Load,
+++    /// scissor) then copies that rectangle in and out, not the whole frame. `None` for anywhere.
+++    pub(super) loads: Option<[u32; 4]>,
++ }
++ 
++ /// The rectangle bounding `a` and `b`, each `[x0, y0, x1, y1)`; `None` (anywhere) where either is.
++@@ -1147,13 +1175,17 @@ impl<M: Clone> ShadowSync<M> {
++                 && !kept
++                     .iter()
++                     .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
+++            // guamp: a texture kept for a merge takes its whole copy in.
+++            let merged = kept
+++                .iter()
+++                .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
++             if !self.entries[i].current {
++                 if !overwrites {
++                     copies.push(ShadowCopy {
++                         copies: Arc::clone(&shadow.copies),
++                         step: Step::Into,
++                         kept: shadow.kept,
++-                        area: None,
+++                        area: shadow.loads.filter(|_| !merged && !shadow.kept),
++                     });
++                 }
++                 self.entries[i].current = true;
++diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++index 2120cac..774a6e3 100644
++--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++@@ -71,6 +71,7 @@ fn through(texture: &Arc<ShadowCopies>, writes: bool) -> (ShadowUse, Use<Resourc
++             overwrites: false,
++             kept: false,
++             area: None,
+++            loads: None,
++         },
++         used,
++     )
++@@ -203,6 +204,7 @@ fn a_copy_back_covers_only_where_the_commands_wrote() {
++         overwrites: false,
++         kept: false,
++         area,
+++        loads: None,
++     };
++     let (_, written) = through(&t, true);
++     let run = |areas: &[Option<[u32; 4]>]| {
++@@ -334,6 +336,7 @@ fn a_use_that_overwrites_every_texel_takes_no_copy_in() {
++         overwrites: true,
++         kept: false,
++         area: None,
+++        loads: None,
++     };
++     let (_, written) = through(&t, true);
++     for stores in [true, false] {
++@@ -689,3 +692,45 @@ fn a_command_writing_an_image_through_a_views_shadow_and_another_way_is_refused(
++         assert_eq!(named(&copies), into);
++     }
++ }
+++
+++/// guamp (partial updates): a pass's loaded attachment that it reads only where it writes
+++/// (`ShadowUse::loads`) is copied in over that rectangle alone, and back over it; joined with a
+++/// use that reads it anywhere, or kept for a merge, it is copied in whole.
+++#[test]
+++fn a_loaded_attachment_is_copied_in_only_where_the_pass_reads_it() {
+++    let buffer = ResourceKey::new();
+++    let t = shadow(buffer, 256..1280);
+++    let area = Some([576, 43, 704, 57]);
+++    let attachment = ShadowUse {
+++        copies: Arc::clone(&t),
+++        writes: true,
+++        overwrites: false,
+++        kept: false,
+++        area,
+++        loads: area,
+++    };
+++    let (_, written) = through(&t, true);
+++    let mut sync = ShadowSync::<u32>::default();
+++    let shadows = [attachment];
+++    let uses = [written.clone()];
+++    let copies = sync.before(&shadows, &uses, |_| Ok(0)).unwrap();
+++    assert_eq!(named(&copies), [(t.shadow_key, true)]);
+++    assert_eq!(copies[0].area, area);
+++    sync.after(&shadows, &uses);
+++    assert_eq!(back_areas(&mut sync), [area]);
+++    // Joined with a draw that samples the texture: read anywhere, a whole copy in.
+++    let mut joined = vec![ShadowUse {
+++        copies: Arc::clone(&t),
+++        writes: true,
+++        overwrites: false,
+++        kept: false,
+++        area,
+++        loads: area,
+++    }];
+++    shadow::join(&mut joined, &through(&t, false).0);
+++    assert_eq!(joined[0].loads, None);
+++    assert_eq!(joined[0].area, area);
+++    let mut sync = ShadowSync::<u32>::default();
+++    let copies = sync.before(&joined, &uses, |_| Ok(0)).unwrap();
+++    assert_eq!(copies[0].area, None);
+++}
++diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
++index cdc5125..e4fce28 100644
++--- a/crates/metal2vulkan-runtime/src/work_counts.rs
+++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
++@@ -97,6 +97,14 @@ pub(crate) struct Counters {
++     shadows_zeroed: AtomicU64,
++     shadow_copies: AtomicU64,
++     shadow_texels_copied_back: AtomicU64,
+++    shadow_texels_copied_in: AtomicU64,
+++    shadow_texels_in_whole: AtomicU64,
+++    passes_ended: AtomicU64,
+++    passes_color0_load: AtomicU64,
+++    passes_color0_clear: AtomicU64,
+++    passes_bounded: AtomicU64,
+++    bounded_area_pixels: AtomicU64,
+++    bounded_extent_pixels: AtomicU64,
++     replay_logs_kept: AtomicU64,
++     replay_log_bytes: AtomicU64,
++     encoders_reencoded: AtomicU64,
++@@ -536,6 +544,35 @@ impl Counters {
++             .fetch_add(texels_back, Ordering::Relaxed);
++     }
++ 
+++    /// guamp (partial updates): copies in of buffers' textures' images that moved `moved`
+++    /// texels of images of `whole` (`ShadowCopy::texels_in`).
+++    pub(crate) fn shadow_texels_in(&self, moved: u64, whole: u64) {
+++        self.shadow_texels_copied_in
+++            .fetch_add(moved, Ordering::Relaxed);
+++        self.shadow_texels_in_whole
+++            .fetch_add(whole, Ordering::Relaxed);
+++    }
+++
+++    /// guamp (partial updates): a render pass ended over `extent` pixels, its color attachment 0
+++    /// loaded (`Some(true)`), cleared (`Some(false)`) or neither, its draws' scissors bounded by
+++    /// `bounds` where they bound them and it loads its colors (`clear_reach::DrawnArea`).
+++    pub(crate) fn pass_ended(&self, extent: [u32; 2], color0_load: Option<bool>, bounds: Option<[u32; 4]>) {
+++        self.passes_ended.fetch_add(1, Ordering::Relaxed);
+++        match color0_load {
+++            Some(true) => self.passes_color0_load.fetch_add(1, Ordering::Relaxed),
+++            Some(false) => self.passes_color0_clear.fetch_add(1, Ordering::Relaxed),
+++            None => 0,
+++        };
+++        if let Some([x0, y0, x1, y1]) = bounds {
+++            let px = |w: u32, h: u32| u64::from(w) * u64::from(h);
+++            self.passes_bounded.fetch_add(1, Ordering::Relaxed);
+++            self.bounded_area_pixels
+++                .fetch_add(px(x1.saturating_sub(x0), y1.saturating_sub(y0)), Ordering::Relaxed);
+++            self.bounded_extent_pixels
+++                .fetch_add(px(extent[0], extent[1]), Ordering::Relaxed);
+++        }
+++    }
+++
++     /// A command buffer kept an ended encoder's log of `bytes` bytes (`replay.rs`).
++     pub(crate) fn replay_log_kept(&self, bytes: usize) {
++         self.replay_logs_kept.fetch_add(1, Ordering::Relaxed);
++@@ -948,6 +985,25 @@ pub struct WorkCounts {
++     /// texture over a buffer, a no-copy buffer or an IOSurface plane): every texel, or those
++     /// inside the rectangle bounding a pass's draws' scissors over an attachment it loads.
++     pub shadow_texels_copied_back: u64,
+++    /// guamp (partial updates): texels the copies in moved into 2D textures' images, and those
+++    /// of the whole images (equal but where a pass's loaded attachment bounds its copy in).
+++    pub shadow_texels_copied_in: u64,
+++    /// The texels of the whole images those copies in were of.
+++    pub shadow_texels_in_whole: u64,
+++    /// guamp (partial updates): render passes ended; of them, those whose color attachment 0
+++    /// loads or clears (after `DontCare` took its answer); those whose draws' scissors bound
+++    /// what they draw, with the pixels of that bound and of their render areas.
+++    pub passes_ended: u64,
+++    /// Of them, those whose color attachment 0 loads.
+++    pub passes_color0_load: u64,
+++    /// Of them, those whose color attachment 0 clears.
+++    pub passes_color0_clear: u64,
+++    /// Of them, those whose draws' scissors bound their drawing over loaded colors.
+++    pub passes_bounded: u64,
+++    /// The pixels of those bounds.
+++    pub bounded_area_pixels: u64,
+++    /// The pixels of those passes' render areas.
+++    pub bounded_extent_pixels: u64,
++     /// Ended compute and blit encoders whose logs their command buffers kept, as a rebind before
++     /// the first submission may encode them again (`replay.rs`), and the bytes of those logs.
++     pub replay_logs_kept: u64,
++@@ -1131,6 +1187,14 @@ impl Device {
++             shadows_zeroed: counters.shadows_zeroed.load(Ordering::Relaxed),
++             shadow_copies: counters.shadow_copies.load(Ordering::Relaxed),
++             shadow_texels_copied_back: counters.shadow_texels_copied_back.load(Ordering::Relaxed),
+++            shadow_texels_copied_in: counters.shadow_texels_copied_in.load(Ordering::Relaxed),
+++            shadow_texels_in_whole: counters.shadow_texels_in_whole.load(Ordering::Relaxed),
+++            passes_ended: counters.passes_ended.load(Ordering::Relaxed),
+++            passes_color0_load: counters.passes_color0_load.load(Ordering::Relaxed),
+++            passes_color0_clear: counters.passes_color0_clear.load(Ordering::Relaxed),
+++            passes_bounded: counters.passes_bounded.load(Ordering::Relaxed),
+++            bounded_area_pixels: counters.bounded_area_pixels.load(Ordering::Relaxed),
+++            bounded_extent_pixels: counters.bounded_extent_pixels.load(Ordering::Relaxed),
++             replay_logs_kept: counters.replay_logs_kept.load(Ordering::Relaxed),
++             replay_log_bytes: counters.replay_log_bytes.load(Ordering::Relaxed),
++             encoders_reencoded: counters.encoders_reencoded.load(Ordering::Relaxed),
