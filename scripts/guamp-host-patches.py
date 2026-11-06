@@ -14,7 +14,12 @@ PATCHES = [
     ('kits/NativePrelink', 'patches/host/nativeprelink-kernel-bias.patch',
      {'native_prelink.py': 'MAX_KERNEL_BIAS', 'emit_prelink.py': 'opaque_external_words'}),
     ('drivers/NativeAES', 'patches/host/nativeaes-hwkeys.patch', {'NativeAES.cpp': 'native_aes_emulated_key'}),
+    # 06/11: DMS Get Revision answer shortened for Settings > About > Modem Firmware ("...KAMORTA_GEN_PACK-1.438466.25" -> "1.438466.25").
+    # Device submodule (UniXNU/QcomBaseband dd0199c), only present with --baseband: skipped when not initialised.
+    ('drivers/QcomBaseband', 'patches/host/qcombaseband-short-revision.patch',
+     {'baseband/coachz_bb_data.h': 'cbd_revision_fix', 'baseband/coachz_baseband.cpp': 'cbd_revision_fix'}),
 ]
+OPTIONAL = {'drivers/QcomBaseband'}
 
 
 def device_root():
@@ -36,7 +41,10 @@ def main():
     device = device_root()
     for relative, patch, markers in PATCHES:
         module = (TREE / relative).resolve()
-        if not module.is_dir():
+        if not module.is_dir() or (relative in OPTIONAL and not any(module.iterdir())):
+            if relative in OPTIONAL:
+                print(f'{relative}: not in the tree, {patch} skipped')
+                continue
             raise SystemExit(f'guamp-host-patches: {relative} missing in the tree')
         if patched(module, markers):
             print(f'{relative}: already patched')

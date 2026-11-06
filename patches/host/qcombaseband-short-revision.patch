@@ -1,0 +1,126 @@
+diff --git a/baseband/coachz_baseband.cpp b/baseband/coachz_baseband.cpp
+index fae6161..bd9ab69 100644
+--- a/baseband/coachz_baseband.cpp
++++ b/baseband/coachz_baseband.cpp
+@@ -72,6 +72,7 @@ static struct cbd_setup bb_data;         // the data port setup ModemManager run
+ static int bb_data_slot[2] = { -1, -1 }; // the bridge's own DPM and WDA clients
+ static uint32_t bb_endpoint_fixes, bb_activations;
+ static uint8_t bb_fix[2048];
++static uint32_t bb_revision_logged;
+ static struct cbe bb_esim;
+ static int bb_esim_slot = -1;
+ static bb_tx bb_uim_held[BB_TX];
+@@ -1203,8 +1204,11 @@ extern "C" int coachz_baseband_qrtr(uint32_t dst_port, uint32_t src_node, uint32
+       IOLockUnlock(bb_lock);
+       return 1;
+     }
+-    const uint32_t fixed = cbe_card_status_fix(&bb_esim, r.service,
++    uint32_t fixed = cbe_card_status_fix(&bb_esim, r.service,
+       static_cast<const uint8_t *>(body), size, bb_fix, sizeof bb_fix);
++    // guamp: short modem revision for Settings > About (coachz_bb_data.h cbd_revision_fix).
++    if (!fixed && (fixed = cbd_revision_fix(r.service, sdu, size, bb_fix, sizeof bb_fix)) && !bb_revision_logged++)
++      printf("COACHZ baseband: modem revision shortened for CommCenter (%u to %u bytes)\n", size, fixed);
+     if (fixed) {
+       cbq_frame_header(bb_out, fixed, r.service, r.cid);
+       memcpy(bb_out + CBQ_HDR, bb_fix, fixed);
+diff --git a/baseband/coachz_bb_data.h b/baseband/coachz_bb_data.h
+index 78a5144..e243e21 100644
+--- a/baseband/coachz_bb_data.h
++++ b/baseband/coachz_bb_data.h
+@@ -399,4 +399,43 @@ static inline int cbd_imsi_from_ef(const uint8_t *ef, uint32_t n, uint8_t out[CB
+     return 1;
+ }
+ 
++/* guamp: DMS Get Revision (0x23) answer with a short TLV 0x01. The SM6115 modem answers a build tag such as
++ * "MPSS.HA.1.0.c4-00040-KAMORTA_GEN_PACK-1.438466.25", which CommCenter shows as is in Settings > About > Modem
++ * Firmware and which runs off the screen; iPhones show a short version ("6.02.01"). Only the revision string changes:
++ * it keeps what follows the last '-' when that is digits and dots with at least one dot ("1.438466.25"); every other
++ * TLV (result, boot and PRI revisions) is copied as it is. 0 when the answer is not changed. */
++#define CBD_SVC_DMS 0x02u
++#define CBD_DMS_GET_REVISION 0x23u
++static inline uint32_t cbd_short_revision(const uint8_t *s, uint32_t n, uint32_t *start)
++{
++    uint32_t dash = n, dots = 0;
++    for (uint32_t i = 0; i < n; i++) if (s[i] == '-') dash = i;
++    if (dash == n || n - dash - 1u < 3u || n - dash - 1u > 32u) return 0;
++    for (uint32_t i = dash + 1u; i < n; i++) {
++        if (s[i] == '.') dots++;
++        else if (s[i] < '0' || s[i] > '9') return 0;
++    }
++    if (!dots || s[dash + 1u] == '.' || s[n - 1u] == '.') return 0;
++    *start = dash + 1u;
++    return n - dash - 1u;
++}
++static inline uint32_t cbd_revision_fix(uint32_t service, const uint8_t *sdu, uint32_t n, uint8_t *out, uint32_t room)
++{
++    if (service != CBD_SVC_DMS || n < 7u || sdu[0] != 0x02u || cbd_rd16(sdu + 3) != CBD_DMS_GET_REVISION || !cbd_sdu_ok(sdu, n)) return 0;
++    const uint32_t end = 7u + cbd_rd16(sdu + 5);
++    if (room < end) return 0;
++    uint32_t w = 7u, changed = 0;
++    for (uint32_t i = 0; i < 7u; i++) out[i] = sdu[i];
++    for (uint32_t at = 7u; at < end; at += 3u + cbd_rd16(sdu + at + 1)) {
++        const uint32_t len = cbd_rd16(sdu + at + 1);
++        uint32_t start = 0, keep = sdu[at] == 0x01u ? cbd_short_revision(sdu + at + 3, len, &start) : 0;
++        if (keep) changed = 1;
++        else start = 0, keep = len;
++        w += cbd_tlv(out + w, room - w, sdu[at], sdu + at + 3 + start, keep);
++    }
++    if (!changed) return 0;
++    cbd_wr16(out + 5, w - 7u);
++    return w;
++}
++
+ #endif /* COACHZ_BB_DATA_H */
+diff --git a/tests/coachz_bb_model_test.c b/tests/coachz_bb_model_test.c
+index e30c4ba..3e670db 100644
+--- a/tests/coachz_bb_model_test.c
++++ b/tests/coachz_bb_model_test.c
+@@ -821,6 +821,41 @@ static void test_esim_cache(void)
+     if (!failures) printf("PASS esim read-only query cache\n");
+ }
+ 
++static void test_revision(void)
++{
++    const int before = failures;
++    static const char rev[] = "MPSS.HA.1.0.c4-00040-KAMORTA_GEN_PACK-1.438466.25";
++    static const char boot[] = "BOOT-1.2";
++    uint8_t sdu[160], out[160];
++    uint32_t n = 7;
++    sdu[0] = 2; cbd_wr16(sdu + 1, 9); cbd_wr16(sdu + 3, CBD_DMS_GET_REVISION);
++    const uint8_t result[4] = { 0, 0, 0, 0 };
++    n += cbd_tlv(sdu + n, sizeof sdu - n, 0x02, result, 4);
++    n += cbd_tlv(sdu + n, sizeof sdu - n, 0x01, (const uint8_t *)rev, sizeof rev - 1);
++    n += cbd_tlv(sdu + n, sizeof sdu - n, 0x10, (const uint8_t *)boot, sizeof boot - 1);
++    cbd_wr16(sdu + 5, n - 7);
++    const uint32_t w = cbd_revision_fix(CBD_SVC_DMS, sdu, n, out, sizeof out);
++    CHECK(w == n - (sizeof rev - 1) + 11);
++    CHECK(cbd_sdu_ok(out, w) && cbd_rd16(out + 3) == CBD_DMS_GET_REVISION && cbd_rd16(out + 1) == 9);
++    uint32_t len = 0;
++    const uint8_t *v = cbd_find(out, w, 0x01, &len);
++    CHECK(v && len == 11 && !memcmp(v, "1.438466.25", 11));
++    v = cbd_find(out, w, 0x10, &len);
++    CHECK(v && len == sizeof boot - 1 && !memcmp(v, boot, len));
++    v = cbd_find(out, w, 0x02, &len);
++    CHECK(v && len == 4);
++    CHECK(!cbd_revision_fix(CBD_SVC_DMS + 1, sdu, n, out, sizeof out));      /* other service */
++    sdu[0] = 0; CHECK(!cbd_revision_fix(CBD_SVC_DMS, sdu, n, out, sizeof out)); sdu[0] = 2;   /* a request */
++    static const char odd[][24] = { "6.02.01", "ABC-12", "ABC-1.2x", "ABC-.12", "ABC-12.", "X-" };
++    for (unsigned i = 0; i < sizeof odd / sizeof odd[0]; i++) {
++        uint32_t m = 7;
++        m += cbd_tlv(sdu + m, sizeof sdu - m, 0x01, (const uint8_t *)odd[i], (uint32_t)strlen(odd[i]));
++        cbd_wr16(sdu + 5, m - 7);
++        CHECK(!cbd_revision_fix(CBD_SVC_DMS, sdu, m, out, sizeof out));
++    }
++    if (failures == before) printf("PASS dms revision short\n");
++}
++
+ int main(void)
+ {
+     test_qmux();
+@@ -832,5 +867,6 @@ int main(void)
+     test_data();
+     test_esim();
+     test_esim_cache();
++    test_revision();
+     return failures ? 1 : 0;
+ }
