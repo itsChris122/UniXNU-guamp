@@ -1,0 +1,58 @@
+guamp: a Metal client's compile line ("t.. p.. v.. c.. l.. f..", adreno-metal clientReport) to the kernel log as
+"GuampMetal: client <process>: shaders ..." whenever its counts change (at most one a second, none while idle); 8 client slots
+instead of 4, the oldest taken again past them instead of writing into the render server's report2. Host check: cc-sim.sh
+-fsyntax-only -Wall -Wextra -Werror on NativeAdrenoPublish.cpp after patches 0001-0019 (81a0b01).
+
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 2044749..60aba07 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -101,8 +101,10 @@ volatile uint32_t native_adreno_open_log_count;
+ struct NativeAdrenoClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
+ struct NativeAdrenoClientRecord native_adreno_client_log[8];
+ /* The last text line (the plugin's failure reason) each process other than the render server streamed: process name and a 64-byte line. */
+-struct NativeAdrenoClientText {char name[20]; char text[64];};
+-struct NativeAdrenoClientText native_adreno_client_text[4];
++/* guamp (UniXNU-guamp patches/native-adreno/0020): eight processes instead of four, the oldest slot taken again past them (a fifth
++ * process's line went into the render server's report2), and each one's compile line last logged (printed). */
++struct NativeAdrenoClientText {char name[20]; char text[64]; char printed[64];};
++struct NativeAdrenoClientText native_adreno_client_text[8];
+ /* Why the latest mount of a connection failed: [0] 1 no free slot, 2 the core's open, 3 the window scope; [1] its IOReturn; [2] the slot; [3] failures so far. */
+ volatile uint32_t native_adreno_mount_fail[4];
+ /* Processes that read MetalPluginName (the Metal discovery), first twelve names, with counts. */
+@@ -967,6 +969,20 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+                  * when the next line starts, with the process that sent it; the rows and report lines kept no copy of another process's. */
+                 static char lastWho[20];
+                 if(line && !strncmp(line,"problem ",8))IOLog("GuampMetal: client %.20s: %.64s\n",lastWho[0]?lastWho:"?",line);
++                /* guamp (UniXNU-guamp patches/native-adreno/0020): a client's compile line (adreno-metal NativeAdrenoMetalPlugin.mm
++                 * clientReport, native_bridge_metal_client_brief: "t<s> p<pipelines>/<ms>/<slowest ms> v<VkPipelines>/<ms> c<hits>/<misses>
++                 * l<libraries>/<ms> f<functions>/<ms>"), sent each second it changes for ten minutes, goes to the kernel log when what follows
++                 * its seconds changed: how long an app's first opening compiled, which no log showed (fin53 had only the render server's T
++                 * row: 112 pipelines in 1471 ms, the slowest 154 ms). One line per second of compiling at most, none while idle. */
++                for(auto &entry:native_adreno_client_text) {
++                    if(line!=entry.text || entry.text[0]!='t' || entry.text[1]<'0' || entry.text[1]>'9')continue;
++                    const char *rest=strchr(entry.text,' ');
++                    if(rest && strncmp(rest,entry.printed,sizeof entry.printed)) {
++                        strlcpy(entry.printed,rest,sizeof entry.printed);
++                        IOLog("GuampMetal: client %.20s: shaders %.64s\n",entry.name,entry.text);
++                    }
++                    break;
++                }
+                 line=value==0x7fff?native_adreno_metal_diag.report2:native_adreno_metal_diag.report;
+                 /* A line from a process other than the render server goes to that process's own row (native_adreno_client_text): the render server
+                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */
+@@ -978,6 +994,14 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+                         if(!entry.name[0]) strlcpy(entry.name,who,sizeof entry.name);
+                         if(!strncmp(entry.name,who,sizeof entry.name)) {line=entry.text;break;}
+                     }
++                    /* 0020: every slot another process's: the oldest taken again (round robin), not the render server's report2. */
++                    if(line==native_adreno_metal_diag.report2) {
++                        static unsigned reused;
++                        auto &entry=native_adreno_client_text[reused++%(sizeof native_adreno_client_text/sizeof native_adreno_client_text[0])];
++                        memset(&entry,0,sizeof entry);
++                        strlcpy(entry.name,who,sizeof entry.name);
++                        line=entry.text;
++                    }
+                 }
+                 memset(line,0,sizeof(native_adreno_metal_diag.report2));length=0;
+             }

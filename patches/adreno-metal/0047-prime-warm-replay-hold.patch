@@ -1,0 +1,126 @@
+guamp: shader priming replays the journal on every boot of the same build too (warm) and keeps the states it makes alive
+
+fin53 (live-20261106-092610, warm cache "V cache hit112 miss0"): the render server still made each pipeline on its render thread at its
+first draw: T pipeline n=112 total=1471 ms max=154 ms; 59 of them between 31 and 91 s of the boot in 869 ms (14.7 ms each), then about
+7 ms each (vkpipe 2.5 ms of it). 0046 skips the replay once prime-replay-done lists the build. Now a boot whose build was replayed
+replays the 128 most frequent descriptors 10 s after the device opened (one quiet wait first, cache hits at background QoS), and both
+replays keep up to 128 states alive, so CoreAnimation's own creation shares the live variant (shader modules, layouts, VkPipelines:
+metal2vulkan-runtime pipeline/memo.rs) instead of reading the disk cache and calling the driver on its render thread. The journal's
+lines of the priming thread itself (callers "qc global=..." without QuartzCore frames) no longer count. NMB_PRIME_WARM=0 and
+NMB_PRIME_HOLD=0 turn the two off; prime.log gets "warm lines=.. made=.. held=.. ms=..". Host check: clang -fsyntax-only -fobjc-arc as
+Objective-C++ against stand-in Foundation/Metal headers. Applies after 0046.
+
+diff --git a/PrimeShaders.h b/PrimeShaders.h
+index 969b8ea..8f1e8ae 100644
+--- a/PrimeShaders.h
++++ b/PrimeShaders.h
+@@ -391,11 +391,33 @@ static MTLRenderPipelineDescriptor *journalDescriptor(id<MTLLibrary> lib, const
+     if (vertex) d.vertexDescriptor = vertex;
+     return d;
+ }
++// guamp (UniXNU-guamp patches/adreno-metal/0047): the replay also on every later boot of the same build ("warm"), and the states it
++// makes are kept alive. fin53 (live-20261106-092610, cache warm: "V cache hit112 miss0") still made each of the render server's 112
++// pipelines on its render thread at its first draw: T pipeline 1471 ms, 59 of them in 869 ms (14.7 ms each) between 31 and 91 s of the
++// boot, then about 7 ms each (vkpipe 2.5 ms of it: the predicted VkPipeline; the rest the disk entries read, checked and decoded), the
++// first one 154 ms; 0031 skipped the replay because prime-replay-done listed the build. Kept alive, a replayed state's variant (its
++// shader modules, layouts and VkPipelines) is what CoreAnimation's own creation of the same descriptor shares (pipeline/memo.rs: a state
++// made again shares the live variant), so that creation no longer reads the disk or calls the driver on the render thread. Warm: at
++// most kWarmMost descriptors, 10 s after the device opened, one quiet wait before the first (each making is a cache hit of a few ms at
++// background QoS; the network-search animation at rest keeps the desktop "busy" for good, so a wait per pipeline would take 10 s each).
++// At most kHoldMost states are kept (the most frequent first; CoreAnimation keeps the ones it uses alive anyway). The journal's lines of
++// the priming thread itself (callers "qc global=..." with no QuartzCore frame) no longer count, or every replay would add one to the
++// descriptors it replayed. NMB_PRIME_WARM=0 turns the warm replay off, NMB_PRIME_HOLD=0 the keeping. prime.log: "warm lines=.. held=..".
++static constexpr size_t kWarmMost = 128, kHoldMost = 128;
++typedef id<MTLRenderPipelineState> PrimeState;
++static bool envOn(const char *name) {
++    const char *value = getenv(name);
++    return !value || strtoul(value, nullptr, 0) != 0;
++}
++static bool replayDone(const std::string &root, const std::string &build) {return readLines(root + "/prime-replay-done").count(build) != 0;}
+ static void replay(id<MTLDevice> device, const std::string &root, const std::string &logPath, const std::string &build,
+                    const std::string &current, const std::set<std::string> &bad) {
+     if (const char *off = getenv("NMB_PRIME_REPLAY"); off && !strtoul(off, nullptr, 0)) return;
+     const std::string donePath = root + "/prime-replay-done";
+-    if (readLines(donePath).count(build)) return;
++    const bool warm = replayDone(root, build);
++    if (warm && !envOn("NMB_PRIME_WARM")) return;
++    const bool hold = envOn("NMB_PRIME_HOLD");
++    static NSMutableArray *held = [NSMutableArray new];
+     FILE *journal = fopen((root + "/pipelines.log").c_str(), "r");
+     if (!journal) return;
+     // The journal grows with every boot (32 MB after 114 boots): its tail only.
+@@ -415,7 +437,9 @@ static void replay(id<MTLDevice> device, const std::string &root, const std::str
+         line.pop_back();
+         if (line.compare(0, 2, "R ") == 0 && line.find(" ok=1 ") != std::string::npos) {
+             const size_t label = line.find(" label="), qc = line.rfind(" | ");
+-            if (label != std::string::npos && qc != std::string::npos && qc > label) {
++            // 0047: a line of this thread's own making (no QuartzCore frame among its callers) is not CoreAnimation's use.
++            const bool primed = qc != std::string::npos && line.compare(qc + 3, 10, "qc global=") == 0;
++            if (label != std::string::npos && qc != std::string::npos && qc > label && !primed) {
+                 ++lines;
+                 // The key: from the label to the functions; the callers after the last " | " and the timings before the label differ per draw.
+                 Seen &s = seen[line.substr(label, qc - label)];
+@@ -429,7 +453,8 @@ static void replay(id<MTLDevice> device, const std::string &root, const std::str
+     std::vector<std::pair<unsigned, const std::string *>> order;
+     for (const auto &entry : seen) order.push_back({entry.second.count, &entry.first});
+     std::stable_sort(order.begin(), order.end(), [](const auto &a, const auto &b) {return a.first > b.first;});
+-    if (order.size() > kReplayMost) order.resize(kReplayMost);
++    const size_t most = warm ? kWarmMost : kReplayMost;
++    if (order.size() > most) order.resize(most);
+     unsigned made = 0, refused = 0, skipped = 0;
+     uint64_t waited = 0;
+     const uint64_t began = nowMs();
+@@ -447,25 +472,27 @@ static void replay(id<MTLDevice> device, const std::string &root, const std::str
+                 native_prime_compiling = 3;
+                 MTLRenderPipelineDescriptor *d = journalDescriptor(lib, seen[key].head, key, missing);
+                 if (!d) {++skipped; continue;}
+-                waited += waitForQuiet();
++                if (!warm) waited += waitForQuiet();
+                 writeCurrent(current, id);
+                 native_prime_compiling = 1;
+-                bool ok = false;
+-                @try {ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;} @catch (NSException *exception) {ok = false;}
++                PrimeState state = nil;  // `id` is the descriptor id string here
++                @try {state = [device newRenderPipelineStateWithDescriptor:d error:&error];} @catch (NSException *exception) {state = nil;}
+                 native_prime_compiling = 0;
+-                ok ? ++made : ++refused;
+-                if (ok) native_prime_made = native_prime_made + 1;
++                state ? ++made : ++refused;
++                if (state) native_prime_made = native_prime_made + 1;
++                if (state && hold && held.count < kHoldMost) [held addObject:state];
+                 error = nil;
+-                usleep(20000);
++                usleep(warm ? 5000 : 20000);
+             }
+         }
+     }
+     unlink(current.c_str());
+-    char text[200];
+-    snprintf(text, sizeof text, "replay lines=%u unique=%zu tried=%zu made=%u refused=%u skipped=%u ms=%llu waited=%llu", lines, seen.size(),
+-             order.size(), made, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
++    char text[220];
++    snprintf(text, sizeof text, "%s lines=%u unique=%zu tried=%zu made=%u refused=%u skipped=%u held=%lu ms=%llu waited=%llu",
++             warm ? "warm" : "replay", lines, seen.size(), order.size(), made, refused, skipped, (unsigned long)held.count,
++             (unsigned long long)(nowMs() - began), (unsigned long long)waited);
+     appendLine(logPath, text);
+-    appendLine(donePath, build);
++    if (!warm) appendLine(donePath, build);
+ }
+ 
+ // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
+@@ -479,10 +506,13 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
+     unlink(current.c_str());
+     // guamp 0031: the journal's pipelines first, 30 s after the device opened (the boot's own pipelines are made by then), then the
+     // library pass at its own delay.
+-    const unsigned early = delaySeconds < 30 ? delaySeconds : 30;
++    // 0047: 10 s on a boot whose build was replayed before (cache hits only, see replay()).
++    const std::string replayBuild = buildId();
++    const unsigned first = replayDone(root, replayBuild) ? 10 : 30;
++    const unsigned early = delaySeconds < first ? delaySeconds : first;
+     sleep(early);
+     const uint64_t replayBegan = nowMs();
+-    replay(device, root, logPath, buildId(), current, readLines(badPath));
++    replay(device, root, logPath, replayBuild, current, readLines(badPath));
+     const uint64_t replayed = (nowMs() - replayBegan) / 1000;
+     if (delaySeconds > early + replayed) sleep(delaySeconds - early - (unsigned)replayed);
+     const std::set<std::string> bad = readLines(badPath);
