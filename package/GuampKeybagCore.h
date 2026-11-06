@@ -430,8 +430,8 @@ static inline int gkb_load_bag(struct gkb_state *st, const struct gkb_io *io, ui
 }
 /* aks_set_system (5): device right. A handle that is not a bag of ours changes nothing (as before the keybag). */
 static inline int gkb_set_system(struct gkb_state *st, const struct gkb_io *io, uint32_t rights, uint64_t handle) {
-    if (!(rights & GKB_RIGHT_DEVICE)) return GKB_NOT_PRIVILEGED;
     if (handle == 0 || handle >= GKB_BAGS || !st->bag[handle].used) return GKB_OK;
+    if (!(rights & GKB_RIGHT_DEVICE)) return GKB_NOT_PRIVILEGED;
     int rc = gkb_set_system_slot(st, (int)handle);
     if (rc == GKB_OK) {
         st->from_file = 1;
