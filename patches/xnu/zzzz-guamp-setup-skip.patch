@@ -563,8 +563,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			{"/chosen", "mac-address-wifi0"}, {"/chosen", "mac-address-bluetooth0"}, {"/product", "product-id"},
 +			{"/product", "wifi-chipset"}, {"/product", "bluetooth-le"}, {"/arm-io/wlan", "local-mac-address"},
 +			/* 29/10 (scripts/make-guamp-siri-adt.py): "touch-id" is cached from a "mesa" node; "assistant" (Siri) is read live, listed so a
-+			 * Siri ADT also refreshes anything derived from it; 05/11 camera (scripts/make-guamp-camera-adt.py): still/front/rear-facing-camera, camera-flash; 06/11 cellular (scripts/check-guamp-mg-cellular.py): HasBaseband (an entry named "baseband") gives cellular-data and contains-cellular-radio, the root model (hw.product) gives DeviceClass and with it telephony/sms/mms/CellularTelephonyCapability, BasebandClass, EUICCChipID, BasebandChipset */
-+			{"/product", "assistant"}, {"/arm-io/mesa", "name"}, {"/arm-io/isp", "camera-front"}, {"/arm-io/isp", "camera-rear"}, {"/product/camera", "flash"}, {"/baseband", "name"}, {"/baseband", "class"}, {"/baseband", "euicc-chip-id"}, {"/product", "baseband-chipset"}, {"/", "model"},
++			 * Siri ADT also refreshes anything derived from it; 05/11 camera (scripts/make-guamp-camera-adt.py): still/front/rear-facing-camera, camera-flash; 06/11 cellular (scripts/check-guamp-mg-cellular.py): HasBaseband (an entry named "baseband") gives cellular-data and contains-cellular-radio, the root model (hw.product) gives DeviceClass and with it telephony/sms/mms/CellularTelephonyCapability, BasebandClass, EUICCChipID, BasebandChipset; 06/11 serial number (scripts/make-guamp-serial-adt.py, GuampBoot fills /serial-number from the ABL): MG caches SerialNumber, so its arrival resets the cache once; only its presence and size enter the stamp, never its bytes (the stamp is logged) */
++			{"/product", "assistant"}, {"/arm-io/mesa", "name"}, {"/arm-io/isp", "camera-front"}, {"/arm-io/isp", "camera-rear"}, {"/product/camera", "flash"}, {"/baseband", "name"}, {"/baseband", "class"}, {"/baseband", "euicc-chip-id"}, {"/product", "baseband-chipset"}, {"/", "model"}, {"/", "serial-number"},
 +		};
 +		uint32_t stamp = 2166136261u;           /* FNV-1a over name, size and bytes of each property */
 +		for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
@@ -579,7 +579,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			}
 +			for (const char *c = name; *c; c++) stamp = (stamp ^ (uint8_t)*c) * 16777619u;
 +			stamp = (stamp ^ size) * 16777619u;
-+			for (unsigned j = 0; j < size && j < 64; j++) stamp = (stamp ^ ((const uint8_t *)value)[j]) * 16777619u;
++			for (unsigned j = 0; j < size && j < 64 && strcmp(name, "serial-number"); j++) stamp = (stamp ^ ((const uint8_t *)value)[j]) * 16777619u;
 +		}
 +		snprintf(mg_marker, sizeof(mg_marker), "/private/var/db/guamp-mg-adt-%08x.done", stamp);
 +		int marked = native_guamp_ui_pc_done(p, scratch, mg_marker);
