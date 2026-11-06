@@ -169,6 +169,8 @@ size_t strlcpy(char *, const char *, size_t);
 size_t strlcat(char *, const char *, size_t);
 int strncmp(const char *, const char *, size_t);
 int strcmp(const char *, const char *);
+char *strchr(const char *, int);
+void *memmove(void *, const void *, size_t);
 }
 #define IONewZero(type, count) static_cast<type *>(nullptr)
 #define IODelete(ptr, type, count) do {(ptr) = nullptr;} while (0)

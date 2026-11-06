@@ -68,6 +68,12 @@ extern volatile uint32_t native_adreno_reassert_table, native_adreno_mailbox_idl
 // patches/native-adreno/0013: imports the GPU only reads cleaned when mapped and every N-th submission (guamp-adreno-ro-imports-owned,
 // default 1; 0 = at every submission) (guamp-adreno-ro-imports-sweep, default 32; 0 = never).
 extern volatile uint32_t native_adreno_ro_imports_owned, native_adreno_ro_imports_sweep;
+// patches/native-adreno/0021 (NativeAdrenoWrittenPlan.h): a client's GPU-written imports (IOSurface render targets) cleaned and
+// invalidated by physical address before and after its jobs while armed (black app switcher previews, fin36/fin55):
+// guamp-adreno-written-clean (bit 0 after, bit 1 before too; default 1, 0 off), -n (jobs per arming, default 4, 0 every job), -gap-ms (the
+// window's rest that arms again, default 500), -rs (the render server's window too, default 0), -max-mib (a pass's cap, default 32).
+extern volatile uint32_t native_adreno_written_clean, native_adreno_written_limit, native_adreno_written_gap_ms, native_adreno_written_rs,
+    native_adreno_written_max_mib;
 // patches/native-adreno/0017 (NativeAdrenoProcFence.h): the render server's last fence, the reader of the CP timestamp the soft
 // priority uses, and its switches (guamp-gpu-other-depth, default 2, 0 off, max 4; guamp-gpu-other-wait-us, default 50000).
 extern volatile uint32_t native_adreno_compositor_fence, native_adreno_other_depth, native_adreno_other_wait_us;
@@ -983,6 +989,14 @@ extern "C" int guamp_adreno_start(const GuampAdrenoStart *in) {
   native_adreno_ro_imports_sweep = bootArg("guamp-adreno-ro-imports-sweep", 32);
   IOLog("GuampAdreno: read-only imports cleaned at map only %u, swept every %u submissions\n", native_adreno_ro_imports_owned,
         native_adreno_ro_imports_sweep);
+  native_adreno_written_clean = bootArg("guamp-adreno-written-clean", 1) & 3;
+  native_adreno_written_limit = bootArg("guamp-adreno-written-clean-n", 4);
+  native_adreno_written_gap_ms = bootArg("guamp-adreno-written-clean-gap-ms", 500);
+  native_adreno_written_rs = bootArg("guamp-adreno-written-clean-rs", 0) ? 1 : 0;
+  native_adreno_written_max_mib = bootArg("guamp-adreno-written-clean-max-mib", 32);
+  IOLog("GuampAdreno: GPU-written imports cleaned by physical address: mode %u (1 after the job, 2 before), %u jobs per arming "
+        "(0 every job), armed again after %u ms of rest, render server %u, at most %u MiB a pass\n", native_adreno_written_clean,
+        native_adreno_written_limit, native_adreno_written_gap_ms, native_adreno_written_rs, native_adreno_written_max_mib);
   IOLog("GuampAdreno: submission coherence: client-cleaned imports %u, re-assert on events %u (check every %u, quiet %u us)\n",
         native_adreno_client_cleans, native_adreno_reassert_mode, native_adreno_reassert_check, native_adreno_wc_quiet_us);
   IOLog("GuampAdreno: job prologue wait for idle %u, submission maintenance own window %u\n", native_adreno_a6xx_prologue_wfi,

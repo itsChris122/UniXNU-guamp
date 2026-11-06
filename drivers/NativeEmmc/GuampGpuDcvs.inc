@@ -83,6 +83,10 @@ __attribute__((weak)) volatile uint64_t native_adreno_publish_ro_owned[3];
 // (mach_absolute_time ticks, NativeAdrenoCpu.cpp), to tell the page checks from the pmap's resets.
 __attribute__((weak)) volatile uint64_t native_adreno_reassert_pages[3];
 __attribute__((weak)) volatile uint64_t native_adreno_reassert_ticks;
+// patches/native-adreno/0021: GPU-written imports cleaned by physical address ([0] passes after a job, [1] mappings, [2] bytes, [3-5] the
+// same before a job, [6] armed mappings left over a pass's cap, [7] mappings past their budget, [8] their bytes, [9] render server jobs
+// left out, [10] us in the passes, [11] the longest pass in us).
+__attribute__((weak)) volatile uint64_t native_adreno_written_stats[12];
 }
 
 namespace gpudcvs {
@@ -214,6 +218,18 @@ void logSubmits() {
     IOLog("GuampGpu: read-only imports left to their map clean: %llu mappings %llu KiB each, sweeps %llu\n", (om - ro[0]) / dn,
           (ob - ro[1]) / dn >> 10, os - ro[2]);
   ro[0] = om; ro[1] = ob; ro[2] = os;
+  // patch 0021: the GPU-written imports cleaned and invalidated by physical address (app switcher snapshots), what it cost, what it left.
+  static uint64_t wr[12];
+  const volatile uint64_t *w = native_adreno_written_stats;
+  if (w[0] != wr[0] || w[3] != wr[3] || w[9] != wr[9] || w[7] != wr[7]) {
+    const uint64_t passes = w[0] - wr[0] + w[3] - wr[3];
+    IOLog("GuampGpu: written imports by PA: after jobs %llu passes %llu maps %llu KiB, before jobs %llu passes %llu maps %llu KiB; "
+          "%llu us each (longest %llu), %llu KiB a submission; past budget %llu maps %llu MiB, over the cap %llu; render server jobs "
+          "left out %llu\n", w[0] - wr[0], w[1] - wr[1], (w[2] - wr[2]) >> 10, w[3] - wr[3], w[4] - wr[4], (w[5] - wr[5]) >> 10,
+          passes ? (w[10] - wr[10]) / passes : 0, w[11], dn ? ((w[2] - wr[2]) + (w[5] - wr[5])) / dn >> 10 : 0, w[7] - wr[7],
+          (w[8] - wr[8]) >> 20, w[6] - wr[6], w[9] - wr[9]);
+  }
+  for (unsigned i = 0; i < 12; ++i) wr[i] = w[i];
 }
 
 void thread(void *, wait_result_t) {

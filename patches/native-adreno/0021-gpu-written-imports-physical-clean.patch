@@ -1,0 +1,255 @@
+guamp: GPU-written imports (IOSurface render targets) cleaned and invalidated by physical address before/after a client's jobs while armed (black app switcher previews)
+
+fin36 and fin55 (live-20261106-092610): the app switcher shows black or old previews. The board maps GPU-written imports clean once and
+leaves them alone afterwards (native_adreno_written_imports_owned: about 60 ms a frame otherwise), so the only cache maintenance of a
+surface the GPU wrote was the bridge's (adreno-metal 0001/0010: DC CIVAC by virtual address in the writing process, first 4 writes,
+again after 500 ms of rest). When the app closes SpringBoard no longer maps the snapshot's pages: DC by VA faulted (SIGSEGV, fin55),
+0060 now skips those pages, and the CPU's stale or dirty lines stay over the pixels the GPU wrote (black preview).
+NativeAdrenoVm::maintainWritten walks the window's GPU-written imports by physical address (NativeAdrenoMemory::maintainImported,
+whoever maps the pages) after each client job (release(), which wait() runs before the waiter returns) and, with bit 1, before it.
+Jobs name only their IBs, so the kernel does not know which surface a job wrote: as 0001/0010 per surface, a mapping is walked at the
+first N completed jobs of its window after map or after the window rested (NativeAdrenoWrittenPlan.h). The render server's window is
+left out by default (its frame buffers are rewritten every frame and read by the display copy, which maintains them itself).
+Board switches (GuampAdrenoProbe.cpp): guamp-adreno-written-clean (default 1: after the job; 3: before too; 0: off, as before),
+-n (default 4; 0 every job), -gap-ms (default 500), -rs (default 0), -max-mib (a pass's cap, default 32). Counters:
+native_adreno_written_stats, logged every 10 s by GuampGpuDcvs.inc ("GuampGpu: written imports by PA: ...").
+Host test: drivers/GuampAdreno/tests/written_host.cpp (run-tests.sh).
+
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index 7106ba1..97a11d9 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -90,6 +90,48 @@ extern "C" {
+ int32_t (*native_adreno_perf_begin)(uint64_t *ticks);
+ void (*native_adreno_perf_end)(int32_t slot,uint64_t submitted,uint64_t start,uint64_t end,uint32_t kernel_us);
+ }
++/* guamp (UniXNU-guamp patches/native-adreno/0021, NativeAdrenoWrittenPlan.h): the GPU-written imports of a client's window, which the
++ * board leaves alone after map (native_adreno_written_imports_owned), cleaned and invalidated by physical address before the job and
++ * after it while armed. Black app switcher previews (fin36, fin55 after 0060): the bridge's walk by virtual address in SpringBoard
++ * (adreno-metal 0001/0010) missed the snapshot's pages SpringBoard no longer mapped. Board switches:
++ *   native_adreno_written_clean     guamp-adreno-written-clean, bit 0 after the job, bit 1 before it too (default 1; 0 off, as before)
++ *   native_adreno_written_limit     guamp-adreno-written-clean-n, completed jobs walked after map or a rest (default 4; 0 every job)
++ *   native_adreno_written_gap_ms    guamp-adreno-written-clean-gap-ms, the window's rest that arms its mappings again (default 500)
++ *   native_adreno_written_rs        guamp-adreno-written-clean-rs, the render server's window too (default 0: its frame buffers are
++ *                                   rewritten every frame and read by the display copy, which maintains them itself)
++ *   native_adreno_written_max_mib   guamp-adreno-written-clean-max-mib, the most a pass walks (default 32; 0 no cap)
++ * native_adreno_written_stats: [0] passes after a job, [1] mappings they walked, [2] their bytes, [3] passes before a job, [4] mappings
++ * they walked, [5] their bytes, [6] armed mappings left over the cap, [7] mappings past their budget (summed over passes), [8] their
++ * bytes, [9] render server jobs left out, [10] us in the passes, [11] the longest pass in us. */
++extern "C" {
++volatile uint32_t native_adreno_written_clean=1,native_adreno_written_limit=4,native_adreno_written_gap_ms=500,native_adreno_written_rs=0,
++    native_adreno_written_max_mib=32;
++volatile uint64_t native_adreno_written_stats[12];
++extern volatile uint32_t native_adreno_written_imports_owned,native_adreno_io_coherent;
++}
++static uint64_t writtenNowUs() {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
++static IOReturn writtenPass(NativeAdrenoVm *vm,uint64_t window_start,uint64_t window_bytes,bool completed)
++{
++    const uint64_t began=writtenNowUs();
++    uint64_t out[5]={};
++    const IOReturn status=vm->maintainWritten(window_start,window_bytes,completed,began,(uint64_t)native_adreno_written_gap_ms*1000ull,
++        native_adreno_written_limit,(uint64_t)native_adreno_written_max_mib<<20,out);
++    const uint64_t spent=writtenNowUs()-began;
++    const unsigned base=completed?0u:3u;
++    if(out[0]) {
++        native_adreno_written_stats[base]=native_adreno_written_stats[base]+1;
++        native_adreno_written_stats[base+1]=native_adreno_written_stats[base+1]+out[0];
++        native_adreno_written_stats[base+2]=native_adreno_written_stats[base+2]+out[1];
++        native_adreno_written_stats[10]=native_adreno_written_stats[10]+spent;
++        if(spent>native_adreno_written_stats[11])native_adreno_written_stats[11]=spent;
++    }
++    if(out[2])native_adreno_written_stats[6]=native_adreno_written_stats[6]+out[2];
++    if(completed && out[3]) {
++        native_adreno_written_stats[7]=native_adreno_written_stats[7]+out[3];
++        native_adreno_written_stats[8]=native_adreno_written_stats[8]+out[4];
++    }
++    return status;
++}
+ IOReturn NativeAdrenoSubmit::release(Job &job)
+ {
+     if(job.perf_slot>=0 && native_adreno_perf_end) {
+@@ -104,6 +146,8 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
+     }
+     if(status)return poison();
+     if(vm_->acquireImported())return poison();
++    /* guamp 0021: after the GPU, before the waiter returns (wait() releases its job first) */
++    if(job.written && (native_adreno_written_clean&1) && writtenPass(vm_,job.window_start,job.window_bytes,true))return poison();
+     job={};return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::detach()
+@@ -197,6 +241,15 @@ extern "C" uint32_t native_adreno_throttle_target(void)
+     }
+     return 0;
+ }
++/* guamp 0021: the window's last submitter (noteWindowOwner) is the render server. */
++static bool windowIsCompositor(uint64_t start)
++{
++    for(unsigned i=0;i<32;++i) {
++        const NativeAdrenoWindowOwner &o=native_adreno_window_owners[i];
++        if(o.bytes && o.start==start)return nativeAdrenoIsCompositor(o.name);
++    }
++    return false;
++}
+ static bool bannedCaller()
+ {
+     const int32_t pid=proc_selfpid();
+@@ -272,6 +325,13 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+         if(bannedCaller()) {native_adreno_banned_refused=native_adreno_banned_refused+1;return kIOReturnNotPermitted;}
+         noteWindowOwner(window_start,window_bytes);
+     }
++    /* guamp 0021: the client's own window (a job reaches no other mapping), whatever guamp-adreno-publish-window says; the kernel's
++     * own submissions (no window) are left out, and the render server's unless native_adreno_written_rs. */
++    const uint64_t written_start=window_start,written_bytes=window_bytes;
++    bool written=native_adreno_written_clean && native_adreno_written_imports_owned && !native_adreno_io_coherent && written_bytes;
++    if(written && !native_adreno_written_rs && windowIsCompositor(written_start)) {
++        written=false;native_adreno_written_stats[9]=native_adreno_written_stats[9]+1;
++    }
+     if(!native_adreno_publish_window)window_bytes=0;
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -368,6 +428,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+     const uint32_t sweep_every=native_adreno_ro_imports_sweep;
+     const bool sweep=sweep_every && !(++ro_turn%sweep_every);
+     IOReturn status=vm_->publishMapped(window_start,window_bytes,&maintained,sweep);
++    /* guamp 0021: before the GPU writes them, no CPU line (dirty or stale) is left over the window's armed GPU-written imports */
++    if(!status && written && (native_adreno_written_clean&2))status=writtenPass(vm_,written_start,written_bytes,false);
+     {
+         const uint64_t spent=submitNowUs()-publish_began;
+         native_adreno_submit_cost[2]=native_adreno_submit_cost[2]+spent;native_adreno_submit_cost[3]=native_adreno_submit_cost[3]+(maintained>>10);
+@@ -417,6 +479,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
+     job->perf_slot=perf_slot;job->perf_ticks=perf_ticks;
++    job->written=written;job->window_start=written_start;job->window_bytes=written_bytes;   /* guamp 0021 */
+     {const uint64_t spent=submitNowUs()-submit_began;job->perf_kernel_us=spent>0xffffffffull?0xffffffffu:(uint32_t)spent;}
+     ++stats_.submissions;
+     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
+diff --git a/NativeAdrenoSubmit.h b/NativeAdrenoSubmit.h
+index 4a38ee6..0f9d864 100644
+--- a/NativeAdrenoSubmit.h
++++ b/NativeAdrenoSubmit.h
+@@ -44,6 +44,9 @@ class NativeAdrenoSubmit final {
+         int32_t perf_slot=-1;
+         uint32_t perf_kernel_us=0;
+         uint64_t perf_ticks=0;
++        /* guamp 0021: a client's job whose window's GPU-written imports are walked at its completion (NativeAdrenoWrittenPlan.h) */
++        bool written=false;
++        uint64_t window_start=0,window_bytes=0;
+     } jobs_[8];
+     NativeAdrenoVm *vm_=nullptr;
+     NativeAdrenoRing *ring_=nullptr;
+diff --git a/NativeAdrenoVm.cpp b/NativeAdrenoVm.cpp
+index cf557ec..7f2ec01 100644
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -2,6 +2,7 @@
+ #include "NativeAdrenoVm.h"
+ #include "NativeAdrenoVmAlias.h"
+ #include "NativeAdrenoReassertPlan.h"
++#include "NativeAdrenoWrittenPlan.h"
+ extern "C" volatile uint32_t native_adreno_trace_stage;
+ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
+     int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
+@@ -494,6 +495,33 @@ IOReturn NativeAdrenoVm::acquireImported()
+     }
+     return kIOReturnSuccess;
+ }
++IOReturn NativeAdrenoVm::maintainWritten(uint64_t window_start,uint64_t window_bytes,bool completed,uint64_t now,uint64_t gap,
++    uint32_t limit,uint64_t max_bytes,uint64_t out[5])
++{
++    if(!out)return kIOReturnBadArgument;
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    for(size_t i=0;i<high_;++i) {
++        Mapping &m=mappings_[i];
++        if(!m.memory || !m.imported || !(m.permissions&ArmSmmu4KWrite))continue;   /* the mapping's own fields first (0019) */
++        /* Coherent mappings need nothing; without native_adreno_written_imports_owned acquireImported maintains them at every completion. */
++        if(coherentMapping(m.writeback) || native_adreno_io_coherent || !importedUntouched(m.imported,m.permissions))continue;
++        if(window_bytes && (m.iova<window_start || m.iova-window_start>=window_bytes))continue;
++        const NativeAdrenoWrittenStep step=nativeAdrenoWrittenStep(m.wr_walks,m.wr_seen,now,limit,gap,completed);
++        if(!step.walk) {
++            if(completed) {m.wr_walks=step.walks;m.wr_seen=step.seen;}
++            ++out[3];out[4]+=m.bytes;continue;
++        }
++        if(max_bytes && out[1] && out[1]+m.bytes>max_bytes) {   /* over the cap: still armed, walked by the next pass */
++            if(completed)m.wr_seen=step.seen;
++            ++out[2];continue;
++        }
++        /* Imports: NativeAdrenoMemory::maintainImported, DC CIVAC over each span's physical pages, whoever maps them (0060's case). */
++        if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
++        if(completed) {m.wr_walks=step.walks;m.wr_seen=step.seen;}
++        ++out[0];out[1]+=m.bytes;
++    }
++    return kIOReturnSuccess;
++}
+ IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const
+ {
+     if(!cached || !dram)return kIOReturnBadArgument;
+diff --git a/NativeAdrenoVm.h b/NativeAdrenoVm.h
+index a8db48c..c51c137 100644
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -54,6 +54,10 @@ class NativeAdrenoVm final {
+         size_t bytes=0;
+         bool imported=false;
+         bool wc_walk=false;         /* write-combined and not from the BO pool: reassertWriteCombined has work for it */
++        /* guamp 0021 (NativeAdrenoWrittenPlan.h): a GPU-written import: completed jobs of its window walked since it was armed, and the
++         * time in microseconds of the last completed job of its window (0 none since map). */
++        uint32_t wr_walks=0;
++        uint64_t wr_seen=0;
+     };
+     Mapping *mappings_=nullptr;
+     NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+@@ -135,6 +139,14 @@ public:
+      * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
+      * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
+     IOReturn acquireImported();
++    /* guamp 0021: the GPU-written imports of [window_start, window_start+window_bytes) that maintenance leaves alone after map
++     * (native_adreno_written_imports_owned) are cleaned and invalidated by physical address while NativeAdrenoWrittenPlan.h says they
++     * are armed: before a client's job (completed false: nothing recorded) and after it (true: counts and times recorded). now and gap
++     * in microseconds, limit 0 = every job. max_bytes (0 none) ends a pass once that much was walked: the rest keep their
++     * count and are walked by the next one. out (added to): [0] mappings walked, [1] bytes walked, [2] armed mappings left over the cap,
++     * [3] mappings past their budget (not walked), [4] bytes of those. */
++    IOReturn maintainWritten(uint64_t window_start,uint64_t window_bytes,bool completed,uint64_t now,uint64_t gap,uint32_t limit,
++        uint64_t max_bytes,uint64_t out[5]);
+     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
+      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
+     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
+diff --git a/NativeAdrenoWrittenPlan.h b/NativeAdrenoWrittenPlan.h
+new file mode 100644
+index 0000000..ae6376c
+--- /dev/null
++++ b/NativeAdrenoWrittenPlan.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_WRITTEN_PLAN_H
++#define NATIVE_ADRENO_WRITTEN_PLAN_H
++#include <stdint.h>
++/* guamp (UniXNU-guamp patches/native-adreno/0021): the GPU-written imports (render targets: IOSurfaces) a client's job may have written
++ * are cleaned and invalidated by physical address before the job (submit) and after it (completion), whoever still maps the pages.
++ * The board maps GPU-written imports clean once at map and leaves them alone afterwards (native_adreno_written_imports_owned: about
++ * 60 ms a frame otherwise); the bridge's own walk (adreno-metal 0001/0010, by virtual address in the writing process) misses the pages
++ * that process no longer maps (0060: the closing app's snapshot in SpringBoard) and SpringBoard then read stale or dirty lines over the
++ * GPU's pixels: black app switcher previews. Jobs name only their IBs, so the kernel does not know which mapping a job wrote; a mapping
++ * of the job's window is walked, as 0001/0010 walk a surface, at the first `limit` completed jobs of its window after it was mapped or
++ * after the window rested `gap` (no completed job of its window for that long): a new or reused capture surface is written right after
++ * a pause, while a window that draws frame after frame (an app's drawables) is walked only at its start.
++ *   walks  completed jobs walked since the mapping was (re)armed     seen  the last completion of its window (0: none yet)
++ *   limit  0: every job, no budget                                    gap   in the caller's time unit (0: armed only at map)
++ * At submission (completed false) nothing is recorded: the walk only says whether the mapping is still armed. */
++struct NativeAdrenoWrittenStep {
++    bool walk;        /* clean and invalidate the mapping now */
++    uint32_t walks;   /* the mapping's new count */
++    uint64_t seen;    /* the mapping's new time of last completion */
++};
++static inline NativeAdrenoWrittenStep nativeAdrenoWrittenStep(uint32_t walks,uint64_t seen,uint64_t now,uint32_t limit,uint64_t gap,
++    bool completed)
++{
++    if(seen && gap && now-seen>=gap)walks=0;   /* the window rested: armed again */
++    NativeAdrenoWrittenStep step{!limit || walks<limit,walks,seen};
++    if(completed) {
++        if(step.walk && limit)++step.walks;
++        step.seen=now?now:1;
++    }
++    return step;
++}
++#endif
