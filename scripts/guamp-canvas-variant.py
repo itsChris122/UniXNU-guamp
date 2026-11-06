@@ -25,7 +25,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '114a2c7aff9380ae002db99ba7f51cd081bbb923a926bbd3c43d4494e5ef5bbf'
+PATCHED_SHA256 = 'ed8ffc306f84e235d8b2f0e23e64e9b34efe04905b7c66c3e0c9ac332031494b'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1707,6 +1707,44 @@ EDITS.append(('    void guampPacingAccepted(const OriginalLegacySwapRequest *req
 '''))
 EDITS.append(('        guamp_pacing[6]=distinct;\n    }\n',
               '        guamp_pacing[6]=distinct;\n        guampSwapProbe(request);   // section 14c\n    }\n'))
+# 18. Cache maintenance of the swapped surface row by row (guamp-scanout-rowflush, default 1, drivers/NativeEmmc/GuampScanout.inc;
+#     07/11, fin53 live-20261106-092610: "source map 1560 us/frame" was flush_dcache64 over the whole 4.8 MiB surface, and then the
+#     scanout scan read the whole surface again, 2.5 ms, both on the copy thread at up to 60 frames per second). When the scanout hook
+#     is going to scan the frame (guamp_scanout_row_flush() 1: diff or flip asked, not held), latestCopyOnce maps without the
+#     whole-surface clean+invalidate and sets guamp_scanout_src_unflushed for the hook, which cleans and invalidates each row just
+#     before reading it and clears the flag. A frame the hook does not scan (refused before the scan, taps not ready) keeps the flag
+#     and is flushed whole here before the variant's own copy, as before. Every other mapping (compose layers, snapshot, async copy)
+#     is flushed as before.
+EDITS.append(('__attribute__((weak)) void guamp_scanout_external(void){}}',
+              '__attribute__((weak)) void guamp_scanout_external(void){}\n'
+              '// Section 18: kernels without the row flush keep the whole-surface flush (weak defaults).\n'
+              '__attribute__((weak)) int guamp_scanout_row_flush(void){return 0;}\n'
+              '__attribute__((weak)) volatile int guamp_scanout_src_unflushed=0;}'))
+EDITS.append(('    IOMemoryMap *guampSourceMap(IOMemoryDescriptor *memory,uint64_t allocation) {\n',
+              '    IOMemoryMap *guampSourceMap(IOMemoryDescriptor *memory,uint64_t allocation,bool *deferred=nullptr) {\n'))
+EDITS.append(('''        if(source && cacheable && fastFlush && source->getVirtualAddress() && source->getLength()<=0xffffffffull)
+            flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
+''', '''        if(source && cacheable && fastFlush && source->getVirtualAddress() && source->getLength()<=0xffffffffull) {
+            if(deferred && guamp_scanout_row_flush())*deferred=true;   // section 18: the scanout hook flushes row by row
+            else flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
+        }
+'''))
+EDITS.append(('''        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 13: the compose buffer is no longer on screen
+        IOMemoryMap *source=guampSourceMap(frame.memory,frame.allocation);
+''', '''        __atomic_store_n(&composeStale,true,__ATOMIC_RELEASE);   // section 13: the compose buffer is no longer on screen
+        bool unflushed=false;   // section 18
+        IOMemoryMap *source=guampSourceMap(frame.memory,frame.allocation,&unflushed);
+'''))
+EDITS.append(('''            const int hooked=!tapsOk?-1:guamp_scanout_present(''',
+              '''            guamp_scanout_src_unflushed=unflushed?1:0;   // section 18
+            const int hooked=!tapsOk?-1:guamp_scanout_present('''))
+EDITS.append(('''            ok=hooked>0 || (frame.scaled
+                ?guampScalePixels(''', '''            // Section 18: not scanned by the hook (flag still set): the whole surface, as before, before the copy here.
+            if(hooked<=0 && unflushed && guamp_scanout_src_unflushed)
+                flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),0);
+            guamp_scanout_src_unflushed=0;
+            ok=hooked>0 || (frame.scaled
+                ?guampScalePixels('''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data

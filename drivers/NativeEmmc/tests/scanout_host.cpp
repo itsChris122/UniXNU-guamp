@@ -211,6 +211,42 @@ int main()
     std::vector<uint8_t> one(4, 255);
     CHECK(gscan::meanLuma(one.data(), 4, 1, 1) == 255, "1x1");
   }
+  // guamp-scanout-rowflush: the row prep runs once per source row, in order, before the row is read, with or without diff, and
+  // changes nothing in the result.
+  {
+    static const uint8_t *base; static uint64_t calls, bad, next;
+    struct P { static void prep(const uint8_t *row, unsigned long long bytes) {
+      if (row != base + next * 3008 || bytes != 750ull * 4) ++bad;
+      ++next; ++calls; } };
+    std::vector<uint8_t> src(3008 * 1666, 9), mem(gscan::bytesFor(750, 1666, 750, 1666)), mem2(mem.size());
+    gscan::State a, b;
+    CHECK(gscan::layout(a, mem.data(), mem.size(), 750, 1666, 750, 1666, nullptr, nullptr) &&
+          gscan::layout(b, mem2.data(), mem2.size(), 750, 1666, 750, 1666, nullptr, nullptr), "prep layout");
+    base = src.data();
+    for (int round = 0; round < 3; ++round) {
+      if (round == 2) src[3008 * 1000 + 40] ^= 0x10;
+      calls = next = 0;
+      const unsigned ca = gscan::scan(a, src.data(), 3008, true, P::prep), cb = gscan::scan(b, src.data(), 3008, true);
+      CHECK(calls == 1666 && !bad && ca == cb, "prep round %d: calls %llu bad %llu changed %u/%u", round,
+            (unsigned long long)calls, (unsigned long long)bad, ca, cb);
+      for (unsigned r = 0; r < 1666; ++r) if (a.srcMask[r] != b.srcMask[r]) { CHECK(false, "prep mask row %u", r); break; }
+    }
+    calls = next = 0;
+    gscan::scan(a, src.data(), 3008, false, P::prep);
+    CHECK(calls == 1666 && !bad, "prep without diff: calls %llu", (unsigned long long)calls);
+    // scanDraw (1:1 in one pass): the same prep, once per row, before the row is read.
+    std::vector<uint8_t> out(3008 * 1666, 0);
+    for (int round = 0; round < 2; ++round) {
+      if (round == 1) src[3008 * 7 + 4] ^= 0x20;
+      calls = next = 0;
+      const unsigned changed = gscan::scanDraw(a, 0, out.data(), 3008, src.data(), 3008, true, nullptr, P::prep);
+      CHECK(calls == 1666 && !bad && (round == 0 || changed == 1), "scanDraw prep round %d: calls %llu changed %u", round,
+            (unsigned long long)calls, changed);
+    }
+    bool same = true;
+    for (unsigned r = 0; r < 1666; ++r) same = same && !memcmp(out.data() + r * 3008, src.data() + r * 3008, 3000);
+    CHECK(same, "scanDraw prep: slot equals the source");
+  }
   run(750, 1666, 720, 1600, 1, 1, false, 120);
   run(750, 1666, 720, 1600, 1, 1, true, 80);
   run(750, 1666, 720, 1600, 1, 0, true, 60);

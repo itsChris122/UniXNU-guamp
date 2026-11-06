@@ -191,11 +191,15 @@ inline u32 allBands(const State &s) { return s.bands >= 32 ? 0xffffffffu : (1u <
 
 // Scans the source: srcMask[r] = the bands of row r that changed since the previous scan (all of them when diff is off or the
 // hashes are not valid). Returns the number of source rows with a change.
-inline u32 scan(State &s, const u8 *src, u64 srcStride, bool diff)
+// prep (may be null) runs for every source row (its first srcW pixels) before the row is read, also with diff off: the kernel
+// cleans and invalidates the row's cache lines there instead of the whole surface before the scan (guamp-scanout-rowflush).
+typedef void (*RowPrep)(const u8 *row, u64 bytes);
+inline u32 scan(State &s, const u8 *src, u64 srcStride, bool diff, RowPrep prep = nullptr)
 {
   u32 changedRows = 0;
   const bool compare = diff && s.hashValid;
   for (u32 r = 0; r < s.srcH; ++r) {
+    if (prep) prep(src + (u64)r * srcStride, (u64)s.srcW * 4);
     u32 m = 0;
     if (diff) m = hashRow(src + (u64)r * srcStride, s.srcW, s.hash + (u64)r * s.bands);
     if (!compare) m = allBands(s);
@@ -297,7 +301,8 @@ inline void draw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *
 // writing a frame) left rows drawn with other pixels than the hashed ones, and later frames equal to the hashed pixels never
 // redrew them (horizontal bands until the next full redraw). Here a torn row is at most one frame old: the next frame compares
 // against what was really drawn. Returns the number of source rows with a change.
-inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *src, u64 srcStride, bool diff, BulkStore bulk)
+inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *src, u64 srcStride, bool diff, BulkStore bulk,
+                    RowPrep prep = nullptr)
 {
   s.rowsDrawn = s.pixelsDrawn = 0;
   s.box[0] = s.box[1] = s.box[2] = s.box[3] = 0;
@@ -309,6 +314,7 @@ inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u
   for (u32 y = 0; y < s.srcH; ++y) {
     volatile u8 *out = to + (u64)y * toStride;
     u8 *stage = s.stage + (((u64)out) & 15);   // same 16-byte phase as the destination row (bulk stores)
+    if (prep) prep(src + (u64)y * srcStride, rowBytes);   // before the one read of the row (see scan)
     __builtin_memcpy(stage, src + (u64)y * srcStride, rowBytes);
     u32 m = 0;
     if (diff) m = hashRow(stage, s.srcW, s.hash + (u64)y * s.bands);

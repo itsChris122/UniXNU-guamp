@@ -50,6 +50,8 @@ volatile int gHold = 0;
 
 struct Kernel {
   bool read = false, diff = false, neon = false, flipWanted = false;
+  bool rowFlush = true;        // guamp-scanout-rowflush (default 1): cache maintenance of the source row by row inside the scan
+  uint32_t dline = 64;         // smallest data cache line (CTR_EL0.DminLine)
   unsigned fullEvery = 600, idleMs = 500;
   unsigned earlyFrames = 12;   // guamp-scanout-early=<n> (default 12, 0 = none): the first n frames logged one by one
   uint64_t flipOffset = 0x500000;
@@ -79,7 +81,8 @@ struct Kernel {
   uint32_t probeRegs[6] = {};
   // stats (log)
   volatile uint64_t frames = 0, unchanged = 0, rows = 0, pixels = 0, full = 0, flips = 0, latchUs = 0, latchMax = 0,
-                    latchTimeouts = 0, idleBacks = 0, refused = 0, externals = 0, scanTicks = 0, drawTicks = 0;
+                    latchTimeouts = 0, idleBacks = 0, refused = 0, externals = 0, scanTicks = 0, drawTicks = 0,
+                    rowFlushed = 0, wholeFlushed = 0;
   volatile uint32_t box[4] = {};
   volatile unsigned lastRefusal = 0;
   uint64_t area = 0;            // output pixels of the last frame's geometry (log)
@@ -121,6 +124,14 @@ static Kernel gK;
 // idle catch-ups). native_legacy_copy_n - taken + gop_draws changes only when the GOP frame did.
 extern "C" {
 volatile uint64_t guamp_scanout_taken = 0, guamp_scanout_gop_draws = 0;
+// guamp-scanout-rowflush (07/11, fin53: "source map 1560 us/frame" = flush_dcache64 of the whole 4.8 MiB surface, then the scan
+// read it all again, 2.5 ms): the variant's copy thread (scripts/guamp-canvas-variant.py section 18) skips the whole-surface
+// clean+invalidate when guamp_scanout_row_flush() says so and sets guamp_scanout_src_unflushed to 1 for the present() call. present()
+// then cleans and invalidates each source row right before the scan reads it (dc civac is ordered with the later loads of the same
+// line, Normal write-back memory) and clears the flag; a frame present() does not scan keeps the flag and the variant flushes the
+// whole surface before its own copy, as before.
+volatile int guamp_scanout_src_unflushed = 0;
+void flush_dcache64(unsigned long long, unsigned, int);   // addr64_t
 }
 
 namespace gscan {
@@ -148,11 +159,45 @@ static void neonStore(volatile void *to, const void *from, u64 bytes)
                    : "+r"(to), "+r"(from), "+r"(bytes)::"v0", "v1", "v2", "v3", "memory", "cc");
 }
 
+// guamp-scanout-rowflush: clean + invalidate one source row (the lines the scan, and later the draw, read of it).
+static void civacRow(const u8 *row, u64 bytes)
+{
+  const uint64_t line = gK.dline;
+  uint64_t a = (uint64_t)row & ~(line - 1);
+  const uint64_t end = (uint64_t)row + bytes;
+  for (; a < end; a += line) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+}
+// The source is read outside the row-flushing scan (luma of the wake gate): the whole surface first, once.
+static void flushWhole(const void *src, uint64_t bytes)
+{
+  if (!guamp_scanout_src_unflushed || !src || !bytes || bytes > 0xffffffffull) return;
+  flush_dcache64((unsigned long long)src, (unsigned)bytes, 0);
+  guamp_scanout_src_unflushed = 0;
+  gK.wholeFlushed = gK.wholeFlushed + 1;
+}
+// A frame with the flag set: scan()/scanDraw() take civacRow as their row prep, then the flag is cleared (every source row was
+// cleaned and invalidated before its first read; a later draw() reads only those rows).
+static RowPrep srcPrep() { return guamp_scanout_src_unflushed ? civacRow : nullptr; }
+static void srcPrepDone(RowPrep prep)
+{
+  if (!prep) return;
+  __asm__ volatile("dsb sy" ::: "memory");
+  guamp_scanout_src_unflushed = 0;
+  gK.rowFlushed = gK.rowFlushed + 1;
+}
+
 static void readOptions()
 {
   if (gK.read) return;
   unsigned v = 0;
   PE_parse_boot_argn("guamp-copy-diff", &v, sizeof(v)); gK.diff = v == 1;
+  v = 1; PE_parse_boot_argn("guamp-scanout-rowflush", &v, sizeof(v)); gK.rowFlush = v != 0;
+  {
+    uint64_t ctr = 0;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const uint32_t dmin = 4u << ((ctr >> 16) & 0xf);   // DminLine: log2 of words
+    gK.dline = dmin >= 16 && dmin <= 2048 ? dmin : 64;
+  }
   v = 0; PE_parse_boot_argn("guamp-copy-neon", &v, sizeof(v)); gK.neon = v == 1;
   v = 0; PE_parse_boot_argn("guamp-scanout-flip", &v, sizeof(v)); gK.flipWanted = v == 1;
   v = 0; PE_parse_boot_argn("guamp-scanout-hwscale", &v, sizeof(v)); gK.hwWanted = v == 1;
@@ -519,7 +564,10 @@ static int presentHw(const u8 *src, uint64_t srcStride, uint32_t srcW, uint32_t 
   // ran before the latch wait and the draw re-read the surface ~3 ms later; rows that changed in between stayed wrong (black
   // bands while dragging a card in the app switcher). The log's "scan" is now scan + draw, its "draw" 0.
   const uint64_t t0 = ticks();
-  const u32 changed = scanDraw(gK.ss, target, gK.slotVa[target], stride, src, srcStride, gK.diff, gK.neon ? neonStore : nullptr);
+  const RowPrep prep = srcPrep();   // guamp-scanout-rowflush
+  const u32 changed = scanDraw(gK.ss, target, gK.slotVa[target], stride, src, srcStride, gK.diff, gK.neon ? neonStore : nullptr,
+                               prep);
+  srcPrepDone(prep);
   const uint64_t t1 = ticks();
   __asm__ volatile("dsb sy" ::: "memory");
   const uint64_t t2 = ticks();
@@ -561,6 +609,7 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
   readOptions();
   // guamp-backlight-wake-wait (GuampBacklightCore.h): a frame the variant copies itself counts by its source's luma (64 reads).
   const bool gateFrame = guamp_backlight::gWakeGate.waiting && src && srcW && srcH && srcStride * (srcH - 1) + (uint64_t)srcW * 4 <= srcBytes;
+  if (gateFrame && ((!gK.diff && !gK.flipWanted) || held())) flushWhole(src, srcBytes);   // guamp-scanout-rowflush: not scanned here
   if (!gK.diff && !gK.flipWanted) {
     if (gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
     return 0;
@@ -602,13 +651,15 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     volatile u8 *to = target ? gK.va[1] : reinterpret_cast<volatile u8 *>(dst);
     const uint64_t t0 = ticks();
     u32 changed;
+    const RowPrep prep = srcPrep();   // guamp-scanout-rowflush
     if (!gK.st.rows) {
       changed = scanDraw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.diff,
-                         gK.neon ? neonStore : nullptr);
+                         gK.neon ? neonStore : nullptr, prep);
     } else {
-      changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff);
+      changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff, prep);
       accumulate(gK.st);
     }
+    srcPrepDone(prep);
     const uint64_t t1 = ticks();
     if (gK.st.rows)
       draw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.neon ? neonStore : nullptr);
@@ -639,9 +690,21 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
   } while (false);
   if (result == 1) guamp_scanout_taken = guamp_scanout_taken + 1;
   IOLockUnlock(gK.lock);
-  // Refused: the variant copies it itself.
-  if (result != 1 && gateFrame) guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
+  // Refused: the variant copies it itself (and flushes the whole surface first if no scan here did it row by row).
+  if (result != 1 && gateFrame) {
+    flushWhole(src, srcBytes);
+    guamp_backlight::wakeNoteFrame(meanLuma(reinterpret_cast<const u8 *>(src), srcStride, srcW, srcH));
+  }
   return result;
+}
+
+// guamp-scanout-rowflush (variant section 18): 1 = the copy thread may skip its whole-surface cache maintenance and set
+// guamp_scanout_src_unflushed, because present() is going to scan the frame (diff or flip asked, not held).
+extern "C" int guamp_scanout_row_flush(void)
+{
+  using namespace gscan;
+  readOptions();
+  return gK.rowFlush && gK.lock && (gK.diff || gK.flipWanted) && !held() ? 1 : 0;
 }
 
 // guamp-copy-wake-keep (variant section 10): 1 while a display-on holds the LEDs at 0 waiting for the first lit frame, so the copy
@@ -704,7 +767,7 @@ static void restore()
 void log()
 {
   if (!gK.read || (!gK.diff && !gK.flipWanted)) return;
-  static uint64_t last[8];
+  static uint64_t last[8], lastRowFlushed, lastWholeFlushed;
   const uint64_t now[8] = {gK.frames, gK.unchanged, gK.rows, gK.pixels, gK.flips, gK.latchUs, gK.scanTicks, gK.drawTicks};
   const uint64_t frames = now[0] - last[0];
   if (!frames && now[4] == last[4]) return;
@@ -715,13 +778,14 @@ void log()
   const uint64_t flips = now[4] - last[4];
   IOLog("GuampScanout: frames +%llu (unchanged +%llu), drawn %llu.%llu%% of the pixels (rows/frame %llu), scan %llu us draw %llu us "
         "per frame, last box %u,%u-%u,%u; diff %u neon %u full redraws %llu; flip %s: flips +%llu latch mean %llu us max %llu, "
-        "timeouts %llu, idle returns %llu, externals %llu, refused %llu (last reason %u)\n",
+        "timeouts %llu, idle returns %llu, externals %llu, refused %llu (last reason %u); rowflush %u: rows +%llu whole +%llu\n",
         frames, now[1] - last[1], frames && area ? (now[3] - last[3]) * 100 / (frames * area) : 0,
         frames && area ? (now[3] - last[3]) * 1000 / (frames * area) % 10 : 0, frames ? (now[2] - last[2]) / frames : 0,
         frames ? (now[6] - last[6]) / frames * 1000000 / f : 0, frames ? (now[7] - last[7]) / frames * 1000000 / f : 0,
         gK.box[0], gK.box[1], gK.box[2], gK.box[3], gK.diff, gK.neon, gK.full, gK.flipOn ? "on" : gK.flipWanted ? "off" : "not asked",
         flips, flips ? (now[5] - last[5]) / flips : 0, gK.latchMax, gK.latchTimeouts, gK.idleBacks, gK.externals, gK.refused,
-        gK.lastRefusal);
+        gK.lastRefusal, gK.rowFlush, gK.rowFlushed - lastRowFlushed, gK.wholeFlushed - lastWholeFlushed);
+  lastRowFlushed = gK.rowFlushed; lastWholeFlushed = gK.wholeFlushed;
   if (gK.hwWanted) {
     static uint64_t lastHw[6];
     const uint64_t hw[6] = {gK.hwFrames, gK.hwCanvas, gK.hwPanel, gK.hwIdleBacks, gK.hwIdleAborts, gK.hwIdleTicks};
