@@ -88,7 +88,7 @@ type_name(int32_t type)
 		 * fin34, 1 when it came back); "?" where the offset is inferred */
 		{ 115, "POWER_DEBUG_INFO?" }, { 346, "HE_CAPABILITY?" }, { 353, "NSS?" }, { 365, "DISPLAY_STATE" },
 		{ 383, "SET_PROPERTY?" }, { 386, "LQM_SUMMARY?" }, { 387, "COLOCATED_NETWORK_SCOPE_ID?" },
-		{ 389, "USERSPACE_P2P_OPTIONS?" }, { 470, "MOVING_NETWORK?" }, { 471, "BATTERY_POWERSAVE_CONFIG?" },
+		{ 389, "USERSPACE_P2P_OPTIONS?" }, { 470, "?" }, { 471, "MOVING_NETWORK" },
 		{ 473, "WCL_CONFIG_BG_MOTIONPROFILE?" }, { 422, "6G_MODE?" }, { 423, "COUNTRY_BAND_SUPPORT?" },
 	};
 
@@ -320,6 +320,70 @@ post_lqm(int rssi, unsigned seconds)
 	}
 	post(EVENT_WEIGHT_AVG_LQM_UPDATE, &avg, sizeof(avg));
 }
+/*
+ * guamp 07/11: auto-join kick. fin51b, fin52, fin52c, fin53: after boot wifid never scans by itself (no SCAN_REQ, no
+ * ASSOCIATE for minutes; only Settings or a manual join), while fin51 (first boot) and every build before did. wifid's boot
+ * auto-join starts in WiFiDeviceManagerEnable (wifid 0x1000f1874): with a WiFiBatteryManager (CPMS/PPM client
+ * "com.apple.duet.ppm-attr.wifi") it only queues a power request and auto-join waits for the asynchronous admission answer
+ * (requestPowerResource:withDetails: 0 = pending), which on this port may never come; it runs once (flag +0x8e1). The
+ * POWER_CHANGED event takes another way: __WiFiDeviceManagerPowerEventCallback (0x1000e1788) starts auto-join (trigger
+ * 0x12) with no admission when the radio is on. Our only POWER_CHANGED is posted at the station's attach (~17 s), before
+ * wifid listens (its first request ~25 s), and the radio is already on, so wifid never sets POWER either. So: when wifid
+ * has asked no SCAN_REQ, ASSOCIATE or POWER guamp-wifi-aj-kick seconds (default 12) after its first request, with the
+ * station on and not joined, POWER_CHANGED is posted again; at most 3 times, 20 s apart. guamp-wifi-aj-kick=0: never.
+ * (Checked from signal_tick, so guamp-wifi-rssi-events=0 turns it off too.)
+ */
+static uint32_t aj_kick_s = 12;                 /* guamp-wifi-aj-kick */
+static uint64_t aj_wifid_first;                 /* uptime of wifid's first request, 0: none yet (apple80211_lock) */
+static bool aj_wifid_acted;                     /* wifid set SCAN_REQ, ASSOCIATE or POWER (apple80211_lock) */
+static uint64_t aj_last_kick;                   /* (signal_tick only) */
+static unsigned aj_kicks;                       /* (signal_tick only) */
+
+static void
+aj_note_wifid(const struct apple80211req *request, bool is_set)
+{
+	lck_mtx_lock(&apple80211_lock);
+	if (aj_wifid_first == 0) {
+		clock_get_uptime(&aj_wifid_first);
+	}
+	if (is_set && (request->req_type == 10 || request->req_type == 20 || request->req_type == 19)) {
+		aj_wifid_acted = true;
+	}
+	lck_mtx_unlock(&apple80211_lock);
+}
+
+static void
+aj_kick_check(const struct hakios_sta_state *state)
+{
+	uint64_t now, first, since_first, since_last = 0;
+	bool acted;
+
+	if (aj_kick_s == 0 || aj_kicks >= 3) {
+		return;
+	}
+	lck_mtx_lock(&apple80211_lock);
+	first = aj_wifid_first;
+	acted = aj_wifid_acted;
+	lck_mtx_unlock(&apple80211_lock);
+	if (first == 0 || acted || !hakios_sta_powered() || state->phase == HAKIOS_STA_OFF ||
+	    state->phase == HAKIOS_STA_JOINING || state->phase == HAKIOS_STA_JOINED) {
+		return;
+	}
+	clock_get_uptime(&now);
+	absolutetime_to_nanoseconds(now - first, &since_first);
+	if (aj_last_kick != 0) {
+		absolutetime_to_nanoseconds(now - aj_last_kick, &since_last);
+	}
+	if (aj_last_kick == 0 ? since_first < (uint64_t)aj_kick_s * NSEC_PER_SEC : since_last < 20 * NSEC_PER_SEC) {
+		return;
+	}
+	aj_last_kick = now;
+	aj_kicks++;
+	printf("GuampWiFi: apple80211: wifid asked no scan and no join %llu s after its first request: POWER_CHANGED posted "
+	    "again (auto-join kick %u of 3)\n", (unsigned long long)(since_first / NSEC_PER_SEC), aj_kicks);
+	post(EVENT_POWER_CHANGED, NULL, 0);
+}
+
 static uint32_t link_rssi_events = 1;          /* guamp-wifi-link-rssi */
 static uint32_t lqm_events = 1;                /* guamp-wifi-lqm */
 
@@ -341,6 +405,7 @@ signal_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		was_joined = state->phase == HAKIOS_STA_JOINED;
 		if (!was_joined) {
 			rssi_told = 1;
+			aj_kick_check(state);           /* (guamp 07/11, see aj_kick_s) */
 		}
 		interval = !was_joined ? 2 : fast ? (fast--, 1) : 5;
 		if (state->phase == HAKIOS_STA_JOINED) {
@@ -388,6 +453,7 @@ guamp_apple80211_init(void)
 	PE_parse_boot_argn("guamp-wifi-rssi-events", &on, sizeof(on));
 	PE_parse_boot_argn("guamp-wifi-link-rssi", &link_rssi_events, sizeof(link_rssi_events));
 	PE_parse_boot_argn("guamp-wifi-lqm", &lqm_events, sizeof(lqm_events));
+	PE_parse_boot_argn("guamp-wifi-aj-kick", &aj_kick_s, sizeof(aj_kick_s));
 	if (on) {
 		signal_call = thread_call_allocate_with_options(signal_tick, NULL, THREAD_CALL_PRIORITY_LOW, 0);
 		if (signal_call != NULL) {
@@ -1034,7 +1100,8 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	/*
 	 * guamp 03/11: settings wifid sends over and over that this radio has nothing to do with, taken as done (as UniXNU-sheng
 	 * WifiNet.cpp does with LOCALE, COUNTRY_CODE, POWERSAVE...): POWERSAVE 5, LOCALE 28, DISPLAY_STATE 365 and -- names
-	 * inferred from the IOC table -- SET_PROPERTY 383, MOVING_NETWORK 470, BATTERY_POWERSAVE_CONFIG 471,
+	 * inferred from the IOC table -- SET_PROPERTY 383, 470 (was taken for MOVING_NETWORK), MOVING_NETWORK 471 (guamp 07/11:
+ * wifid __WiFiDeviceManagerMovingNetworkNotifyFamily sets 0x1d7 with a boolean),
 	 * WCL_CONFIG_BG_MOTIONPROFILE 473. guamp-wifi-accept-sets=0 refuses them as before.
 	 */
 	case 5:
@@ -1203,6 +1270,9 @@ hakios_apple80211_ioctl(u_long command, void *data)
 		return EOPNOTSUPP;
 	}
 	proc_selfname(who, sizeof(who));
+	if (strncmp(who, "wifid", sizeof(who)) == 0) {
+		aj_note_wifid(request, is_set);         /* (guamp 07/11: auto-join kick, see aj_kick_s) */
+	}
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
 	const unsigned times = note(request, is_set, error);
 	/* guamp 02/11: each kind of request is said its first 25 times (was: the first 800 of all, used up before the join by
