@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,270 @@
+@@ -650,6 +650,387 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -74,6 +74,20 @@
 + * is traced or issetugid() is 0; launchd daemons that go through a MAC label transition at exec (sandbox) may get
 + * P_SUGID, so the mirror flags 0x1f4847b6e/b6f stay 0. For the listed processes issetugid (kern_prot.c) now answers
 + * 0 (guamp_oslog_issetugid, first answers logged "guamp oslog: issetugid ..."); guamp-oslog-sugid=0 turns this off.
++ * 06/11 (fin53: AMFI 0x69 -> 0x169 and issetugid 0 seen for wifid, CommCenter, bluetoothd, right before the getenv()
++ * calls of _os_trace_init_slow, and still not one line with the " name[pid:tid] " header of the mirror): the mirror
++ * depends only on the libsystem_trace bytes ACTIVITY_LOG_STDERR (0x1f4847b6e) / OS_ACTIVITY_DT_MODE (0x1f4847b6f)
++ * (_os_log_impl_flatten_and_send 0x1a07051b0: mirror when either is set), and with both gates answered they can stay 0
++ * only if getenv() does not see the variables put at exec. The kernel no longer depends on the environment: at each
++ * issetugid() of a listed process (libc, libtrace and others call it early) it sets the ACTIVITY_LOG_STDERR byte in
++ * the process's own copy of the shared cache data (copy on write, like any write of the process), after checking that
++ * the cache is the one these addresses come from (17.7.11 21H461: "adrp/add ACTIVITY_LOG_STDERR" of
++ * _os_trace_init_slow at 0x1a070e750 and the string at 0x1a07171fc, slide from the shared region); with
++ * guamp-oslog-level=1|2 also the info (1) or info+debug (3) bits of the libtrace mode word (0x1f4847af8, the bits
++ * OS_ACTIVITY_MODE=info|debug sets). The first changes are logged: "guamp oslog: libtrace mirror for name[pid]:
++ * stderr byte 0 -> 1, mode a -> b, env DT_MODE yes|no" (the last field says whether OS_ACTIVITY_DT_MODE= is in the
++ * argument/environment area of the process: no = the exec injection did not happen, yes = it got there and was not
++ * read). guamp-oslog-poke=0 turns this off.
 + * The tee also joins the iovecs of one writev (the mirror writes header, message and newline separately).
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
@@ -92,6 +106,8 @@
 +static int guamp_oslog_sugid = 1;
 +static SInt32 guamp_oslog_sugid_said;
 +static SInt32 guamp_oslog_amfi_said;
++static int guamp_oslog_poke_on = 1;
++static SInt32 guamp_oslog_poke_said;
 +
 +static int
 +guamp_oslog_enabled(void)
@@ -121,6 +137,7 @@
 +	PE_parse_boot_argn("guamp-oslog-amfi", &guamp_oslog_amfi, sizeof(guamp_oslog_amfi));
 +	PE_parse_boot_argn("guamp-oslog-stderr", &guamp_oslog_stderr, sizeof(guamp_oslog_stderr));
 +	PE_parse_boot_argn("guamp-oslog-sugid", &guamp_oslog_sugid, sizeof(guamp_oslog_sugid));
++	PE_parse_boot_argn("guamp-oslog-poke", &guamp_oslog_poke_on, sizeof(guamp_oslog_poke_on));
 +	guamp_oslog_left = lines > 0 ? lines : 0;
 +	guamp_oslog_level = level;
 +	os_atomic_store(&guamp_oslog_state, 1, release);
@@ -217,6 +234,105 @@
 +	return 0;
 +}
 +
++#include <vm/vm_shared_region.h>
++
++/* 06/11 (fin53): libsystem_trace 17.7.11 (21H461) addresses, unslid (see the comment at the top) */
++#define GUAMP_DSC_BASE          0x180000000ULL
++#define GUAMP_TRACE_INIT_ENV    0x1a070e750ULL          /* adrp x0, ...; add x0, x0, "ACTIVITY_LOG_STDERR" */
++#define GUAMP_TRACE_INIT_INSN   0x9107f000b0000040ULL
++#define GUAMP_TRACE_ENV_NAME    0x1a07171fcULL
++#define GUAMP_TRACE_MODE        0x1f4847af8ULL          /* uint32_t mode: 1 info, 2 debug */
++#define GUAMP_TRACE_LOG_STDERR  0x1f4847b6eULL          /* uint8_t ACTIVITY_LOG_STDERR */
++
++/* 1 when needle is in the argument/environment strings of p (the area KERN_PROCARGS2 returns), 0 not, -1 unknown */
++static int
++guamp_oslog_env_has(struct proc *p, const char *needle)
++{
++	char buf[256];
++	size_t nlen = strlen(needle);
++	user_addr_t end = (user_addr_t)p->user_stack;
++	size_t len = (size_t)p->p_argslen;
++
++	if (end == 0 || len == 0 || len > 256 * 1024 || nlen == 0 || nlen >= sizeof(buf) / 2 || len > end) {
++		return -1;
++	}
++	for (user_addr_t at = end - len; at < end;) {
++		size_t take = (size_t)(end - at) < sizeof(buf) ? (size_t)(end - at) : sizeof(buf);
++		if (copyin(at, buf, take) != 0) {
++			return -1;
++		}
++		for (size_t i = 0; i + nlen <= take; i++) {
++			if (memcmp(buf + i, needle, nlen) == 0) {
++				return 1;
++			}
++		}
++		if (take < sizeof(buf)) {
++			break;
++		}
++		at += take - (nlen - 1);
++	}
++	return 0;
++}
++
++/* 06/11: libtrace mirror bytes set by the kernel for a listed process (see the comment at the top); p is current_proc() */
++static void
++guamp_oslog_poke(struct proc *p)
++{
++	static const char name[] = "ACTIVITY_LOG_STDERR";
++	char seen[sizeof(name)];
++	mach_vm_offset_t start = 0;
++	uint64_t insn = 0, slide;
++	uint32_t mode = 0, mode_was = 0, want = 0;
++	uint8_t was = 0, on = 1;
++	int changed = 0;
++
++	if (!guamp_oslog_poke_on || p != current_proc() || !proc_is64bit(p)) {
++		return;
++	}
++	vm_shared_region_t sr = vm_shared_region_get(current_task());
++	if (sr == NULL) {
++		return;
++	}
++	kern_return_t kr = vm_shared_region_start_address(sr, &start, TASK_NULL);
++	vm_shared_region_deallocate(sr);
++	if (kr != KERN_SUCCESS || start < GUAMP_DSC_BASE) {
++		return;
++	}
++	slide = start - GUAMP_DSC_BASE;
++	if (copyin((user_addr_t)(GUAMP_TRACE_INIT_ENV + slide), &insn, sizeof(insn)) != 0 || insn != GUAMP_TRACE_INIT_INSN ||
++	    copyin((user_addr_t)(GUAMP_TRACE_ENV_NAME + slide), seen, sizeof(seen)) != 0 ||
++	    memcmp(seen, name, sizeof(name)) != 0) {
++		if (OSAddAtomic(1, &guamp_oslog_poke_said) < 16) {
++			printf("guamp oslog: libtrace mirror for %s[%d]: not the expected shared cache (slide %#llx), left alone\n",
++			    p->p_comm, proc_getpid(p), (unsigned long long)slide);
++		}
++		return;
++	}
++	if (copyin((user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), &was, sizeof(was)) != 0) {
++		return;
++	}
++	if (was == 0) {
++		if (copyout(&on, (user_addr_t)(GUAMP_TRACE_LOG_STDERR + slide), sizeof(on)) != 0) {
++			return;
++		}
++		changed = 1;
++	}
++	want = guamp_oslog_level == 1 ? 1u : guamp_oslog_level >= 2 ? 3u : 0u;
++	if (want != 0 && copyin((user_addr_t)(GUAMP_TRACE_MODE + slide), &mode_was, sizeof(mode_was)) == 0 &&
++	    (mode_was & want) != want) {
++		mode = mode_was | want;
++		if (copyout(&mode, (user_addr_t)(GUAMP_TRACE_MODE + slide), sizeof(mode)) == 0) {
++			changed = 1;
++		}
++	} else {
++		mode = mode_was;
++	}
++	if (changed && OSAddAtomic(1, &guamp_oslog_poke_said) < 16) {
++		int env = guamp_oslog_env_has(p, "OS_ACTIVITY_DT_MODE=");
++		printf("guamp oslog: libtrace mirror for %s[%d]: stderr byte %u -> 1, mode %#x -> %#x, env DT_MODE %s\n",
++		    p->p_comm, proc_getpid(p), (unsigned)was, mode_was, mode, env > 0 ? "yes" : env == 0 ? "no" : "?");
++	}
++}
 +/* 06/11: issetugid() of the listed processes (see the comment at the top); sugid is proc_issetugid(p). */
 +int guamp_oslog_issetugid(struct proc *p, int sugid);
 +int
@@ -225,6 +341,7 @@
 +	if (!guamp_oslog_enabled() || !guamp_oslog_match(p->p_comm)) {
 +		return sugid;
 +	}
++	guamp_oslog_poke(p);
 +	int answer = guamp_oslog_sugid ? 0 : sugid;
 +	if (OSAddAtomic(1, &guamp_oslog_sugid_said) < 16) {
 +		printf("guamp oslog: issetugid for %s[%d]: %d -> %d\n", p->p_comm, proc_getpid(p), sugid, answer);
@@ -307,7 +424,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +930,9 @@
+@@ -666,6 +1047,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
