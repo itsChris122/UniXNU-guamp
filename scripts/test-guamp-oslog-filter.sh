@@ -12,6 +12,7 @@ awk '/^\+\+\+ b\/bsd\/kern\/guamp_oslog_filter.h/ {on=1; next} on && /^(--- |dif
     "$patch" > "$work/guamp_oslog_filter.h"
 [ -s "$work/guamp_oslog_filter.h" ] || { echo "FAIL: guamp_oslog_filter.h not found in the patch"; exit 1; }
 grep -q 'guamp_oslog_amfi_policy(p, uap->call, uap->arg, error)' "$patch" || { echo "FAIL: mac_base.c hook missing"; exit 1; }
+grep -q 'guamp_oslog_issetugid(p, proc_issetugid(p))' "$patch" || { echo "FAIL: kern_prot.c hook missing"; exit 1; }
 
 cat > "$work/t.c" <<'EOF'
 #include <stdint.h>
@@ -77,6 +78,14 @@ int main(void)
 	/* the AMFI bit libsystem_trace tests: byte 1, bit 0 of the 64-bit flags */
 	uint64_t flags = GUAMP_AMFI_DEV_ENV_VARS;
 	CHECK((((const uint8_t *)&flags)[1] & 1) == 1);
+
+	/* 06/11: local time of the os_log mirror dropped, other lines untouched */
+	CHECK(strcmp(guamp_oslog_strip_time("2026-11-06 01:40:07.123456+0100 wifid[42:1a2b] [com.apple.wifi:x] hi"),
+	    "wifid[42:1a2b] [com.apple.wifi:x] hi") == 0);
+	CHECK(strcmp(guamp_oslog_strip_time(aj), aj) == 0);
+	CHECK(strcmp(guamp_oslog_strip_time("2026-11-06 01:40"), "2026-11-06 01:40") == 0);
+	CHECK(*guamp_oslog_strip_time("2026-11-06 01:40:07.1+0100") == 0);
+	CHECK(strcmp(guamp_oslog_strip_time(""), "") == 0);
 
 	printf(fails ? "%d FAILED\n" : "all passed\n", fails);
 	return fails != 0;

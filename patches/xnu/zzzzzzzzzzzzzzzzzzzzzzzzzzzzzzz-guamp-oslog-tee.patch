@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,240 @@
+@@ -650,6 +650,270 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -69,6 +69,12 @@
 + * or /System/Developer/, i.e. all of CoreWiFi (the unified auto-join), WiFiPolicy, CoreTelephony...; with
 + * ACTIVITY_LOG_STDERR set (byte 0x1f4847b6e) it mirrors them too. guamp-oslog-stderr=1 (default) adds
 + * ACTIVITY_LOG_STDERR=1; 0: DT mode only, as before.
++ * 06/11 (fin52: AMFI answered 0x169 to wifid, still no os_log line from any listed process): the libsystem_trace
++ * initializer (0x1a070e730) reads ACTIVITY_LOG_STDERR, OS_ACTIVITY_DT_MODE, OS_ACTIVITY_TOOLS_* only when the process
++ * is traced or issetugid() is 0; launchd daemons that go through a MAC label transition at exec (sandbox) may get
++ * P_SUGID, so the mirror flags 0x1f4847b6e/b6f stay 0. For the listed processes issetugid (kern_prot.c) now answers
++ * 0 (guamp_oslog_issetugid, first answers logged "guamp oslog: issetugid ..."); guamp-oslog-sugid=0 turns this off.
++ * The tee also joins the iovecs of one writev (the mirror writes header, message and newline separately).
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
 + */
@@ -83,6 +89,8 @@
 +static int guamp_oslog_dedup = 1;
 +static int guamp_oslog_amfi = 1;
 +static int guamp_oslog_stderr = 1;
++static int guamp_oslog_sugid = 1;
++static SInt32 guamp_oslog_sugid_said;
 +static SInt32 guamp_oslog_amfi_said;
 +
 +static int
@@ -112,6 +120,7 @@
 +	PE_parse_boot_argn("guamp-oslog-dedup", &guamp_oslog_dedup, sizeof(guamp_oslog_dedup));
 +	PE_parse_boot_argn("guamp-oslog-amfi", &guamp_oslog_amfi, sizeof(guamp_oslog_amfi));
 +	PE_parse_boot_argn("guamp-oslog-stderr", &guamp_oslog_stderr, sizeof(guamp_oslog_stderr));
++	PE_parse_boot_argn("guamp-oslog-sugid", &guamp_oslog_sugid, sizeof(guamp_oslog_sugid));
 +	guamp_oslog_left = lines > 0 ? lines : 0;
 +	guamp_oslog_level = level;
 +	os_atomic_store(&guamp_oslog_state, 1, release);
@@ -208,27 +217,47 @@
 +	return 0;
 +}
 +
++/* 06/11: issetugid() of the listed processes (see the comment at the top); sugid is proc_issetugid(p). */
++int guamp_oslog_issetugid(struct proc *p, int sugid);
++int
++guamp_oslog_issetugid(struct proc *p, int sugid)
++{
++	if (!guamp_oslog_enabled() || !guamp_oslog_match(p->p_comm)) {
++		return sugid;
++	}
++	int answer = guamp_oslog_sugid ? 0 : sugid;
++	if (OSAddAtomic(1, &guamp_oslog_sugid_said) < 16) {
++		printf("guamp oslog: issetugid for %s[%d]: %d -> %d\n", p->p_comm, proc_getpid(p), sugid, answer);
++	}
++	return answer;
++}
++
 +static struct guamp_oslog_ring guamp_oslog_recent;
 +
 +static void
 +guamp_oslog_tee(struct proc *p, int fd, uio_t uio)
 +{
 +	char buf[512];
++	size_t used = 0;
 +	int iovcnt = uio_iovcnt(uio);
 +	if (!uio_isuserspace(uio)) {
 +		return;
 +	}
-+	for (int i = 0; i < iovcnt && i < 8; i++) {
++	/* one writev = one buffer: the os_log mirror writes header, message and newline as three iovecs */
++	for (int i = 0; i < iovcnt && i < 8 && used < sizeof(buf) - 1; i++) {
 +		user_addr_t base = 0;
 +		user_size_t len = 0;
 +		if (uio_getiov(uio, i, &base, &len) != 0 || len == 0) {
 +			continue;
 +		}
-+		size_t take = len < sizeof(buf) - 1 ? (size_t)len : sizeof(buf) - 1;
-+		if (copyin(base, buf, take) != 0) {
++		size_t take = len < sizeof(buf) - 1 - used ? (size_t)len : sizeof(buf) - 1 - used;
++		if (copyin(base, buf + used, take) != 0) {
 +			continue;
 +		}
-+		buf[take] = '\0';
++		used += take;
++	}
++	buf[used] = '\0';
++	{
 +		char *line = buf;
 +		while (*line) {
 +			if (guamp_oslog_left < -16) {
@@ -240,11 +269,12 @@
 +			}
 +			char saved = *nl;
 +			*nl = '\0';
-+			if (nl != line) {
++			const char *msg = guamp_oslog_strip_time(line);
++			if (*msg) {
 +				unsigned repeats = 0;
-+				int keep = guamp_oslog_keep(line, guamp_oslog_skip, guamp_oslog_only);
++				int keep = guamp_oslog_keep(msg, guamp_oslog_skip, guamp_oslog_only);
 +				if (keep && guamp_oslog_dedup) {
-+					keep = guamp_oslog_ring_note(&guamp_oslog_recent, (uint32_t)proc_getpid(p), line, &repeats);
++					keep = guamp_oslog_ring_note(&guamp_oslog_recent, (uint32_t)proc_getpid(p), msg, &repeats);
 +				}
 +				if (!keep) {
 +					if (repeats != 0 && guamp_oslog_left > 0) {
@@ -264,7 +294,7 @@
 +					}
 +					return;
 +				}
-+				printf("guamp oslog: %s[%d] %d %.400s\n", p->p_comm, proc_getpid(p), fd, line);
++				printf("guamp oslog: %s[%d] %d %.400s\n", p->p_comm, proc_getpid(p), fd, msg);
 +			}
 +			if (saved == '\0') {
 +				break;
@@ -277,7 +307,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +900,9 @@
+@@ -666,6 +930,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
@@ -287,6 +317,27 @@
  	error = fp_writev(&context, fp, uio, flags, retval);
  
  	fp_drop(p, fd, fp, 0);
+--- a/bsd/kern/kern_prot.c
++++ b/bsd/kern/kern_prot.c
+@@ -660,6 +660,8 @@
+ 	return (p->p_flag & P_SUGID) ? 1 : 0;
+ }
+ 
++int guamp_oslog_issetugid(struct proc *p, int sugid);	/* guamp-oslog, sys_generic.c */
++
+ int
+ issetugid(proc_t p, __unused struct issetugid_args *uap, int32_t *retval)
+ {
+@@ -672,7 +674,8 @@
+ 	 * that libc *might* have put in their data segment.
+ 	 */
+ 
+-	*retval = proc_issetugid(p);
++	/* guamp-oslog (sys_generic.c): 0 for the listed processes, so libsystem_trace reads OS_ACTIVITY_* */
++	*retval = guamp_oslog_issetugid(p, proc_issetugid(p));
+ 	return 0;
+ }
+ 
 --- a/security/mac_base.c
 +++ b/security/mac_base.c
 @@ -1560,6 +1560,8 @@
@@ -322,7 +373,7 @@
  
 --- /dev/null
 +++ b/bsd/kern/guamp_oslog_filter.h
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,121 @@
 +/*
 + * guamp-oslog (05/11): line filters of the os_log tee in sys_generic.c, kept free of kernel headers so that
 + * scripts/test-guamp-oslog-filter.sh can build them on the host.
@@ -418,6 +469,29 @@
 +	r->hash[slot] = h;
 +	r->count[slot] = 0;
 +	return 1;
++}
++
++/* 06/11: the os_log mirror starts each line with the local time ("2026-11-06 01:40:07.123456+0100 "); the kernel log
++ * has its own time and the dedup must not see it: returns the line after that time, or the line itself */
++static inline const char *
++guamp_oslog_strip_time(const char *line)
++{
++	static const char shape[] = "dddd-dd-dd dd:dd:dd";
++
++	for (int i = 0; shape[i]; i++) {
++		char c = line[i];
++		if (shape[i] == 'd' ? (c < '0' || c > '9') : c != shape[i]) {
++			return line;
++		}
++	}
++	const char *s = line + sizeof(shape) - 1;
++	while (*s && *s != ' ') {
++		s++;
++	}
++	while (*s == ' ') {
++		s++;
++	}
++	return s;
 +}
 +
 +#endif /* GUAMP_OSLOG_FILTER_H */
