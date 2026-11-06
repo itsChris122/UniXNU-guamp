@@ -2,7 +2,7 @@ diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
 index 11a8212..5c6121b 100644
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1876,6 +1876,151 @@ proc_handle_critical_exit(proc_t p, int rv)
+@@ -1876,6 +1876,167 @@ proc_handle_critical_exit(proc_t p, int rv)
  	}
  }
  
@@ -34,7 +34,7 @@ index 11a8212..5c6121b 100644
 +          "=&r"(mair), "=&r"(tcr), "=&r"(ttbr) : "r"(address) : "memory");
 +    printf("GuampMap: %s va %llx PAR %llx attr %02llx SCTLR %llx MAIR %llx TCR %llx TTBR0 %llx\n",
 +        label, address, par, (par >> 56) & 255, sctlr, mair, tcr, ttbr);
-+    if (!(par & 1) && strcmp(label, "fault") == 0) {
++    if (!(par & 1) && (strcmp(label, "fault") == 0 || strcmp(label, "x0") == 0)) {
 +        uint64_t detail[7];
 +        guamp_ram_mapping_diag(par, detail);
 +        printf("GuampMapRange: pa %llx first %llx last %llx managed %llu native-wimg %llx native-PTE %llx dram %llu ram-nc %llu\n",
@@ -65,6 +65,22 @@ index 11a8212..5c6121b 100644
 +        } else { printf("GuampMap: saved exception unavailable %d\n", status); }
 +        guamp_user_translation("fault", (uint64_t)subcode);
 +        if (ts.x[0] != (uint64_t)subcode) { guamp_user_translation("x0", ts.x[0]); }
++        if (ts.x[0] >= 4096 && ts.x[0] < (1ULL << 48)) {
++            /* The object x0 names (a class or an instance): its first 8 words, and how its 16 KiB page reads, to tell a zeroed
++             * or foreign page from one bad field. fin51: look_up_class handed realizeClassWithoutSwift the shared cache class
++             * BKSHIDEventDeferringToken (__DATA_DIRTY of BackBoardServices) with isa 1..15 and bits 0, so it read class_ro at 0. */
++            uint64_t words[8] = {};
++            int werr = copyin((user_addr_t)(ts.x[0] & ~7ULL), words, sizeof(words));
++            printf("GuampMap: x0 words err %d %llx %llx %llx %llx %llx %llx %llx %llx\n", werr, words[0], words[1], words[2],
++                words[3], words[4], words[5], words[6], words[7]);
++            uint64_t chunk[64], zero = 0, small = 0, total = 0;
++            user_addr_t page = (user_addr_t)(ts.x[0] & ~16383ULL);
++            for (uint64_t off = 0; off < 16384; off += sizeof(chunk)) {
++                if (copyin(page + off, chunk, sizeof(chunk))) { break; }
++                for (unsigned i = 0; i < 64; i++) { total++; if (!chunk[i]) { zero++; } else if (chunk[i] < 4096) { small++; } }
++            }
++            printf("GuampMap: x0 page %llx words %llu zero %llu small %llu\n", (uint64_t)page, total, zero, small);
++        }
 +        if (ts.x[1] != (uint64_t)subcode && ts.x[1] != ts.x[0]) { guamp_user_translation("x1", ts.x[1]); }
 +    }
 +
@@ -154,7 +170,7 @@ index 11a8212..5c6121b 100644
  void
  proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  {
-@@ -2027,6 +2172,14 @@ skipcheck:
+@@ -2027,6 +2188,14 @@ skipcheck:
  
  
  	/* stash the usage into corpse data if making_corpse == true */
