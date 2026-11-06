@@ -1,0 +1,63 @@
+guamp: NBLibrary risponde alle varianti SPI di _MTLLibrary (iOS 17) che fanno la stessa funzione specializzata:
+newFunctionWithName:constantValues:pipelineLibrary:error: / :completionHandler:, ...functionCache:error:,
+...functionCache:specializedName:error: / :completionHandler:, newFunctionWithNameInternal:, newFunctionWithDescriptor:completionHandler:,
+newFunctionWithDescriptor:destinationArchive:error: e ...destinationArchive:functionCache:completionHandler:. Pipeline library, function
+cache e archivio di destinazione (binari GPU Apple) sono ignorati; le costanti diventano specialization constants SPIR-V come in
+newFunctionWithName:constantValues:error: (nmb_function_new_specialized). Causa: fin53, con guamp-gpu-all-deny=none mediaserverd ha la
+GPU e il prewarm di MetalFilter (CMCapture FigPreloadShaders) chiama la variante pipelineLibrary: tre abort (26,3 / 27,9 / 55,4 s).
+Si applica dopo 0055.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index bd5b811..22513f1 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1442,6 +1442,29 @@ static std::string quartzCoreCallers();
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+  handler(function,error);
+ }
++// Metal's other entry points to the same specialization (_MTLLibrary SPI, iOS 17): MetalFilter's prewarm, which CMCapture's
++// FigPreloadShaders runs in mediaserverd, asks newFunctionWithName:constantValues:pipelineLibrary:error: (fin53: three aborts of
++// mediaserverd on the unrecognized selector). A pipeline library or a function cache only holds Apple GPU binaries for reuse, the
++// specialized name only labels the function: the function is the one newFunctionWithName:constantValues:error: makes.
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)library error:(NSError **)error {
++ return [self newFunctionWithName:name constantValues:values error:error];
++}
++- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)library
++          completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++ [self newFunctionWithName:name constantValues:values completionHandler:handler];
++}
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache error:(NSError **)error {
++ return [self newFunctionWithName:name constantValues:values error:error];
++}
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache
++                       specializedName:(NSString *)specializedName error:(NSError **)error {
++ return [self newFunctionWithName:name constantValues:values error:error];
++}
++- (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values functionCache:(id)cache
++            specializedName:(NSString *)specializedName completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++ [self newFunctionWithName:name constantValues:values completionHandler:handler];
++}
++- (id<MTLFunction>)newFunctionWithNameInternal:(NSString *)name {return [self newFunctionWithName:name];}
+ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+ // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+ // runtime does when the function is made.
+@@ -1452,6 +1475,19 @@ static std::string quartzCoreCallers();
+  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+  if(error)*error=nil;return function;
+ }
++// The descriptor forms with a handler or a destination archive (an Apple binary archive to fill: nothing is recorded in it) make the
++// function on the caller's thread, as the constant-value form above does.
++- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
++ handler(function,error);
++}
++- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d destinationArchive:(id)archive error:(NSError **)error {
++ return [self newFunctionWithDescriptor:d error:error];
++}
++- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d destinationArchive:(id)archive functionCache:(id)cache
++                completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
++ [self newFunctionWithDescriptor:d completionHandler:handler];
++}
+ - (NSArray<NSString *> *)functionNames {
+  NSMutableArray *names=[NSMutableArray array];
+  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
