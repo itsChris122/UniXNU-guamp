@@ -15,7 +15,7 @@
 +	/* guamp-oslog (sys_generic.c): OS_ACTIVITY_DT_MODE=YES for the listed processes, so their os_log lines also go to
 +	 * stderr and from there to the kernel log. ip_strings starts with the executable path (exec_save_path). */
 +	{
-+		const char *guamp_env[2];
++		const char *guamp_env[3];
 +		int guamp_envn = guamp_oslog_exec_env(imgp->ip_strings, guamp_env);
 +		for (int gi = 0; gi < guamp_envn; gi++) {
 +			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(guamp_env[gi]), UIO_SYSSPACE, TRUE);
@@ -36,7 +36,7 @@
  		error = E2BIG;
 --- a/bsd/kern/sys_generic.c
 +++ b/bsd/kern/sys_generic.c
-@@ -650,6 +650,222 @@
+@@ -650,6 +650,240 @@
  	return fp_writev(ctx, fp, uio, flags, retval);
  }
  
@@ -62,6 +62,13 @@
 + * variables, _os_trace_allow_development_env_vars); on a release build platform daemons never get it, so wifid wrote
 + * nothing but AssertMacros lines (those go to stderr directly). For the listed processes __mac_syscall (mac_base.c)
 + * now adds that bit (guamp_oslog_amfi_policy); guamp-oslog-amfi=0 turns this off.
++ * 06/11 (fin50/fin51: still not one os_log line from wifid, CommCenter or bluetoothd): (1) the AMFI call is answered
++ * also when the sandbox refuses it (mac_proc_check_mac_syscall, before the policy: wifid & co. are sandboxed), and the
++ * first answers are logged ("guamp oslog: AMFI ..."); (2) with OS_ACTIVITY_DT_MODE alone _os_log_impl_mirror_to_stderr
++ * (libsystem_trace 17.7.11, 0x1a07141fc) drops every non-error line whose caller lives in /System/Library/, /usr/lib/
++ * or /System/Developer/, i.e. all of CoreWiFi (the unified auto-join), WiFiPolicy, CoreTelephony...; with
++ * ACTIVITY_LOG_STDERR set (byte 0x1f4847b6e) it mirrors them too. guamp-oslog-stderr=1 (default) adds
++ * ACTIVITY_LOG_STDERR=1; 0: DT mode only, as before.
 + * In DT mode the text is formatted inside the process, so <private> arguments may appear in clear: the lines stay in
 + * the kernel log (kpan, USB mirror), never on the network.
 + */
@@ -75,6 +82,8 @@
 +static char guamp_oslog_only[256];
 +static int guamp_oslog_dedup = 1;
 +static int guamp_oslog_amfi = 1;
++static int guamp_oslog_stderr = 1;
++static SInt32 guamp_oslog_amfi_said;
 +
 +static int
 +guamp_oslog_enabled(void)
@@ -102,6 +111,7 @@
 +	}
 +	PE_parse_boot_argn("guamp-oslog-dedup", &guamp_oslog_dedup, sizeof(guamp_oslog_dedup));
 +	PE_parse_boot_argn("guamp-oslog-amfi", &guamp_oslog_amfi, sizeof(guamp_oslog_amfi));
++	PE_parse_boot_argn("guamp-oslog-stderr", &guamp_oslog_stderr, sizeof(guamp_oslog_stderr));
 +	guamp_oslog_left = lines > 0 ? lines : 0;
 +	guamp_oslog_level = level;
 +	os_atomic_store(&guamp_oslog_state, 1, release);
@@ -135,7 +145,7 @@
 +	return 0;
 +}
 +
-+/* Called by exec_extract_strings with the executable path; returns how many strings it put in env (0..2). */
++/* Called by exec_extract_strings with the executable path; returns how many strings it put in env (0..3). */
 +int guamp_oslog_exec_env(const char *path, const char **env);
 +int
 +guamp_oslog_exec_env(const char *path, const char **env)
@@ -156,6 +166,9 @@
 +		return 0;
 +	}
 +	env[n++] = "OS_ACTIVITY_DT_MODE=YES";
++	if (guamp_oslog_stderr) {
++		env[n++] = "ACTIVITY_LOG_STDERR=1";
++	}
 +	if (guamp_oslog_level == 1) {
 +		env[n++] = "OS_ACTIVITY_MODE=info";
 +	} else if (guamp_oslog_level >= 2) {
@@ -171,7 +184,7 @@
 +int
 +guamp_oslog_amfi_policy(struct proc *p, int call, user_addr_t arg, int error)
 +{
-+	uint64_t req[2], flags = 0;	/* { pid or 0, user address of the 64-bit flags } (libsystem_trace, arm64) */
++	uint64_t req[2], flags = 0, was;	/* { pid or 0, user address of the 64-bit flags } (libsystem_trace, arm64) */
 +
 +	if (call != 90 || arg == USER_ADDR_NULL || !guamp_oslog_enabled() || !guamp_oslog_amfi ||
 +	    !proc_is64bit(p) || !guamp_oslog_match(p->p_comm)) {
@@ -183,9 +196,14 @@
 +	if (error == 0 && copyin((user_addr_t)req[1], &flags, sizeof(flags)) != 0) {
 +		return error;
 +	}
++	was = flags;
 +	flags |= GUAMP_AMFI_DEV_ENV_VARS;
 +	if (copyout(&flags, (user_addr_t)req[1], sizeof(flags)) != 0) {
 +		return error;
++	}
++	if (OSAddAtomic(1, &guamp_oslog_amfi_said) < 24) {
++		printf("guamp oslog: AMFI dyld policy for %s[%d]: error %d, flags %#llx -> %#llx\n", p->p_comm, proc_getpid(p),
++		    error, (unsigned long long)was, (unsigned long long)flags);
 +	}
 +	return 0;
 +}
@@ -259,7 +277,7 @@
  static int
  writev_internal(struct proc *p, int fd, uio_t uio, int flags,
      guardid_t *puguard, user_ssize_t *retval)
-@@ -666,6 +882,9 @@
+@@ -666,6 +900,9 @@
  	context = *(vfs_context_current());
  	context.vc_ucred = fp->fp_glob->fg_cred;
  
@@ -280,7 +298,18 @@
  int
  __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
  {
-@@ -1614,6 +1616,10 @@
+@@ -1578,6 +1580,10 @@
+ 
+ 	error = mac_proc_check_mac_syscall(p, target, uap->call);
+ 	if (error) {
++		if (strcmp(target, "AMFI") == 0) {
++			/* guamp-oslog (sys_generic.c): the sandbox of a listed daemon may refuse this call; answer it anyway */
++			error = guamp_oslog_amfi_policy(p, uap->call, uap->arg, error);
++		}
+ 		return error;
+ 	}
+ 
+@@ -1614,6 +1620,10 @@
  	}
  
  done:
