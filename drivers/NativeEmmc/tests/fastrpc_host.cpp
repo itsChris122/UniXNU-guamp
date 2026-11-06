@@ -286,24 +286,27 @@ static void testListener() {
   CHECK(l.state == Listener::Attach);
   l.receive(rsp(s.ctx, 0).data(), 16, 3);
   l.step(3);
-  // remotectl open "adsp_default_listener"
+  // remotectl open "adsp_listener" first, then init2 (as fastrpc_apps_user.c: listener thread at the domain init)
   s = decode(sent.back());
   CHECK(s.handle == kRemotectl && s.sc == scalars(0, 2, 2) && s.pid == Listener::kTgid);
-  CHECK(ld32(s.in[0].data()) == 22 && std::string((const char *)s.in[1].data()) == "adsp_default_listener" && s.outLen[0] == 8);
-  st32(&shared[s.outAt[0]], 0x55); st32(&shared[s.outAt[0] + 4], 0);
+  CHECK(ld32(s.in[0].data()) == 14 && std::string((const char *)s.in[1].data()) == "adsp_listener" && s.outLen[0] == 8);
+  st32(&shared[s.outAt[0]], 0x77); st32(&shared[s.outAt[0] + 4], 0);
+  l.step(3 + Listener::kSilentMs);   // no answer for 5 s: reported once
+  CHECK(logged("no answer|open adsp_listener"));
   l.receive(rsp(s.ctx, 0).data(), 16, 4);
   l.step(4);
   s = decode(sent.back());
-  CHECK(s.handle == 0x55 && s.sc == scalars(0, 0, 0));   // register
+  CHECK(s.handle == 0x77 && s.sc == scalars(3, 0, 0));   // init2
   l.receive(rsp(s.ctx, 0).data(), 16, 5);
   l.step(5);
+  // then remotectl open "adsp_default_listener" and register
   s = decode(sent.back());
-  CHECK(s.handle == kRemotectl && std::string((const char *)s.in[1].data()) == "adsp_listener");
-  st32(&shared[s.outAt[0]], 0x77); st32(&shared[s.outAt[0] + 4], 0);
+  CHECK(s.handle == kRemotectl && std::string((const char *)s.in[1].data()) == "adsp_default_listener");
+  st32(&shared[s.outAt[0]], 0x55); st32(&shared[s.outAt[0] + 4], 0);
   l.receive(rsp(s.ctx, 0).data(), 16, 6);
   l.step(6);
   s = decode(sent.back());
-  CHECK(s.handle == 0x77 && s.sc == scalars(3, 0, 0));   // init2
+  CHECK(s.handle == 0x55 && s.sc == scalars(0, 0, 0));   // register
   l.receive(rsp(s.ctx, 0).data(), 16, 7);
   l.step(7);
   // next2 #1: prevCtx 0, prevResult -1, nothing to give back
