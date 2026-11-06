@@ -173,6 +173,56 @@ static void guampMemQueuesSample() {
   printed = true;
 }
 
+// GuampMemX (07/11, xnu zzz(40)-guamp-mem-thrash-contig.patch): where the wired memory goes and what the 4 KiB pages cost, every
+// 10 s with the GuampMem lines. Wired = boot (kernel image, vm_page array, physmap and the other pages wired before the VM ran) +
+// zones + pmap pages (page tables, pv lists) + kernel stacks + GPU (NativeAdreno objects and imported user ranges) + the rest
+// (IOKit buffers, kmem). Faults/s, copy-on-write and zero-fill/s: with 4 KiB pages under a userland built for 16 KiB, every
+// 16 KiB of touched memory takes four faults. fc-thrash: 250 ms periods judged thrashing, periods the file cache share guard hid,
+// the largest ghost-found count of a period (reset here); contig: contiguous runs failed after one scan (no zone_gc).
+// Read without locks, like the queue counters above.
+extern "C" unsigned int guamp_vm_wire_initial __asm("_vm_page_wire_count_initial");
+extern "C" size_t guamp_zone_pages_wired __asm("_zone_pages_wired");
+extern "C" unsigned int guamp_pmap_pages __asm("_inuse_pmap_pages_count");
+extern "C" unsigned int guamp_stack_total __asm("_stack_total");
+extern "C" vm_offset_t guamp_kernel_stack_size __asm("_kernel_stack_size");
+extern "C" unsigned int guamp_fc_thrash_periods;
+extern "C" unsigned int guamp_fc_guard_hidden;
+extern "C" unsigned int guamp_fc_found_max;
+extern "C" unsigned int guamp_fc_threshold __asm("_phantom_cache_thrashing_threshold_ssd");
+extern "C" unsigned int guamp_contig_nogc_failures;
+extern "C" volatile uint64_t native_adreno_bo_mem[8];
+
+static void guampMemXSample(const vm_statistics64_data_t &vm) {
+  static uint64_t lastAt = 0, lastFaults = 0, lastCow = 0, lastZero = 0;
+  static uint32_t lastPeriods = 0, lastHidden = 0, lastContig = 0;
+  const uint64_t now = mach_absolute_time();
+  uint64_t ns = 0;
+  if (lastAt) absolutetime_to_nanoseconds(now - lastAt, &ns);
+  const uint64_t ms = ns / 1000000 ? ns / 1000000 : 1;
+  const uint64_t pg = PAGE_SIZE;
+  const uint64_t wired = uint64_t(vm.wire_count) * pg, boot = uint64_t(guamp_vm_wire_initial) * pg;
+  const uint64_t zones = uint64_t(guamp_zone_pages_wired) * pg, pmap = uint64_t(guamp_pmap_pages) * pg;
+  const uint64_t stacks = uint64_t(guamp_stack_total) * uint64_t(guamp_kernel_stack_size);
+  const uint64_t gpu = native_adreno_bo_mem[0] + native_adreno_bo_mem[2];
+  const uint64_t known = boot + zones + pmap + stacks + gpu;
+  const uint32_t periods = guamp_fc_thrash_periods, hidden = guamp_fc_guard_hidden, contig = guamp_contig_nogc_failures;
+  const uint32_t foundMax = guamp_fc_found_max;
+  guamp_fc_found_max = 0;
+  IOLog("GuampMemX: wired MiB %llu = boot %llu + zones %llu + pmap %llu + stacks %llu + gpu %llu + other %lld; faults/s %llu cow %llu "
+        "zero %llu; fc-thrash periods +%u hidden +%u found max %u/250ms (threshold %u); contig no-gc +%u\n",
+        wired >> 20, boot >> 20, zones >> 20, pmap >> 20, stacks >> 20, gpu >> 20, (long long)(wired - known) / (1 << 20),
+        lastAt ? (vm.faults - lastFaults) * 1000 / ms : 0, lastAt ? (vm.cow_faults - lastCow) * 1000 / ms : 0,
+        lastAt ? (vm.zero_fill_count - lastZero) * 1000 / ms : 0, periods - lastPeriods, hidden - lastHidden, foundMax,
+        guamp_fc_threshold, contig - lastContig);
+  lastAt = now;
+  lastFaults = vm.faults;
+  lastCow = vm.cow_faults;
+  lastZero = vm.zero_fill_count;
+  lastPeriods = periods;
+  lastHidden = hidden;
+  lastContig = contig;
+}
+
 static void guampMemSample() {
   static unsigned round = 0;
   vm_statistics64_data_t vm = {};
@@ -187,6 +237,7 @@ static void guampMemSample() {
           vm.total_uncompressed_pages_in_compressor * mb / 1024, vm.external_page_count * mb / 1024,
           vm.internal_page_count * mb / 1024, vm.purgeable_count * mb / 1024, vm.pageins, vm.pageouts,
           vm.compressions, vm.decompressions, vm.swapouts);
+    guampMemXSample(vm);
   } else {
     IOLog("GuampMem: VM statistics unavailable, status %d count %u\n", result, count);
   }

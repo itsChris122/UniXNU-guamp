@@ -1,0 +1,136 @@
+guamp: file cache thrashing thresholds for 4 KiB pages on eMMC without the compressor, contiguous runs without zone_gc retries (07/11)
+
+diff --git a/osfmk/vm/vm_phantom_cache.c b/osfmk/vm/vm_phantom_cache.c
+index 4579ab7..67c7bf5 100644
+--- a/osfmk/vm/vm_phantom_cache.c
++++ b/osfmk/vm/vm_phantom_cache.c
+@@ -32,9 +32,19 @@
+ #include <vm/vm_pageout.h>
+ #include <vm/vm_phantom_cache.h>
+ #include <vm/vm_compressor.h>
++#include <pexpert/pexpert.h>
+ 
+ 
+ uint32_t phantom_cache_eval_period_in_msecs = 250;
++/*
++ * guamp (zzz...-guamp-mem-thrash-contig.patch, 07/11): guard of the file cache share in percent (stock 50, see
++ * vm_phantom_cache_check_pressure) and counters for the GuampMemX line: periods judged thrashing, periods hidden by the guard,
++ * the largest ghost-found count of a period since the last read (reset by the reader).
++ */
++uint32_t guamp_fc_guard_pct = 50;
++uint32_t guamp_fc_thrash_periods = 0;
++uint32_t guamp_fc_guard_hidden = 0;
++uint32_t guamp_fc_found_max = 0;
+ uint32_t phantom_cache_thrashing_threshold_ssd = 1000;
+ #if !XNU_TARGET_OS_OSX
+ uint32_t phantom_cache_thrashing_threshold = 500;
+@@ -113,6 +123,28 @@ vm_phantom_cache_init(void)
+ 	if (!VM_CONFIG_COMPRESSOR_IS_ACTIVE && !guamp_filecache_thrash_enabled()) {
+ 		return;
+ 	}
++	/*
++	 * guamp (zzz...-guamp-mem-thrash-contig.patch, 07/11): the thresholds count pages per 250 ms period and were sized for 16 KiB pages
++	 * on NVMe (1000 = 64 MB/s of re-reads). With 4 KiB pages on the eMMC (mostly 4 KiB reads) fin53 re-read 1.3 GiB in 6 minutes,
++	 * 2000-3500 pages/s for 70 s after the Home screen (500-870 per period), and never reached 1000. Without an active compressor
++	 * guamp-fc-thrash-pages (default 256 per period = ~4 MiB/s of re-reads for 1 s) sets both thresholds; =0 keeps the stock ones.
++	 */
++	if (!VM_CONFIG_COMPRESSOR_IS_ACTIVE) {
++		uint32_t guamp_pages = 256;
++		PE_parse_boot_argn("guamp-fc-thrash-pages", &guamp_pages, sizeof(guamp_pages));
++		if (guamp_pages != 0) {
++			phantom_cache_thrashing_threshold = guamp_pages;
++			phantom_cache_thrashing_threshold_ssd = guamp_pages;
++		}
++		guamp_fc_guard_pct = 80;
++		PE_parse_boot_argn("guamp-fc-thrash-guard-pct", &guamp_fc_guard_pct, sizeof(guamp_fc_guard_pct));
++		if (guamp_fc_guard_pct == 0 || guamp_fc_guard_pct > 100) {
++			guamp_fc_guard_pct = 100;
++		}
++		printf("guamp fc-thrash: threshold %u pages per %u ms (ssd %u), guard %u%% of pageable memory\n",
++		    phantom_cache_thrashing_threshold, phantom_cache_eval_period_in_msecs, phantom_cache_thrashing_threshold_ssd,
++		    guamp_fc_guard_pct);
++	}
+ #if !XNU_TARGET_OS_OSX
+ 	num_entries = (uint32_t)(((max_mem / PAGE_SIZE) / 10) / VM_GHOST_PAGES_PER_ENTRY);
+ #else /* !XNU_TARGET_OS_OSX */
+@@ -471,8 +503,14 @@ vm_phantom_cache_check_pressure()
+ 		    sample_period_ghost_found_count_ssd,
+ 		    phantom_cache_thrashing_threshold_ssd)) {
+ 			/* Thrashing in the current period: Set bit 0. */
++			if (!(pc_history & 1)) {
++				guamp_fc_thrash_periods++;
++			}
+ 			pc_history |= 1;
+ 		}
++		if (sample_period_ghost_found_count + sample_period_ghost_found_count_ssd > guamp_fc_found_max) {
++			guamp_fc_found_max = sample_period_ghost_found_count + sample_period_ghost_found_count_ssd;
++		}
+ 	}
+ 
+ 	/*
+@@ -490,7 +528,17 @@ vm_phantom_cache_check_pressure()
+ 	 * guamp (06/11): without the compressor the anonymous pages sit on the throttled queue, outside AVAILABLE_MEMORY, so the file
+ 	 * cache is always "more than half" of it and this guard hid every thrashing period (fin50: 650 of 753 MiB). Count them.
+ 	 */
+-	if (vm_page_external_count > ((AVAILABLE_MEMORY + (VM_CONFIG_COMPRESSOR_IS_ACTIVE ? 0 : vm_page_throttled_count)) * 50) / 100) {
++	/*
++	 * guamp (zzz...-guamp-mem-thrash-contig.patch, 07/11): with the throttled pages counted the file cache was still above half in
++	 * every fin53 sample from 51 s on (1306 of 2387 MiB at 381 s), so no thrashing was ever reported. Without the compressor the
++	 * anonymous memory of idle daemons (band 0: 233 processes, 474 MiB) can only come back by jetsam; the guard keeps its meaning
++	 * (most of memory is already file cache, a kill gives little) at guamp_fc_guard_pct, 80 without the compressor.
++	 */
++	if (vm_page_external_count > ((uint64_t)(AVAILABLE_MEMORY + (VM_CONFIG_COMPRESSOR_IS_ACTIVE ? 0 : vm_page_throttled_count)) *
++	    (VM_CONFIG_COMPRESSOR_IS_ACTIVE ? 50 : guamp_fc_guard_pct)) / 100) {
++		if (pressure_detected) {
++			guamp_fc_guard_hidden++;
++		}
+ 		pressure_detected = FALSE;
+ 	}
+ 
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index b28939a..04c8c7d 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -5954,6 +5954,29 @@ static unsigned int vm_page_find_contiguous_last_idx = 0, vm_page_lomem_find_con
+ int vm_page_find_contig_debug = 0;
+ #endif
+ 
++/*
++ * guamp (zzz...-guamp-mem-thrash-contig.patch, 07/11): a contiguous run that is not found costs three scans of every page of RAM
++ * (752k pages with 4 KiB pages, 35-175 ms each with the page queues and free lock held), a buffer cache flush, a zone trim and a
++ * zone drain. fin53 (live-20261106-092610): 16 GPU runs of 4-16 MiB failed that way in 6 minutes (pairs every ~40 s at 220-358 s, next
++ * to the 168-250 ms CA intervals of GuampPacing) and none of the retries after zone_gc ever found one; the caller then takes the
++ * scattered path anyway. Runs of guamp-contig-gc-kib KiB or more (default 1024; 0 = stock retries for every size) get one scan only.
++ * guamp_contig_nogc_failures counts them for the GuampMemX line (NativeEmmc GuampPerf.inc).
++ */
++unsigned int guamp_contig_nogc_failures = 0;
++static unsigned int guamp_contig_gc_pages = 0;   /* 0 = not read yet, UINT32_MAX = retries for every size */
++
++static bool
++guamp_contig_skip_gc(unsigned int contig_pages)
++{
++	if (guamp_contig_gc_pages == 0) {
++		unsigned int kib = 1024;
++		PE_parse_boot_argn("guamp-contig-gc-kib", &kib, sizeof(kib));
++		unsigned int pages = kib ? (unsigned int)(((uint64_t)kib * 1024 + PAGE_SIZE - 1) / PAGE_SIZE) : UINT32_MAX;
++		guamp_contig_gc_pages = pages ? pages : 1;
++	}
++	return contig_pages >= guamp_contig_gc_pages;
++}
++
+ static vm_page_t
+ vm_page_find_contiguous(
+ 	unsigned int    contig_pages,
+@@ -6624,6 +6647,12 @@ done_scanning:
+ #if MACH_ASSERT
+ 	vm_page_verify_free_lists();
+ #endif
++	if (m == NULL && guamp_contig_skip_gc(contig_pages)) {
++		os_atomic_inc(&guamp_contig_nogc_failures, relaxed);
++		printf("guamp contig: %u pages not found in one scan of %u (wired %u), no zone_gc (guamp-contig-gc-kib)\n",
++		    contig_pages, scanned, vm_page_wire_count);
++		return m;
++	}
+ 	if (m == NULL && zone_gc_called < 2) {
+ 		printf("%s(num=%d,low=%d): found %d pages at 0x%llx...scanned %d pages...  yielded %d times...  dumped run %d times... stole %d pages... stole %d compressed pages... wired count is %d\n",
+ 		    __func__, contig_pages, max_pnum, npages, (vm_object_offset_t)start_pnum << PAGE_SHIFT,
