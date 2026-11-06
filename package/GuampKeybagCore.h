@@ -43,6 +43,15 @@ enum {
 #define GKB_RIGHT_DEVICE 1u                   /* com.apple.keystore.device (keybagd) */
 #define GKB_RIGHT_KEYCHAIN 2u                 /* com.apple.keystore.access-keychain-keys (securityd, sharingd, ...) */
 
+/* 21H461 GSSCred has platform-application, com.apple.mkb.usersession.info and its own seatbelt profile, but neither
+ * keystore entitlement. It wraps its credential-cache keys directly through libaks. This exact signed capability
+ * combination permits key operations; exporting or replacing the system bag still requires RIGHT_DEVICE. */
+static inline uint32_t gkb_client_rights(int device, int keychain, int platform, int usersession, int gsscred_profile) {
+    uint32_t rights = device ? GKB_RIGHT_DEVICE : 0;
+    if (keychain || (platform && usersession && gsscred_profile)) rights |= GKB_RIGHT_KEYCHAIN;
+    return rights;
+}
+
 struct gkb_bag {
     uint8_t used;
     uint32_t type;

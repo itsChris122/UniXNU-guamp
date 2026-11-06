@@ -54,6 +54,16 @@ static uint64_t keybagd_init(struct gkb_state *st) {
 }
 
 int main(int argc, char **argv) {
+    /* GSSCred's original 21H461 signature: all three capabilities required, no right to export the bag. */
+    assert(gkb_client_rights(0, 0, 0, 0, 0) == 0);
+    assert(gkb_client_rights(1, 0, 0, 0, 0) == GKB_RIGHT_DEVICE);
+    assert(gkb_client_rights(0, 1, 0, 0, 0) == GKB_RIGHT_KEYCHAIN);
+    assert(gkb_client_rights(0, 0, 0, 1, 1) == 0);
+    assert(gkb_client_rights(0, 0, 1, 0, 1) == 0);
+    assert(gkb_client_rights(0, 0, 1, 1, 0) == 0);
+    const uint32_t gss_rights = gkb_client_rights(0, 0, 1, 1, 1);
+    assert(gss_rights == GKB_RIGHT_KEYCHAIN && !(gss_rights & GKB_RIGHT_DEVICE));
+    puts("PASS GSSCred signed capability combination and ordinary-client refusals");
     uint8_t k[32], p[16], c[16], kek[32], data[32], exp[40], out[40], back[32];
     struct gkb_aes aes;
 
@@ -95,6 +105,9 @@ int main(int argc, char **argv) {
     assert(gkb_wrap(&st, &io, 0, 0, 10, item_key, 32, out) == GKB_NOT_PRIVILEGED);
     assert(gkb_unwrap(&st, &io, 0, 0, 10, wrapped, 40, plain, 1, &legacy) == GKB_NOT_PRIVILEGED);
     struct gkb_blob blob;
+    assert(gkb_wrap(&st, &io, gss_rights, 0, 10, item_key, 32, out) == GKB_OK);
+    assert(gkb_unwrap(&st, &io, gss_rights, 0, 10, out, 40, plain, 1, &legacy) == GKB_OK && !memcmp(plain, item_key, 32));
+    assert(gkb_save_bag(&st, gss_rights, 0, &blob) == GKB_NOT_PRIVILEGED);
     assert(gkb_save_bag(&st, GKB_RIGHT_KEYCHAIN, 0, &blob) == GKB_NOT_PRIVILEGED);
     assert(gkb_save_bag(&st, GKB_RIGHT_DEVICE, 0, &blob) == GKB_OK);
     uint64_t hx;

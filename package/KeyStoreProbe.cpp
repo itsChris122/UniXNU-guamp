@@ -5,6 +5,8 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSKext.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
@@ -290,6 +292,17 @@ bool kbHeld(task_t task, const char *name) {
     OSSafeReleaseNULL(value);
     return held;
 }
+bool kbProfile(task_t task, const char *name) {
+    OSObject *value = IOUserClient::copyClientEntitlement(task, "seatbelt-profiles");
+    OSArray *profiles = OSDynamicCast(OSArray, value);
+    bool held = false;
+    if (profiles) for (unsigned i = 0; i < profiles->getCount(); i++) {
+        OSString *profile = OSDynamicCast(OSString, profiles->getObject(i));
+        if (profile && profile->isEqualTo(name)) { held = true; break; }
+    }
+    OSSafeReleaseNULL(value);
+    return held;
+}
 void kbSelfName(char name[32]) {
     name[0] = '?';
     name[1] = 0;
@@ -328,9 +341,9 @@ extern "C" uint32_t native_aks_client_rights(task_t task) {
     if (!native_aks_keybag_enabled()) return 0;
     const unsigned mode = kbArg("guamp-aks-ent", 1);
     if (mode == 0) return GKB_RIGHT_DEVICE | GKB_RIGHT_KEYCHAIN;
-    uint32_t rights = 0;
-    if (kbHeld(task, "com.apple.keystore.device")) rights |= GKB_RIGHT_DEVICE;
-    if (kbHeld(task, "com.apple.keystore.access-keychain-keys")) rights |= GKB_RIGHT_KEYCHAIN;
+    uint32_t rights = gkb_client_rights(kbHeld(task, "com.apple.keystore.device"),
+        kbHeld(task, "com.apple.keystore.access-keychain-keys"), kbHeld(task, "platform-application"),
+        kbHeld(task, "com.apple.mkb.usersession.info"), kbProfile(task, "com.apple.GSSCred"));
     if (mode == 2 && !rights) {
         char name[32];
         kbSelfName(name);
