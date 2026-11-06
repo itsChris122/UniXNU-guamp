@@ -24,6 +24,8 @@ struct Pmi632 {
   uint64_t stuckAt = 0;
   unsigned vbus = 0, adcReads = 0;
   int ibat = 0;
+  int temp = 250;            // battery temperature, 0.1 C
+  bool tempValid = false;    // the older cases run without a reading (FCC 2000 as before the zones)
   bool autoApsd = true;
   uint8_t pendingResult = 0;
   uint64_t apsdAt = 0;   // 0: none pending
@@ -43,7 +45,9 @@ struct Pmi632 {
     r[reg::kAiclOptions] = 0xd4;
     r[reg::kAicl5v] = 0x06;
     r[reg::kAiclCont] = 0x05;
-    r[reg::kUsbinOptions1] = 0x44;
+    r[reg::kUsbinOptions1] = 0x0c;   // XNU before HVDCP authentication (Linux 4c)
+    r[reg::kHvdcpPulseMax] = 0x54;
+    r[reg::kUsbinAdapterAllow] = 0x03;
     r[reg::kStatus1] = 0x07;
     r[reg::kStatus7] = 0x20;
   }
@@ -74,6 +78,7 @@ struct Pmi632 {
   void sleepMs(unsigned ms) { now = now + ms; }
   int vbusMv(unsigned *mv) { adcReads = adcReads + 1; *mv = vbus; return 0; }
   int ibatMa(int *ma) { *ma = ibat; return 0; }
+  int tempDc(int *dc) { if (!tempValid) return -1; *dc = temp; return 0; }
   __attribute__((format(printf, 2, 3))) void log(const char *f, ...) {
     char b[1024];
     va_list ap;
@@ -102,6 +107,11 @@ struct Pmi632 {
       assert(v * 50u <= max);
     }
     if (a == reg::kAicl5v) assert(v <= 7);
+    if (a == reg::kCmdHvdcp2) assert(false);                                   // never a QC voltage request
+    if (a == reg::kHvdcpPulseMax) assert((v & 0xc0) <= 0x40 && (v & 0x3f) <= 20);   // QC2/QC3 at most 9 V
+    if (a == reg::kUsbinAdapterAllow) assert(v == 0x08);                        // 5 V to 9 V, never 12 V
+    if (a == reg::kAdapterOverride) assert(v == 0x00);
+    if (a == reg::kUsbinOptions1) assert(!(v & 0x20));                          // never HVDCP autonomous mode
     if (a == reg::kTypecModeCfg) assert(!(v & 0x04));   // never source only
     if (a == reg::kOtgCmd) assert(!(v & 0x01));        // never the OTG boost
   }
@@ -204,7 +214,9 @@ int main() {
   assert(inputChoice(3000, true, 0x10, 2, false).ma == 1500 && inputChoice(3000, false, 0, 3, false).ma == 3000);
   assert(inputChoice(3000, true, 0x08, 1, true).ma == 1500 && inputChoice(3000, true, 0x08, 3, true).ma == 3000);
   assert(inputChoice(3000, true, 0x02, 0, false).ma == 1500 && inputChoice(3000, true, 0x04, 3, true).ma == 1500);
-  assert(inputChoice(3000, true, 0x28, 1, true).ma == 3000 && inputChoice(3000, true, 0x48, 0, false).ma == 3000);
+  assert(inputChoice(3000, true, 0x28, 1, true).ma == 1500 && inputChoice(3000, true, 0x48, 0, false).ma == 3000);
+  assert(inputChoice(3000, true, 0x28, 3, true).ma == 3000 && inputChoice(3000, true, 0x48, 2, false).ma == 1500);
+  assert(inputChoice(1000, true, 0x48, 3, false).ma == 1000);
   assert(inputChoice(1000, true, 0x08, 3, false).ma == 1000 && inputChoice(9000, true, 0x08, 3, false).ma == 3000);
   assert(inputChoice(100, true, 0x01, 0, false).ma == 100);
   assert(std::strcmp(inputChoice(3000, true, 0x28, 1, true).source, "QC2") == 0);
@@ -540,8 +552,8 @@ int main() {
     run(d, q, 3);
     assert(q.r[reg::kIclCfg] == 30 && q.logged("Rp 1.5A -> source DCP (Type-C Rp): ICL 1500 mA"));
   }
-  // 20. USB-A port of the charger (A-to-C cable: legacy, Rp default): BC1.2 DCP 1500 mA; a QC result (HVDCP
-  //     detection by the PMIC) 3000 mA at 5 V, nothing raises VBUS
+  // 20. USB-A port of the charger (A-to-C cable: legacy, Rp default): BC1.2 DCP 1500 mA; a QC2 result (HVDCP
+  //     detection by the PMIC) 1500 mA, nothing in the driver requests a voltage
   {
     Pmi632 q;
     Controller d;
@@ -552,7 +564,7 @@ int main() {
     run(d, q, 2);
     q.plugCable(0x28, 0x08, 0x03);
     run(d, q, 3);
-    assert(q.r[reg::kIclCfg] == 60 && q.logged("-> source QC2 (HVDCP at 5 V): ICL 3000 mA"));
+    assert(q.r[reg::kIclCfg] == 30 && q.logged("-> source QC2 (HVDCP2, Rp default): ICL 1500 mA"));
     for (const auto &w : q.trace) assert(w.first != 0x1343);   // CMD_HVDCP_2: never a voltage request
     // a PC on a legacy cable with Rp default: SDP 500 as before
     q.unplug();
@@ -593,11 +605,133 @@ int main() {
     q.collapse();
     run(d, q, 70);
     assert(d.aiclMax && q.r[reg::kIclCfg] == 2 && d.rpChanges == 1);
+    q.tempValid = true;   // a temperature zone change keeps the weak-adapter 100 mA
+    run(d, q, 1);
+    assert(d.aiclMax && q.r[reg::kIclCfg] == 2 && q.r[reg::kFcc] == 60);
+  }
+  // 23. HVDCP as Linux: boot with a DCP charger already detected by the boot chain -> 0x1362 4c, 0x135b 54, allowance
+  //     08, one APSD rerun so the PMIC can authenticate; the QC2 adapter then goes to 9 V (PMIC, no driver request);
+  //     USBIN over-voltage with the QC result turns HVDCP off for the connection, back on at unplug
+  {
+    Pmi632 q;
+    Controller d;
+    q.plugCable(0x08, 0x08, 0x03);
+    q.r[reg::kApsdStatus] = 0x01;
+    q.r[reg::kApsdResult] = 0x08;
+    q.apsdAt = 0;
+    q.pendingResult = 0x28;
+    q.vbus = 5000;
+    run(d, q, 1);
+    assert(q.r[reg::kUsbinOptions1] == 0x4c && q.r[reg::kHvdcpPulseMax] == 0x54 && q.r[reg::kUsbinAdapterAllow] == 0x08);
+    assert(q.apsdReruns == 1 && q.logged("source detection (plug-in, HVDCP on), APSD rerun") && d.phase == kDetecting);
+    run(d, q, 3);
+    assert(d.phase == kConfigured && std::strcmp(d.choice.source, "QC2") == 0 && q.r[reg::kIclCfg] == 30);
+    q.r[reg::kQcStatus] = 0x02;
+    q.vbus = 8950;
+    run(d, q, 2);
+    assert(q.logged("HVDCP QC status 02 (9 V), APSD result 28 QC2, VBUS 8950 mV, ICL 1500 mA FCC 2000 mA"));
+    run(d, q, 15);
+    assert(q.logged("VBUS 8950 mV, battery 0 mA, FULLON, QC 9 V, zone no temperature"));
+    const unsigned reruns = q.apsdReruns;
+    q.pendingResult = 0x08;
+    q.r[reg::kUsbinRt] = 0x18;
+    run(d, q, 1);
+    assert(d.hvdcpOff && (q.r[reg::kUsbinOptions1] & 0x44) == 0 && q.apsdReruns == reruns + 1);
+    assert(q.logged("HVDCP off for this connection (USBIN 18, QC status 02, result 28): over-voltage 1, APSD rerun"));
+    q.r[reg::kUsbinRt] = 0x10;
+    q.r[reg::kQcStatus] = 0x01;
+    run(d, q, 3);
+    assert(d.phase == kConfigured && std::strcmp(d.choice.source, "DCP") == 0 && (q.r[reg::kUsbinOptions1] & 0x44) == 0);
+    run(d, q, 5);
+    assert(d.hvdcpOvs == 1);
+    q.unplug();
+    run(d, q, 2);
+    assert(!d.hvdcpOff && (q.r[reg::kUsbinOptions1] & 0x44) == 0x44);
+    // a 12 V QC status (non-compliant adapter) does the same
+    q.pendingResult = 0x28;
+    q.plugCable(0x28, 0x08, 0x03);
+    run(d, q, 3);
+    assert(d.phase == kConfigured && std::strcmp(d.choice.source, "QC2") == 0);
+    q.r[reg::kQcStatus] = 0x04;
+    q.pendingResult = 0x08;
+    run(d, q, 1);
+    assert(d.hvdcpOff && d.hvdcpOvs == 2 && q.logged("QC status 04 (12 V)"));
+  }
+  // 24. guamp-hvdcp=0 / guamp-pd=0: the 0x1362 of before (0c, HVDCP_EN without authentication), no boot rerun
+  {
+    Pmi632 q;
+    Controller d;
+    d.hvdcp = false;
+    q.plugCable(0x08, 0x08, 0x03);
+    q.r[reg::kApsdStatus] = 0x01;
+    q.r[reg::kApsdResult] = 0x08;
+    q.apsdAt = 0;
+    run(d, q, 3);
+    assert(q.r[reg::kUsbinOptions1] == 0x0c && q.apsdReruns == 0 && std::strcmp(d.choice.source, "DCP") == 0);
+  }
+  // 25. Battery temperature zones (Moto mmi-temp-zones): mmi_find_temp_zone with its hysteresis, then FCC/FV/stop
+  {
+    assert(mmiZone(kZoneNone, 25) == 3 && mmiZone(kZoneNone, 5) == 1 && mmiZone(kZoneNone, -5) == kZoneCold);
+    assert(mmiZone(kZoneNone, 60) == kZoneHot && mmiZone(kZoneNone, 45) == 4 && mmiZone(kZoneNone, 12) == 2);
+    assert(mmiZone(3, 45) == 4 && mmiZone(4, 44) == 4 && mmiZone(4, 42) == 3);
+    assert(mmiZone(2, 16) == 2 && mmiZone(2, 17) == 3 && mmiZone(3, 14) == 2);
+    assert(mmiZone(4, 60) == kZoneHot && mmiZone(kZoneHot, 59) == kZoneHot && mmiZone(kZoneHot, 58) == 4);
+    assert(mmiZone(kZoneCold, -19) == kZoneCold && mmiZone(kZoneCold, -18) == 0 && mmiZone(0, 0) == 1);
+    assert(zoneTarget(3, 3000).fccMa == 3000 && zoneTarget(3, 3000).fvMv == 4350 && !zoneTarget(3, 3000).stop);
+    assert(zoneTarget(4, 3000).fccMa == 2000 && zoneTarget(4, 3000).fvMv == 4200);
+    assert(zoneTarget(1, 3000).fccMa == 1000 && zoneTarget(1, 3000).fvMv == 4350 && zoneTarget(2, 3000).fccMa == 1000);
+    assert(zoneTarget(0, 3000).stop && zoneTarget(kZoneHot, 3000).stop && zoneTarget(kZoneCold, 3000).stop);
+    assert(zoneTarget(kZoneNone, 3000).fccMa == 2000 && zoneTarget(3, 1500).fccMa == 1500 && zoneTarget(3, 9000).fccMa == 3000);
+    Pmi632 q;
+    Controller d;
+    q.tempValid = true;
+    q.temp = 250;
+    q.plugCable(0x10, 0x02, 0x00);
+    run(d, q, 3);
+    assert(q.r[reg::kFcc] == 60 && q.r[reg::kFv] == 75 && q.r[reg::kChgEnable] == 1 && q.r[reg::kIclCfg] == 60);
+    assert(q.logged("battery 25.0 C -> zone 15..45 C: FCC 3000 mA FV 4350 mV, change 1") &&
+           q.logged("ICL 3000 mA FCC 3000 mA FV 4350 mV"));
+    q.temp = 470;
+    run(d, q, 1);
+    assert(q.r[reg::kFcc] == 40 && q.r[reg::kFv] == 60 && q.r[reg::kChgEnable] == 1 && q.r[reg::kIclCfg] == 60);
+    q.temp = 610;
+    run(d, q, 1);
+    assert((q.r[reg::kChgEnable] & 1) == 0 && q.logged("zone HOT >= 60 C: FCC 0 mA FV 4350 mV, charging off"));
+    q.temp = 590;
+    run(d, q, 1);
+    assert((q.r[reg::kChgEnable] & 1) == 0);
+    q.temp = 570;
+    run(d, q, 1);
+    assert(q.r[reg::kChgEnable] == 1 && q.r[reg::kFcc] == 40);
+    q.temp = 420;
+    run(d, q, 1);
+    assert(q.r[reg::kFcc] == 60 && q.r[reg::kFv] == 75);
+    q.temp = 50;
+    run(d, q, 3);
+    assert(d.zone == 1 && q.r[reg::kFcc] == 20 && q.r[reg::kFv] == 75 && q.r[reg::kChgEnable] == 1);
+    q.temp = -30;   // -3 C: zone -20..0 C, no charging here (Moto 1000 mA)
+    run(d, q, 2);
+    assert(d.zone == 0 && (q.r[reg::kChgEnable] & 1) == 0 && q.logged("battery -3.0 C -> zone -20..0 C"));
+    q.temp = -300;
+    run(d, q, 1);
+    assert(d.zone == kZoneCold && (q.r[reg::kChgEnable] & 1) == 0);
+    q.tempValid = false;
+    run(d, q, 1);
+    assert(d.zone == kZoneNone && q.r[reg::kFcc] == 40 && q.r[reg::kChgEnable] == 1);
+    // SPMI error while applying a zone: retried on the next poll
+    q.tempValid = true;
+    q.temp = 250;
+    q.failAddr = reg::kFcc;
+    q.failCount = 1;
+    run(d, q, 1);
+    assert(d.zoneRetry);
+    run(d, q, 1);
+    assert(!d.zoneRetry && q.r[reg::kFcc] == 60);
   }
   for (const auto &s : p.logs) fputs(s.c_str(), stdout);
   printf("PASS: %zu log lines, %u writes; boot/unplug/replug (SDP, DCP, APSD timeout), Type-C reset, collapse -> "
          "weak-adapter steps -> 100 mA -> re-detect, thermal/BAT_OV guards, suspend toggle, SPMI error retry, source "
-         "change, DRP, Type-C recovery of Rp without VBUS (C-to-C replug), wall chargers (Type-C Rp, DCP, QC at 5 V, Rp change, ICL cap), FV <= 4.40 V and ICL/FCC ceilings on every write\n",
+         "change, DRP, Type-C recovery of Rp without VBUS (C-to-C replug), wall chargers (Type-C Rp, DCP, QC2/QC3, Rp change, ICL cap), HVDCP (Linux config, boot rerun, 9 V, over-voltage off, guamp-hvdcp=0), battery temperature zones, FV <= 4.40 V and ICL/FCC ceilings on every write\n",
          p.logs.size(), p.writes);
   return 0;
 }

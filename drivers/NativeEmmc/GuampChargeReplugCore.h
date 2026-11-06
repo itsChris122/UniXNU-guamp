@@ -11,9 +11,19 @@
 //   void sleepMs(unsigned ms); void log(const char *format, ...)            one complete line per call
 //   int vbusMv(unsigned *mv)                                                 USBIN voltage (ADC5 USB_IN_V_16)
 //   int ibatMa(int *ma)                                                      battery current (QG), positive = charging
+//   int tempDc(int *dc)                                                      battery temperature (BAT_THERM), 0.1 C
 // Limits: float voltage kFvMv (4.35 V, DT qcom,fv-max-uv 4.40 V), ICL <= 3000 mA and FCC <= 3000 mA (DT usb-icl-ua,
 // fcc-max-ua); the input current per source follows Linux's update_sw_icl_max (inputChoice): an SDP, float or unknown
 // source gets at most 500 mA, Type-C Rp 1.5/3.0 A on a non-legacy cable, BC1.2 CDP/DCP/OCP and HVDCP more.
+// Fast charging (06/11): the PMI632 has no USB PD PHY (qpnp-smb5.c sets pd_not_supported for PMI632_SUBTYPE, the guamp
+// DT has no qcom,qpnp-pdphy node and no 0x1700 block), so a PD charger is a 5 V Type-C source here as in Linux. What
+// Linux does above 5 V is HVDCP (QC2/QC3): smb5_init_hw enables detection and authentication (USBIN_OPTIONS_1 0x1362
+// HVDCP_AUTH_ALG_EN + HVDCP_EN, autonomous mode off; TWRP 4c, XNU before 0c) with HVDCP_PULSE_COUNT_MAX 0x135b = 54
+// (QC2 at most 9 V, QC3 at most 20 pulses = 9 V) and USBIN_ADAPTER_ALLOW_CFG 0x1360 = 08 (5 V to 9 V: 12 V is never
+// accepted). The PMIC itself moves a QC2 adapter to its QC2 maximum; this driver never writes CMD_HVDCP_2 (0x1343,
+// no voltage request), and like Moto's usbin_ov handler (qc_usbov) it turns HVDCP off for the connection on USBIN
+// over-voltage or a 12 V QC status. Charge current by battery temperature as Moto's mmi heartbeat with the guamp DT
+// qcom,mmi-temp-zones (mmiZone/zoneTarget), FCC capped by guamp-fcc-ma.
 #ifndef GUAMP_CHARGE_REPLUG_CORE_H
 #define GUAMP_CHARGE_REPLUG_CORE_H
 #include <stdint.h>
@@ -24,7 +34,8 @@ constexpr uint16_t kStatus1 = 0x1006, kStatus2 = 0x1007, kStatus7 = 0x100d, kChg
                    kFcc = 0x1061, kFv = 0x1070, kJeitaEn = 0x1090, kJeitaThresholds = 0x1094,
                    kIclStatus = 0x1107, kAiclStatus = 0x110a, kPowerPath = 0x110b, kOtgCmd = 0x1140, kOtgCfg = 0x1153,
                    kBatifPullUp = 0x1286,
-                   kApsdStatus = 0x1307, kApsdResult = 0x1308, kUsbinRt = 0x1310, kUsbinCmdIl = 0x1340, kCmdApsd = 0x1341,
+                   kApsdStatus = 0x1307, kApsdResult = 0x1308, kQcStatus = 0x1309, kUsbinRt = 0x1310,
+                   kCmdHvdcp2 = 0x1343, kAdapterOverride = 0x1344, kHvdcpPulseMax = 0x135b, kUsbinCmdIl = 0x1340, kCmdApsd = 0x1341,
                    kCmdIclOverride = 0x1342, kTypeCCfg = 0x1358, kUsbinOptions1 = 0x1362, kUsbinLoadCfg = 0x1365,
                    kIclOptions = 0x1366, kIclCfg = 0x1370, kAiclOptions = 0x1380, kAicl5v = 0x1381, kAiclCont = 0x1384,
                    kTypecSnkStatus = 0x1506, kTypecSrcStatus = 0x1508, kTypecStateMachine = 0x1509,
@@ -36,6 +47,81 @@ constexpr uint16_t kStatus1 = 0x1006, kStatus2 = 0x1007, kStatus7 = 0x100d, kChg
 }
 constexpr unsigned kFvMv = 4350, kFvMaxMv = 4400, kIclMaxMa = 3000, kFccMaxMa = 3000, kSdpMa = 500;
 static_assert(kFvMv <= kFvMaxMv && (kFvMv - 3600) / 10 <= 0xff, "float voltage above the guamp DT limit");
+// HVDCP as Linux leaves it (TWRP dump): 0x135b QC2 max 9 V (bits 7:6 = 01) and QC3 max 20 pulses (bits 5:0)
+constexpr uint8_t kHvdcpPulseLinux = 0x54, kAdapterAllow5To9 = 0x08;
+// FCC without a battery temperature reading: what this port used before the temperature zones
+constexpr unsigned kFccNoTempMa = 2000;
+// Moto mmi heartbeat zones, guamp DT qcom,mmi-temp-zones = <temp_c norm_mv fcc_max_ma fcc_norm_ma>: zone i covers
+// [temp_c of zone i-1, temp_c of zone i) (zone 0 from MIN_TEMP_C -20 C), ZONE_HOT at or above the last temp_c (60 C),
+// ZONE_COLD below -20 C, 2 C hysteresis (mmi_find_temp_zone). In a zone with norm_mv and no fcc_norm_ma Moto charges at
+// fcc_max_ma up to norm_mv (STEP_MAX/STEP_FLOAT: FV = norm_mv); with fcc_norm_ma (equal to fcc_max_ma on guamp) to
+// the full FV. Stricter than Moto here: zone 0 (below 0 C) does not charge either (Moto: 1000 mA up to 4.2 V).
+struct TempZone {
+  int tempC;
+  unsigned normMv, fccMaxMa, fccNormMa;
+};
+constexpr TempZone kMmiZones[5] = {{0, 4200, 1000, 0}, {10, 4200, 1000, 1000}, {15, 0, 1000, 1000}, {45, 0, 3000, 3000},
+                                   {60, 4200, 2000, 0}};
+constexpr unsigned kZones = 5;
+constexpr int kMinTempC = -20, kZoneHystC = 2;
+constexpr uint8_t kZoneHot = 0x10, kZoneCold = 0x11, kZoneNone = 0xff;
+static_assert(kMmiZones[1].fccNormMa == kMmiZones[1].fccMaxMa && kMmiZones[2].fccNormMa == kMmiZones[2].fccMaxMa &&
+                  kMmiZones[3].fccNormMa == kMmiZones[3].fccMaxMa, "zoneTarget assumes fcc_norm == fcc_max");
+// mmi_find_temp_zone (smb5-lib.c, max_chrg_temp unset: the last zone's temp_c), one zone per call
+inline uint8_t mmiZone(uint8_t prev, int t) {
+  const int maxTemp = kMmiZones[kZones - 1].tempC;
+  if (prev == kZoneNone) {
+    for (int i = static_cast<int>(kZones) - 1; i >= 0; i = i - 1)
+      if (t >= kMmiZones[i].tempC) return i == static_cast<int>(kZones) - 1 ? kZoneHot : static_cast<uint8_t>(i + 1);
+    return kZoneCold;
+  }
+  if (prev == kZoneCold) return t >= kMinTempC + kZoneHystC ? 0 : kZoneCold;
+  if (prev == kZoneHot) return t <= maxTemp - kZoneHystC ? static_cast<uint8_t>(kZones - 1) : kZoneHot;
+  if (prev >= kZones) return kZoneNone;
+  unsigned hotterFcc, colderFcc;
+  int hotterT = kMmiZones[prev].tempC, colderT;
+  if (prev == 0) {
+    hotterFcc = kMmiZones[1].fccMaxMa;
+    colderFcc = 0;
+    colderT = kMinTempC;
+  } else if (prev == kZones - 1) {
+    hotterFcc = 0;
+    colderFcc = kMmiZones[prev - 1].fccMaxMa;
+    colderT = kMmiZones[prev - 1].tempC;
+  } else {
+    hotterFcc = kMmiZones[prev + 1].fccMaxMa;
+    colderFcc = kMmiZones[prev - 1].fccMaxMa;
+    colderT = kMmiZones[prev - 1].tempC;
+  }
+  if (kMmiZones[prev].fccMaxMa < hotterFcc) hotterT = hotterT + kZoneHystC;
+  if (kMmiZones[prev].fccMaxMa < colderFcc) colderT = colderT - kZoneHystC;
+  if (t < kMinTempC) return kZoneCold;
+  if (t >= maxTemp) return kZoneHot;
+  if (t >= hotterT) return static_cast<uint8_t>(prev + 1);
+  if (t < colderT) return static_cast<uint8_t>(prev - 1);
+  return prev;
+}
+struct ChargeTarget {
+  unsigned fccMa, fvMv;
+  bool stop;
+};
+// FCC/FV for a zone (kZoneNone = no temperature: kFccNoTempMa), FCC capped by cap (guamp-fcc-ma, <= kFccMaxMa)
+inline ChargeTarget zoneTarget(uint8_t zone, unsigned cap) {
+  if (cap > kFccMaxMa) cap = kFccMaxMa;
+  if (zone == kZoneNone) return {cap < kFccNoTempMa ? cap : kFccNoTempMa, kFvMv, false};
+  if (zone == kZoneHot || zone == kZoneCold || zone == 0 || zone >= kZones) return {cap, kFvMv, true};
+  const TempZone &z = kMmiZones[zone];
+  const unsigned fv = (z.normMv && !z.fccNormMa && z.normMv < kFvMv) ? z.normMv : kFvMv;
+  return {cap < z.fccMaxMa ? cap : z.fccMaxMa, fv, false};
+}
+inline const char *zoneName(uint8_t zone) {
+  static const char *const k[kZones] = {"-20..0 C", "0..10 C", "10..15 C", "15..45 C", "45..60 C"};
+  return zone == kZoneNone ? "no temperature" : zone == kZoneHot ? "HOT >= 60 C" : zone == kZoneCold ? "COLD < -20 C"
+                                                 : zone < kZones ? k[zone] : "?";
+}
+inline const char *qcName(uint8_t qc) {   // QC_CHANGE_STATUS 0x1309 (QC2 adapter voltage)
+  return (qc & 0x04) ? "12 V" : (qc & 0x02) ? "9 V" : (qc & 0x01) ? "5 V" : "none";
+}
 // JEITA thresholds 0x1094-0x109f (soft hot/cold, hard hot/cold, AFP hot/cold; ADC codes, MSB first) as Linux runs
 // with them (TWRP dump analisi/pmic/twrp-pc.txt; Linux only reads them, guamp's battery profiles have no
 // qcom,jeita-*-thresholds). With the 30 kOhm pull-up and the 10 kOhm NTC they are 45/0 C, 60/-20 C and 71 C (code =
@@ -116,7 +202,7 @@ inline uint8_t rpLevel(uint8_t sm, uint8_t snk) {
   return (snk & 0x02) ? 3 : (snk & 0x04) ? 2 : (snk & 0x08) ? 1 : 0;
 }
 // Input current by source, smb5-lib.c update_sw_icl_max / get_rp_based_dcp_current for a PMI632 (no PD: a PD charger
-// is a Type-C source at 5 V with its Rp): HVDCP 3000 (HVDCP_CURRENT_UA; this port never raises VBUS above 5 V), a
+// is a Type-C source at 5 V with its Rp): HVDCP by Rp as Moto's mmi heartbeat (see below; QC2 up to 9 V), a
 // non-legacy Type-C cable with Rp 1.5/3.0 A the Rp current (typec_rp_med_high), else BC1.2 (APSD_RESULT_STATUS 0x1308:
 // bit 0 SDP, 1 OCP, 2 CDP, 3 DCP, 4 float, 5 QC2, 6 QC3): DCP/OCP 3000 with Rp 3.0 A else 1500, CDP 1500, SDP 500
 // (Linux: 100 mA until USB enumeration votes 500), float/unknown 500 (Linux 100 mA until the USB stack decides; with
@@ -129,8 +215,14 @@ inline InputChoice inputChoice(unsigned cap, bool apsdDone, uint8_t result, uint
   if (cap > kIclMaxMa) cap = kIclMaxMa;
   const uint8_t r = apsdDone ? result : 0;
   InputChoice c = {kSdpMa, "none", "unknown source, SDP level"};
-  if (r & 0x40) c = {3000, "QC3", "HVDCP at 5 V"};
-  else if (r & 0x20) c = {3000, "QC2", "HVDCP at 5 V"};
+  // HVDCP as Moto's mmi heartbeat (cl_cc): Rp 3.0 A 3000, Rp 1.5 A 1500, else QC3 3000; QC2 with Rp default/none gets
+  // 1500 here (Moto 500 mA, i.e. 4.5 W at 9 V, below a 5 V DCP; AICL still limits a weak adapter)
+  if (r & 0x60) {
+    const bool qc3 = (r & 0x40) != 0;
+    if (rp == 3) c = {3000, qc3 ? "QC3" : "QC2", "HVDCP, Rp 3.0A"};
+    else if (rp == 2) c = {1500, qc3 ? "QC3" : "QC2", "HVDCP, Rp 1.5A"};
+    else c = {qc3 ? 3000u : 1500u, qc3 ? "QC3" : "QC2", qc3 ? "HVDCP3" : "HVDCP2, Rp default"};
+  }
   else if (rp >= 2 && !legacy) c = {rp == 3 ? 3000u : 1500u, r & 0x08 ? "DCP" : r & 0x04 ? "CDP" : r & 0x01 ? "SDP" :
                                     r & 0x10 ? "FLOAT" : r & 0x02 ? "OCP" : "none", "Type-C Rp"};
   else if (r & 0x08) c = {rp == 3 ? 3000u : 1500u, "DCP", "BC1.2 DCP, Rp based"};
@@ -167,7 +259,7 @@ inline const char *stateName(uint8_t s1) {
 }
 
 struct Snapshot {
-  uint8_t s1, s2, s7, apsd, result, usbin, pp, icl, aicl, cmdIl, sm, misc, snk, legacy, fv, src, sm2, cc, typecRt;
+  uint8_t s1, s2, s7, apsd, result, usbin, pp, icl, aicl, cmdIl, sm, misc, snk, legacy, fv, src, sm2, cc, typecRt, qc;
   bool present() const { return (usbin & 0x10) != 0; }
   // A source on CC without VBUS. TYPEC 0x1509 bits 3:0 are the sink state machine (logs: 1 with nothing plugged and
   // 0x150e ff, 3 attached, 2 = waiting for VBUS); 0x150b bit 3 tCC debounce done, bit 4 VBUS error (Rp seen, VBUS never
@@ -193,8 +285,10 @@ enum Phase : uint8_t { kAbsent, kDetecting, kConfigured };
 
 struct Controller {
   // configuration (PmicService.inc fills these from boot arguments)
-  unsigned iclMa = kIclMaxMa, fccMa = 2000;   // iclMa: ceiling of the per-source input current (inputChoice)
+  unsigned iclMa = kIclMaxMa, fccMa = kFccMaxMa;   // ceilings: per-source input current (inputChoice), FCC (zoneTarget)
   bool typecDrp = false, recover = true;
+  bool hvdcp = true;       // guamp-hvdcp / guamp-pd: HVDCP (QC2/QC3) detection and authentication as Linux
+  bool tempZones = true;   // guamp-chg-temp: FCC/FV by battery temperature (Moto mmi-temp-zones)
   // state
   Phase phase = kAbsent;
   bool started = false, present = false, attached = false, suspended = false, aiclMax = false;
@@ -208,6 +302,15 @@ struct Controller {
   unsigned apsdReruns = 0, aicl5vMv = kAicl5vDefaultMv, aiclContMv = kAiclContDefaultMv;
   unsigned plugins = 0, unplugs = 0, weakSteps = 0, redetects = 0, suspendRecoveries = 0, typecResets = 0, errors = 0;
   unsigned otgOffs = 0;
+  // HVDCP: off for this connection after USBIN over-voltage / 12 V (Moto qc_usbov), boot APSD rerun once enabled
+  bool hvdcpOff = false, bootRerun = false, zoneRetry = false;
+  unsigned hvdcpOvs = 0;
+  uint8_t lastQc = 0xff;
+  // battery temperature zone and the FCC/FV/stop it gives (zoneTarget), applied by configure()
+  uint8_t zone = kZoneNone;
+  ChargeTarget target = {kFccNoTempMa, kFvMv, false};
+  int tempDc = 0;
+  unsigned zoneChanges = 0;
   uint8_t iclCode = 0, fccCode = 0, lastIcl = 0xff, lastAicl = 0xff, lastResult = 0xff;
   unsigned appliedMa = 0;
   // Type-C Rp / cable re-evaluation while configured (smblib_handle_rp_change): the new choice must be seen on two
@@ -241,6 +344,15 @@ struct Controller {
     if (!e) e = masked(b, reg::kChgPause, 0x01, 0x00, &pause);
     if (!e) e = masked(b, reg::kTypeCCfg, 0x80, 0x00, &cc);           // BC1.2 not gated on CC (no debug accessory)
     if (!e) e = masked(b, reg::kUsbinOptions1, 0x08, 0x08, &bc12);    // BC1.2 source detection on (smblib_apsd_enable)
+    // HVDCP (smb5_init_hw for pd_not_supported / smblib_hvdcp_enable_mmi): HVDCP_EN on, authentication as configured,
+    // autonomous mode off; QC2 at most 9 V / QC3 at most 20 pulses; no adapter allowance override (FORCE_NULL)
+    uint8_t hv = 0, pulses = 0, over = 0;
+    const bool hvOn = hvdcp && !hvdcpOff;
+    if (!e) e = masked(b, reg::kUsbinOptions1, 0x64, hvOn ? 0x44 : hvdcpOff ? 0x00 : 0x04, &hv);
+    if (!e) e = b.rd(reg::kHvdcpPulseMax, &pulses);
+    if (!e && pulses != kHvdcpPulseLinux) e = b.wr(reg::kHvdcpPulseMax, kHvdcpPulseLinux);
+    if (!e) e = masked(b, reg::kAdapterOverride, 0x0f, 0x00, &over);
+    if (!e && hvOn && !(hv & 0x40)) bootRerun = true;   // authentication just turned on
     if (!e) e = masked(b, reg::kTypecDebugAccessSink, 0x1f, 0x03, &dbg);
     // smb5_configure_typec / smblib_set_prop_pr_swap_in_progress outside a role swap: CC threshold 1.6 V in source
     // mode, no sink exit on CC alone, no VSAFE0V bypass, normal tCC debounce, CC-out not software driven (TWRP 06/00/00)
@@ -282,9 +394,10 @@ struct Controller {
     text[24] = 0;
     b.log("GuampChg: Linux config (%s), before: AICL-opt %02x rerun %02x therm-pull %02x JEITA-en %02x pause %02x "
           "TypeC-cfg %02x BC1.2 %02x dbg-sink %02x exit %02x debounce %02x ccout %02x allow %02x opt2 %02x tc-int %02x %02x "
-          "JEITA thresholds %s%s\n",
+          "JEITA thresholds %s%s, HVDCP opt1 %02x -> %02x pulses %02x override %02x\n",
           when, aiclOpt, rerun, pull, jeita, pause, cc, bc12, dbg, exitCfg, debounce, ccout, allow, opt2, int1, int2, text,
-          same ? " (Linux)" : " -> Linux 45/0/60/-20/71 C");
+          same ? " (Linux)" : " -> Linux 45/0/60/-20/71 C", hv,
+          static_cast<unsigned>((hv & ~0x64u) | (hvOn ? 0x44u : hvdcpOff ? 0x00u : 0x04u)), pulses, over);
     return 0;
   }
 
@@ -295,7 +408,7 @@ struct Controller {
         {reg::kAiclStatus, &s.aicl}, {reg::kUsbinCmdIl, &s.cmdIl}, {reg::kTypecStateMachine, &s.sm},
         {reg::kTypecMisc, &s.misc}, {reg::kTypecSnkStatus, &s.snk}, {reg::kTypecLegacy, &s.legacy}, {reg::kFv, &s.fv},
         {reg::kTypecSrcStatus, &s.src}, {reg::kTypecStatus0a, &s.sm2}, {reg::kTypecStatus0e, &s.cc},
-        {reg::kTypecRt, &s.typecRt}};
+        {reg::kTypecRt, &s.typecRt}, {reg::kQcStatus, &s.qc}};
     for (const auto &r : list) {
       int e = b.rd(r.a, r.v);
       if (e) return e;
@@ -326,9 +439,10 @@ struct Controller {
   // unsuspend and a read back of everything written.
   template <class Bus> int configure(Bus &b, unsigned ma) {
     if (ma > kIclMaxMa) ma = kIclMaxMa;
-    unsigned fcc = fccMa > kFccMaxMa ? kFccMaxMa : fccMa;
+    unsigned fcc = target.fccMa > kFccMaxMa ? kFccMaxMa : target.fccMa;
+    const unsigned fvMv = target.fvMv > kFvMv ? kFvMv : target.fvMv;
     const uint8_t icl = static_cast<uint8_t>(ma / 50), fc = static_cast<uint8_t>(fcc / 50),
-                  fv = static_cast<uint8_t>((kFvMv - 3600) / 10);
+                  fv = static_cast<uint8_t>((fvMv - 3600) / 10);
     int e = b.wr(reg::kIclCfg, icl);
     if (!e) e = masked(b, reg::kIclOptions, 0x03, 0x03);
     if (!e) e = masked(b, reg::kCmdIclOverride, 0x01, 0x00);
@@ -339,14 +453,15 @@ struct Controller {
       e = masked(b, reg::kChgEnable, 0x01, 0x00);
       b.sleepMs(1);
     }
-    if (!e) e = masked(b, reg::kChgEnable, 0x01, 0x01);
+    // Moto STEP_STOP (ZONE_HOT/ZONE_COLD, here also below 0 C): charging disabled, input stays on for the system
+    if (!e) e = masked(b, reg::kChgEnable, 0x01, target.stop ? 0x00 : 0x01);
     if (!e) e = masked(b, reg::kUsbinCmdIl, 0x01, 0x00);
     uint8_t rIcl = 0, rFcc = 0, rFv = 0, rEn = 0;
     if (!e) e = b.rd(reg::kIclCfg, &rIcl);
     if (!e) e = b.rd(reg::kFcc, &rFcc);
     if (!e) e = b.rd(reg::kFv, &rFv);
     if (!e) e = b.rd(reg::kChgEnable, &rEn);
-    if (!e && (rIcl != icl || rFcc != fc || rFv != fv || !(rEn & 1))) e = -5;
+    if (!e && (rIcl != icl || rFcc != fc || rFv != fv || (rEn & 1) != (target.stop ? 0 : 1))) e = -5;
     if (!e) { iclCode = icl; fccCode = fc; appliedMa = ma; }
     return e;
   }
@@ -448,6 +563,54 @@ struct Controller {
           snap.result);
   }
 
+  // Battery temperature -> Moto zone -> FCC/FV/stop (target); true when the target changed (the caller reconfigures)
+  template <class Bus> bool updateZone(Bus &b) {
+    int dc = 0;
+    const bool valid = tempZones && b.tempDc(&dc) == 0;
+    const uint8_t before = zone;
+    zone = valid ? mmiZone(zone, dc / 10) : kZoneNone;
+    if (valid) tempDc = dc;
+    const ChargeTarget t = zoneTarget(zone, fccMa);
+    const bool changed = t.fccMa != target.fccMa || t.fvMv != target.fvMv || t.stop != target.stop;
+    target = t;
+    if (zone != before) {
+      zoneChanges = zoneChanges + 1;
+      if (!valid)
+        b.log("GuampChg: battery temperature unavailable -> FCC %u mA FV %u mV (no zone), change %u\n", t.fccMa, t.fvMv,
+              zoneChanges);
+      else if (zoneChanges <= 20 || zoneChanges % 20 == 0)
+        b.log("GuampChg: battery %s%d.%d C -> zone %s: FCC %u mA FV %u mV%s, change %u\n", dc < 0 ? "-" : "",
+              (dc < 0 ? -dc : dc) / 10, (dc < 0 ? -dc : dc) % 10, zoneName(zone), t.stop ? 0u : t.fccMa, t.fvMv,
+              t.stop ? ", charging off" : "", zoneChanges);
+    }
+    return changed;
+  }
+
+  // HVDCP while plugged: one line per QC status change (QC2 adapter at 5/9 V) with the measured VBUS; USBIN
+  // over-voltage or a 12 V status with a QC result turns HVDCP off for this connection and reruns APSD (Moto's
+  // usbin_ov handler: qc_usbov, smblib_hvdcp_enable_mmi(false), smblib_rerun_apsd); true = detection restarted
+  template <class Bus> bool watchHvdcp(Bus &b, uint64_t ms, const Snapshot &s) {
+    if (s.qc != lastQc) {
+      unsigned mv = 0;
+      const int ve = b.vbusMv(&mv);
+      if (lastQc != 0xff || s.qc)
+        b.log("GuampChg: HVDCP QC status %02x (%s), APSD result %02x %s, VBUS %u mV%s, ICL %u mA FCC %u mA\n",
+              s.qc, qcName(s.qc), s.result, apsdName(s.result), ve ? 0u : mv, ve ? " (no ADC)" : "", appliedMa,
+              target.stop ? 0u : fccCode * 50u);
+      lastQc = s.qc;
+    }
+    if (hvdcpOff || !(s.result & 0x60) || !((s.usbin & 0x08) || (s.qc & 0x04))) return false;
+    hvdcpOff = true;
+    hvdcpOvs = hvdcpOvs + 1;
+    int e = masked(b, reg::kUsbinOptions1, 0x44, 0x00);
+    if (!e) e = b.wr(reg::kCmdApsd, 0x01);
+    b.log("GuampChg: HVDCP off for this connection (USBIN %02x, QC status %02x, result %02x): over-voltage %u, APSD rerun%s\n",
+          s.usbin, s.qc, s.result, hvdcpOvs, e ? " failed" : "");
+    if (e) fail(b, "HVDCP off", e);
+    beginDetection(b, ms, false, "HVDCP over-voltage");
+    return true;
+  }
+
   template <class Bus> void poll(Bus &b, uint64_t ms) {
     int e = b.wr(reg::kWdogPet, 1);
     uint8_t mode = 0;
@@ -474,6 +637,7 @@ struct Controller {
       started = true;
       linuxDiff(b, "boot, before");
       linuxConfig(b, "boot");
+      if (!s.present()) bootRerun = false;   // a later plug-in authenticates with the new configuration anyway
     }
     otgOff(b, present ? "plugged" : "no VBUS");   // every poll: whatever turned it on, the next poll undoes it
 
@@ -521,6 +685,11 @@ struct Controller {
       if (present || phase != kAbsent) {
         unplugs = unplugs + 1;
         e = edgeReset(b);
+        if (!e && hvdcpOff) {   // typec_src_removal: HVDCP disabled by an over-voltage comes back for the next source
+          hvdcpOff = false;
+          e = masked(b, reg::kUsbinOptions1, 0x44, hvdcp ? 0x44 : 0x04);
+        }
+        lastQc = 0xff;
         if (!e) {   // next source starts from the safe SDP current (a weak-adapter 100 mA must not stick)
           e = b.wr(reg::kIclCfg, static_cast<uint8_t>(kSdpMa / 50));
           if (!e) iclCode = static_cast<uint8_t>(kSdpMa / 50);
@@ -596,7 +765,13 @@ struct Controller {
             s.typecAttached() ? "attached" : "unattached", rpName(s.snk), s.apsd, s.result);
       // At boot APSD ran before this driver: rerun only when it has no result (smblib_rerun_apsd_if_required);
       // on a real plug-in the hardware runs it by itself.
-      beginDetection(b, ms, plugins == 1 && unplugs == 0 && !s.apsdDone(), "plug-in");
+      // HVDCP authentication enabled by this driver after the boot chain's APSD: one rerun on a DCP/OCP result so the
+      // PMIC can authenticate a QC adapter (Linux enables it in smb5_init_hw, before any detection)
+      const bool atBoot = plugins == 1 && unplugs == 0;
+      const bool hvRerun = atBoot && bootRerun && s.apsdDone() && (s.result & 0x0a) && !(s.result & 0x60);
+      beginDetection(b, ms, atBoot && (!s.apsdDone() || hvRerun), hvRerun ? "plug-in, HVDCP on" : "plug-in");
+      bootRerun = false;
+      if (hvRerun) return;   // the snapshot still holds the old result: judge the rerun from the next poll
     }
 
     // --- source detection and configuration ---------------------------------------------------------------------
@@ -604,6 +779,7 @@ struct Controller {
       if (s.apsdDone() || (apsdReruns >= 2 && ms - phaseAt >= 10000)) {
         const uint8_t result = s.apsdDone() ? s.result : 0;
         const InputChoice ch = inputChoice(iclMa, s.apsdDone(), result, s.rp(), s.legacyCable());
+        updateZone(b);
         int c = linuxConfig(b, "configure");
         if (!c) c = configure(b, ch.ma);
         unsigned mv = 0;
@@ -611,7 +787,7 @@ struct Controller {
         b.log("GuampChg: APSD %s result %02x %s, Type-C %s Rp %s%s -> source %s (%s): ICL %u mA FCC %u mA FV %u mV, "
               "VBUS %u mV%s: %s (SPMI %d)\n",
               s.apsdDone() ? "done" : "timeout", result, apsdName(result), s.typecAttached() ? "attached" : "unattached",
-              rpLevelName(s.rp()), s.legacyCable() ? " legacy cable" : "", ch.source, ch.rule, ch.ma, fccCode * 50u, kFvMv,
+              rpLevelName(s.rp()), s.legacyCable() ? " legacy cable" : "", ch.source, ch.rule, ch.ma, target.stop ? 0u : fccCode * 50u, target.fvMv,
               ve ? 0u : mv, ve ? " (no ADC)" : "", c ? "error" : "configured", c);
         if (c) { fail(b, "configure", c); return; }   // retried on the next poll
         lastResult = result;
@@ -633,6 +809,12 @@ struct Controller {
     }
 
     // --- configured: watch for a changed source and a stuck input ------------------------------------------------
+    if (watchHvdcp(b, ms, s)) return;
+    if (updateZone(b) || zoneRetry) {   // battery temperature zone changed: same ICL, new FCC/FV/stop
+      int c = configure(b, aiclMax ? kWeakAdapterIclMa : appliedMa);   // never lifts the weak-adapter 100 mA
+      zoneRetry = c != 0;
+      if (c) { fail(b, "temperature zone", c); return; }
+    }
     if (s.apsdDone() && s.result != lastResult && lastResult != 0xff) {
       b.log("GuampChg: APSD result %02x %s -> %02x %s\n", lastResult, apsdName(lastResult), s.result, apsdName(s.result));
       beginDetection(b, ms, false, "source change");
@@ -644,10 +826,10 @@ struct Controller {
       int ma = 0;
       const int ve = b.vbusMv(&mv), ie = b.ibatMa(&ma);
       b.log("GuampChg: input after 15 s: source %s, ICL set %u mA, ICL status %u mA, AICL %02x%s%s, VBUS %u mV%s, "
-            "battery %d mA%s, %s\n",
+            "battery %d mA%s, %s, QC %s, zone %s\n",
             choice.source, appliedMa, s.icl * 50u, s.aicl, (s.aicl & 0x01) ? " DONE" : "",
             (s.aicl & 0x10) ? " USBIN_COLLAPSE" : "", ve ? 0u : mv, ve ? " (no ADC)" : "", ie ? 0 : ma,
-            ie ? " (no QG)" : "", stateName(s.s1));
+            ie ? " (no QG)" : "", stateName(s.s1), qcName(s.qc), zoneName(zone));
     }
     // smblib_handle_rp_change: a changed Type-C Rp (or cable flag) changes the input current; not while the weak-adapter
     // work-around holds the ICL at 100 mA

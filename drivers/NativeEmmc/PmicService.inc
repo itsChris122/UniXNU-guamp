@@ -16,13 +16,18 @@
 //             SpringBoard -__handleHIDEvent: 0xB002E -> -_handleRingerSwitchEvent: (gated by MobileGestalt ringer-switch
 //             = ADT /buttons property function-button_ringerab, see make-guamp-adt.py) -> _updateRingerState:.
 // Boot arguments: guamp-pmic=0 turns it off; guamp-icl-ma (default 3000, the ceiling of the per-source input current
-// of Linux update_sw_icl_max: Type-C Rp 1.5/3.0 A, DCP/OCP 1500 or 3000 with Rp 3.0 A, CDP 1500, HVDCP 3000 at 5 V,
-// SDP/float/unknown 500) and guamp-fcc-ma (default 2000), both capped at 3000 (guamp DT); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
+// of Linux update_sw_icl_max: Type-C Rp 1.5/3.0 A, DCP/OCP 1500 or 3000 with Rp 3.0 A, CDP 1500, HVDCP by Rp (QC3 3000,
+// QC2 1500 with Rp default), SDP/float/unknown 500) and guamp-fcc-ma (default 3000 since 06/11, the FCC ceiling under
+// the battery temperature zones: 3000 at 15-45 C, 2000 at 45-60 C, 1000 at 0-15 C, off below 0 and from 60 C, 2000
+// without a temperature reading), both capped at 3000 (guamp DT); guamp-chg-temp=0 drops the zones (FCC = min(guamp-fcc-ma,
+// 2000) as before); guamp-hvdcp=0 or guamp-pd=0 keeps HVDCP authentication off (no QC, 5 V only; a real USB PD sink is
+// impossible on the PMI632, see GuampChargeReplugCore.h); guamp-typec-drp=1 keeps Linux's DRP try.SNK role
 // instead of sink only; guamp-chg-recover=0 turns off the stuck-input recovery (weak-adapter steps, re-detection);
 // guamp-ringer=0 leaves GPIO 33 alone, guamp-ringer-start=0 starts at "silent".
 //   torch     the camera flash LED (PMI632 slave 3, 0xd300) as a torch, GuampTorch.inc: guamp-torch (default 1 since 28/10), driven
 //             only by the GuampTorch IOKit service / guamp_torch_request() (no button), applied by this thread.
-// Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, SPMI errors.
+// Every 30 s one log line: buttons, charger status bytes, APSD result, the codes written, QC status, VBUS and battery
+// current (ADC/QG), battery temperature zone, SPMI errors.
 
 #include <stdarg.h>
 #include "GuampSpmi.h"
@@ -208,6 +213,13 @@ struct ChargeBus {
     *ma = -static_cast<int>((static_cast<int64_t>(signedRaw) * (subtype == 3 ? 152588 : 305176)) / 1000000);
     return 0;
   }
+  // Battery temperature in 0.1 C from GuampBatteryService (BAT_THERM, one conversion a minute); none without a reading
+  // (guamp-battery=0 or guamp-battery-temp=0): the charger then keeps FCC <= 2000 mA
+  int tempDc(int *dc) {
+    if (!gBatteryTempValid) return SPMI_ERR_NODEV;
+    *dc = gBatteryTemp;
+    return 0;
+  }
   __attribute__((format(printf, 2, 3))) void log(const char *format, ...) {
     va_list ap;
     va_start(ap, format);
@@ -353,21 +365,28 @@ void thread(void *, wait_result_t) {
   gBatterySdamStore = batterySdam == 1;
   IOLog("GuampBattery: QG fuel gauge and power-source publisher %s, BAT_THERM ADC %s, SDAM store %s\n",
         gBatteryEnabled ? "enabled" : "disabled", gBatteryTempEnabled ? "on" : "off", gBatterySdamStore ? "on" : "off");
-  unsigned iclMa = guamp_charge::kIclMaxMa, fccMa = 2000;
+  unsigned iclMa = guamp_charge::kIclMaxMa, fccMa = guamp_charge::kFccMaxMa;
   PE_parse_boot_argn("guamp-icl-ma", &iclMa, sizeof(iclMa));
   PE_parse_boot_argn("guamp-fcc-ma", &fccMa, sizeof(fccMa));
   if (iclMa > 3000) iclMa = 3000;
   if (fccMa > 3000) fccMa = 3000;
-  unsigned typecDrp = 0, chgRecover = 1;
+  unsigned typecDrp = 0, chgRecover = 1, hvdcp = 1, pd = 1, chgTemp = 1;
   PE_parse_boot_argn("guamp-typec-drp", &typecDrp, sizeof(typecDrp));
   PE_parse_boot_argn("guamp-chg-recover", &chgRecover, sizeof(chgRecover));
+  PE_parse_boot_argn("guamp-hvdcp", &hvdcp, sizeof(hvdcp));
+  PE_parse_boot_argn("guamp-pd", &pd, sizeof(pd));
+  PE_parse_boot_argn("guamp-chg-temp", &chgTemp, sizeof(chgTemp));
   gCharge.iclMa = iclMa;
   gCharge.fccMa = fccMa;
   gCharge.typecDrp = typecDrp == 1;
   gCharge.recover = chgRecover != 0;
-  IOLog("GuampChg: controller ICL up to %u mA per source (SDP %u) FCC %u mA FV %u mV, Type-C %s, recovery %s\n", iclMa,
+  gCharge.hvdcp = hvdcp != 0 && pd != 0;
+  gCharge.tempZones = chgTemp != 0;
+  IOLog("GuampChg: controller ICL up to %u mA per source (SDP %u) FCC up to %u mA FV %u mV, Type-C %s, recovery %s, "
+        "HVDCP QC2/QC3 %s (up to 9 V; no PD PHY on the PMI632), temperature zones %s\n", iclMa,
         guamp_charge::kSdpMa, fccMa, guamp_charge::kFvMv, gCharge.typecDrp ? "DRP try.SNK" : "sink only",
-        gCharge.recover ? "on" : "off");
+        gCharge.recover ? "on" : "off", gCharge.hvdcp ? "on" : "off (guamp-hvdcp=0/guamp-pd=0)",
+        gCharge.tempZones ? "on" : "off (FCC <= 2000 mA)");
   ChargeBus chargeBus;
   uint32_t stable = 0, last = 0, sent = 0;
   const bool ringer = ringerInit();
@@ -474,11 +493,19 @@ void thread(void *, wait_result_t) {
       }
       if (tick % 1200 == 0)
         IOLog("GuampPmic: ringer %s presses %u\n", gRingerState ? "ring" : "silent", gRingerPresses);
-      if (tick % 1200 == 0)
-        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u source %s, SPMI errors %u; touch step %u error %d events %u\n",
+      if (tick % 1200 == 0) {
+        // the input as it is now: QC status (QC2 adapter voltage), VBUS (ADC) and battery current (QG, + = charging)
+        unsigned vbus = 0;
+        int ibat = 0;
+        const int ve = (gChg[6] & 0x10) ? chargeBus.vbusMv(&vbus) : -1, ie = chargeBus.ibatMa(&ibat);
+        const int tdc = gCharge.tempDc, tabs = tdc < 0 ? -tdc : tdc;
+        IOLog("GuampPmic: buttons %x, charger status %02x %02x %02x, APSD %02x result %02x, FV %02x, USBIN %02x TYPEC %02x mode %02x, ICL code %u FCC code %u source %s, QC %02x (%s), VBUS %u mV, battery %d mA, %s%d.%d C zone %s%s, SPMI errors %u; touch step %u error %d events %u\n",
               gButtons, gChg[0], gChg[1], gChg[2], gChg[3], gChg[4], gChg[5], gChg[6], gChg[7], gTypecMode, gCharge.iclCode,
-              gCharge.fccCode, gCharge.choice.source, gErrors,
+              gCharge.fccCode, gCharge.choice.source, gCharge.snap.qc, guamp_charge::qcName(gCharge.snap.qc), ve ? 0u : vbus,
+              ie ? 0 : ibat, tdc < 0 ? "-" : "", tabs / 10, tabs % 10, guamp_charge::zoneName(gCharge.zone),
+              gCharge.target.stop ? " (charging off)" : "", gErrors,
               touch::gStep, touch::gError, touch::gEvents);
+      }
     }
     {   // held keys: countdown to the PMIC key reset (S1+S2); the last line before such a reset says how far it was
       uint64_t ns = 0;
