@@ -1,0 +1,134 @@
+turnip (guamp A610): the per-overlap flush only for the pipelines that read their colour attachments (TU_GUAMP_FLOOP, default on)
+
+metal2vulkan reads Metal framebuffer fetch as input attachments in rasterization order: in such a pass every colour attachment is
+also an input attachment of the subpass, and only the fetching pipelines carry RASTERIZATION_ORDER_ATTACHMENT_ACCESS. Turnip
+(tu_render_pass_check_feedback_loop) then marks the whole subpass as a colour feedback loop and gives EVERY pipeline of the pass
+COLOR_ATTACHMENT_FEEDBACK_LOOP, so tu6_emit_prim_mode_sysmem drew every draw with GRAS_SC_CNTL FLUSH_PER_OVERLAP_AND_OVERWRITE (CCU
+written back to DRAM at each overlap): fin55 TU row f31495 of s36932 Turnip passes for 31514 bridge passes, i.e. every pass, every
+draw. The cost grows with overlapping layers, not with blurs (user: the flat ringtone list scrolls smoothly, Reduce Transparency,
+which adds opaque layers over the same pixels, is slower).
+Now a pipeline that reads no input attachment (new tu_shader fs.guamp_reads_inputs, set when the FS binds one) and has no
+rasterization-order access drops a colour-only feedback loop (NO_FLUSH); before the first draw of a pipeline that does read after
+one that did not (or of one with rasterization-order access), the render pass cache gets CCU_CLEAN_COLOR + CACHE_INVALIDATE + WAIT_FOR_IDLE (what a by-region self-dependency
+barrier emits). The fetching pipelines keep FLUSH_PER_OVERLAP_AND_OVERWRITE (sysmem) / FLUSH_PER_OVERLAP (GMEM). Depth/stencil
+feedback loops, dynamic rendering and the UBWC rule for readers are unchanged. rp.sysmem_single_prim_mode (TU row f, autotune GMEM
+choice) now marks only passes that really fetch. TU_GUAMP_FLOOP=0|off restores the upstream rule. Applies after 0001-0004.
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ae1bc40..4baecc8 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1409,6 +1409,24 @@ enum tu_guamp_gmem_policy {
+ static uint64_t tu_guamp_counts[8];
+ static const char *tu_guamp_last_reason;
+ 
++/* guamp 0005: TU_GUAMP_FLOOP (default on): pipelines that read no input attachment drop the colour feedback loop of a subpass
++ * whose colour attachments are also its input attachments (tu_pipeline.cc), and a CCU clean + invalidate goes before the first
++ * draw of a pipeline that reads them after one that did not. 0/off = upstream rule (every pipeline of such a subpass flushed per
++ * overlap in sysmem). */
++extern "C" bool tu_guamp_floop_demote(void);
++extern "C" bool
++tu_guamp_floop_demote(void)
++{
++   static int on = -1;
++   int value = __atomic_load_n(&on, __ATOMIC_RELAXED);
++   if (value < 0) {
++      const char *text = getenv("TU_GUAMP_FLOOP");
++      value = !(text && (!strcmp(text, "0") || !strcmp(text, "off")));
++      __atomic_store_n(&on, value, __ATOMIC_RELAXED);
++   }
++   return value;
++}
++
+ static enum tu_guamp_gmem_policy
+ tu_guamp_gmem_policy(void)
+ {
+@@ -8514,6 +8532,17 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+    if (cmd->state.dirty & TU_CMD_DIRTY_FS)
+       tu_flush_dynamic_input_attachments(cmd);
+ 
++   /* guamp 0005: a draw that reads input attachments after draws that wrote without the per-overlap flush (their feedback loop
++    * dropped in tu6_emit_prim_mode_sysmem) first cleans the colour cache and invalidates UCHE, as a by-region self-dependency. */
++   if (tu_guamp_floop_demote()) {
++      const struct tu_shader *guamp_fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++      const bool reads = (guamp_fs && guamp_fs->fs.guamp_reads_inputs) || cmd->state.raster_order_attachment_access;
++      if (reads && !cmd->state.guamp_prev_draw_reads)
++         cmd->state.renderpass_cache.flush_bits |=
++            TU_CMD_FLAG_CCU_CLEAN_COLOR | TU_CMD_FLAG_CACHE_INVALIDATE | TU_CMD_FLAG_WAIT_FOR_IDLE;
++      cmd->state.guamp_prev_draw_reads = reads;
++   }
++
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 17bebeb..40a900f 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -590,6 +590,7 @@ struct tu_cmd_state
+    bool raster_order_attachment_access;
+    bool raster_order_attachment_access_valid;
+    bool blit_cache_cleaned;
++   bool guamp_prev_draw_reads; /* guamp 0005 */
+    VkImageAspectFlags pipeline_feedback_loops;
+    bool pipeline_writes_shading_rate;
+    bool pipeline_reads_shading_rate;
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 8b010ed..cc1f129 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3749,6 +3749,8 @@ static const enum mesa_vk_dynamic_graphics_state tu_prim_mode_sysmem_state[] = {
+    MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE,
+ };
+ 
++extern "C" bool tu_guamp_floop_demote(void); /* guamp 0005, tu_cmd_buffer.cc */
++
+ template <chip CHIP>
+ static unsigned
+ tu6_prim_mode_sysmem_size(struct tu_device *dev,
+@@ -3776,6 +3778,16 @@ tu6_emit_prim_mode_sysmem(struct tu_cs *cs,
+     */
+    raster_order_attachment_access |= TU_DEBUG(RAST_ORDER);
+ 
++   /* guamp 0005: metal2vulkan makes every colour attachment of a framebuffer-fetch pass an input attachment of its subpass too,
++    * so tu_render_pass_check_feedback_loop marks the subpass and EVERY pipeline of the pass got FLUSH_PER_OVERLAP_AND_OVERWRITE,
++    * not only the fetching ones (TU row of fin55: f31495 of 31514 bridge passes). A pipeline that neither reads an input
++    * attachment nor asks rasterization order cannot see its own writes, so its colour feedback loop needs no flush; the next
++    * pipeline that does read gets a CCU clean + invalidate before its first draw (tu_cmd_buffer.cc, as a self-dependency barrier
++    * would). Depth/stencil loops are untouched. TU_GUAMP_FLOOP=0 restores the upstream rule. */
++   if (feedback_loops == VK_IMAGE_ASPECT_COLOR_BIT && !raster_order_attachment_access &&
++       !fs->fs.dynamic_input_attachments_used && !fs->fs.guamp_reads_inputs && tu_guamp_floop_demote())
++      feedback_loops = 0;
++
+    /* If there is a feedback loop, then the shader can read the previous value
+     * of a pixel being written out. It can also write some components and then
+     * read different components without a barrier in between. This is a
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index d99d55c..f42497e 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -533,6 +533,10 @@ build_bindless(struct tu_device *dev, nir_builder *b,
+    const struct tu_descriptor_set_binding_layout *bind_layout =
+       &layout->set[set].layout->binding[binding];
+ 
++   /* guamp 0005: a pipeline whose FS reads no input attachment keeps NO_FLUSH in a subpass feedback loop (tu_pipeline.cc). */
++   if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
++      shader->fs.guamp_reads_inputs = true;
++
+    /* input attachments use non bindless workaround */
+    if (bind_layout->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT &&
+        (!dynamic_renderpass ||
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 1cd0e89..22ea92a 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -108,6 +108,9 @@ struct tu_shader
+ 
+          uint16_t dynamic_input_attachments_used;
+ 
++         /* guamp 0005: the FS reads an input attachment (either render pass form). */
++         bool guamp_reads_inputs;
++
+          struct {
+             uint32_t status;
+             bool force_late_z;
