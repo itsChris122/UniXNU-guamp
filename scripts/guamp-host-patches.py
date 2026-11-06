@@ -21,7 +21,7 @@ PATCHES = [
     # 07/11: UIM provisioning session (0x38) for the card's USIM: the SM6115 modem waits for the host (QCRIL on Android) to open it,
     # CommCenter never asks, so the SIM stayed unread ("SOS", no ICCID/IMSI). Applies after qcombaseband-short-revision.patch.
     ('drivers/QcomBaseband', 'patches/host/qcombaseband-uim-provisioning.patch',
-     {'baseband/coachz_bb_uimprov.h': 'cbu_request', 'baseband/coachz_baseband.cpp': 'bb_uim_status_note'}),
+     {'baseband/coachz_bb_uimprov.h': 'cbu_tick', 'baseband/coachz_baseband.cpp': 'bb_uim_tick'}),
 ]
 OPTIONAL = {'drivers/QcomBaseband'}
 
