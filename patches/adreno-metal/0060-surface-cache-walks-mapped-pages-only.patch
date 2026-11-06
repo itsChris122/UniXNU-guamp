@@ -1,0 +1,70 @@
+guamp: the surface cache walks (DC CVAC / DC CIVAC) touch only pages the process still maps (SpringBoard SIGSEGV leaving an app, fin55)
+
+fin55 (live-20261106-092610): SpringBoard died twice, at 1110.3 s leaving Telefono and at 1869.4 s leaving Safari, of SIGSEGV
+KERN_INVALID_ADDRESS (code 0xb100001) at the same PC: NativeAdrenoMetal +0x2d660 = "dc civac, x11" in invalidateWrittenSurfaces (0001,
+0010), called with completed=true from -[NBCommandBuffer finish] on the bridge's completion pthread; faults 0x118800000 and 0x11fb2e000.
+(The exit trace's "IntelligentRouting.framework" is only dyld's first image, not the faulting one: plugin base 0x10a4ef000, found from
+the PC, LR and the frame chain.) A written surface's pages, the closing app's snapshot, were no longer mapped at IOSurfaceGetBaseAddress
+for the whole IOSurfaceGetAllocSize, although the texture retains the surface, and a DC by VA on an unmapped page faults at EL0.
+cleanToCoherency and cleanInvalidateToCoherency now clip each range to the readable regions vm_region_recurse_64 reports (one Mach call
+per range) and count what they skip; the first 3 cases go to NBLOG ("surface invalidate skipped N unmapped bytes of base+size", to the
+kernel log as a problem). A page unmapped between the region query and the walk can still fault (the window is the walk itself).
+Stop-gap without a new addon: guamp-m2v-env=NMB_SURFACE_INVALIDATE=0 (no invalidation at all: 0001's stale switcher previews may come
+back). Applies after 0001-0057; the Objective-C++ is not compiled outside the CI (forMappedSpans checked on the host with simulated
+regions).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 22513f1..2fa65de 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1237,8 +1237,38 @@ NB_RESOURCE_SPI
+ static std::mutex gSurfaceSeedLock;
+ static std::unordered_map<uint32_t,uint32_t> gSurfaceSeeds;   // IOSurfaceID: the seed it was last cleaned at
+ static std::atomic<uint64_t> gSurfaceCleanSkips;
++// guamp (UniXNU-guamp patches/adreno-metal/0060): the cache walks touch only pages this process still maps. fin55 (live-20261106-092610,
++// 1110.3 s leaving Telefono, 1869.4 s leaving Safari): SpringBoard died twice of SIGSEGV KERN_INVALID_ADDRESS on DC CIVAC in
++// invalidateWrittenSurfaces at completion (NativeAdrenoMetal +0x2d660, called from -finish), fault 0x118800000 / 0x11fb2e000: a written
++// surface's pages (the closing app's snapshot) were no longer mapped at IOSurfaceGetBaseAddress for the whole IOSurfaceGetAllocSize,
++// although the texture retains the surface. A DC by VA on an unmapped page faults at EL0, so each range is clipped to the readable
++// regions vm_region_recurse_64 reports (one Mach call per range); what is skipped is counted and its first cases are logged.
++static std::atomic<uint64_t> gCacheWalkSkippedBytes,gCacheWalkSkippedRanges;
++template<typename Walk> static void forMappedSpans(const char *what,uintptr_t start,size_t bytes,Walk &&walk) {
++ const uintptr_t end=start+bytes;
++ if(!bytes || end<start)return;
++ uintptr_t at=start;uint64_t skipped=0;
++ while(at<end) {
++  vm_address_t address=(vm_address_t)at;vm_size_t size=0;natural_t depth=0;
++  vm_region_submap_short_info_data_64_t info={};mach_msg_type_number_t count=VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
++  if(vm_region_recurse_64(mach_task_self(),&address,&size,&depth,(vm_region_recurse_info_t)&info,&count)!=KERN_SUCCESS || !size)break;
++  if((uintptr_t)address>=end)break;
++  const uintptr_t from=std::max<uintptr_t>((uintptr_t)address,at),to=std::min<uintptr_t>((uintptr_t)address+(uintptr_t)size,end);
++  if(to<=from)break;
++  skipped+=from-at;
++  if(info.protection&VM_PROT_READ)walk(from,(size_t)(to-from));else skipped+=to-from;
++  at=to;
++ }
++ if(at<end)skipped+=end-at;
++ if(!skipped)return;
++ gCacheWalkSkippedBytes+=skipped;
++ if(gCacheWalkSkippedRanges++<3)
++  NBLOG(@"native-metal: %s skipped %llu unmapped bytes of %llx+%llx",what,(unsigned long long)skipped,(unsigned long long)start,(unsigned long long)bytes);
++}
+ static void cleanToCoherency(uintptr_t start,size_t bytes) {
+- for(uintptr_t at=start&~(uintptr_t)63,end=start+bytes;at<end;at+=64)__asm__ volatile("dc cvac, %0"::"r"(at):"memory");
++ forMappedSpans("surface clean",start,bytes,[](uintptr_t from,size_t length) {
++  for(uintptr_t at=from&~(uintptr_t)63,end=from+length;at<end;at+=64)__asm__ volatile("dc cvac, %0"::"r"(at):"memory");
++ });
+  __asm__ volatile("dsb sy":::"memory");
+ }
+ static void flushSurfaces(NSMutableSet *surfaces) {
+@@ -1288,7 +1318,9 @@ static unsigned surfaceInvalidateLimit() {
+  return limit;
+ }
+ static void cleanInvalidateToCoherency(uintptr_t start,size_t bytes) {
+- for(uintptr_t at=start&~(uintptr_t)63,end=start+bytes;at<end;at+=64)__asm__ volatile("dc civac, %0"::"r"(at):"memory");
++ forMappedSpans("surface invalidate",start,bytes,[](uintptr_t from,size_t length) {   // guamp 0060: mapped pages only
++  for(uintptr_t at=from&~(uintptr_t)63,end=from+length;at<end;at+=64)__asm__ volatile("dc civac, %0"::"r"(at):"memory");
++ });
+  __asm__ volatile("dsb sy":::"memory");
+ }
+ static void invalidateWrittenSurfaces(NSMutableSet *written,bool completed) {
