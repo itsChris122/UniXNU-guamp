@@ -356,11 +356,15 @@ bool naContext(Session &s) {
   // The 3 GiB GPU aperture (patches/native-adreno/0003): four 256 MiB client windows above 2 GiB for the wallpaper extensions, the
   // three 170 MiB ones and the render server's 1 GiB unchanged. A table pool of 1540 pages instead of 1027; if it cannot be had the
   // 2 GiB layout is used as before. guamp-adreno-wide=0 keeps the 2 GiB layout.
-  native_adreno_wide_request = bootArg("guamp-adreno-wide", 1);
+  // fin55: Maps got a 256 MiB window of the 512 it asks for ("0 MiB of windows free": 1.5 GiB of windows, eight processes at 192) and
+  // aborted with "VectorKit received null buffer from Metal" when its BOs and imports filled it. patches/native-adreno/0022: 2 (the
+  // default now) tries the 4 GiB aperture first (2053 table pages, 8 MiB contiguous; guamp-gpu-all windows to 0xFF000000, 2544 MiB),
+  // then 3 GiB, then 2; guamp-adreno-wide=1 is the 3 GiB of before.
+  native_adreno_wide_request = bootArg("guamp-adreno-wide", 2);
   const IOReturn ctx = NativeAdrenoGpuContextBringup(reinterpret_cast<volatile uint8_t *>(s.smmu.va), kSmmuBytes, 0, 2, 0, 0, 1, 1,
                                                      naProgress, &s.report);
   IOLog("GuampAdreno: context bringup %x (step %u, output bits %u, aperture %s GiB, wide asked %u)\n", ctx, gContextStep,
-        s.report.output_bits, native_adreno_wide_active ? "3" : "2", native_adreno_wide_request);
+        s.report.output_bits, native_adreno_wide_active >= 2 ? "4" : native_adreno_wide_active ? "3" : "2", native_adreno_wide_request);
   if (ctx) return false;
   // CB0 ACTLR without CPRE (arm_mmu500_reset, MMU-500 errata 841119/826419), then TLBIALL, TLBSYNC and TLBSTATUS of that bank.
   const uint32_t bank0 = smmuBank0(s);

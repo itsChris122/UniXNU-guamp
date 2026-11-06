@@ -54,6 +54,21 @@ static void windows() {
   CHECK(n.take(192ull << 20, 64ull << 20, &x, &y) && n.take(192ull << 20, 64ull << 20, &x, &y));
   CHECK(n.take(192ull << 20, 64ull << 20, &x, &y) && y == 128ull << 20 && x + y == 0x80000000ull);
   CHECK(!n.take(16ull << 20, 0, &x, &y));
+  // 4 GiB aperture (patches/native-adreno/0022): windows up to 0xFF000000, 159 granules (2544 MiB). fin55: Maps opened with 1280 MiB
+  // held by the others (six of 192 MiB, the widget renderer 128) and got 256 of its 512; now it and Photos (512 each) get theirs whole
+  NagWindows f;
+  f.init(0xFF000000ull);
+  CHECK(f.granules() == 159);
+  CHECK(f.freeBytes() == 2544ull << 20);
+  for (int i = 0; i < 6; ++i) CHECK(f.take(192ull << 20, 64ull << 20, &x, &y) && y == 192ull << 20 && x + y <= 0xFF000000ull);
+  CHECK(f.take(128ull << 20, 64ull << 20, &x, &y) && y == 128ull << 20);
+  CHECK(f.take(512ull << 20, 64ull << 20, &x, &y) && y == 512ull << 20 && x + y <= 0xFF000000ull);
+  CHECK(f.take(512ull << 20, 64ull << 20, &x, &y) && y == 512ull << 20 && x + y <= 0xFF000000ull);
+  CHECK(f.freeBytes() == (2544ull - 6 * 192 - 128 - 2 * 512) << 20);
+  // init clamps an end past 2^32 to NagTop
+  NagWindows t;
+  t.init(0x180000000ull);
+  CHECK(t.granules() == NagMaxGranules && t.freeBytes() == 0xA0000000ull);
 }
 
 static void rates() {

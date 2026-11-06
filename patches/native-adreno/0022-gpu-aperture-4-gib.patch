@@ -1,0 +1,103 @@
+guamp: GPU aperture of 4 GiB, 2544 MiB of client windows instead of 1536 (Maps "VectorKit received null buffer from Metal")
+
+fin55, 2871.7 s: Maps[996] SIGABRT "VectorKit received null buffer from Metal" starting a route (no GPS); just before it the bridge logged
+"native-metal: buffer refused: buffer: OutOfMemory(Device)" with the kernel refusing nothing (BoAlloc refused 0, gpu-all refused 0). At
+2808 s Maps had opened with "window 256 MiB (asked 512), 0 MiB of windows free": the 1.5 GiB of windows above the render server's 1 GiB
+were held by mediaserverd, chronod, SpringBoard, the widget renderer, Preferences, Camera, Spotlight... (192 MiB each). Maps then grew
+from 54 to 244 MiB of BOs of the other processes plus 60 MiB of imports, and its 256 MiB of GPU addresses ran out: vkAllocateMemory
+failed with VK_ERROR_OUT_OF_DEVICE_MEMORY while 40 MiB of RAM were free and 653 MiB jetsam-available.
+
+- native_adreno_wide_request=2 tries a 4 GiB aperture first (the whole 32-bit input range, start level 1: 1 + 4 + 2048 = 2053 table
+  pages, 8 MiB contiguous at bring-up), then the 3 GiB one (1540 pages), then the 2 GiB layout, as before; native_adreno_wide_active is
+  2 for 4 GiB (every existing "wide" test is a truth test, unchanged).
+- guamp-gpu-all windows reach 0xFF000000 with it: the last 16 MiB granule stays out, so that no window ends at 2^32.
+- MaxLeaves (1 << 20) already covered 4 GiB; setScope accepts an end of 2^32 with 32 input bits.
+
+diff --git a/NativeAdrenoGpuContext.cpp b/NativeAdrenoGpuContext.cpp
+index 7b13825..d9835c6 100644
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -42,7 +42,12 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     /* The wide table pool (6 MiB contiguous) when the board asked for it; if it cannot be had, the 2 GiB pool as before. */
+     uint64_t aperture=GpuApertureBytes;
+     native_adreno_wide_active=0;
+-    if(!status && native_adreno_wide_request) {
++    /* guamp 0022: the 4 GiB pool (8 MiB contiguous) first when the board asked for it, then the 3 GiB one. */
++    if(!status && native_adreno_wide_request>=2) {
++        if(tables_.allocate(FullTablePages*0x1000,report->output_bits,true,FullTablePages*0x1000)==kIOReturnSuccess)aperture=GpuFullApertureBytes;
++        else (void)tables_.release();
++    }
++    if(!status && native_adreno_wide_request && aperture==GpuApertureBytes) {
+         if(tables_.allocate(WideTablePages*0x1000,report->output_bits,true,WideTablePages*0x1000)==kIOReturnSuccess)aperture=GpuWideApertureBytes;
+         else (void)tables_.release();
+     }
+@@ -55,6 +60,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+             bank,asid,1000,report->output_bits);
+         if(!status)smmu_.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
+         if(!status && aperture==GpuWideApertureBytes)native_adreno_wide_active=1;
++        if(!status && aperture==GpuFullApertureBytes)native_adreno_wide_active=2;
+     }
+     if(!status) {
+         step(Program);
+diff --git a/NativeAdrenoGpuContext.h b/NativeAdrenoGpuContext.h
+index 4dcbbc5..505d77e 100644
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -19,10 +19,16 @@ enum : uint64_t {
+     /* guamp (patches/native-adreno/0003-wide-aperture-extension-windows.patch): 0..3 GiB when the board asks for it, so that the
+      * client windows above 2 GiB (NativeAdrenoPublish.cpp) exist. Same input size (32 bits), same root level: one more level-2 table
+      * and 512 more leaf tables. */
+-    GpuWideApertureBytes=0xC0000000
++    GpuWideApertureBytes=0xC0000000,
++    /* guamp (patches/native-adreno/0022-gpu-aperture-4-gib.patch): 0..4 GiB, the whole 32-bit input range (one more level-2 table and
++     * 512 more leaf tables than 3 GiB, 8 MiB of tables), asked with native_adreno_wide_request=2. fin55: the processes' windows
++     * (1.5 GiB above the render server's 1 GiB) were all taken, Maps got 256 of its 512 MiB and aborted ("VectorKit received null
++     * buffer from Metal", OutOfMemory(Device) from metal2vulkan) when its BOs and imports filled them. */
++    GpuFullApertureBytes=0x100000000ull
+ };
+-/* Set by the board before NativeAdrenoGpuContextBringup: nonzero asks for the wide aperture. The bring-up sets
+- * native_adreno_wide_active to 1 when its table pool and SMMU region were made that size (the 2 GiB layout otherwise, as before). */
++/* Set by the board before NativeAdrenoGpuContextBringup: nonzero asks for the wide aperture (2: the 4 GiB one, else the 3 GiB one). The
++ * bring-up sets native_adreno_wide_active to 1 when its table pool and SMMU region were made 3 GiB, 2 when 4 GiB (0022: 4 GiB is tried
++ * first when asked, then 3, then the 2 GiB layout as before). */
+ extern "C" {extern volatile uint32_t native_adreno_wide_request,native_adreno_wide_active;}
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+@@ -36,7 +42,7 @@ class NativeAdrenoGpuContext final {
+     bool ready_=false,used_=false;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+-    enum : size_t {TablePages=1027,WideTablePages=1540};   /* 1 + 2 + 1024, 1 + 3 + 1536 table pages */
++    enum : size_t {TablePages=1027,WideTablePages=1540,FullTablePages=2053};   /* 1 + 2 + 1024, 1 + 3 + 1536, 1 + 4 + 2048 table pages */
+     NativeAdrenoGpuContext()=default;
+     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
+     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 60aba07..94358da 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -1182,7 +1182,9 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit
+     g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+     g.service=service;g.published=true;
+     /* guamp-gpu-all: the windows of the other processes, above the render server's 1 GiB to the end of the aperture (3 GiB wide, else 2). */
+-    g.windows.init(native_adreno_wide_active?0xC0000000ull:0x80000000ull);
++    /* guamp 0022: with the 4 GiB aperture up to 0xFF000000, the last 16 MiB granule left out so that no window ends at 2^32 (an end
++     * that a 32-bit sum in user space would read as 0): 2544 MiB of windows instead of 1536. */
++    g.windows.init(native_adreno_wide_active>=2?0xFF000000ull:native_adreno_wide_active?0xC0000000ull:0x80000000ull);
+     native_adreno_gpu_all_stats[10]=uint32_t(g.windows.freeBytes()>>20);
+     service->setName("NativeAdrenoGpu");
+     service->registerService();
+diff --git a/NativeAdrenoSmmuContext.h b/NativeAdrenoSmmuContext.h
+index 17cdc05..55b5857 100644
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -30,7 +30,8 @@ public:
+     ~NativeAdrenoSmmuContext()=default;
+     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
+     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
+-    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves; the GPU's wide 3 GiB one (guamp, patches/native-adreno/0003) 786432. */
++    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves; the GPU's wide 3 GiB one (guamp, patches/native-adreno/0003) 786432, the 4 GiB one (0022)
++     * 1048576, all of them. */
+     enum : size_t {MaxLeaves=size_t(1)<<20};
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
