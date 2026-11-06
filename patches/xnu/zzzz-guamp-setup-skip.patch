@@ -93,7 +93,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	{"com.apple.spotlightknowledged", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.systemstats.microstackshot_periodic", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.tailspind", GUAMP_SLIM_ALL, 1},
-+	{"com.apple.tipsd", GUAMP_SLIM_ALL, 1},
++	{"com.apple.tipsd", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},	/* 07/11: NOT in the 29/10 list: with Wi-Fi up the Tips app found no tipsd (never started in fin55) and loaded no content */
 +	/* guamp-slim-fast=1: labels checked against /System/Library/LaunchDaemons of 21H461 (29/10). Find My */
 +	{"com.apple.icloud.findmydeviced", GUAMP_SLIM_FAST, 1},
 +	{"com.apple.findmy.findmybeaconingd", GUAMP_SLIM_FAST, 1},
