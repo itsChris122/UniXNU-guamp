@@ -17,6 +17,7 @@ as cellular, as read from libMobileGestalt.dylib 21H461 (answer table: obfuscate
   BasebandClass                IODeviceTree:/baseband "class"
   EUICCChipID                  IODeviceTree:/baseband "euicc-chip-id" (absent: no eUICC)
   BasebandChipset              IODeviceTree:/product "baseband-chipset"
+  personal-hotspot             IODeviceTree:/product "personal-hotspot" (07/11, Preferences: Personal Hotspot row; d22ap has it)
 SIMStatus/SIMTrayStatus are asked to CommCenter at run time; "sim", "apn", "lte-device", "umts-device", "call-waiting" and the other
 CoreTelephony words have no answer function in 21H461; no MobileGestalt key gives the number of SIM slots (CommCenter learns the
 slots from the baseband). So the guamp answers that describe the real phone (SM6115 modem, two nano-SIM slots, voice and data,
@@ -62,15 +63,18 @@ def answers(adt):
             'telephony': tel, 'sms': tel, 'CellularTelephonyCapability': tel, 'mms': cls == 1, 'data-plan': cls == 3 and bb,
             'BasebandClass': u32(adt.get('/device-tree/baseband/class')),
             'EUICCChipID': u32(adt.get('/device-tree/baseband/euicc-chip-id')),
-            'BasebandChipset': text(adt.get('/device-tree/product/baseband-chipset'))}
+            'BasebandChipset': text(adt.get('/device-tree/product/baseband-chipset')),
+            'personal-hotspot': bool(u32(adt.get('/device-tree/product/personal-hotspot')))}
 
 
 # The real phone: SM6115 modem with voice, SMS and data, two physical SIM slots, no eUICC.
 GUAMP = {'DeviceClassNumber': 1, 'HasBaseband': True, 'cellular-data': True, 'contains-cellular-radio': True, 'telephony': True,
-         'sms': True, 'CellularTelephonyCapability': True, 'mms': True, 'data-plan': False, 'EUICCChipID': None}
+         'sms': True, 'CellularTelephonyCapability': True, 'mms': True, 'data-plan': False, 'EUICCChipID': None,
+         'personal-hotspot': True}
 # ADT properties the answers above come from: guamp-mg-adt-sync must stamp all of them.
 STAMPED = {('/baseband', 'name'), ('/baseband', 'class'), ('/baseband', 'euicc-chip-id'), ('/product', 'baseband-chipset'),
-           ('/', 'model'), ('/', 'model-number'), ('/', 'region-info'), ('/', 'regulatory-model-number')}
+           ('/', 'model'), ('/', 'model-number'), ('/', 'region-info'), ('/', 'regulatory-model-number'),
+           ('/product', 'personal-hotspot')}
 
 
 def check_guamp(a, where):
@@ -137,8 +141,9 @@ def self_test():
     phone = {'/device-tree/model': b'iPhone10,3\0', '/device-tree/compatible': b'motorola,guamp\0qcom,bengal\0qcom,sm6115\0',
              '/device-tree/product/baseband-chipset': b'mav16\0', '/device-tree/baseband/name': b'baseband\0',
              '/device-tree/baseband/compatible': b'baseband,n41\0qcom,sm6115-mpss-pas\0',
-             '/device-tree/baseband/class': struct.pack('<I', 3), '/device-tree/baseband/guamp,sim-slots': struct.pack('<I', 2)}
-    check_guamp(answers(phone), 'guamp ADT (06/11 layout)')
+             '/device-tree/baseband/class': struct.pack('<I', 3), '/device-tree/baseband/guamp,sim-slots': struct.pack('<I', 2),
+             '/device-tree/product/personal-hotspot': struct.pack('<I', 1)}
+    check_guamp(answers(phone), 'guamp ADT (07/11 layout)')
     fin49 = dict(phone, **{'/device-tree/compatible': b'J121AP\0motorola,guamp\0qcom,bengal\0qcom,sm6115\0',
                            '/device-tree/baseband/euicc-chip-id': struct.pack('<I', 2)})
     a = answers(fin49)
@@ -238,7 +243,8 @@ class Dylib:
 
 KEYS = ('HasBaseband', 'cellular-data', 'contains-cellular-radio', 'telephony', 'sms', 'CellularTelephonyCapability', 'mms',
         'data-plan', 'BasebandClass', 'EUICCChipID', 'BasebandChipset',
-        'ModelNumber', 'RegionInfo', 'RegulatoryModelNumber')   # 07/11 About (scripts/make-guamp-model-number-adt.py)
+        'ModelNumber', 'RegionInfo', 'RegulatoryModelNumber',   # 07/11 About (scripts/make-guamp-model-number-adt.py)
+        'personal-hotspot')   # 07/11 Personal Hotspot (scripts/make-guamp-hotspot-adt.py)
 
 
 def check_mg(path):
@@ -260,6 +266,7 @@ def check_mg(path):
     assert s['ModelNumber'][0] == ['IODeviceTree:/', 'model-number'], s['ModelNumber']
     assert s['RegionInfo'][0] == ['IOPlatformExpertDevice', 'region-info'], s['RegionInfo']
     assert s['RegulatoryModelNumber'][0] == ['IODeviceTree:/', obf('regulatory-model-number')], s['RegulatoryModelNumber']
+    assert s['personal-hotspot'][0] == ['IODeviceTree:/product', obf('personal-hotspot')], s['personal-hotspot']
     return s
 
 
