@@ -177,6 +177,48 @@ int main() {
     CHECK(emmcra::tryHit(1000040, 128, 2000000, &d, 0) == 0);  // the read-ahead size or more: never cached
     CHECK(emmcra::noteRequest(5000000, 8) == false && emmcra::noteRequest(5000008, 8) == true && !emmcra::gLock->held);
   }
+  // 16. (07/11) The read-ahead tail stops where a cached slot starts: 100 blocks read instead of 128, the data right,
+  // the rest served by the later slot; the victim never shortens its own replacement.
+  gArgRa = 64; gArgAdapt = 0; gArgSlots = 32; emmcra::configure();
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  CHECK(readRun(2000100, 8, 3000000, &how) && how == 1);   // slot [2000100, 2000228)
+  {
+    uint64_t blocks = gCard.blocksRead, clipped = emmcra::gClipped, cmds = gCard.commands;
+    CHECK(readRun(2000000, 8, 3000000, &how) && how == 1);
+    CHECK(gCard.blocksRead - blocks == 100 && emmcra::gClipped - clipped == 28);
+    CHECK(emmcra::find(2000000, 100) != nullptr && emmcra::find(2000000, 101) == nullptr);
+    CHECK(readRun(2000090, 8, 3000000, &how) && how == 1);   // inside the clipped slot
+    CHECK(readRun(2000100, 16, 3000000, &how) && how == 1);  // the later slot
+    CHECK(gCard.commands == cmds + 1);
+  }
+  // 17. A slot starting inside the requested run: nothing ahead to read, bypass; the cached slot stays.
+  CHECK(readRun(2100004, 8, 3000000, &how) && how == 1);
+  {
+    uint64_t bypass = emmcra::gBypass;
+    CHECK(readRun(2100000, 8, 3000000, &how) && how == 0);
+    CHECK(emmcra::gBypass == bypass + 1 && emmcra::find(2100004, 8) != nullptr);
+  }
+  // 18. The only other slot is the victim (8 slots, all used, the oldest right after the request): not a clip.
+  gArgSlots = 8; emmcra::configure();
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  CHECK(readRun(2200050, 8, 3000000, &how) && how == 1);   // oldest
+  for (unsigned k = 1; k < 8; k++) CHECK(readRun(2300000 + k * 1000, 8, 3000000, &how) && how == 1);
+  {
+    uint64_t blocks = gCard.blocksRead;
+    CHECK(readRun(2200000, 8, 3000000, &how) && how == 1);
+    CHECK(gCard.blocksRead - blocks == 128 && emmcra::find(2200050, 8) != nullptr);
+  }
+  // 19. Unused blocks of a 16 KiB fill are counted apart.
+  gArgAdapt = 1; gArgSlots = 8; emmcra::configure();
+  for (unsigned i = 0; i < emmcra::kSlots; i++) emmcra::gSlot[i].count = 0;
+  {
+    uint64_t small = emmcra::gUnusedSmall;
+    emmcra::note(2400000, 8);
+    CHECK(readRun(2400000, 8, 3000000, &how) && how == 1);   // 32 blocks, 8 used
+    for (unsigned k = 0; k < 8; k++) { emmcra::note(2500000 + k * 1024, 8); CHECK(readRun(2500000 + k * 1024, 8, 3000000, &how) && how == 1); }
+    CHECK(emmcra::find(2400000, 8) == nullptr && emmcra::gUnusedSmall - small == 24);
+  }
+  gArgAdapt = 0; gArgSlots = 0;
   // 15. Off: tryHit never serves.
   gArgRa = 0; emmcra::configure();
   { IOMemoryDescriptor d; d.bytes.assign(8 * kBlock, 0); CHECK(emmcra::tryHit(1000000, 8, 2000000, &d, 0) == 0); }

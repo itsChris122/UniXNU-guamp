@@ -96,6 +96,9 @@ uint32_t native_emmc_dma = 0;
 uint32_t native_emmc_dma_write = 0;                 // CMD25 + ADMA2 writes in use (guamp-emmc-dmaw=1, self-tested)
 uint64_t native_emmc_dma_write_failures = 0, native_emmc_dma_write_runs = 0;
 uint64_t native_emmc_dma_failures = 0;
+// 07/11: CMD25 + ADMA2 write runs (Data window and batched kpan log) under the card gate: count, blocks, time from the
+// busy wait before the command to the end of the card busy after it (the card programming), the longest run.
+uint64_t native_emmc_w_runs = 0, native_emmc_w_blocks = 0, native_emmc_w_ticks = 0, native_emmc_w_max = 0, native_emmc_w_busy = 0;
 int native_emmc_last_pid = -1;
 void proc_selfname(char *, int);
 int proc_selfpid(void);
@@ -198,15 +201,23 @@ constexpr uint32_t kDmaWriteTestBlock = 12000;     // 64 free kpan blocks for th
 //   so tryHit() copies a listed slot holding gLock alone, before doAsyncReadWrite takes the card gate;
 // - two requests missing the same range: the second finds the first one's slot once it has the gate (no second read);
 // - guamp-emmc-ra-slots up to 1024 (64 MiB at 64 KiB); the default table now asks 512 (32 MiB).
+// 07/11 (fin53 boot, 11-41 s: card 82-96 % busy, CPU 30-65 % idle at 21-31 s, so the boot waits for the card; per 10 s
+// 12k fills read 330-410 MB ahead of which 120-140 MB never served, 26-33 % of the card time spent on blocks read ahead):
+// - a fill no longer reads into the start of a slot already cached after it (the next stream fill or a 16 KiB fill
+//   further on): it stops there, the blocks are served by that slot. Only the read-ahead tail is shortened, never the
+//   requested run, and the slot chosen as victim is retired first so it does not shorten the fill it makes room for;
+// - the "ra" line also gives the unused KiB of the 16 KiB fills (adapt) apart, and the KiB the clipping did not read
+//   ("overlap skipped"), to size the stream fills from the next boot.
 namespace emmcra {
 constexpr unsigned kMaxSlots = 1024, kStreams = 8, kSmallBlocks = 32;   // 32 blocks = 16 KiB
-struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint32_t used; uint8_t *data; };
+struct Slot { uint64_t lba; uint32_t count; uint32_t age; uint32_t used; uint8_t *data; bool small; };
 static Slot gSlot[kMaxSlots];
 static unsigned kSlots = 32;   // guamp-emmc-ra-slots (the name of the former constant, so the loops read the same)
 static uint32_t gBlocks = 0, gClock = 0, gHistOn = 1, gAdapt = 0;
 static bool gLastSeq = false;
 static uint64_t gHits = 0, gFills = 0, gHitBlocks = 0, gExtraBlocks = 0, gBypass = 0, gUnused = 0, gSmall = 0;
 static uint64_t gFastHits = 0;   // hits served without the card gate (tryHit)
+static uint64_t gUnusedSmall = 0, gClipped = 0;   // unused blocks of 16 KiB fills; read-ahead blocks already in a later slot
 static uint64_t gHist[6] = {}, gSeq = 0, gReqs = 0, gEnds[kStreams] = {};
 static unsigned gEndAt = 0;
 static IOLock *gLock = nullptr;
@@ -259,7 +270,10 @@ static bool noteRequest(uint64_t lba, uint64_t count) {
   return seq;
 }
 static void retire(Slot &slot) {   // the slot leaves the cache: count what was read and never served
-  if (slot.count > slot.used) gUnused += slot.count - slot.used;
+  if (slot.count > slot.used) {
+    gUnused += slot.count - slot.used;
+    if (slot.small) gUnusedSmall += slot.count - slot.used;
+  }
   slot.count = 0;
 }
 // Card gate held: drops every slot overlapping [lba, lba + count).
@@ -323,13 +337,14 @@ static void report() {
     lSeq = gSeq; lReqs = gReqs;
   }
   if (gBlocks) {
-    static uint64_t lFast;
+    static uint64_t lFast, lUnusedSmall, lClipped;
     IOLog("NativeEmmc ra: hits %llu (%llu KiB), fills %llu (+%llu KiB ahead, %llu small), bypass %llu, unused %llu KiB; "
-          "%llu hits without the card gate, %u slots\n",
+          "%llu hits without the card gate, %u slots; unused of small fills %llu KiB, overlap skipped %llu KiB\n",
           gHits - lHits, (gHitBlocks - lHitBlocks) * kBlock / 1024, gFills - lFills, (gExtraBlocks - lExtra) * kBlock / 1024,
-          gSmall - lSmall, gBypass - lBypass, (gUnused - lUnused) * kBlock / 1024, gFastHits - lFast, kSlots);
+          gSmall - lSmall, gBypass - lBypass, (gUnused - lUnused) * kBlock / 1024, gFastHits - lFast, kSlots,
+          (gUnusedSmall - lUnusedSmall) * kBlock / 1024, (gClipped - lClipped) * kBlock / 1024);
     lHits = gHits; lFills = gFills; lHitBlocks = gHitBlocks; lExtra = gExtraBlocks; lBypass = gBypass; lUnused = gUnused;
-    lSmall = gSmall; lFast = gFastHits;
+    lSmall = gSmall; lFast = gFastHits; lUnusedSmall = gUnusedSmall; lClipped = gClipped;
   }
 }
 }  // namespace emmcra
@@ -680,6 +695,7 @@ public:
       cacheOp(dmaTable, descriptors * 8, 0);
       cacheOp(dmaData, bytes, 0);
     }
+    const uint64_t began = mach_absolute_time();
     if (!waitIdle(5000)) native_emmc_stuck_busy++;
     w32(rStatus, 0xFFFFFFFF);
     w32(rAdmaAddr, dmaTablePhys);
@@ -693,8 +709,15 @@ public:
     bool ok = !wait(sCmdDone, 100) && !wait(sXferDone, 5000);
     w8(rHostCtl, static_cast<uint8_t>(r8(rHostCtl) & ~0x18));                // PIO paths: no DMA select
     // Transfer complete comes after the auto CMD12 busy; the card may still be programming its cache
+    const uint64_t transferred = mach_absolute_time();
     if (ok && !waitIdle(5000)) { native_emmc_stuck_busy++; ok = false; }
     if (ok) native_emmc_writes += count;
+    const uint64_t took = mach_absolute_time() - began;
+    native_emmc_w_runs++;
+    native_emmc_w_blocks += count;
+    native_emmc_w_ticks += took;
+    native_emmc_w_busy += mach_absolute_time() - transferred;
+    if (took > native_emmc_w_max) native_emmc_w_max = took;
     return ok;
   }
 
@@ -814,19 +837,52 @@ struct Card {
     if (ok) guamp_emmc_log_bytes += kBlock;
     return ok;
   }
-  // Writes the blocks of source that differ from shadow; false on a write error
+  // Writes the blocks of source that differ from shadow; false on a write error.
+  // 07/11 (fin53 boot, 11-41 s: "mirror-max" 62-108 ms per 10 s, 54-132 KiB of log text written one PIO CMD24 per block
+  // while holding the card gate, so every page fault of that moment waited up to 0.1 s): in a periodic pass with the
+  // verified CMD25 + ADMA2 writes, consecutive changed blocks (up to the 64 KiB bounce buffer) go out as one command;
+  // a failed run is written again block by block. The flushes of guamp_emmc_flush (restart, power off, panic: flushType
+  // set) keep the single-block PIO path. Only kpan blocks, as before (bounds checked per run).
+  bool mirrorRun(uint64_t index, uint32_t count, uint8_t *copy) {
+    if (!count) return true;
+    if (!logBlocks || index >= logBlocks || count > logBlocks - index) return false;
+    emmcra::invalidate(logFirst + index, count);
+    bool ok = host.writeDma(logFirst + index, count, bounce);
+    if (ok) guamp_emmc_log_bytes += static_cast<uint64_t>(count) * kBlock;
+    else {
+      native_emmc_errors++;
+      host.recover();
+      for (uint32_t i = 0; i < count; i++)
+        if (!writeLogBlock(index + i, bounce + static_cast<uint64_t>(i) * kBlock)) return false;
+    }
+    memcpy(copy, bounce, static_cast<size_t>(count) * kBlock);
+    return true;
+  }
   bool mirrorRange(uint64_t firstBlock, const volatile uint8_t *source, uint8_t *copy, uint32_t bytes) {
-    uint32_t blocks = (bytes + kBlock - 1) / kBlock;
+    const bool batch = native_emmc_dma_write && !flushType && !emmcra::gPanic;
+    uint32_t blocks = (bytes + kBlock - 1) / kBlock, runFirst = 0, runCount = 0;
     for (uint32_t b = 0; b < blocks; b++) {
-      uint8_t *page = bounce;
+      uint8_t *page = batch ? bounce + static_cast<uint64_t>(runCount) * kBlock : bounce;
       uint32_t offset = b * kBlock, length = bytes - offset < kBlock ? bytes - offset : kBlock;
       memset(page, 0, kBlock);
       for (uint32_t i = 0; i < length; i++) page[i] = source[offset + i];
-      if (!memcmp(page, copy + offset, kBlock)) continue;
-      if (!writeLogBlock(firstBlock + b, page)) return false;
-      memcpy(copy + offset, page, kBlock);
+      if (!memcmp(page, copy + offset, kBlock)) {
+        if (batch && !mirrorRun(firstBlock + runFirst, runCount, copy + static_cast<uint64_t>(runFirst) * kBlock)) return false;
+        runCount = 0;
+        continue;
+      }
+      if (!batch) {
+        if (!writeLogBlock(firstBlock + b, page)) return false;
+        memcpy(copy + offset, page, kBlock);
+        continue;
+      }
+      if (!runCount) runFirst = b;
+      if (++runCount == kBounceBlocks) {
+        if (!mirrorRun(firstBlock + runFirst, runCount, copy + static_cast<uint64_t>(runFirst) * kBlock)) return false;
+        runCount = 0;
+      }
     }
-    return true;
+    return !batch || mirrorRun(firstBlock + runFirst, runCount, copy + static_cast<uint64_t>(runFirst) * kBlock);
   }
   bool findPartitions();
   void mirror(bool framebuffer);
@@ -864,10 +920,23 @@ static int readAhead(uint64_t lba, uint32_t count, uint64_t end, IOMemoryDescrip
     unlock();
     return served;
   }
+  const uint64_t smallBefore = gSmall;
   uint64_t blocks = fillBlocks(lba, count, end - lba, seq);
   if (blocks <= count) { gBypass = gBypass + 1; unlock(); return 0; }
+  const bool small = gSmall != smallBefore;
   slot = victim();
+  // The read-ahead tail stops where a cached slot starts (07/11): those blocks are served by it. The victim does not
+  // count (it leaves the cache now), and a fill left with nothing ahead is a bypass that keeps the victim.
+  uint64_t clipped = blocks;
+  for (unsigned i = 0; i < kSlots; i = i + 1)
+    if (&gSlot[i] != slot && gSlot[i].count && gSlot[i].lba > lba && gSlot[i].lba < lba + clipped) clipped = gSlot[i].lba - lba;
+  if (clipped < blocks) {
+    gClipped += blocks - (clipped > count ? clipped : count);
+    if (clipped <= count) { gBypass = gBypass + 1; unlock(); return 0; }
+    blocks = clipped;
+  }
   if (slot->count) retire(*slot);
+  slot->small = small;
   unlock();
   if (!gCard.readBlocks(lba, static_cast<uint32_t>(blocks), slot->data)) { lock(); gBypass = gBypass + 1; unlock(); return 0; }
   lock();
@@ -1104,6 +1173,21 @@ void mirrorEntry(thread_call_param_t, thread_call_param_t)
       }
     }
     emmcra::report();
+    {
+      static uint64_t lastWRuns = 0, lastWBlocks = 0, lastWTicks = 0, lastWBusy = 0;
+      const uint64_t wRuns = native_emmc_w_runs - lastWRuns;
+      if (wRuns) {
+        uint64_t total = 0, busyAfter = 0, longest = 0;
+        absolutetime_to_nanoseconds(native_emmc_w_ticks - lastWTicks, &total);
+        absolutetime_to_nanoseconds(native_emmc_w_busy - lastWBusy, &busyAfter);
+        absolutetime_to_nanoseconds(native_emmc_w_max, &longest);
+        native_emmc_w_max = 0;
+        IOLog("NativeEmmc write: %llu DMA runs, %llu blocks each, %llu us each of which %llu after the transfer (card busy), "
+              "longest %llu us\n", wRuns, (native_emmc_w_blocks - lastWBlocks) / wRuns, total / 1000 / wRuns,
+              busyAfter / 1000 / wRuns, longest / 1000);
+      }
+      lastWRuns = native_emmc_w_runs; lastWBlocks = native_emmc_w_blocks; lastWTicks = native_emmc_w_ticks; lastWBusy = native_emmc_w_busy;
+    }
     if (native_emmc_errors)
       IOLog("NativeEmmc: %llu errors, %llu recoveries (%llu busy past the limit), last error status 0x%08x, %llu writes, DMA write runs %llu (failed %llu)\n",
             native_emmc_errors, native_emmc_recoveries, native_emmc_stuck_busy, native_emmc_last_error, native_emmc_writes,
