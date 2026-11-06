@@ -1,0 +1,119 @@
+turnip (guamp A610): TU_GUAMP_GMEM=fetch|blur (tile memory for the framebuffer-fetch passes, and for Turnip-owned passes that load
+nothing), exact tile stores also where the aligned rows would leave an image that shares its memory (a plane of a planar IOSurface
+imported whole, a texture over a buffer at an offset), and counter [7]: passes in sysmem with SINGLE_PRIM_MODE
+
+metal2vulkan reads Metal's framebuffer fetch as input attachments in rasterization order; in sysmem Turnip draws such a pipeline with
+GRAS_SC_CNTL FLUSH_PER_OVERLAP_AND_OVERWRITE (the CCU written back to DRAM at every overlap), in GMEM with FLUSH_PER_OVERLAP on chip
+and the input read from tile memory. fetch = msaa + those passes (the autotune then picks GMEM for them); blur = fetch + passes whose
+attachments are all Turnip's own and cleared or don't-care (Core Animation's blur and offscreen passes), left to the autotune.
+0003 checked the fast store only against the end of the BO: the bridge imports a planar surface whole ('b3a8' 750x1666: BGR10 XR
+plane then the A8 plane), so the two rows past 1666 (6 KiB of tile garbage) land inside the BO, at the start of the next plane.
+Policy values 0-3 unchanged (row TU pol 4 fetch, 5 blur; f<counter 7> with adreno-metal 0055). Applies after 0001-0003 (both 0003).
+
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5999,6 +5999,17 @@
+    if (row_bytes > pitch)
+       return true;
+    const uint64_t rows = align64(y2, align_h);
++   /* guamp 0004: rows past the view's last row on an image that shares its memory. Turnip pads the last level of its own linear
++    * layout to the block height (fdl6), but there the image is the caller's: a plane of a planar IOSurface (the bridge imports the
++    * surface whole and binds plane 0 right before plane 1, so 'b3a8' 750x1666 would get two rows of tile garbage, 6 KiB, at the
++    * start of its alpha plane), or a texture over a buffer at an offset (the buffer's other data follow). Those writes stay inside
++    * the BO, where the BO-end check below never looks. */
++   bool shared = image->mem_offset != 0;
++#ifdef TU_HAS_DARWIN
++   shared = shared || image->mem->bo->darwin_host_import;
++#endif
++   if (shared && rows > iview->view.height)
++      return true;
+    const uint64_t layers = iview->vk.layer_count ? iview->vk.layer_count : 1;
+    const uint64_t end = iview->view.base_addr + (layers - 1) * (uint64_t) iview->view.layer_size + (rows - 1) * pitch + row_bytes;
+    const struct tu_bo *bo = image->mem->bo;
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1388,13 +1388,22 @@
+  *   none   every pass in system memory, as before this patch;
+  *   msaa   passes with a multisampled attachment (the default);
+  *   owned  those, and passes whose attachments are all in memory Turnip allocated (no host import: IOSurfaces stay in sysmem);
+- *   all    TU_DEBUG "sysmem" is ignored (Turnip's autotune for every pass, the fin46d test).
++ *   all    TU_DEBUG "sysmem" is ignored (Turnip's autotune for every pass, the fin46d test);
++ *   fetch  msaa, and passes where a pipeline needs SINGLE_PRIM_MODE in sysmem (patches/mesa-turnip/0004): a framebuffer fetch through
++ *          input attachments in rasterization order (metal2vulkan's form of Metal's fetch), a feedback loop. In sysmem each such draw
++ *          runs FLUSH_PER_OVERLAP_AND_OVERWRITE (the CCU written back to DRAM at every overlap, the bridge measured 50-130 ms for a
++ *          home screen frame when every pipeline had it); in GMEM it is FLUSH_PER_OVERLAP on chip and the input attachment is read
++ *          from tile memory, and Turnip's autotune picks GMEM for such a pass anyway;
++ *   blur   fetch, and passes whose attachments are all Turnip's own memory and none is loaded (cleared or don't-care: the blur and
++ *          offscreen group passes of Core Animation), left to the autotune.
+  * Without "sysmem" in TU_DEBUG the variable changes nothing. tu_guamp_render_counts() reads the counters for the Metal plugin's rows. */
+ enum tu_guamp_gmem_policy {
+    TU_GUAMP_GMEM_NONE = 0,
+    TU_GUAMP_GMEM_MSAA = 1,
+    TU_GUAMP_GMEM_OWNED = 2,
+    TU_GUAMP_GMEM_ALL = 3,
++   TU_GUAMP_GMEM_FETCH = 4, /* guamp 0004 */
++   TU_GUAMP_GMEM_BLUR = 5,  /* guamp 0004 */
+ };
+ 
+ static uint64_t tu_guamp_counts[8];
+@@ -1414,6 +1423,10 @@
+          value = TU_GUAMP_GMEM_OWNED;
+       else if (text && (!strcmp(text, "all") || !strcmp(text, "autotune")))
+          value = TU_GUAMP_GMEM_ALL;
++      else if (text && !strcmp(text, "fetch"))
++         value = TU_GUAMP_GMEM_FETCH;
++      else if (text && (!strcmp(text, "blur") || !strcmp(text, "offscreen")))
++         value = TU_GUAMP_GMEM_BLUR;
+       __atomic_store_n(&policy, value, __ATOMIC_RELAXED);
+    }
+    return (enum tu_guamp_gmem_policy) value;
+@@ -1451,6 +1464,18 @@
+    return true;
+ }
+ 
++/* guamp 0004: no attachment of the pass is loaded from memory (each is cleared or don't-care), so tile memory costs no load. */
++static bool
++tu_guamp_pass_unloaded(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++   for (unsigned i = 0; i < pass->attachment_count; i++) {
++      if (cmd->state.attachments && cmd->state.attachments[i] && (pass->attachments[i].load || pass->attachments[i].load_stencil))
++         return false;
++   }
++   return true;
++}
++
+ /* Whether a pass TU_DEBUG "sysmem" would send to system memory goes on to Turnip's choice (TU_GUAMP_GMEM). */
+ static bool
+ tu_guamp_gmem_allowed(const struct tu_cmd_buffer *cmd)
+@@ -1462,6 +1487,11 @@
+       return tu_guamp_pass_multisampled(cmd) || tu_guamp_pass_owned(cmd);
+    case TU_GUAMP_GMEM_MSAA:
+       return tu_guamp_pass_multisampled(cmd);
++   case TU_GUAMP_GMEM_FETCH:
++      return tu_guamp_pass_multisampled(cmd) || cmd->state.rp.sysmem_single_prim_mode;
++   case TU_GUAMP_GMEM_BLUR:
++      return tu_guamp_pass_multisampled(cmd) || cmd->state.rp.sysmem_single_prim_mode ||
++             (tu_guamp_pass_owned(cmd) && tu_guamp_pass_unloaded(cmd));
+    default:
+       return false;
+    }
+@@ -1469,7 +1499,8 @@
+ 
+ /* Counters: [0] passes in GMEM, [1] passes in sysmem, [2] multisampled passes in GMEM, [3] passes TU_GUAMP_GMEM let past "sysmem",
+  * [4] tile stores made exact because the aligned blocks would leave the image (tu_clear_blit.cc), [5] the policy, [6] multisampled
+- * passes in sysmem. *reason: the last reason a pass went to sysmem (a static string). */
++ * passes in sysmem, [7] passes in sysmem with SINGLE_PRIM_MODE (a fetch or feedback loop flushed per overlap in DRAM; guamp 0004).
++ * *reason: the last reason a pass went to sysmem (a static string). */
+ extern "C" void tu_guamp_count_exact_store(void);
+ extern "C" void
+ tu_guamp_count_exact_store(void)
+@@ -4171,6 +4202,8 @@
+    __atomic_fetch_add(&tu_guamp_counts[sysmem ? 1 : 0], 1, __ATOMIC_RELAXED);
+    if (multisampled)
+       __atomic_fetch_add(&tu_guamp_counts[sysmem ? 6 : 2], 1, __ATOMIC_RELAXED);
++   if (sysmem && cmd_buffer->state.rp.sysmem_single_prim_mode)
++      __atomic_fetch_add(&tu_guamp_counts[7], 1, __ATOMIC_RELAXED); /* guamp 0004 */
+    if (sysmem && cmd_buffer->state.rp.gmem_disable_reason)
+       __atomic_store_n(&tu_guamp_last_reason, cmd_buffer->state.rp.gmem_disable_reason, __ATOMIC_RELAXED);
+    if (sysmem)

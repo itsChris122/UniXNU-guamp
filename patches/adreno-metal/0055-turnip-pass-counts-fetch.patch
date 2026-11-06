@@ -1,0 +1,20 @@
+guamp: the TU row also shows f<passes rendered in sysmem with SINGLE_PRIM_MODE>, the framebuffer-fetch (input attachments in
+rasterization order) or feedback-loop passes whose draws Turnip flushes per overlap in DRAM, counter [7] of tu_guamp_render_counts
+(mesa-turnip 0004; a Turnip with 0003 alone reports 0 there), and the policies 4 fetch and 5 blur. Applies after 0031.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -3238,7 +3238,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+   uint64_t c[8]={};const char *reason=nullptr;
+   if(tuCounts && tuCounts(c,8,&reason)>=7)
+-   snprintf(tuRow,sizeof tuRow,"TU g%llu s%llu m%llu/%llu p%llu x%llu pol%llu %.30s",(unsigned long long)c[0],(unsigned long long)c[1],
+-    (unsigned long long)c[2],(unsigned long long)c[6],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[5],
+-    reason?reason:"-");
++   // guamp 0055: f<sysmem passes flushed per overlap (fetch, feedback loop; mesa-turnip 0004)>; pol 4 fetch, 5 blur.
++   snprintf(tuRow,sizeof tuRow,"TU g%llu s%llu m%llu/%llu p%llu x%llu f%llu pol%llu %.30s",(unsigned long long)c[0],(unsigned long long)c[1],
++    (unsigned long long)c[2],(unsigned long long)c[6],(unsigned long long)c[3],(unsigned long long)c[4],(unsigned long long)c[7],
++    (unsigned long long)c[5],reason?reason:"-");
+  }
+  {
+   std::lock_guard<std::mutex> lock(gWindowLock);
