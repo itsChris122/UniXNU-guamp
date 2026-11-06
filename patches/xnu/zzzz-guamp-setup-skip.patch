@@ -1,7 +1,7 @@
 diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7858,6 +7858,642 @@
+@@ -7858,6 +7858,658 @@
  	printf("guamp: /private/var skeleton: %d created, %d failed (last error %d)\n", native_guamp_skeleton_created,
  	    native_guamp_skeleton_failed, native_guamp_skeleton_error);
  }
@@ -54,7 +54,15 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 + * dictation (assistantd, corespeechd), mobileassetd, chronod, PowerLog. guamp-slim-commcenter=1 (NOW list) leaves
 + * CommCenter enabled for the SIM work (it is off in every other list). com.apple.biometrickitd.mesa (29/10, NOW list): launchd
 + * only loads it when the ADT has a "mesa" node (_LimitLoadToDeviceTree), i.e. with the Touch ID ADT; without AppleMesa/SEP it has
-+ * no sensor, so it stays disabled and BiometricKit clients fail at once; guamp-biokit=1 enables it (scripts/make-guamp-siri-adt.py). */
++ * no sensor, so it stays disabled and BiometricKit clients fail at once; guamp-biokit=1 enables it (scripts/make-guamp-siri-adt.py).
++ * 07/11 (owner: re-enable what the phone can now use; Wi-Fi, Bluetooth, modem and FairPlay emulation work): the 29/10 list no
++ * longer has CommCenter (guamp-slim-commcenter=1 is no longer needed), fairplayd.A2 (guamp-slim-fairplay=1 is no longer needed),
++ * IndexAgent and corespotlightservice (search; the keyboard 100% CPU loop was dictation, fixed by guamp-kb-prefs), newsd and
++ * siriknowledged; the 27/10 list (guamp-slim-legacy=1, guamp-slim=2) is unchanged. Still off: identityservicesd (no Apple
++ * activation for iMessage/FaceTime), locationd (stock list; never tried here, RunAtLoad + KeepAlive, also hosts CoreMotion
++ * while the sensors give no samples; opt-in guamp-slim-locationd=1), routined (abort loop, needs locationd), accessoryupdaterd,
++ * biomesyncd, knowledgeconstructiond, spotlightknowledged (background only), mediaanalysisd (CPU/eMMC/RAM), the stackshot takers. */
++static int native_guamp_slim_locationd;	/* 07/11: guamp-slim-locationd=1 leaves locationd out of the 29/10 list */
 +#define GUAMP_SLIM_NOW 1
 +#define GUAMP_SLIM_LEGACY 2
 +#define GUAMP_SLIM_BT 4
@@ -70,26 +78,26 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	int lists;
 +	int disabled;
 +} native_guamp_slim_jobs[] = {
-+	{"com.apple.CommCenter", GUAMP_SLIM_ALL | GUAMP_SLIM_COMMCENTER, 1},
++	{"com.apple.CommCenter", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT | GUAMP_SLIM_COMMCENTER, 1},	/* 07/11: NOT in the 29/10 list: the modem runs (QcomBaseband, guamp-baseband=2) */
 +	{"com.apple.accessoryupdaterd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.biomesyncd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.biometrickitd.mesa", GUAMP_SLIM_NOW | GUAMP_SLIM_BIOKIT, 1},
 +	{"com.apple.bluetoothd", GUAMP_SLIM_BT, 1},
-+	{"com.apple.corespotlightservice", GUAMP_SLIM_ALL | GUAMP_SLIM_SPOTLIGHT, 1},
-+	{"com.apple.fairplayd.A2", GUAMP_SLIM_NOW | GUAMP_SLIM_FAIRPLAY, 1},
++	{"com.apple.corespotlightservice", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT | GUAMP_SLIM_SPOTLIGHT, 1},	/* 07/11: NOT in the 29/10 list (Spotlight search) */
++	{"com.apple.fairplayd.A2", GUAMP_SLIM_FAIRPLAY, 1},	/* 07/11: in no list any more: FairPlay is emulated in the kernel (fin32) */
 +	{"com.apple.iconservices.iconservicesagent", GUAMP_SLIM_ALL, 0},
 +	{"com.apple.identityservicesd", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.itunescloudd", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},	/* 04/11: NOT in the 29/10 list: MusicWidgets looked it up 6348 times (10 tries per service, error 3) */
 +	{"com.apple.knowledgeconstructiond", GUAMP_SLIM_ALL, 1},
-+	{"com.apple.locationd", GUAMP_SLIM_ALL, 1},
++	{"com.apple.locationd", GUAMP_SLIM_ALL, 1},	/* 07/11: guamp-slim-locationd=1 enables it (29/10 list only) */
 +	{"com.apple.mediaanalysisd", GUAMP_SLIM_ALL | GUAMP_SLIM_MEDIA, 1},
 +	{"com.apple.mediaanalysisd.service", GUAMP_SLIM_ALL | GUAMP_SLIM_MEDIA, 1},
-+	{"com.apple.newsd", GUAMP_SLIM_ALL, 1},
++	{"com.apple.newsd", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},	/* 07/11: NOT in the 29/10 list: News and its widget need only the network (Wi-Fi up) */
 +	{"com.apple.photoanalysisd", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},
 +	{"com.apple.routined", GUAMP_SLIM_ALL, 1},
-+	{"com.apple.siriknowledged", GUAMP_SLIM_ALL, 1},
++	{"com.apple.siriknowledged", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT, 1},	/* 07/11: NOT in the 29/10 list: Siri vocabulary/contacts, launched on demand */
 +	{"com.apple.spindump", GUAMP_SLIM_ALL, 1},
-+	{"com.apple.spotlight.IndexAgent", GUAMP_SLIM_ALL | GUAMP_SLIM_SPOTLIGHT, 1},
++	{"com.apple.spotlight.IndexAgent", GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT | GUAMP_SLIM_SPOTLIGHT, 1},	/* 07/11: NOT in the 29/10 list (Spotlight search) */
 +	{"com.apple.spotlightknowledged", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.systemstats.microstackshot_periodic", GUAMP_SLIM_ALL, 1},
 +	{"com.apple.tailspind", GUAMP_SLIM_ALL, 1},
@@ -174,7 +182,8 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n";
 +	size_t used = strlcpy(native_guamp_slim_plist, head, sizeof(native_guamp_slim_plist));
 +	for (size_t i = 0; i < sizeof(native_guamp_slim_jobs) / sizeof(native_guamp_slim_jobs[0]); i++) {
-+		if (!(native_guamp_slim_jobs[i].lists & list) || (native_guamp_slim_jobs[i].lists & skip)) {
++		if (!(native_guamp_slim_jobs[i].lists & list) || (native_guamp_slim_jobs[i].lists & skip) ||
++		    (native_guamp_slim_locationd && (list & GUAMP_SLIM_NOW) && strcmp(native_guamp_slim_jobs[i].label, "com.apple.locationd") == 0)) {
 +			continue;
 +		}
 +		int n = snprintf(native_guamp_slim_plist + used, sizeof(native_guamp_slim_plist) - used, "\t<key>%s</key>\n\t<%s/>\n",
@@ -480,6 +489,9 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	PE_parse_boot_argn("guamp-slim-media", &guamp_slim_media, sizeof(guamp_slim_media));
 +	unsigned int guamp_slim_fairplay = 0;	/* 29/10: 1 leaves fairplayd.A2 enabled */
 +	PE_parse_boot_argn("guamp-slim-fairplay", &guamp_slim_fairplay, sizeof(guamp_slim_fairplay));
++	unsigned int guamp_slim_locationd = 0;	/* 07/11, opt-in: 1 leaves locationd enabled (29/10 list only) */
++	PE_parse_boot_argn("guamp-slim-locationd", &guamp_slim_locationd, sizeof(guamp_slim_locationd));
++	native_guamp_slim_locationd = guamp_slim_locationd == 1;
 +	unsigned int guamp_slim_fast = 0, guamp_slim_commcenter = 0;	/* 29/10, opt-in: GUAMP_SLIM_FAST jobs off, CommCenter on */
 +	PE_parse_boot_argn("guamp-slim-fast", &guamp_slim_fast, sizeof(guamp_slim_fast));
 +	PE_parse_boot_argn("guamp-slim-commcenter", &guamp_slim_commcenter, sizeof(guamp_slim_commcenter));
@@ -524,8 +536,12 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			}
 +			printf("guamp-slim=%u: launchd disabled list with %s (%s, spotlight %s, media %s, fairplayd %s, %zu bytes)\n", guamp_slim,
 +			    guamp_slim == 2 ? "services + bluetoothd" : "services", list == GUAMP_SLIM_NOW ? "29/10 list" : "27/10 list",
-+			    (skip & GUAMP_SLIM_SPOTLIGHT) ? "on" : "off", (skip & GUAMP_SLIM_MEDIA) ? "on" : "off",
-+			    (list == GUAMP_SLIM_NOW && !(skip & GUAMP_SLIM_FAIRPLAY)) ? "off" : "on", built);
++			    (list == GUAMP_SLIM_NOW || (skip & GUAMP_SLIM_SPOTLIGHT)) ? "on" : "off", (skip & GUAMP_SLIM_MEDIA) ? "on" : "off",
++			    "on", built);
++			if (list == GUAMP_SLIM_NOW) {
++				printf("guamp-slim: 29/10 list (07/11) leaves CommCenter, fairplayd, Spotlight, newsd, siriknowledged on; locationd %s\n",
++				    native_guamp_slim_locationd ? "on" : "off");
++			}
 +		}
 +		if (guamp_migration_rerun == 1 && strcmp(native_guamp_setup_files[i].path, "/private/var/mobile/Library/Preferences/com.apple.migration.plist") == 0) {
 +			int32_t result = 0;
@@ -644,7 +660,7 @@ diff -ru a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static void
  native_staged_apps_prepare(proc_t p, user_addr_t scratch, mount_t data_mount)
  {
-@@ -7983,6 +8532,7 @@
+@@ -7983,6 +8548,7 @@
  	if (!error) native_gpu_addon_prepare(p, scratch);
  	if (!error) native_staged_apps_prepare(p, scratch, data_mount);
  	if (!error) native_guamp_data_skeleton(p, scratch);
