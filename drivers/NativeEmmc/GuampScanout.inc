@@ -23,7 +23,8 @@
 //                            values), a 1:1 frame (composition) with the boot loader's setup. Every SSPP/scaler register goes with
 //                            the flip's CTL flush, at the vsync. With no frame for guamp-hwscale-idle-ms (default 1000, 0 never)
 //                            the GOP frame is drawn from the shown slot (CPU scaler, outside the lock, given up if a frame comes)
-//                            and shown again with the boot loader's setup (USB mirror, panic screen). Any doubt (scaler not
+//                            and (only with guamp-hwscale-idle-flip=1) shown again with the boot loader's setup; by default the
+//                            pipe stays on the slot (fin52c: the flip back made the wallpaper vanish and come back at boot). Any doubt (scaler not
 //                            QSEED3LITE, pipe not VIG0, output not the panel, slot outside the region) leaves the flip as before.
 // Idle default (06/11): fin50 had 60 ms, shorter than the render server's frame interval at 10-15 fps (70-100 ms), so almost
 // every frame was followed by an idle return: a catch-up read of the write-combining buffer (slow) in a kernel-high thread
@@ -86,6 +87,7 @@ struct Kernel {
   bool hwWanted = false, hwOn = false;
   int hwProbe = 0;              // 0 not tried, 1 on, <0 why not (logged)
   unsigned hwIdleMs = 1000;
+  bool hwIdleFlip = false;     // guamp-hwscale-idle-flip=1: the idle return also points the pipe back at the GOP frame (fin52)
   uint32_t saved[gscanhw::kSavedCount] = {}, outSize = 0, srcFormat = 0, scVersion = 0;
   gscanhw::Slots slots = {};
   volatile uint8_t *slotVa[2] = {};
@@ -147,6 +149,7 @@ static void readOptions()
   if (gK.hwWanted) gK.flipWanted = true;
   PE_parse_boot_argn("guamp-hwscale-idle-ms", &gK.hwIdleMs, sizeof(gK.hwIdleMs));
   if (gK.hwIdleMs > 10000) gK.hwIdleMs = 10000;
+  v = 0; PE_parse_boot_argn("guamp-hwscale-idle-flip", &v, sizeof(v)); gK.hwIdleFlip = v == 1;
   PE_parse_boot_argn("guamp-copy-diff-full", &gK.fullEvery, sizeof(gK.fullEvery));
   PE_parse_boot_argn("guamp-flip-idle-ms", &gK.idleMs, sizeof(gK.idleMs));
   PE_parse_boot_argn("guamp-scanout-early", &gK.earlyFrames, sizeof(gK.earlyFrames));
@@ -297,8 +300,13 @@ static void hwIdle()
   }
   IOLockLock(gK.lock);
   gK.hwIdleBusy = false;
-  if (drawn && presents == gK.presents && gK.hwOn && gK.shownSlot == slot && !held() && clocksOn() && waitLatch()) {
-    pointGop();
+  // fin52c (06/11): pointing the pipe back at the GOP frame (boot loader setup, CPU-scaled copy) showed the lock screen
+  // wallpaper go and come back twice at boot (idle returns at ~60 s, frames in between). The GOP frame is kept up to date for
+  // the USB mirror and the compose-keep fallback, the pipe stays on the slot; guamp-hwscale-idle-flip=1 = the old behaviour.
+  // Panic/restart/blank fill point it back themselves (restore, guamp_scanout_external).
+  if (drawn && presents == gK.presents && gK.hwOn && gK.shownSlot == slot && !held() && clocksOn() &&
+      (!gK.hwIdleFlip || waitLatch())) {
+    if (gK.hwIdleFlip) pointGop();
     gK.hwIdleBacks = gK.hwIdleBacks + 1;
   } else {
     gK.hwIdleAborts = gK.hwIdleAborts + 1;
