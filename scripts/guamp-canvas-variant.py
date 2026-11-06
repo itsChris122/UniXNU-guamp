@@ -25,7 +25,7 @@ Section 14 (frame pacing): the refresh tick (sheng-vsync) defaults to 60 Hz and 
 from pathlib import Path
 import hashlib,sys
 ORIGINAL_SHA256 = '09d7811db8fc6b659e12a05690867326e851f0d11bec7ffbb36b72c33ea035ca'
-PATCHED_SHA256 = '2b1ad4c65a2b898cf2bcfd7f62b19844527bc07f8c9fe3dfdb3bd7888b3129f4'
+PATCHED_SHA256 = '7f0b7bd9e9c20c49486bea9616b96282f8d419de34277ee6462b8600a9b7a9a8'
 EDITS = []
 # 1. Integer scaler, after the BGRA format test.
 EDITS.append((r'''static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1622,6 +1622,30 @@ EDITS.append(('    {if(submitted)*submitted=0;if(retired)*retired=0;return -1;}\
 EDITS.append(('        guampPacingAccepted(request);   // section 14\n',
               '        guampPacingAccepted(request);   // section 14\n'
               '        guamp_adreno_note_swap();   // section 16b: the copy waits for what was handed out before this swap\n'))
+# 17. Video over the Control Center (06/11, fin51): a video in a Safari page is a separate 4:2:0 layer of the swap (layer 2, the
+#     page in layer 0 or 1), and the composition drew the layers in index order, so the video went over everything the render
+#     server put in the page layer on top of it (Control Center, menus, the player's own controls). The render server keeps the
+#     video detached while the Control Center covers it, i.e. it treats the video as an underlay: the page layer carries the
+#     picture with a transparent hole where the video shows. guamp-compose-video-under (default 1, 0 = index order as before):
+#     the 4:2:0 layers are drawn first (bottom), then the other layers in index order, blended over them (premultiplied
+#     source-over: the hole shows the video, opaque UI covers it).
+EDITS.append(('    int composeKeepWanted=-1;uint32_t composeHoles=0;\n',
+              '    int composeKeepWanted=-1;uint32_t composeHoles=0;\n'
+              '    // Section 17: 4:2:0 video layers under the others (guamp-compose-video-under, default 1).\n'
+              '    int composeVideoUnderWanted=-1;\n'
+              '    bool composeVideoUnderOn() {\n'
+              '        if(composeVideoUnderWanted<0){unsigned v=1;PE_parse_boot_argn("guamp-compose-video-under",&v,sizeof v);composeVideoUnderWanted=v!=0;}\n'
+              '        return composeVideoUnderWanted==1;\n'
+              '    }\n'))
+EDITS.append(('''        for(unsigned i=0;i<4;++i) {
+            if(!composeCurrent[i].memory)continue;
+            GuampLayerSource &s=set->source[set->count];''', '''        // Section 17: the 4:2:0 video layers first (under), then the others in index order; 0 = index order only.
+        const bool videoUnder=composeVideoUnderOn();
+        for(unsigned pass=0;pass<2;++pass)for(unsigned i=0;i<4;++i) {
+            if(!composeCurrent[i].memory)continue;
+            const bool isVideo=composeCurrent[i].layer.kind==1 || composeCurrent[i].layer.kind==2;
+            if(videoUnder?((pass==0)!=isVideo):(pass!=0))continue;
+            GuampLayerSource &s=set->source[set->count];'''))
 def apply(data):
     digest = hashlib.sha256(data).hexdigest()
     if PATCHED_SHA256 and digest == PATCHED_SHA256: return data
