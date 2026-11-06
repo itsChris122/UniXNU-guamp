@@ -13,10 +13,13 @@
 //              x n, phy_page {addr u64, size u64} x n, fdlist u64 x 16, crclist u32 x 64, then each buffer 128 aligned
 //   sc         method << 24 | in << 16 | out << 8 (no handles here)
 //   attach     handle 1 method 0, in: tgid (FASTRPC_INIT_ATTACH_SNS, pid 0)
-//   then       remotectl (handle 0) open "adsp_listener", init2 (method 3); open "adsp_default_listener", its method 0
-//              (register); then next2 (method 4) in a loop (order of fastrpc_apps_user.c: the domain init starts the
-//              listener thread, init2 included, before sscrpcd opens and registers adsp_default_listener; registering
-//              first left the open of adsp_listener without an answer, fin3..fin51: no reverse call, no SEE sensor): in {prevCtx, prevResult, prevLen, bufsLen} +
+//   then       init2 (method 3) on adsp_listener, a STATIC handle (3, inc/adsp_listener.h _const_adsp_listener_handle:
+//              the stub never opens it by name; fin3..fin52 sent remotectl open "adsp_listener", which the sensors PD
+//              never answers, so no reverse call was ever served and no SEE sensor came up); if the PD refuses it,
+//              adsp_listener1 (static handle 7, init2 method 5, next2 method 6, as listener_android.c tries first);
+//              then remotectl (handle 0) open "adsp_default_listener", its method 0 (register); then next2
+//              (method 4) in a loop (order of fastrpc_apps_user.c: the listener thread runs init2 at the domain init,
+//              before sscrpcd opens and registers adsp_default_listener): in {prevCtx, prevResult, prevLen, bufsLen} +
 //              prevbufs, out {ctx, handle, sc, bufsLenReq} + bufs. bufs = the reverse call's in buffers (u32 len,
 //              8 aligned data) then its out lengths (u32 each); prevbufs = the answered out buffers (u32 len, 8 aligned
 //              data). Handle 0 of a reverse call is apps_remotectl (open/close), the handle it returns is apps_std.
@@ -589,6 +592,8 @@ struct Server {
 struct Listener {
   enum State : uint32_t { Idle, Attach, OpenDefault, Register, OpenListener, Init2, Next, Failed };
   static constexpr uint32_t kDlerr = 128, kRetryMs = 1000, kTgid = 0x6d70;   // any nonzero group id
+  // static handles of the reverse-call listener (inc/adsp_listener.h, inc/adsp_listener1.h): never opened by name
+  static constexpr uint32_t kListenerHandle = 3, kListener1Handle = 7;
   static constexpr uint32_t kMaxErrors = 60;   // a minute of 1 s retries: the sensors PD may come up after the channel
   struct Hooks {
     void *ctx = nullptr;
@@ -602,7 +607,7 @@ struct Listener {
   State state = Idle;
   Invoke iv;
   uint8_t msg[kMsgBytes] = {};
-  bool msgPending = false, inFlight = false, silentNoted = false;
+  bool msgPending = false, inFlight = false, silentNoted = false, listener1 = false;
   uint64_t ctx = 0, retryAt = 0, sentAt = 0;
   static constexpr uint32_t kSilentMs = 5000;   // an answer still missing after this is reported once (next2 excluded)
   uint32_t seq = 0, hDefault = 0, hListener = 0, errors = 0, served = 0, prevCtx = 0, prevLen = 0;
@@ -641,7 +646,18 @@ struct Listener {
     st32(prim, prevCtx); st32(prim + 4, (uint32_t)prevResult); st32(prim + 8, prevLen); st32(prim + 12, bufsCap);
     const uint8_t *in[4] = {prim, outStage, nullptr, nullptr};
     const uint32_t len[4] = {16, prevLen, 16, bufsCap};
-    return invoke(hListener, scalars(4, 2, 2), in, len);
+    return invoke(hListener, scalars(listener1 ? 6 : 4, 2, 2), in, len);
+  }
+  // What to look at when a step stays without an answer (the "no answer" line)
+  const char *silentHint() const {
+    switch (state) {
+      case Attach: return "next: the sensors PD is not up (servreg msm/adsp/sensor_pd) or pd 2 is wrong";
+      case Init2: return listener1 ? "next: neither static listener answers; compare tid/pid with sscrpcd"
+                                   : "next: adsp_listener1 (static handle 7)";
+      case OpenDefault: return "next: adsp_default_listener1 or the PD is busy";
+      case Register: return "next: the default listener is held by another client";
+      default: return "";
+    }
   }
   bool enter(State s) {
     state = s;
@@ -654,7 +670,7 @@ struct Listener {
         return invoke(kInitHandle, scalars(0, 1, 0), in, len);
       }
       case OpenListener: return openModule("adsp_listener");
-      case Init2: return invoke(hListener, scalars(3, 0, 0), nullptr, nullptr);
+      case Init2: return invoke(hListener, scalars(listener1 ? 5 : 3, 0, 0), nullptr, nullptr);
       case OpenDefault: return openModule("adsp_default_listener");
       case Register: return invoke(hDefault, scalars(0, 0, 0), nullptr, nullptr);
       case Next: return next2();
@@ -682,6 +698,14 @@ struct Listener {
       if (inFlight && state != Next && !silentNoted && nowMs - sentAt >= kSilentMs) {
         silentNoted = true;
         note("no answer", stateName(state), nowMs - sentAt, ctx);
+        if (silentHint()[0]) note("hint", silentHint(), hListener, state);
+        // the static adsp_listener stays silent: try adsp_listener1 (the late answer, if any, is then unexpected)
+        if (state == Init2 && !listener1) {
+          listener1 = true;
+          hListener = kListener1Handle;
+          note("state", "init2 on adsp_listener1 (static handle 7)", hListener, 0);
+          if (!enter(Init2)) state = Failed;
+        }
       }
       return 0;
     }
@@ -709,9 +733,21 @@ struct Listener {
     }
     if (!inFlight || (rctx & 0xff0) != (ctx & 0xff0)) { note("unexpected", "", rctx, (uint64_t)(uint32_t)retval); return; }
     inFlight = false;
+    if (retval && state == Init2 && !listener1) {   // adsp_listener refused (no such module/handle): adsp_listener1
+      note("error", "init2 on adsp_listener (static handle 3)", (uint64_t)(uint32_t)retval, 0);
+      listener1 = true;
+      hListener = kListener1Handle;
+      note("state", "init2 on adsp_listener1 (static handle 7)", hListener, 0);
+      if (!enter(Init2)) state = Failed;
+      return;
+    }
     if (retval) { failStep(retval, nowMs); return; }
     switch (state) {
-      case Attach: note("state", "attached to the sensors PD", 0, 0); enter(OpenListener); return;
+      case Attach:
+        note("state", "attached to the sensors PD", 0, 0);
+        hListener = listener1 ? kListener1Handle : kListenerHandle;
+        enter(Init2);
+        return;
       case OpenDefault: case OpenListener: {
         const uint32_t h = shm.r32(iv.off[2]), err = shm.r32(iv.off[2] + 4);
         if (err || !h) { failStep(err ? (int32_t)err : (int32_t)kEFailed, nowMs); return; }
@@ -719,7 +755,7 @@ struct Listener {
         else { hDefault = h; note("state", "adsp_default_listener open", h, 0); enter(Register); }
         return;
       }
-      case Init2: note("state", "listener initialized (init2)", 0, 0); enter(OpenDefault); return;
+      case Init2: note("state", "listener initialized (init2)", hListener, 0); enter(OpenDefault); return;
       case Register:
         note("state", "listener up: serving reverse calls (registered as default listener)", 0, 0);
         prevCtx = 0; prevResult = -1; prevLen = 0;

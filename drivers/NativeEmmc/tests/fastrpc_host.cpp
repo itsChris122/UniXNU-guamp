@@ -226,7 +226,7 @@ static std::vector<uint8_t> rsp(uint64_t ctx, int32_t ret, bool v2 = false, uint
 // One reverse call packed as the DSP packs it in next2's out buffer (pack_in_bufs + pack_out_lens)
 struct Reverse { uint32_t ctx, handle, sc; std::vector<std::vector<uint8_t>> in; std::vector<uint32_t> outLen; };
 static void answerNext(const Seen &s, const Reverse &r) {
-  CHECK(s.handle == 0x77 && s.sc == scalars(4, 2, 2) && s.outLen.size() == 2 && s.outLen[0] == 16);
+  CHECK(s.handle == Listener::kListenerHandle && s.sc == scalars(4, 2, 2) && s.outLen.size() == 2 && s.outLen[0] == 16);
   std::vector<uint8_t> b;
   for (auto &x : r.in) {
     uint8_t l[4]; st32(l, (uint32_t)x.size()); b.insert(b.end(), l, l + 4);
@@ -259,6 +259,52 @@ static std::vector<std::vector<uint8_t>> previous(const Seen &s, uint32_t *ctx, 
 static std::vector<uint8_t> w32s(std::initializer_list<uint32_t> w) { std::vector<uint8_t> b; for (uint32_t v : w) { uint8_t q[4]; st32(q, v); b.insert(b.end(), q, q + 4); } return b; }
 static std::vector<uint8_t> cs(const char *s) { return std::vector<uint8_t>(s, s + strlen(s) + 1); }
 
+// adsp_listener (static handle 3) silent or refused: init2 and next2 move to adsp_listener1 (static handle 7, 5 / 6)
+static void testListenerFallback(bool refused) {
+  static Vfs vfs;
+  static Listener l;
+  static uint8_t in[8 * 1024], out[8 * 1024];
+  l = Listener{};
+  l.hooks = {nullptr, sendHook, hlog};
+  l.server.vfs = &vfs;
+  l.shm = {shared.data(), kDsp, (uint32_t)shared.size()};
+  l.inStage = in; l.outStage = out; l.bufsCap = sizeof(in);
+  sent.clear(); logs.clear();
+  l.start();
+  l.step(0);
+  Seen s = decode(sent.back());
+  l.receive(rsp(s.ctx, 0).data(), 16, 1);
+  l.step(1);
+  s = decode(sent.back());
+  CHECK(s.handle == Listener::kListenerHandle && s.sc == scalars(3, 0, 0));
+  const uint64_t old = s.ctx;
+  if (refused) {
+    l.receive(rsp(s.ctx, 0x3e).data(), 16, 2);
+    l.step(2);
+  } else {
+    l.step(1 + Listener::kSilentMs);   // no answer for 5 s: reported with the hint, then adsp_listener1
+    CHECK(logged("no answer|init2") && logged("hint|next: adsp_listener1 (static handle 7)"));
+    l.step(2 + Listener::kSilentMs);
+  }
+  s = decode(sent.back());
+  CHECK(s.handle == Listener::kListener1Handle && s.sc == scalars(5, 0, 0) && s.ctx != old);
+  CHECK(logged("state|init2 on adsp_listener1 (static handle 7)"));
+  l.receive(rsp(old, 0).data(), 16, 6000);   // a late answer of the old init2 is ignored
+  CHECK(l.state == Listener::Init2);
+  l.receive(rsp(s.ctx, 0).data(), 16, 6001);
+  l.step(6001);
+  s = decode(sent.back());
+  CHECK(s.handle == kRemotectl && std::string((const char *)s.in[1].data()) == "adsp_default_listener");
+  st32(&shared[s.outAt[0]], 0x55); st32(&shared[s.outAt[0] + 4], 0);
+  l.receive(rsp(s.ctx, 0).data(), 16, 6002);
+  l.step(6002);
+  s = decode(sent.back());
+  l.receive(rsp(s.ctx, 0).data(), 16, 6003);
+  l.step(6003);
+  s = decode(sent.back());
+  CHECK(l.state == Listener::Next && s.handle == Listener::kListener1Handle && s.sc == scalars(6, 2, 2));
+}
+
 static void testListener() {
   static Vfs vfs;
   vfs.hooks = {nullptr, halloc, hfree};
@@ -286,17 +332,10 @@ static void testListener() {
   CHECK(l.state == Listener::Attach);
   l.receive(rsp(s.ctx, 0).data(), 16, 3);
   l.step(3);
-  // remotectl open "adsp_listener" first, then init2 (as fastrpc_apps_user.c: listener thread at the domain init)
+  // init2 first, on the static adsp_listener handle 3 (never opened by name: inc/adsp_listener.h, listener_android.c)
   s = decode(sent.back());
-  CHECK(s.handle == kRemotectl && s.sc == scalars(0, 2, 2) && s.pid == Listener::kTgid);
-  CHECK(ld32(s.in[0].data()) == 14 && std::string((const char *)s.in[1].data()) == "adsp_listener" && s.outLen[0] == 8);
-  st32(&shared[s.outAt[0]], 0x77); st32(&shared[s.outAt[0] + 4], 0);
-  l.step(3 + Listener::kSilentMs);   // no answer for 5 s: reported once
-  CHECK(logged("no answer|open adsp_listener"));
-  l.receive(rsp(s.ctx, 0).data(), 16, 4);
-  l.step(4);
-  s = decode(sent.back());
-  CHECK(s.handle == 0x77 && s.sc == scalars(3, 0, 0));   // init2
+  CHECK(s.handle == Listener::kListenerHandle && s.sc == scalars(3, 0, 0) && s.pid == Listener::kTgid);
+  for (const auto &m : sent) CHECK(decode(m).handle != kRemotectl);   // no remotectl open of "adsp_listener"
   l.receive(rsp(s.ctx, 0).data(), 16, 5);
   l.step(5);
   // then remotectl open "adsp_default_listener" and register
@@ -314,6 +353,7 @@ static void testListener() {
   uint32_t pc; int32_t pr;
   previous(s, &pc, &pr, {});
   CHECK(pc == 0 && pr == -1 && s.in.size() == 2 && s.in[1].empty());
+  CHECK(s.handle == Listener::kListenerHandle && s.sc == scalars(4, 2, 2));
   // reverse call 1: apps_remotectl open "apps_std"
   answerNext(s, {0x1001, 0, scalars(0, 2, 2), {w32s({9, 64}), cs("apps_std")}, {8, 64}});
   l.receive(rsp(s.ctx, 0).data(), 16, 8);
@@ -403,6 +443,8 @@ static void testPersist(const char *path) {
 int main(int argc, char **argv) {
   testServer();
   testListener();
+  testListenerFallback(true);
+  testListenerFallback(false);
   if (argc > 1) testPersist(argv[1]);
   if (argc > 2) {   // the blob of scripts/guamp-sensors-config.py built from the vendor backup
     FILE *b = fopen(argv[2], "rb");
