@@ -26,7 +26,7 @@ clang++ -target arm64-apple-ios17 -mkernel -mgeneral-regs-only -std=gnu++20 -O2 
   -x c++ - <<EOF || rc=1
 #include "$HERE/../GuampScanoutCore.h"
 void f(gscan::State &s, volatile unsigned char *d, const unsigned char *p) { gscan::scan(s, p, 3008, true); gscan::accumulate(s);
-  gscan::draw(s, 0, d, 2880, p, 3008, nullptr); }
+  gscan::draw(s, 0, d, 2880, p, 3008, nullptr); gscan::scanDraw(s, 1, d, 2880, p, 3008, true, nullptr); }
 EOF
 echo "== kernel glue: GuampScanout.inc on arm64-apple-ios, -Werror, integer registers only"
 clang++ --target=arm64-apple-ios17 -std=gnu++20 -ffreestanding -fno-exceptions -fno-rtti -mgeneral-regs-only -O2   -Wall -Wextra -Werror -Wdeprecated-volatile -Wno-unused-parameter -c "$HERE/scanout_glue_check.cpp" -o "$WORK/glue.o" && echo "glue: compiled" || rc=1

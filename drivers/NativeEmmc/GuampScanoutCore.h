@@ -290,6 +290,48 @@ inline void draw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *
   s.bufValid[t] = true;
 }
 
+// 1:1 only (no taps): scan + accumulate + draw of buffer t in one pass, row by row, from one read of the source. Each source row
+// is first copied into the cached staging line, then hashed and stored from there: what the hash records is exactly what the
+// buffer gets. With scan() and draw() apart (fin52b/fin53, "black bands in the app switcher") the source was read twice, ~3 ms
+// and a latch wait apart; a surface that changed in between (the render server reusing a retired surface, the GPU still
+// writing a frame) left rows drawn with other pixels than the hashed ones, and later frames equal to the hashed pixels never
+// redrew them (horizontal bands until the next full redraw). Here a torn row is at most one frame old: the next frame compares
+// against what was really drawn. Returns the number of source rows with a change.
+inline u32 scanDraw(State &s, unsigned t, volatile u8 *to, u64 toStride, const u8 *src, u64 srcStride, bool diff, BulkStore bulk)
+{
+  s.rowsDrawn = s.pixelsDrawn = 0;
+  s.box[0] = s.box[1] = s.box[2] = s.box[3] = 0;
+  if (s.rows || s.columns || s.srcW != s.dstW || s.srcH != s.dstH) return 0;
+  const u32 all = allBands(s);
+  const bool compare = diff && s.hashValid;
+  const u64 rowBytes = (u64)s.srcW * 4;
+  u32 changedRows = 0;
+  for (u32 y = 0; y < s.srcH; ++y) {
+    volatile u8 *out = to + (u64)y * toStride;
+    u8 *stage = s.stage + (((u64)out) & 15);   // same 16-byte phase as the destination row (bulk stores)
+    __builtin_memcpy(stage, src + (u64)y * srcStride, rowBytes);
+    u32 m = 0;
+    if (diff) m = hashRow(stage, s.srcW, s.hash + (u64)y * s.bands);
+    if (!compare) m = all;
+    s.srcMask[y] = m;
+    if (m) ++changedRows;
+    for (unsigned b = 0; b < 2; ++b) s.pending[b][y] = s.bufValid[b] ? (s.pending[b][y] | m) : all;
+    const u32 mask = s.pending[t][y];
+    if (!mask) continue;
+    s.pending[t][y] = 0;
+    u32 x0, x1;
+    spanOf(s, mask, &x0, &x1);
+    if (x1 <= x0) continue;
+    storeSpan(out + (u64)x0 * 4, stage + (u64)x0 * 4, (u64)(x1 - x0) * 4, bulk);
+    s.rowsDrawn += 1;
+    s.pixelsDrawn += x1 - x0;
+    boxAdd(s, x0, x1, y);
+  }
+  s.hashValid = diff;
+  s.bufValid[t] = true;
+  return changedRows;
+}
+
 // Brings buffer t up to date from buffer `from` (the other scanout buffer, same layout): its pending rows are copied. Reading a
 // write-combining or device buffer is slow, so this is for the small idle catch-up only.
 inline void catchUp(State &s, unsigned t, volatile u8 *to, const volatile u8 *from, u64 stride)

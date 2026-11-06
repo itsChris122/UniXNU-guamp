@@ -110,6 +110,66 @@ static void run(uint32_t sw, uint32_t sh, uint32_t w, uint32_t h, int scaled, un
          frames, 100.0 * (double)drawn / ((double)w * h * frames));
 }
 
+// scanDraw (1:1, one pass): every drawn buffer equals the current source, with alternation and invalidations; and the
+// fin53 race: the old two-pass path (scan, then draw re-reading a surface that changed in between) leaves a row wrong for good,
+// the one-pass path cannot (what is hashed is what is drawn).
+static void runOnePass(uint32_t w, uint32_t h, bool useBulk, unsigned frames)
+{
+  const uint64_t srcStride = (w * 4 + 63) & ~63ull, dstStride = (w * 4 + 15) & ~15ull;
+  std::vector<uint8_t> src(srcStride * h), buf[2] = {std::vector<uint8_t>(dstStride * h + 16, 0), std::vector<uint8_t>(dstStride * h + 16, 0)};
+  for (auto &b : src) b = (uint8_t)rnd();
+  gscan::State s;
+  std::vector<uint8_t> mem(gscan::bytesFor(w, h, w, h));
+  CHECK(gscan::layout(s, mem.data(), mem.size(), w, h, w, h, nullptr, nullptr), "layout one pass");
+  unsigned t = 0;
+  uint64_t drawn = 0;
+  for (unsigned f = 0; f < frames; ++f) {
+    const unsigned kind = rnd() % 6;
+    if (kind == 1) for (auto &b : src) b = (uint8_t)rnd();
+    else if (kind >= 2) {
+      const uint32_t ry = rnd() % h, rh = 1 + rnd() % (h - ry < 60 ? h - ry : 60), rx = rnd() % w, rw = 1 + rnd() % (w - rx);
+      for (uint32_t y = ry; y < ry + rh; ++y) for (uint32_t x = rx; x < rx + rw; ++x) src[y * srcStride + x * 4 + rnd() % 4] ^= 0x5a;
+    }
+    if (rnd() % 23 == 0) s.bufValid[0] = s.bufValid[1] = false;
+    if (rnd() % 31 == 0) s.hashValid = false;
+    const bool diff = rnd() % 17 != 0;
+    if ((f & 1) && rnd() % 3) t ^= 1;
+    gscan::scanDraw(s, t, buf[t].data(), dstStride, src.data(), srcStride, diff, useBulk ? bulk : nullptr);
+    drawn += s.pixelsDrawn;
+    bool same = true;
+    for (uint32_t y = 0; y < h && same; ++y) same = !memcmp(&buf[t][y * dstStride], &src[y * srcStride], w * 4);
+    CHECK(same, "one pass frame %u buffer %u differs (%ux%u)", f, t, w, h);
+    if (failures > 10) return;
+  }
+  printf("one pass %ux%u bulk %d: %u frames, %.1f%% of the pixels drawn\n", w, h, useBulk, frames,
+         100.0 * (double)drawn / ((double)w * h * frames));
+}
+
+static void raceCheck()
+{
+  const uint32_t w = 128, h = 8;
+  const uint64_t stride = w * 4;
+  std::vector<uint8_t> a(stride * h, 0x11), buf(stride * h + 16, 0x77), mem(gscan::bytesFor(w, h, w, h));
+  gscan::State s;
+  // Two passes: frame 1 scans A2 (row 3 changed), the surface is reused (row 3 black) before the draw; frame 2 is A2 again.
+  CHECK(gscan::layout(s, mem.data(), mem.size(), w, h, w, h, nullptr, nullptr), "layout race");
+  gscan::scan(s, a.data(), stride, true); gscan::accumulate(s); gscan::draw(s, 0, buf.data(), stride, a.data(), stride, nullptr);
+  std::vector<uint8_t> a2 = a; a2[3 * stride + 8] = 0x99;
+  std::vector<uint8_t> torn = a2; memset(&torn[3 * stride], 0, stride);
+  gscan::scan(s, a2.data(), stride, true); gscan::accumulate(s); gscan::draw(s, 0, buf.data(), stride, torn.data(), stride, nullptr);
+  gscan::scan(s, a2.data(), stride, true); gscan::accumulate(s); gscan::draw(s, 0, buf.data(), stride, a2.data(), stride, nullptr);
+  const bool oldStale = memcmp(&buf[3 * stride], &a2[3 * stride], stride) != 0;
+  // One pass: the torn read is what is hashed, so the next frame (A2 again) redraws the row.
+  CHECK(gscan::layout(s, mem.data(), mem.size(), w, h, w, h, nullptr, nullptr), "layout race 2");
+  gscan::scanDraw(s, 0, buf.data(), stride, a.data(), stride, true, nullptr);
+  gscan::scanDraw(s, 0, buf.data(), stride, torn.data(), stride, true, nullptr);
+  gscan::scanDraw(s, 0, buf.data(), stride, a2.data(), stride, true, nullptr);
+  CHECK(!memcmp(buf.data(), a2.data(), stride * h), "one pass heals the torn row");
+  CHECK(s.rowsDrawn == 1, "one pass redraws only the torn row (%llu)", (unsigned long long)s.rowsDrawn);
+  printf("race: two passes leave the torn row %s, one pass heals it the next frame\n", oldStale ? "wrong for good" : "(not reproduced)");
+  CHECK(oldStale, "the two-pass race should reproduce (test model)");
+}
+
 int main()
 {
   // Unchanged source after a full draw: nothing to draw.
@@ -157,6 +217,10 @@ int main()
   run(720, 1600, 720, 1600, 0, 1, true, 80);
   run(721, 999, 720, 640, 1, 1, false, 60);
   run(100, 37, 64, 36, 1, 1, true, 200);
+  runOnePass(750, 1666, true, 60);
+  runOnePass(720, 1600, false, 40);
+  runOnePass(97, 33, true, 300);
+  raceCheck();
   if (failures) { printf("%d failures\n", failures); return 1; }
   printf("scanout core: all checks passed\n");
   return 0;

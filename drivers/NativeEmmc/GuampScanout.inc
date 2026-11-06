@@ -514,12 +514,13 @@ static int presentHw(const u8 *src, uint64_t srcStride, uint32_t srcW, uint32_t 
   // A slot that holds another kind of frame (or another stride) is redrawn whole.
   for (unsigned t = 0; t < 2; ++t)
     if (gK.slotKind[t] != key[0] || gK.slotStride[t] != stride) gK.ss.bufValid[t] = false;
-  const uint64_t t0 = ticks();
-  const u32 changed = scan(gK.ss, src, srcStride, gK.diff);
-  accumulate(gK.ss);
-  const uint64_t t1 = ticks();
   if (!waitLatch()) return refuse(5);   // the slot just left may still be scanned: never draw into it
-  draw(gK.ss, target, gK.slotVa[target], stride, src, srcStride, gK.neon ? neonStore : nullptr);
+  // One pass (GuampScanoutCore.h scanDraw): each row hashed from the same read that is stored into the slot. fin53: the scan
+  // ran before the latch wait and the draw re-read the surface ~3 ms later; rows that changed in between stayed wrong (black
+  // bands while dragging a card in the app switcher). The log's "scan" is now scan + draw, its "draw" 0.
+  const uint64_t t0 = ticks();
+  const u32 changed = scanDraw(gK.ss, target, gK.slotVa[target], stride, src, srcStride, gK.diff, gK.neon ? neonStore : nullptr);
+  const uint64_t t1 = ticks();
   __asm__ volatile("dsb sy" ::: "memory");
   const uint64_t t2 = ticks();
   gK.slotKind[target] = key[0];
@@ -592,17 +593,25 @@ extern "C" int guamp_scanout_present(volatile void *dst, uint64_t dstBytes, uint
     if (gK.fullEvery && ++gK.sinceFull >= gK.fullEvery) {
       gK.sinceFull = 0; gK.st.hashValid = false; gK.st.bufValid[0] = gK.st.bufValid[1] = false; gK.full = gK.full + 1;
     }
-    const uint64_t t0 = ticks();
-    const u32 changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff);
-    accumulate(gK.st);
-    const uint64_t t1 = ticks();
+    // The latch wait first, then scan and draw as close together as possible (1:1: one pass, scanDraw; see presentHw).
     unsigned target = 0;
     if (gK.flipOn) {
       target = gK.shown ^ 1;
       if (!waitLatch()) { flipOff(5); target = 0; }   // the buffer just left may still be scanned: never draw into it
     }
     volatile u8 *to = target ? gK.va[1] : reinterpret_cast<volatile u8 *>(dst);
-    draw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.neon ? neonStore : nullptr);
+    const uint64_t t0 = ticks();
+    u32 changed;
+    if (!gK.st.rows) {
+      changed = scanDraw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.diff,
+                         gK.neon ? neonStore : nullptr);
+    } else {
+      changed = scan(gK.st, reinterpret_cast<const u8 *>(src), srcStride, gK.diff);
+      accumulate(gK.st);
+    }
+    const uint64_t t1 = ticks();
+    if (gK.st.rows)
+      draw(gK.st, target, to, dstStride, reinterpret_cast<const u8 *>(src), srcStride, gK.neon ? neonStore : nullptr);
     __asm__ volatile("dsb sy" ::: "memory");
     const uint64_t t2 = ticks();
     if (gK.flipOn && gK.st.rowsDrawn && target != gK.shown) point(target);
