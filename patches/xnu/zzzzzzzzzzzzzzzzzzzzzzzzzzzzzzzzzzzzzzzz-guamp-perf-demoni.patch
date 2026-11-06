@@ -1,0 +1,170 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index d6b4e7a..7490050 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -10348,6 +10348,16 @@ static const uint8_t native_guamp_disabled[383] = {0x3c,0x3f,0x78,0x6d,0x6c,0x20
+ #define GUAMP_SLIM_FAST 64	/* added by guamp-slim-fast=1 (NOW list only) */
+ #define GUAMP_SLIM_COMMCENTER 128	/* skipped by guamp-slim-commcenter=1 (NOW list only) */
+ #define GUAMP_SLIM_BIOKIT 256	/* skipped by guamp-biokit=1 (NOW list only) */
++/* guamp 07/11 (perf-demoni): guamp-slim-quiet=1 (opt-in, NOW list only) disables the part of the FAST list that no feature of
++ * this phone uses and that touches neither Phone, Wallet, Watch, Wi-Fi, Bluetooth, App Store, Safari nor Maps: software update and
++ * beta enrollment (an update cannot be installed here), repair, Classroom, MDM client, Siri inference, ML host and app
++ * predictions, TV app helpers, Xcode pairing, Screen Distance (no TrueDepth), Tap to Pay (no NFC reader), and the diagnostic
++ * collectors that only feed Apple analytics. fin53 log (live-20261106-092610): 19 of these were running, mlhostd 4 % of a core
++ * at rest. Left on (they are in FAST only): Find My (Watch activation lock), Health/Fitness/Home (Watch, Home keys in Wallet),
++ * Maps helpers, duetexpertd (App Library), AMS/ads/family/Books/Game Center (App Store), translationd and sociallayerd (Safari),
++ * rtcreportingd (calls), wirelessinsightsd and corecaptured (Wi-Fi/cellular), nearbyd, announced, intelligentroutingd (Bluetooth
++ * audio), coreidvd (Wallet IDs), transparencyd, triald, analyticsd, osanalyticshelper and OTACrashCopier (crash and panic logs). */
++#define GUAMP_SLIM_QUIET 512	/* added by guamp-slim-quiet=1 (NOW list only) */
+ #define GUAMP_SLIM_ALL (GUAMP_SLIM_NOW | GUAMP_SLIM_LEGACY | GUAMP_SLIM_BT)
+ static const struct {
+ 	const char *label;
+@@ -10388,28 +10398,28 @@ static const struct {
+ 	/* analytics, crash and diagnostic collectors (-no_corpses: no crash reports anyway) */
+ 	{"com.apple.analyticsd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.osanalytics.osanalyticshelper", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.aggregated", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.diagnosticextensionsd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.aggregated", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.diagnosticextensionsd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.rtcreportingd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.symptomsd-diag", GUAMP_SLIM_FAST, 1},
++	{"com.apple.symptomsd-diag", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.wirelessinsightsd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.geoanalyticsd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.corecaptured", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.OTACrashCopier", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.nand.aspcarry", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.ReportMemoryException", GUAMP_SLIM_FAST, 1},
++	{"com.apple.nand.aspcarry", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.ReportMemoryException", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	/* software update, Trial experiments, repair */
+-	{"com.apple.mobile.softwareupdated", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.softwareupdateservicesd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.betaenrollmentd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.mobilerepaird", GUAMP_SLIM_FAST, 1},
++	{"com.apple.mobile.softwareupdated", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.softwareupdateservicesd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.betaenrollmentd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.mobilerepaird", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.triald", GUAMP_SLIM_FAST, 1},
+ 	/* device management, Classroom */
+ 	{"com.apple.remotemanagementd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.devicemanagementclient.mdmd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.studentd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.devicemanagementclient.mdmd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.studentd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	/* Siri inference (server side and learning; dictation daemons stay) */
+-	{"com.apple.siriinferenced", GUAMP_SLIM_FAST, 1},
++	{"com.apple.siriinferenced", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	/* Health, Fitness, Home */
+ 	{"com.apple.healthd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.fitcore", GUAMP_SLIM_FAST, 1},
+@@ -10422,8 +10432,8 @@ static const struct {
+ 	{"com.apple.maps.destinationd", GUAMP_SLIM_FAST, 1},
+ 	/* Duet and on-device ML predictions (coreduetd, biomed, dasd stay) */
+ 	{"com.apple.duetexpertd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.ospredictiond", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.mlhostd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.ospredictiond", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.mlhostd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.intelligentroutingd", GUAMP_SLIM_FAST, 1},
+ 	/* store engagement, ads, Books, Game Center, TV */
+ 	{"com.apple.amsengagementd", GUAMP_SLIM_FAST, 1},
+@@ -10431,21 +10441,21 @@ static const struct {
+ 	{"com.apple.bookdatastored", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.bookassetd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.gamed", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.tvremoted", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.videosubscriptionsd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.watchlistd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.tvremoted", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.videosubscriptionsd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
++	{"com.apple.watchlistd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	/* family sharing */
+ 	{"com.apple.familycircled", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.askpermissiond", GUAMP_SLIM_FAST, 1},
+ 	/* no hardware or no account: UWB, Xcode pairing, translation, Announce, eye relief, key transparency, ID, Tap to Pay */
+ 	{"com.apple.nearbyd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.dt.remotepairingdeviced", GUAMP_SLIM_FAST, 1},
++	{"com.apple.dt.remotepairingdeviced", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.translationd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.announced", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.eyereliefd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.eyereliefd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.transparencyd", GUAMP_SLIM_FAST, 1},
+ 	{"com.apple.coreidvd", GUAMP_SLIM_FAST, 1},
+-	{"com.apple.softposreaderd", GUAMP_SLIM_FAST, 1},
++	{"com.apple.softposreaderd", GUAMP_SLIM_FAST | GUAMP_SLIM_QUIET, 1},
+ 	{"com.apple.sociallayerd", GUAMP_SLIM_FAST, 1},
+ };
+ static char native_guamp_slim_plist[8192];
+@@ -10918,6 +10928,8 @@ native_guamp_setup_skip(proc_t p, user_addr_t scratch)
+ 	unsigned int guamp_slim_fast = 0, guamp_slim_commcenter = 0;	/* 29/10, opt-in: GUAMP_SLIM_FAST jobs off, CommCenter on */
+ 	PE_parse_boot_argn("guamp-slim-fast", &guamp_slim_fast, sizeof(guamp_slim_fast));
+ 	PE_parse_boot_argn("guamp-slim-commcenter", &guamp_slim_commcenter, sizeof(guamp_slim_commcenter));
++	unsigned int guamp_slim_quiet = 0;	/* 07/11, opt-in: GUAMP_SLIM_QUIET jobs off */
++	PE_parse_boot_argn("guamp-slim-quiet", &guamp_slim_quiet, sizeof(guamp_slim_quiet));
+ 	unsigned int guamp_biokit = 0;	/* 29/10: 1 leaves biometrickitd.mesa enabled (Touch ID ADT only) */
+ 	PE_parse_boot_argn("guamp-biokit", &guamp_biokit, sizeof(guamp_biokit));
+ 	unsigned int guamp_kb_prefs = 1;	/* default 1: written only when absent (29/10); guamp-kb-prefs=2 rewrites them, =0 leaves them as is */
+@@ -10950,7 +10962,9 @@ native_guamp_setup_skip(proc_t p, user_addr_t scratch)
+ 			    (guamp_slim_media == 1 ? GUAMP_SLIM_MEDIA : 0) | (guamp_slim_fairplay == 1 ? GUAMP_SLIM_FAIRPLAY : 0) |
+ 			    (guamp_slim_commcenter == 1 ? GUAMP_SLIM_COMMCENTER : 0) | (guamp_biokit == 1 ? GUAMP_SLIM_BIOKIT : 0) : 0;
+ 			int fast = list == GUAMP_SLIM_NOW && guamp_slim_fast == 1;
+-			size_t built = native_guamp_slim_build(list | (fast ? GUAMP_SLIM_FAST : 0), skip);
++			int quiet = list == GUAMP_SLIM_NOW && guamp_slim_quiet == 1;
++			size_t built = native_guamp_slim_build(list | (fast ? GUAMP_SLIM_FAST : 0) | (quiet ? GUAMP_SLIM_QUIET : 0), skip);
++			printf("guamp-slim-quiet=%d\n", quiet);
+ 			printf("guamp-slim-fast=%d, guamp-slim-commcenter=%d (CommCenter %s), guamp-biokit=%d\n", fast, (skip & GUAMP_SLIM_COMMCENTER) ? 1 : 0,
+ 			    (skip & GUAMP_SLIM_COMMCENTER) ? "enabled" : "disabled", (skip & GUAMP_SLIM_BIOKIT) ? 1 : 0);
+ 			if (built) {
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 539cb83..b1c7b8b 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4582,15 +4582,20 @@ guamp_coreaudio_host_clock(uint64_t unslid, uint64_t *seen_out)
+  * guamp 31/10: the Music, Stocks and Calendar widget extensions run at ~95-99 % of a core each for as long as the phone is on
+  * (fin21w guamp-wprobe=MusicWidgets: the main thread always inside CoreText TOpenTypeMorph::ShapeGlyphs / OTL GSUB lookups),
+  * which starved the audio server and the render server. Until the cause is fixed, processes whose name starts with one of
+- * guamp-bg-procs (default "MusicWidgets,StocksWidget,CalendarWidget"; "0" = off) are put in the Darwin background band
++ * guamp-bg-procs (default below; "0" = off) are put in the Darwin background band
+  * (TASK_POLICY_DARWIN_BG, external): they still run, on what the rest leaves. Checked every 15 s for 20 minutes.
+  */
+ #include <kern/policy_internal.h>
+ 
+ static thread_call_t guamp_bg_call;
+ static uint32_t guamp_bg_round;
+-static char guamp_bg_names[96] = "MusicWidgets,StocksWidget,CalendarWidget";
+-#define GUAMP_BG_MAX 16
++/* guamp 07/11 (perf-demoni, fin53 log live-20261106-092610, GuampCpu at 71-161 s while the Home Screen loads, 557-693 % of the
++ * 8 cores in use): WorldClockWidget 32 % (the fourth widget extension of the same kind), CacheDeleteAppContainerCaches 20-38 %
++ * for over a minute (purgeable space scan; its 16-byte name), mlhostd and triald (ML host, Trial experiments) 3-4 % at rest.
++ * Daemons that SpringBoard, Phone, Wallet, Watch, Wi-Fi, Bluetooth, App Store, Safari or Maps wait on are not listed. The
++ * buffer holds a longer guamp-bg-procs; the done list is a ring of 32 pids so respawned processes do not print every round. */
++static char guamp_bg_names[192] = "MusicWidgets,StocksWidget,CalendarWidget,WorldClockWidget,CacheDeleteAppCo,mlhostd,triald";
++#define GUAMP_BG_MAX 32
+ static int guamp_bg_done[GUAMP_BG_MAX];
+ static uint32_t guamp_bg_count;
+ 
+@@ -4634,7 +4639,7 @@ guamp_bg_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		}
+ 		int pid = task_pid(task);
+ 		bool seen = false;
+-		for (uint32_t i = 0; i < guamp_bg_count; i++) {
++		for (uint32_t i = 0; i < guamp_bg_count && i < GUAMP_BG_MAX; i++) {
+ 			seen = seen || guamp_bg_done[i] == pid;
+ 		}
+ 		if (seen) {
+@@ -4660,9 +4665,8 @@ guamp_bg_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 			printf("guamp-bg-procs: %s[%d] suspended (%d)\n", names[i], pids[i], kr);
+ 		}
+ 		task_deallocate(found[i]);
+-		if (guamp_bg_count < GUAMP_BG_MAX) {
+-			guamp_bg_done[guamp_bg_count++] = pids[i];
+-		}
++		guamp_bg_done[guamp_bg_count % GUAMP_BG_MAX] = pids[i];
++		guamp_bg_count++;
+ 		printf("guamp-bg-procs: %s[%d] put in the background band\n", names[i], pids[i]);
+ 	}
+ 	if (++guamp_bg_round < 80) {
