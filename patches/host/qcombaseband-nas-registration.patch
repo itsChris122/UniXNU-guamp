@@ -1,0 +1,378 @@
+diff --git a/baseband/coachz_baseband.cpp b/baseband/coachz_baseband.cpp
+--- a/baseband/coachz_baseband.cpp
++++ b/baseband/coachz_baseband.cpp
+@@ -17,6 +17,7 @@
+ #include <libkern/c++/OSData.h>
+ #include <kern/thread_call.h>
+ #include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "coachz_bb_qmux.h"
+ #include "coachz_bb_sahara.h"
+@@ -26,6 +27,7 @@
+ #include "coachz_bb_pdp.h"
+ #include "coachz_bb_esim.h"
+ #include "coachz_bb_uimprov.h"
++#include "coachz_bb_nasreg.h"
+ 
+ #define BB_FRAME_MAX (64u * 1024u)       // one read or write: a QMUX frame, a SAHARA packet or a READ_DATA answer
+ // Frames waiting for ABM, per channel. At boot the 53 clients' registrations and indications arrive faster than ABM reads; with 64 the
+@@ -321,8 +323,10 @@
+ static void bb_sim_request(const struct cbq_result &r, const uint8_t *sdu);
+ 
+ // A request for the modem, with the data port named as this modem has it.
++static void bb_nas_request_note(uint32_t service, const uint8_t *sdu, uint32_t n);   // guamp fin63, below
+ static void bb_to_modem(const struct cbq_result &r, const uint8_t *sdu)
+ {
++  bb_nas_request_note(r.service, sdu, r.len);
+   if (r.service == CBD_SVC_WDS) bb_pdp_note(r.local_port, r.cid, r.channel, sdu, r.len);
+   bb_sim_request(r, sdu);
+   if (r.service == CBE_SVC_UIM && bb_esim.route_failed) {
+@@ -1257,6 +1261,63 @@
+   if (what == CBU_WAIT_CLOSE && cbu_need(&bb_prov, &bb_prov.last, bb_now_ms())) bb_uim_send(CBU_WAIT_OPEN, &bb_prov.last);
+   return 1;
+ }
++// guamp 08/11 (fin63): NAS registration follow-up (coachz_bb_nasreg.h). Logs the modem's registration and operating mode as
++// CommCenter receives them, and CommCenter's system selection / operating mode requests; with guamp-bb-nas-reattach=1 it asks
++// the modem for automatic registration when it stays Online, not registered, with the USIM ready (fin62: stuck "searching"
++// after CommCenter's boot airplane-mode cycle).
++static struct cbn_state bb_nas;
++static int bb_nas_slot = -1, bb_nas_reattach = -1;
++static uint8_t bb_nas_req[32];
++static int bb_nas_enabled(void)
++{
++  if (bb_nas_reattach < 0) {
++    uint32_t on = 0;
++    bb_nas_reattach = PE_parse_boot_argn("guamp-bb-nas-reattach", &on, sizeof on) && on ? 1 : 0;
++    printf("COACHZ baseband: NAS registration follow-up: %s\n",
++           bb_nas_reattach ? "log and automatic register when stuck searching (guamp-bb-nas-reattach=1)" : "log only");
++  }
++  return bb_nas_reattach;
++}
++static void bb_nas_note(uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++  struct cbn_serving v;
++  uint8_t mode = 0;
++  const char *source = n && sdu[0] == 4u ? "indication" : "answer";
++  if (service == CBN_SVC_NAS && cbn_parse_serving(sdu, n, &v)) {
++    if (cbn_note_serving(&bb_nas, &v, bb_now_ms()))
++      printf("COACHZ baseband: NAS serving system (%s, %u ms): registration %u CS %u PS %u selected %u, %u radio interfaces, first %u; registered %u times\n",
++             source, bb_now_ms(), v.reg, v.cs, v.ps, v.selected, v.rats, v.rat, bb_nas.registered_count);
++  } else if (service == CBN_SVC_DMS && cbn_parse_mode(sdu, n, &mode)) {
++    if (cbn_note_mode(&bb_nas, mode, bb_now_ms())) printf("COACHZ baseband: DMS operating mode %u (%s, %u ms)\n", mode, source, bb_now_ms());
++  }
++}
++static void bb_nas_request_note(uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++  if (!cbn_logged_request(service, sdu, n)) return;
++  char hex[3 * 40 + 1];
++  uint32_t w = 0;
++  const uint32_t len = cbd_rd16(sdu + 5);
++  for (uint32_t i = 0; i < len && i < 40 && 7u + i < n; i++) w += (uint32_t)snprintf(hex + w, sizeof hex - w, "%02x ", sdu[7 + i]);
++  hex[w ? w - 1 : 0] = 0;
++  printf("COACHZ baseband: CommCenter %s request TLVs (%u bytes, %u ms): %s\n",
++         service == CBN_SVC_NAS ? "NAS 0x33 system selection" : "DMS 0x2e operating mode", len, bb_now_ms(), hex);
++}
++static void bb_nas_tick(void)
++{
++  const uint32_t now = bb_now_ms();
++  if (!cbn_tick(&bb_nas, bb_nas_enabled(), bb_prov.ready, now)) return;
++  if (bb_nas_slot < 0) bb_nas_slot = cbq_client_alloc(&bb_qmux, CBQ_INTERNAL, CBN_SVC_NAS);
++  const struct cbq_server *server = cbq_server_find(&bb_qmux, CBN_SVC_NAS);
++  if (bb_nas_slot < 0 || !server) return;
++  const uint32_t txn = cbn_next_txn(&bb_nas), len = cbn_register_request(bb_nas_req, sizeof bb_nas_req, txn);
++  if (!len) return;
++  const uint32_t queued = bb_tx_count;
++  bb_queue_tx(CBQ_PORT_BASE + (uint32_t)bb_nas_slot, server->node, server->port, bb_nas_req, len);
++  if (bb_tx_count == queued) return;
++  cbn_sent(&bb_nas, txn, now);
++  printf("COACHZ baseband: NAS automatic register asked (try %u, %u ms): Online and not registered with the USIM ready\n", bb_nas.tries, now);
++}
++
+ // Periodic, from coachz_baseband_poll (bb_lock held).
+ static void bb_uim_tick(void)
+ {
+@@ -1278,6 +1339,10 @@
+     if (bb_esim_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_esim_slot) {
+       if (!bb_uim_answer(static_cast<const uint8_t *>(body), size))
+         cbe_answer(&bb_esim, static_cast<const uint8_t *>(body), size, bb_now_ms());
++    } else if (bb_nas_slot >= 0 && dst_port == CBQ_PORT_BASE + (uint32_t)bb_nas_slot) {
++      uint32_t error = 0;
++      if (cbn_answer(&bb_nas, static_cast<const uint8_t *>(body), size, &error))
++        printf("COACHZ baseband: NAS automatic register answer: error 0x%x (try %u)\n", error, bb_nas.tries);
+     } else if (cbd_answer(&bb_data, r.service, static_cast<const uint8_t *>(body), size)) bb_data_step();
+   } else if (r.kind == CBQ_TO_HOST) {
+     if (r.service == CBD_SVC_WDS) bb_pdp_note(dst_port, r.cid, r.channel, static_cast<const uint8_t *>(body), size);
+@@ -1300,6 +1365,7 @@
+     } else bb_push(r.channel == 0 ? CBH_QMUX1 : CBH_QMUX2, bb_out, r.len);
+     bb_sim_answer(r, sdu, size);   // after the answer itself: bb_activation_indicate reuses bb_out
+     bb_uim_status_note(r.service, sdu, size);
++    bb_nas_note(r.service, sdu, size);
+   }
+   IOLockUnlock(bb_lock);
+   return 1;
+@@ -1314,6 +1380,7 @@
+   IOLockLock(bb_lock);
+   bb_esim_step();
+   bb_uim_tick();
++  bb_nas_tick();
+   while (bb_tx_count && n < 16) {
+     batch[n++] = bb_txq[bb_tx_head];
+     bb_tx_head = (bb_tx_head + 1) % BB_TX;
+diff --git a/baseband/coachz_bb_nasreg.h b/baseband/coachz_bb_nasreg.h
+new file mode 100755
+index 0000000..d547671
+--- /dev/null
++++ b/baseband/coachz_bb_nasreg.h
+@@ -0,0 +1,135 @@
++/* guamp: NAS registration follow-up for a modem that stays "searching" after CommCenter's boot airplane-mode cycle.
++ *
++ * fin62 (08/11): with the USIM ready the SM6115 modem registered on the network (Serving System: registered, LTE, CS and PS
++ * attached), then CommCenter, which boots in airplane mode, set Low Power and Online again (DMS 0x2e). From there the modem
++ * reported "not registered, searching", CS/PS detached, no radio interface, and never registered again; no network reject
++ * indication. CommCenter on an Apple modem relies on the baseband to register by itself after Online.
++ *
++ * This header follows what the modem tells CommCenter: NAS Serving System (0x24 answer and indication, TLV 0x01
++ * {registration state, CS attach, PS attach, selected network, radio interface count, radio interfaces}) and the DMS operating
++ * mode (0x2d answer TLV 0x01, event report 0x01 TLV 0x14). Changes are logged as states only (no PLMN, cell or identifier).
++ * When enabled, a modem that has been Online and not registered (states 0 or 2) for CBN_SEARCH_MS while the USIM is ready gets
++ * NAS Initiate Network Register (0x22, TLV 0x01 action 1 = automatic), the request ModemManager/qmicli use; at most CBN_TRIES
++ * times per boot, CBN_RETRY_MS apart, and never while the modem reports registered or not Online. */
++#ifndef COACHZ_BB_NASREG_H
++#define COACHZ_BB_NASREG_H
++#include <stdint.h>
++#include "coachz_bb_data.h"
++
++#define CBN_SVC_DMS 0x02u
++#define CBN_SVC_NAS 0x03u
++#define CBN_DMS_EVENT_REPORT 0x0001u
++#define CBN_DMS_GET_MODE 0x002du
++#define CBN_DMS_SET_MODE 0x002eu
++#define CBN_NAS_REGISTER 0x0022u
++#define CBN_NAS_SERVING_SYSTEM 0x0024u
++#define CBN_NAS_SET_SELECTION 0x0033u
++#define CBN_MODE_ONLINE 0u
++#define CBN_REG_NOT 0u
++#define CBN_REG_YES 1u
++#define CBN_REG_SEARCHING 2u
++#define CBN_SEARCH_MS 15000u
++#define CBN_RETRY_MS 30000u
++#define CBN_TRIES 3u
++#define CBN_TIMEOUT_MS 10000u
++#define CBN_TXN_BASE 0x7d00u
++
++struct cbn_serving { uint8_t reg, cs, ps, selected, rats, rat; };
++
++struct cbn_state {
++    uint8_t have_serving, have_mode, mode, tries, pending;
++    struct cbn_serving serving;
++    uint16_t txn, wait_txn;
++    uint32_t not_registered_ms, online_ms, last_sent, deadline, sent, answered, last_error, registered_count;
++};
++
++/* Serving System of an answer without error (type 2) or an indication (type 4): 1 when TLV 0x01 was read. */
++static inline int cbn_parse_serving(const uint8_t *sdu, uint32_t n, struct cbn_serving *out)
++{
++    if (n < 7u || !cbd_sdu_ok(sdu, n) || cbd_rd16(sdu + 3) != CBN_NAS_SERVING_SYSTEM) return 0;
++    if (!((sdu[0] == 2u && !cbd_error(sdu, n)) || sdu[0] == 4u)) return 0;
++    uint32_t len = 0;
++    const uint8_t *p = cbd_find(sdu, n, 0x01, &len);
++    if (!p || len < 5u || len < 5u + p[4]) return 0;
++    out->reg = p[0]; out->cs = p[1]; out->ps = p[2]; out->selected = p[3]; out->rats = p[4];
++    out->rat = p[4] ? p[5] : 0xffu;
++    return 1;
++}
++/* DMS operating mode from a Get Operating Mode answer (TLV 0x01) or an event report indication (TLV 0x14): 1 when read. */
++static inline int cbn_parse_mode(const uint8_t *sdu, uint32_t n, uint8_t *mode)
++{
++    if (n < 7u || !cbd_sdu_ok(sdu, n)) return 0;
++    const uint32_t message = cbd_rd16(sdu + 3);
++    uint32_t len = 0;
++    const uint8_t *p = 0;
++    if (sdu[0] == 2u && message == CBN_DMS_GET_MODE && !cbd_error(sdu, n)) p = cbd_find(sdu, n, 0x01, &len);
++    else if (sdu[0] == 4u && message == CBN_DMS_EVENT_REPORT) p = cbd_find(sdu, n, 0x14, &len);
++    if (!p || len < 1u) return 0;
++    *mode = p[0];
++    return 1;
++}
++static inline int cbn_not_registered(uint8_t reg) { return reg == CBN_REG_NOT || reg == CBN_REG_SEARCHING; }
++
++/* A new Serving System: 1 when it differs from the last one (the caller logs it). */
++static inline int cbn_note_serving(struct cbn_state *s, const struct cbn_serving *v, uint32_t now)
++{
++    const int changed = !s->have_serving || s->serving.reg != v->reg || s->serving.cs != v->cs || s->serving.ps != v->ps ||
++        s->serving.rats != v->rats || s->serving.rat != v->rat || s->serving.selected != v->selected;
++    if (cbn_not_registered(v->reg) && (!s->have_serving || !cbn_not_registered(s->serving.reg))) s->not_registered_ms = now ? now : 1u;
++    if (v->reg == CBN_REG_YES && (!s->have_serving || s->serving.reg != CBN_REG_YES)) s->registered_count++;
++    s->serving = *v; s->have_serving = 1;
++    return changed;
++}
++/* A new operating mode: 1 when it differs from the last one. */
++static inline int cbn_note_mode(struct cbn_state *s, uint8_t mode, uint32_t now)
++{
++    const int changed = !s->have_mode || s->mode != mode;
++    if (mode == CBN_MODE_ONLINE && changed) s->online_ms = now ? now : 1u;
++    s->mode = mode; s->have_mode = 1;
++    return changed;
++}
++/* Periodic: 1 when the bridge should ask for automatic registration now (then cbn_sent). */
++static inline int cbn_tick(struct cbn_state *s, int enabled, int sim_ready, uint32_t now)
++{
++    if (s->pending && (int32_t)(now - s->deadline) >= 0) s->pending = 0;
++    if (!enabled || !sim_ready || s->pending || s->tries >= CBN_TRIES) return 0;
++    if (!s->have_serving || !s->have_mode || s->mode != CBN_MODE_ONLINE || !cbn_not_registered(s->serving.reg)) return 0;
++    const uint32_t since = (int32_t)(s->online_ms - s->not_registered_ms) > 0 ? s->online_ms : s->not_registered_ms;
++    if (now - since < CBN_SEARCH_MS) return 0;
++    if (s->tries && now - s->last_sent < CBN_RETRY_MS) return 0;
++    return 1;
++}
++/* NAS Initiate Network Register, automatic. */
++static inline uint32_t cbn_register_request(uint8_t *sdu, uint32_t room, uint32_t txn)
++{
++    const uint8_t automatic = 1u;
++    if (room < 7u + 4u) return 0;
++    const uint32_t w = cbd_tlv(sdu + 7, room - 7u, 0x01, &automatic, 1);
++    return cbd_request(sdu, txn, CBN_NAS_REGISTER, w);
++}
++static inline uint32_t cbn_next_txn(struct cbn_state *s)
++{
++    s->txn = (uint16_t)(s->txn + 1u);
++    return CBN_TXN_BASE + (s->txn & 0xffu);
++}
++static inline void cbn_sent(struct cbn_state *s, uint32_t txn, uint32_t now)
++{
++    s->tries++; s->sent++; s->pending = 1; s->wait_txn = (uint16_t)txn; s->last_sent = now; s->deadline = now + CBN_TIMEOUT_MS;
++}
++/* The modem's answer to the bridge's register request: 1 when it was (error in *error). */
++static inline int cbn_answer(struct cbn_state *s, const uint8_t *sdu, uint32_t n, uint32_t *error)
++{
++    if (!s->pending || n < 7u || !cbd_sdu_ok(sdu, n) || sdu[0] != 2u || cbd_rd16(sdu + 1) != s->wait_txn ||
++        cbd_rd16(sdu + 3) != CBN_NAS_REGISTER) return 0;
++    *error = cbd_error(sdu, n);
++    s->pending = 0; s->answered++; s->last_error = *error;
++    return 1;
++}
++/* Host requests worth a log line: NAS Set System Selection Preference (its TLVs, no identifiers) and DMS Set Operating Mode. */
++static inline int cbn_logged_request(uint32_t service, const uint8_t *sdu, uint32_t n)
++{
++    if (n < 7u || !cbd_sdu_ok(sdu, n) || sdu[0] != 0u) return 0;
++    const uint32_t message = cbd_rd16(sdu + 3);
++    return (service == CBN_SVC_NAS && message == CBN_NAS_SET_SELECTION) || (service == CBN_SVC_DMS && message == CBN_DMS_SET_MODE);
++}
++#endif
+diff --git a/tests/coachz_bb_nasreg_model_test.c b/tests/coachz_bb_nasreg_model_test.c
+new file mode 100755
+index 0000000..65846ec
+--- /dev/null
++++ b/tests/coachz_bb_nasreg_model_test.c
+@@ -0,0 +1,110 @@
++/* guamp: host model of the NAS registration follow-up (coachz_bb_nasreg.h), with the wire facts of the fin62 log:
++   Serving System TLV 0x01 "01 01 01 02 01 08" (registered, LTE) then "02 02 02 00 01 00" (searching, no radio interface),
++   DMS operating mode answer/indication, Initiate Network Register encoding, answer matching and the attempt limits. */
++#include <stdio.h>
++#include <string.h>
++#include "coachz_bb_nasreg.h"
++
++static int failures;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
++
++static uint32_t msg(uint8_t *sdu, uint8_t type, uint16_t txn, uint16_t message, const uint8_t *tlvs, uint32_t n)
++{
++    sdu[0] = type; sdu[1] = (uint8_t)txn; sdu[2] = (uint8_t)(txn >> 8); sdu[3] = (uint8_t)message; sdu[4] = (uint8_t)(message >> 8);
++    sdu[5] = (uint8_t)n; sdu[6] = (uint8_t)(n >> 8);
++    memcpy(sdu + 7, tlvs, n);
++    return 7u + n;
++}
++static const uint8_t ok_result[] = { 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 };
++
++int main(void)
++{
++    uint8_t sdu[128], t[64];
++    struct cbn_serving v;
++    uint8_t mode = 0xff;
++
++    /* fin62 45.385812: registered, CS/PS attached, selected network 2? (3GPP), one radio interface LTE (8) */
++    const uint8_t registered[] = { 0x01, 0x06, 0x00, 0x01, 0x01, 0x01, 0x02, 0x01, 0x08 };
++    uint32_t n = msg(sdu, 4, 9, CBN_NAS_SERVING_SYSTEM, registered, sizeof registered);
++    CHECK(cbn_parse_serving(sdu, n, &v) && v.reg == 1 && v.cs == 1 && v.ps == 1 && v.rats == 1 && v.rat == 8);
++    /* fin62 47.454930: searching, detached, one interface "none" (0) */
++    const uint8_t searching[] = { 0x01, 0x06, 0x00, 0x02, 0x02, 0x02, 0x00, 0x01, 0x00 };
++    n = msg(sdu, 4, 13, CBN_NAS_SERVING_SYSTEM, searching, sizeof searching);
++    CHECK(cbn_parse_serving(sdu, n, &v) && v.reg == 2 && v.cs == 2 && v.ps == 2 && v.rat == 0);
++    /* an answer with an error, a truncated TLV and another message are not read */
++    memcpy(t, "\x02\x04\x00\x01\x00\x10\x00", 7); memcpy(t + 7, searching, sizeof searching);
++    n = msg(sdu, 2, 1, CBN_NAS_SERVING_SYSTEM, t, 7 + sizeof searching);
++    CHECK(!cbn_parse_serving(sdu, n, &v));
++    const uint8_t truncated[] = { 0x01, 0x05, 0x00, 0x02, 0x02, 0x02, 0x00, 0x03 };
++    n = msg(sdu, 4, 1, CBN_NAS_SERVING_SYSTEM, truncated, sizeof truncated);
++    CHECK(!cbn_parse_serving(sdu, n, &v));
++    n = msg(sdu, 4, 1, 0x004e, searching, sizeof searching);
++    CHECK(!cbn_parse_serving(sdu, n, &v));
++
++    /* DMS mode: Get Operating Mode answer TLV 0x01 (fin62 33.379: "... 01 01 00 05" = 5) and event report TLV 0x14 */
++    memcpy(t, ok_result, 7); t[7] = 0x01; t[8] = 1; t[9] = 0; t[10] = 5;
++    n = msg(sdu, 2, 5, CBN_DMS_GET_MODE, t, 11);
++    CHECK(cbn_parse_mode(sdu, n, &mode) && mode == 5);
++    const uint8_t report[] = { 0x14, 0x01, 0x00, 0x00 };
++    n = msg(sdu, 4, 0, CBN_DMS_EVENT_REPORT, report, sizeof report);
++    CHECK(cbn_parse_mode(sdu, n, &mode) && mode == 0);
++    const uint8_t other[] = { 0x15, 0x01, 0x00, 0x00 };
++    n = msg(sdu, 4, 0, CBN_DMS_EVENT_REPORT, other, sizeof other);
++    CHECK(!cbn_parse_mode(sdu, n, &mode));
++
++    /* the follow-up: the fin62 sequence */
++    struct cbn_state s;
++    memset(&s, 0, sizeof s);
++    struct cbn_serving reg = { 1, 1, 1, 2, 1, 8 }, search = { 2, 2, 2, 0, 1, 0 };
++    CHECK(cbn_note_mode(&s, 0, 33790) == 1);
++    CHECK(cbn_note_serving(&s, &reg, 45385) == 1 && s.registered_count == 1);
++    CHECK(!cbn_tick(&s, 1, 1, 46000));                              /* registered: nothing to do */
++    CHECK(cbn_note_mode(&s, 1, 46971) == 1);                        /* Low Power (CommCenter's airplane cycle) */
++    CHECK(cbn_note_serving(&s, &search, 47083) == 1);
++    CHECK(!cbn_tick(&s, 1, 1, 47083 + CBN_SEARCH_MS + 1));          /* not Online: never */
++    CHECK(cbn_note_mode(&s, 0, 47176) == 1);                        /* Online again */
++    CHECK(cbn_note_serving(&s, &search, 47454) == 0);               /* same state: no new log line */
++    CHECK(!cbn_tick(&s, 1, 1, 47176 + CBN_SEARCH_MS - 1));          /* counted from the later of Online and "searching" */
++    CHECK(!cbn_tick(&s, 0, 1, 47176 + CBN_SEARCH_MS));              /* disabled: log only */
++    CHECK(!cbn_tick(&s, 1, 0, 47176 + CBN_SEARCH_MS));              /* USIM not ready: never */
++    CHECK(cbn_tick(&s, 1, 1, 47176 + CBN_SEARCH_MS));
++    uint32_t txn = cbn_next_txn(&s);
++    n = cbn_register_request(sdu, sizeof sdu, txn);
++    CHECK(n == 11 && sdu[0] == 0 && cbd_rd16(sdu + 1) == txn && cbd_rd16(sdu + 3) == 0x22 && cbd_rd16(sdu + 5) == 4 &&
++          sdu[7] == 0x01 && sdu[8] == 1 && sdu[9] == 0 && sdu[10] == 1);
++    CHECK(cbn_register_request(sdu, 10, txn) == 0);
++    cbn_sent(&s, txn, 62176);
++    CHECK(!cbn_tick(&s, 1, 1, 62177));                              /* waiting for the answer */
++    uint32_t error = 0;
++    memcpy(t, ok_result, 7);
++    n = msg(sdu, 2, (uint16_t)(txn + 1), CBN_NAS_REGISTER, t, 7);
++    CHECK(!cbn_answer(&s, sdu, n, &error));                         /* another transaction */
++    n = msg(sdu, 2, (uint16_t)txn, CBN_NAS_REGISTER, t, 7);
++    CHECK(cbn_answer(&s, sdu, n, &error) && error == 0 && !s.pending && s.answered == 1);
++    CHECK(!cbn_tick(&s, 1, 1, 62176 + CBN_RETRY_MS - 1));           /* retry spacing */
++    CHECK(cbn_tick(&s, 1, 1, 62176 + CBN_RETRY_MS));
++    cbn_sent(&s, cbn_next_txn(&s), 92176);
++    CHECK(!cbn_tick(&s, 1, 1, 92176 + 5000));
++    CHECK(!cbn_tick(&s, 1, 1, 92176 + CBN_TIMEOUT_MS - 1) && s.pending);
++    CHECK(!cbn_tick(&s, 1, 1, 92176 + CBN_TIMEOUT_MS) && !s.pending);   /* timed out: pending cleared, spacing still applies */
++    CHECK(cbn_tick(&s, 1, 1, 92176 + CBN_RETRY_MS));
++    cbn_sent(&s, cbn_next_txn(&s), 122176);
++    s.pending = 0;
++    CHECK(s.tries == CBN_TRIES && !cbn_tick(&s, 1, 1, 122176 + 10 * CBN_RETRY_MS));   /* at most CBN_TRIES per boot */
++    CHECK(cbn_note_serving(&s, &reg, 130000) == 1 && s.registered_count == 2);
++    CHECK(!cbn_tick(&s, 1, 1, 200000));
++
++    /* logged host requests */
++    const uint8_t a7[] = { 0xa7, 0x01, 0x00, 0x01 };
++    n = msg(sdu, 0, 6, CBN_NAS_SET_SELECTION, a7, sizeof a7);
++    CHECK(cbn_logged_request(CBN_SVC_NAS, sdu, n));
++    const uint8_t online[] = { 0x01, 0x01, 0x00, 0x00 };
++    n = msg(sdu, 0, 7, CBN_DMS_SET_MODE, online, sizeof online);
++    CHECK(cbn_logged_request(CBN_SVC_DMS, sdu, n) && !cbn_logged_request(CBN_SVC_NAS, sdu, n));
++    n = msg(sdu, 2, 7, CBN_DMS_SET_MODE, ok_result, 7);
++    CHECK(!cbn_logged_request(CBN_SVC_DMS, sdu, n));
++
++    if (failures) { printf("%d failures\n", failures); return 1; }
++    printf("PASS: NAS registration follow-up model (fin62 wire facts, Online gating, limits, answer matching)\n");
++    return 0;
++}

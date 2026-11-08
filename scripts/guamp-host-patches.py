@@ -22,6 +22,10 @@ PATCHES = [
     # CommCenter never asks, so the SIM stayed unread ("SOS", no ICCID/IMSI). Applies after qcombaseband-short-revision.patch.
     ('drivers/QcomBaseband', 'patches/host/qcombaseband-uim-provisioning.patch',
      {'baseband/coachz_bb_uimprov.h': 'cbu_imsi_request', 'baseband/coachz_baseband.cpp': 'bb_uim_imsi_result'}),
+    # 08/11 (fin63): NAS registration follow-up: logs registration/operating mode and CommCenter's selection requests; with
+    # guamp-bb-nas-reattach=1 asks automatic registration when the modem stays searching. Applies after the UIM patch.
+    ('drivers/QcomBaseband', 'patches/host/qcombaseband-nas-registration.patch',
+     {'baseband/coachz_bb_nasreg.h': 'cbn_register_request', 'baseband/coachz_baseband.cpp': 'bb_nas_tick'}),
 ]
 OPTIONAL = {'drivers/QcomBaseband'}
 
