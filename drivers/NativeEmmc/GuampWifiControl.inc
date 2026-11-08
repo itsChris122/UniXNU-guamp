@@ -67,6 +67,7 @@ struct WifiControl {
   // (SIM ready, LTE found): the whole transport failed with it (peer-reset), so CommCenter lost the modem (SIM "unknown")
   // and Wi-Fi died. Now a WLFW loss only stops Wi-Fi: QRTR, the baseband bridge, RMTFS, TFTP and SERVREG keep running.
   uint32_t wlanLosses=0,rejuvenationsSeen=0;
+  uint32_t wlanCrashBits=0;   // fin64: last SMP2P "wlan" value reported (bit 0 force-fatal, bit 1 early-crash)
   // Diagnostics: the gate being waited for or the step that failed, and transitions already reported.
   const char *gate="idle";
   bool sawInbound=false,sawNegotiated=false,sawOpenSent=false,sawRemote=false,sawServer=false;
@@ -164,6 +165,15 @@ struct WifiControl {
       sawInbound=true; trace("smp2p 435 inbound present: size/valid/features",0,smp.inSize,smp.inValid,smp.inFeatures);
     }
     if(e!=Ok&&e!=Again) return fail(e);
+    // fin64: WLAN firmware crash signalled by the modem (icnss: force-fatal / early-crash): Wi-Fi only.
+    if((smp.wlan&3u)!=wlanCrashBits) {
+      wlanCrashBits=smp.wlan&3u;
+      if(wlanCrashBits) {
+        trace("smp2p wlan: Wi-Fi firmware crash (bit0 force-fatal, bit1 early-crash), modem link kept: wlan/WLFW state/ms",0,
+              wlanCrashBits,unsigned(wlan.state),uint32_t(now-started));
+        wlanDown(PeerReset,"WLFW stopped after the Wi-Fi firmware crash indication: losses/WLFW state/ms");
+      } else trace("smp2p wlan: crash bits cleared: wlan/-/ms",0,smp.wlan,0,uint32_t(now-started));
+    }
     if(stage==AwaitModem) {
       if(!smp.ready()) return now>=deadline?fail(Timeout):Ok;
       trace("smp2p modem ready: slave/wlan/ms",0,smp.slave,smp.wlan,uint32_t(now-started));

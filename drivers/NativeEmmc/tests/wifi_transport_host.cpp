@@ -105,8 +105,11 @@ static void smpTest() {
   CHECK(e.update(1u<<3,0)==Ok&&le32(f.bytes.data()+e.outbound+36)==0);
   f.w(in+16,1); CHECK(e.poll()==PeerReset&&le32(f.bytes.data()+e.outbound+16)==2);
   CHECK(e.poll()==Ok);
-  f.w(in+56,1); CHECK(e.poll()==PeerReset);
-  f.w(in+56,0); f.w(in+36,0); CHECK(e.poll()==PeerReset);
+  // fin64: the "wlan" entry (WLAN firmware force-fatal bit 0 / early-crash bit 1) is reported, not a modem reset
+  f.w(in+56,1); CHECK(e.poll()==Ok&&e.wlan==1&&e.ready());
+  f.w(in+56,2); CHECK(e.poll()==Ok&&e.wlan==2&&e.ready());
+  f.w(in+56,0); CHECK(e.poll()==Ok&&e.wlan==0);
+  f.w(in+36,0); CHECK(e.poll()==PeerReset);   // the modem's own ready bit gone: still a peer reset
 }
 static std::vector<uint8_t> frame(uint16_t cmd,uint16_t p1,uint32_t p2,const std::vector<uint8_t> &data={}) {
   std::vector<uint8_t> p(8+align8(uint32_t(data.size()))); put16(p.data(),cmd); put16(p.data()+2,p1); put32(p.data()+4,p2);

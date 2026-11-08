@@ -56,7 +56,11 @@ struct Smp2pEdge {
     }
     slave=in.hasEntry?in.value:0; wlan=0;
     for(uint32_t n=0;n<in.validEntries;n++) if(nameEquals(in.names[n],"wlan",17)) wlan=in.values[n];
-    if((slave&1)||(wlan&3)||restarted||(seenReady&&!(slave&2))) return PeerReset;
+    // guamp 08/11 (fin64): the "wlan" entry is the WLAN firmware's, not the modem's: bengal.dtsi qcom,smp2p_map_wlan_1_in maps
+    // bit 0 "qcom,smp2p-force-fatal-error" and bit 1 "qcom,smp2p-early-crash-ind" for icnss, which restarts Wi-Fi only.
+    // fin63r: wlan 2 (early crash) ~1 s after the modem registered on LTE took the whole link down (SIM lost). The bits stay
+    // in `wlan` for the owner (WifiControl stops Wi-Fi); only the modem's own entry and restart flag mean a peer reset.
+    if((slave&1)||restarted||(seenReady&&!(slave&2))) return PeerReset;
     if(slave&2) seenReady=true;
     return in.hasEntry?Ok:Again;
   }
