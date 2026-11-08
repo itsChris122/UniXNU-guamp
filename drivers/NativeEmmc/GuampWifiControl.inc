@@ -63,6 +63,10 @@ struct WifiControl {
   // Before Running, and on failure, it stays BeatMs: that is where it tells which gate stalled.
   uint32_t runningBeatMs=BeatMs;
   bool routerStarted=false,wlanStarted=false;
+  // guamp 08/11 (fin62): fin61 showed the modem dropping its WLFW service ~1 s after it applied the carrier configuration
+  // (SIM ready, LTE found): the whole transport failed with it (peer-reset), so CommCenter lost the modem (SIM "unknown")
+  // and Wi-Fi died. Now a WLFW loss only stops Wi-Fi: QRTR, the baseband bridge, RMTFS, TFTP and SERVREG keep running.
+  uint32_t wlanLosses=0,rejuvenationsSeen=0;
   // Diagnostics: the gate being waited for or the step that failed, and transitions already reported.
   const char *gate="idle";
   bool sawInbound=false,sawNegotiated=false,sawOpenSent=false,sawRemote=false,sawServer=false;
@@ -211,7 +215,11 @@ struct WifiControl {
     }
 #endif
     if(routerStarted) { e=qrtr.step(); if(e!=Again&&e) return fail(e); }
-    if(wlanStarted) { e=wlan.step(now); if(e) return fail(e); }
+    if(wlan.rejuvenations!=rejuvenationsSeen) {
+      rejuvenationsSeen=wlan.rejuvenations;
+      trace("WLFW rejuvenate indication 0x39 (ignored, as upstream ath10k): count/state/ms",0,rejuvenationsSeen,unsigned(wlan.state),uint32_t(now-started));
+    }
+    if(wlanStarted) { e=wlan.step(now); if(e) wlanDown(e,"WLFW step failed, modem link kept: losses/WLFW state/ms"); }
     return Ok;
   }
   const char *where() const { return gate; }
@@ -277,6 +285,13 @@ private:
   void itemTrace(uint32_t id) {
     uint32_t at=0,size=0; const int e=arena->find(1,id,&at,&size);
     trace("smem item id/offset/bytes",e,id,at,size);
+  }
+  // Wi-Fi only: WLFW stops, the modem link stays (the runtime sees wlanLosses and ends the Wi-Fi side).
+  void wlanDown(int e,const char *why) {
+    if(!wlanStarted&&wlan.state==Wlfw::Failed) return;
+    wlanLosses++;
+    trace(why,e,wlanLosses,unsigned(wlan.state),uint32_t(now-started));
+    wlan.peerLost(); wlanStarted=false;
   }
   int fail(int e) {
     if(ops.trace) { trace("FAILED: stage/ms (gate on the next line)",e,stage,uint32_t(now-started),0); heartbeat(); }
@@ -352,9 +367,12 @@ private:
   }
   static void serviceEvent(void *p,bool up) {
     auto &c=*static_cast<WifiControl *>(p);
-    if(!up) { c.wlan.peerLost(); c.wlanStarted=false; c.error=PeerReset; return; }
+    if(!up) { c.wlanDown(PeerReset,"WLFW server gone, modem link kept: losses/WLFW state/ms"); return; }
     Wlfw::Ops w={&c,qmiTx,assign,power,fileSize,fileRead,wlanEvent};
-    int e=c.wlan.start(w,c.now); if(e) c.error=e; else c.wlanStarted=true;
+    // fin62: after a loss the host ath10k side is not restarted, so WLFW is not started again either (no second
+    // power-up or MSA hand-over to the modem); the return of the service is only logged. Wi-Fi recovery is a later step.
+    if(c.wlanLosses) { c.trace("WLFW server back after a loss (Wi-Fi not restarted yet): losses/-/ms",0,c.wlanLosses,0,uint32_t(c.now-c.started)); return; }
+    int e=c.wlan.start(w,c.now); if(e) c.wlanDown(e,"WLFW start failed, modem link kept: losses/WLFW state/ms"); else c.wlanStarted=true;
   }
   static void simNote(void *p,const char *what,int status) {
     auto &c=*static_cast<WifiControl *>(p);
@@ -371,7 +389,7 @@ private:
   }
   static void qrtrRx(void *p,const uint8_t *v,uint32_t n) {
     auto &c=*static_cast<WifiControl *>(p);
-    int e=c.wlan.receive(v,n); if(e!=NotFound&&e) c.error=e;
+    int e=c.wlan.receive(v,n); if(e!=NotFound&&e) c.wlanDown(e,"WLFW message rejected, modem link kept: losses/WLFW state/ms");
   }
 #if defined(GUAMP_BASEBAND) && GUAMP_BASEBAND
   // The bridge's callbacks carry no context: the one WifiControl that turned it on.

@@ -21,7 +21,10 @@
 #include "../GuampQftp.inc"
 #include "../GuampServreg.inc"
 #include "../GuampRmtfs.inc"
+// fin62 test: the WLFW service callbacks are private; exposed only for this include
+#define private public
 #include "../GuampWifiControl.inc"
+#undef private
 using namespace guampwifi;
 static unsigned checks=0;
 #define CHECK(x) do { ++checks; if(!(x)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,#x); exit(1); } } while(0)
@@ -715,6 +718,24 @@ static void modemBurstTest() {
   CHECK(intents);
   int remote=0; for(auto &ri:r.c->glink.channels[0].remoteIntent) if(ri.id) remote++;
   CHECK(remote==2);
+  // guamp 08/11 (fin62): the WLFW service going away (fin61: ~1 s after the modem applied its carrier configuration)
+  // stops Wi-Fi only; the control stage, the QRTR router and the step result stay as they were.
+  WifiControl::serviceEvent(r.c.get(),true);
+  CHECK(r.c->wlanStarted&&r.c->step(10)==Ok);
+  WifiControl::serviceEvent(r.c.get(),false);
+  CHECK(!r.c->wlanStarted&&r.c->wlanLosses==1&&r.c->wlan.state==Wlfw::Failed&&r.saw("WLFW server gone, modem link kept"));
+  CHECK(r.c->step(11)==Ok&&r.c->stage==WifiControl::Running&&r.c->routerStarted&&r.c->qrtr.running&&!r.c->error);
+  WifiControl::serviceEvent(r.c.get(),false);   // a second "gone" for a stopped WLFW is not counted again
+  CHECK(r.c->wlanLosses==1&&r.c->step(12)==Ok);
+  WifiControl::serviceEvent(r.c.get(),true);    // the service is back: logged only, no second WLFW start (fin62)
+  CHECK(!r.c->wlanStarted&&r.c->wlan.state==Wlfw::Failed&&r.saw("WLFW server back after a loss")&&r.c->step(13)==Ok);
+  { uint8_t bad[7]={2,0,0,0x20,0,0xff,0xff};   // a malformed WLFW message: Wi-Fi only, never the modem link
+    WifiControl::qrtrRx(r.c.get(),bad,sizeof bad); }
+  CHECK(r.c->step(14)==Ok&&r.c->stage==WifiControl::Running&&r.c->routerStarted&&!r.c->error);
+  { uint8_t ind[7]={4,0,0,0x39,0,0,0};   // rejuvenate indication: logged, WLFW goes on (upstream ath10k ignores it)
+    const uint32_t before=r.c->wlan.rejuvenations; (void)r.c->wlan.receive(ind,sizeof ind);
+    CHECK(r.c->wlan.rejuvenations==before+1); }
+  CHECK(r.c->step(15)==Ok&&r.c->stage==WifiControl::Running);
   // a malformed frame is still refused, with its header kept for the failure log
   push(frame(9,9,1,std::vector<uint8_t>(8)));
   CHECK(r.c->step(5)==Protocol&&r.c->glink.refusedCmd==9&&r.c->glink.refusedP1==9&&r.saw("glink REFUSED rx command/param1/param2 0 9 9 1"));

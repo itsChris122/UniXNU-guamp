@@ -32,6 +32,7 @@ struct Wlfw {
   uint64_t waitUntil=0,assignAfter=0;
   bool issued=false,msaInd=false,fwInd=false,alreadyRunning=false,powered=false,assigned=false;
   int error=0;
+  uint32_t rejuvenations=0;
   static constexpr const char *BoardFile="/image/bdwlan_guamp_ipa.bin";
   static int send(void *ctx,const uint8_t *p,uint32_t n) {
     auto *w=static_cast<Wlfw *>(ctx); return w->ops.send(w->ops.ctx,p,n);
@@ -40,7 +41,10 @@ struct Wlfw {
     auto *w=static_cast<Wlfw *>(ctx);
     if(msg==0x21) w->fwInd=true;
     if(msg==0x2b) w->msaInd=true;
-    if(msg==0x39) w->fail(PeerReset); // firmware recovery/rejuvenation requires transport restart
+    // guamp 08/11 (fin62): upstream ath10k registers handlers only for FW_READY and MSA_READY and ignores 0x39
+    // (rejuvenate, not even enabled in our IND_REGISTER). Counted for the log; a real WLAN PD restart shows up as the
+    // WLFW server going away, handled by the control layer without touching the modem link.
+    if(msg==0x39) w->rejuvenations++;
   }
   int start(const Ops &platform,uint64_t now) {
     if(state!=Off&&state!=Failed) return Busy;

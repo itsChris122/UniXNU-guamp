@@ -267,6 +267,7 @@ struct Sm6115Runtime {
   }
   // The transport is stepped even after a Wi-Fi failure (error set): only the CE poll stops. The result is the
   // Wi-Fi error (so Wi-Fi loops end), or the transport error that failed it.
+  uint32_t wlanLossesSeen=0; bool wlanGone=false;   // guamp 08/11 (fin62): WLFW losses reported; CE poll off
   int pump() {
     // guamp 05/11: a pump nested in this one (a wait inside control.step or a CE handler) still reads the copy engines:
     // gw_snoc_poll_ce keeps itself from nesting (gw_servicing_ce); only the RPM and control steps are not re-entered
@@ -275,7 +276,15 @@ struct Sm6115Runtime {
     int e=owner.stepRpm(nowMs());
     if(!e&&control.stage!=WifiControl::Off&&control.stage!=WifiControl::Prepared&&control.stage!=WifiControl::Failed)
       e=control.step(nowMs());
-    if(!e&&ath10kStarted&&!error)gw_snoc_poll_ce();
+    // guamp 08/11 (fin62): Wi-Fi firmware lost while the modem link runs. No provider error (whatever loop calls this
+    // pump must keep calling it: it carries the baseband, RMTFS and TFTP too); only the CE poll stops, so no WLAN MMIO
+    // read happens while its firmware may be restarting.
+    if(!e&&control.wlanLosses!=wlanLossesSeen) {
+      wlanLossesSeen=control.wlanLosses; wlanGone=true;
+      IOLog("GuampWiFi: Wi-Fi firmware (WLFW) lost %u time(s), WLFW state %u: CE poll stopped, modem link kept\n",
+            wlanLossesSeen,unsigned(control.wlan.state));
+    }
+    if(!e&&ath10kStarted&&!error&&!wlanGone)gw_snoc_poll_ce();
     pumping=false;
     if(e&&!error)return fail(e,"transport pump");
     return error;
