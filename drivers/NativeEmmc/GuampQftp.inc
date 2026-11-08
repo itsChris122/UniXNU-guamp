@@ -8,6 +8,9 @@
 //    /readonly/vendor/firmware/X -> /image/X of the modem firmware partition (read only, original signed files),
 //    /readonly/firmware/modem_pr... -> /image/modem_pr...; /readwrite/X -> a RAM store for this boot (tqftpserv
 //    writes them to /data/vendor/tmp/tqftpserv); ".." and empty components are refused (sanitize_path).
+//  - guamp 08/11 (fin61): a /readwrite file the modem has not written in this boot is read through fileSize/fileRead
+//    with its "/readwrite/X" name (the owner serves the persist partition copy, Android's /mnt/vendor/persist/rfs/msm/mpss,
+//    read only); a write of such a file starts from that copy in the RAM store (open without O_TRUNC, as tqftpserv).
 // Error codes and texts as tqftpserv. No eMMC write ever happens here.
 #ifndef GUAMP_QFTP_INC
 #define GUAMP_QFTP_INC
@@ -19,7 +22,7 @@ struct Qftp {
   // NEW_SERVER (QFTP) and from the source of every session reply.
   static constexpr uint32_t Service=4096,ServiceInstance=1,Port=0x4400,Sessions=4,FirstSessionPort=0x4401;
   static constexpr uint32_t MaxBlock=4096,MaxFile=64u*1024u*1024u,MaxWindow=64;
-  static constexpr uint32_t StoreFiles=8,StoreFileBytes=128u*1024u,PathBytes=96;
+  static constexpr uint32_t StoreFiles=16,StoreFileBytes=128u*1024u,PathBytes=96;
   enum Op : uint16_t { Rrq=1,Wrq=2,DataOp=3,AckOp=4,ErrorOp=5,OackOp=6 };
   struct StoreFile { char name[PathBytes]; uint8_t *data; uint32_t size; };
   struct Session {
@@ -38,14 +41,14 @@ struct Qftp {
   Session sessions[Sessions]={};
   StoreFile store[StoreFiles]={};
   uint8_t packet[MaxBlock+4]={};
-  uint32_t requests=0,refused=0,completed=0;
+  uint32_t requests=0,refused=0,completed=0,persisted=0;
 
   int start(void *opaque,int (*tx)(void *,uint32_t,uint32_t,uint32_t,const uint8_t *,uint32_t),
             int (*stat)(void *,const char *,uint32_t *),
             int (*read)(void *,const char *,uint32_t,uint8_t *,uint32_t),const Allocator *rw=nullptr) {
     if(!tx||!stat||!read) return Invalid;
     stop();ctx=opaque;send=tx;fileSize=stat;fileRead=read;allocator=rw?*rw:Allocator{};
-    requests=refused=completed=0;return Ok;
+    requests=refused=completed=persisted=0;return Ok;
   }
   void stop() {
     for(auto &s:sessions) s={};
@@ -148,7 +151,15 @@ private:
     for(int i=0;i<int(StoreFiles);i++) if(!store[i].data) {
       store[i].data=static_cast<uint8_t *>(allocator.alloc(allocator.ctx,StoreFileBytes));
       if(!store[i].data) return -1;
-      memset(store[i].data,0,StoreFileBytes);memcpy(store[i].name,name,strlen(name)+1);store[i].size=0;*bytes=0;return i;
+      memset(store[i].data,0,StoreFileBytes);memcpy(store[i].name,name,strlen(name)+1);store[i].size=0;*bytes=0;
+      uint32_t have=0;   // guamp 08/11: the persisted copy, when the owner has one (read only there)
+      if(fileSize&&fileRead&&!fileSize(ctx,name,&have)&&have&&have<=StoreFileBytes) {
+        uint32_t at=0;
+        for(;at<have;) { uint32_t chunk=have-at>4096?4096:have-at; if(fileRead(ctx,name,at,store[i].data+at,chunk))break; at+=chunk; }
+        if(at==have) { store[i].size=have;*bytes=have;trace2("WRQ starts from the persisted copy: bytes/-/-",name,Ok,have,0,0); }
+        else memset(store[i].data,0,StoreFileBytes);
+      }
+      return i;
     }
     return -1;
   }
@@ -178,7 +189,11 @@ private:
     uint32_t bytes=0;
     if(readwrite) {
       x.file=fileOpen(write,file,true,&bytes);
-      if(x.file<0) {
+      int e=NotFound;
+      if(x.file<0&&!write&&!(e=fileSize(ctx,file,&bytes))&&bytes<=MaxFile) {
+        // guamp 08/11: not written in this boot: the persisted copy, served read only like the firmware files
+        x.readwrite=false;persisted++;trace2("RRQ from persist (read only): node/port/bytes",path,Ok,node,port,bytes);
+      } else if(x.file<0) {
         refused++;trace2(write?"WRQ REFUSED (RAM store full): node/port/-":"RRQ: file not found: node/port/-",path,write?NoMemory:NotFound,node,port,0);
         return write?error(Port,node,port,2,"Access violation"):error(Port,node,port,1,"file not found");
       }

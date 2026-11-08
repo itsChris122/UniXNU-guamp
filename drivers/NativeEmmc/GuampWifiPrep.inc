@@ -68,6 +68,7 @@ struct FirmwareStore {
   uint8_t *scratch=nullptr;
   uint8_t *ath10kBoard=nullptr;
   uint32_t ath10kBoardBytes=0;
+  const char *root="/image/";   // guamp 08/11: "/rfs/msm/mpss/" for the persist store below
   bool ready=false;
   bool isReady() const { return __atomic_load_n(&ready,__ATOMIC_ACQUIRE); }
   int mount(uint64_t first,uint64_t blocks) {
@@ -86,10 +87,10 @@ struct FirmwareStore {
     IOLockUnlock(gate);return guampwifi::Ok;
   }
   int sizeLocked(const char *path,uint32_t *bytes) {
-    guampwifi::Ext4FirmwareSource source(&fs);return source.size(path,bytes);
+    guampwifi::Ext4FirmwareSource source(&fs,root);return source.size(path,bytes);
   }
   int readLocked(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
-    guampwifi::Ext4FirmwareSource source(&fs);return source.read(path,at,out,bytes);
+    guampwifi::Ext4FirmwareSource source(&fs,root);return source.read(path,at,out,bytes);
   }
   int size(const char *path,uint32_t *bytes) {
     if(!isReady())return guampwifi::NotReady;
@@ -125,6 +126,23 @@ struct FirmwareStore {
   }
 };
 static FirmwareStore gFirmwareStore{};
+// guamp 08/11 (fin61): Android's tftp_server maps the modem's /readwrite to /mnt/vendor/persist/rfs/msm/mpss (persist
+// partition): the modem keeps there its saved configurations (mcfg_sw*, ticf.bin, shob/dhob, datablock/, mot_rfs/). The
+// RAM-only /readwrite of GuampQftp.inc started empty at every boot, so the modem never found them (USIM stuck "detected").
+// Mounted read only next to the modem partition; the TFTP server reads a /readwrite file from here only when the modem
+// has not written it in this boot. Never written.
+static FirmwareStore gPersistRfs{};
+bool findPartition(const char *wanted, uint64_t *first, uint64_t *blocks, uint64_t *attributes);
+static void mountPersistRfs() {
+  uint64_t first=0,blocks=0,attributes=0;
+  gPersistRfs.root="/rfs/msm/mpss/";
+  if(!findPartition("persist",&first,&blocks,&attributes)) { IOLog("GuampQftp: persist partition not found: /readwrite stays RAM only\n"); return; }
+  int e=gPersistRfs.mount(first,blocks);
+  uint32_t probe=0;
+  const int t=e?e:gPersistRfs.size("/rfs/msm/mpss/server_check.txt",&probe);
+  IOLog("GuampQftp: persist rfs/msm/mpss for the modem /readwrite (read only) %s (mount %d, server_check.txt %d, %u bytes)\n",
+        e?"unavailable":"ready",e,t,probe);
+}
 
 // lx_platform::fw_get has no context. Keep this callback scoped to the one
 // guamp SNOC instance. firmware-5.bin is the 60-byte upstream WCN3990 API5
@@ -478,6 +496,7 @@ void firmwareReport() {
         int persistent=gFirmwareStore.mount(window.first,window.blocks);
         IOLog("GuampWifi: persistent read-only firmware source %s; QRTR TFTP remains opt-in to the transport owner\n",
               persistent?"unavailable":"ready");
+        if(!persistent)mountPersistRfs();
 #if defined(GUAMP_WIFI_RUNTIME) && GUAMP_WIFI_RUNTIME
 #if !defined(GUAMP_WIFI_REDWOOD) || !GUAMP_WIFI_REDWOOD
         if(mode==2)IOLog("GuampWifi: guamp-wifi-start=2 (iOS station) is not built (GUAMP_WIFI_REDWOOD); modem not started\n");
@@ -550,13 +569,27 @@ extern "C" int guamp_ath10k_firmware_get(const char *name,const uint8_t **data,s
 
 // C ABI for the WLFW BDF and QFTP callbacks: read only, files under /image of the modem firmware partition only
 // (Ext4FirmwareSource::allowed: no "..", no empty component), as tqftpserv serves its firmware directory.
+// guamp 08/11: "/readwrite/X" (GuampQftp.inc, only for a file the modem has not written in this boot) is the persist copy
+// /rfs/msm/mpss/X, read only.
+static bool persistRfsPath(const char *path,char *out,uint32_t room) {
+  const char *rw="/readwrite/",*base="/rfs/msm/mpss/";
+  uint32_t i=0; for(;rw[i];i++) if(path[i]!=rw[i]) return false;
+  const uint32_t bl=uint32_t(strlen(base)),rl=uint32_t(strlen(path+i));
+  if(!rl||bl+rl>=room) return false;
+  memcpy(out,base,bl); memcpy(out+bl,path+i,rl+1);
+  return guampwifi::Ext4FirmwareSource::allowedUnder(out,base);
+}
 extern "C" int guamp_wifi_firmware_file_size(const char *path,uint32_t *bytes) {
   if(!path||!bytes)return guampwifi::Invalid;
+  char rfs[128];
+  if(persistRfsPath(path,rfs,sizeof rfs))return wifiprep::gPersistRfs.size(rfs,bytes);
   if(!guampwifi::Ext4FirmwareSource::allowed(path))return guampwifi::NotFound;
   return wifiprep::gFirmwareStore.size(path,bytes);
 }
 extern "C" int guamp_wifi_firmware_file_read(const char *path,uint32_t at,uint8_t *out,uint32_t bytes) {
   if(!path||(!out&&bytes)||!bytes)return guampwifi::Invalid;
+  char rfs[128];
+  if(persistRfsPath(path,rfs,sizeof rfs))return wifiprep::gPersistRfs.read(rfs,at,out,bytes);
   if(!guampwifi::Ext4FirmwareSource::allowed(path))return guampwifi::NotFound;
   return wifiprep::gFirmwareStore.read(path,at,out,bytes);
 }

@@ -129,6 +129,40 @@ static void writeTest() {
     for(;b<=Qftp::StoreFileBytes/4096;b++) CHECK(rx(g,s0,data(b,blockData))==Ok);
     CHECK(rx(g,s0,data(b,blockData))==Ok&&op(g.sent.back())==5&&g.sent.back().data[3]==3); }
 }
+// guamp 08/11 (fin61): /readwrite falls back to the owner's persisted copy (persist rfs/msm/mpss), read only.
+static void persistTest() {
+  { Rig g; const uint32_t s0=Qftp::sessionPort(0);
+    std::vector<uint8_t> saved(700); for(size_t i=0;i<saved.size();i++) saved[i]=uint8_t(i*7+3);
+    g.files["/readwrite/mcfg_swABC"]=saved; g.files["/readwrite/mot_rfs/imei_sv"]={'1'};
+    // not written in this boot: served from the persisted copy, nothing allocated in the RAM store
+    CHECK(rx(g,Qftp::Port,req(1,"/readwrite/mcfg_swABC"))==Ok&&op(g.sent.back())==3&&g.sent.back().data.size()==516&&g.sent.back().from==s0);
+    CHECK(!memcmp(g.sent.back().data.data()+4,saved.data(),512)&&g.saw("RRQ from persist")&&g.live==0&&g.q.persisted==1);
+    CHECK(rx(g,s0,ack(1))==Ok&&g.sent.back().data.size()==4+188&&!memcmp(g.sent.back().data.data()+4,saved.data()+512,188));
+    CHECK(rx(g,s0,ack(2))==Ok&&!g.q.active()&&!g.q.stored("/readwrite/mcfg_swABC"));
+    CHECK(rx(g,Qftp::Port,req(1,"/readwrite/mot_rfs/imei_sv",{{"tsize","0"}}),0x51)==Ok&&oack(g.sent.back())["tsize"]=="1");
+    CHECK(rx(g,Qftp::Port,ack(0),0x51)==Ok);  // stray ACK on the service port answered with an error, session unchanged
+    CHECK(rx(g,s0,ack(0),0x51)==Ok&&g.sent.back().data.size()==5&&g.sent.back().data[4]=='1');
+    CHECK(rx(g,s0,ack(1),0x51)==Ok&&!g.q.active());
+    CHECK(rx(g,Qftp::Port,req(1,"/readwrite/missing"),0x52)==Ok&&g.sent.back().data[3]==1);   // neither copy: not found
+    // a write starts from the persisted copy (no truncation, as tqftpserv's open without O_TRUNC) and is read back from RAM
+    CHECK(rx(g,Qftp::Port,req(2,"/readwrite/mcfg_swABC"),0x53)==Ok&&op(g.sent.back())==4&&g.saw("WRQ starts from the persisted copy"));
+    CHECK(rx(g,s0,data(1,{0xee,0xff}),0x53)==Ok&&!g.q.active());
+    const Qftp::StoreFile *f=g.q.stored("/readwrite/mcfg_swABC");
+    CHECK(f&&f->size==700&&f->data[0]==0xee&&f->data[1]==0xff&&!memcmp(f->data+2,saved.data()+2,698));
+    CHECK(g.files["/readwrite/mcfg_swABC"]==saved);   // the backing copy is never written
+    CHECK(rx(g,Qftp::Port,req(1,"/readwrite/mcfg_swABC"),0x54)==Ok&&g.sent.back().data[4]==0xee&&g.q.persisted==2); }
+  { Rig g; const uint32_t s0=Qftp::sessionPort(0);   // a persisted copy larger than one RAM file: the write starts empty
+    g.files["/readwrite/huge"]=std::vector<uint8_t>(Qftp::StoreFileBytes+1,9);
+    CHECK(rx(g,Qftp::Port,req(2,"/readwrite/huge"))==Ok&&!g.saw("WRQ starts from the persisted copy"));
+    CHECK(rx(g,s0,data(1,{1,2,3}))==Ok);
+    const Qftp::StoreFile *f=g.q.stored("/readwrite/huge"); CHECK(f&&f->size==3); }
+  { Rig g;   // more RAM files than before (16): every one gets its own store slot
+    for(uint32_t i=0;i<Qftp::StoreFiles;i++) {
+      char name[32]; snprintf(name,sizeof name,"/readwrite/f%u",i);
+      CHECK(rx(g,Qftp::Port,req(2,name),0x60+i)==Ok&&op(g.sent.back())==4);
+      CHECK(rx(g,Qftp::sessionPort(0),data(1,{uint8_t(i)}),0x60+i)==Ok&&g.q.stored(name)); }
+    CHECK(rx(g,Qftp::Port,req(2,"/readwrite/one_more"),0x90)==Ok&&g.sent.back().data[3]==2&&g.saw("RAM store full")); }
+}
 // SERVREG_LOC: independent decoder of qmi_servreg_loc_get_domain_list_resp (u8 list length, u8 name length).
 struct Entry { std::string name; uint32_t instance; uint8_t valid; uint32_t data; };
 struct Domains { uint16_t result,total,rev; bool hasList; std::vector<Entry> list; };
@@ -177,6 +211,6 @@ static void servregTest() {
   std::vector<uint8_t> other={0,1,0,0x20,0,0,0}; CHECK(r.s.receive(0,4,other.data(),7)==Unsupported);
 }
 int main() {
-  readTest(); writeTest(); servregTest();
-  printf("PASS %u checks: QFTP (tqftpserv sessions, options, windows, /readwrite RAM store, translate) and SERVREG_LOC domain list\n",checks);
+  readTest(); writeTest(); persistTest(); servregTest();
+  printf("PASS %u checks: QFTP (tqftpserv sessions, options, windows, /readwrite RAM store and persisted copy, translate) and SERVREG_LOC domain list\n",checks);
 }
